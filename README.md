@@ -28,7 +28,7 @@
 - `core/logging.py` — loguru 结构化日志与 `run_id`/`frame_id` 上下文
 - `core/exceptions.py` — 统一异常体系
 - `container.py` — 轻量依赖注入容器
-- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制、场景状态机与交通流生成、地图系统（内置地图注册表 / OpenDRIVE 自定义地图 / 坐标系元数据）
+- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制（VIL 直接位姿 / SIL 控制指令双模式）、场景状态机与交通流生成、地图系统（内置地图注册表 / OpenDRIVE 自定义地图 / 坐标系元数据）
 - `acquisition/` — 传感器生命周期、环形缓冲（背压 + 跨线程投递）、异步原子写入器
 - `processing/` — 原始测量→契约帧转换、最近邻时间同步、数组清洗去噪
 - `evaluation/` — 轨迹/舒适/安全/覆盖指标、报告生成与图表渲染、数据回放
@@ -47,6 +47,18 @@ CARLA 世界步进模式在 `scenario.simulation_mode` 中声明，采集启动�
 - 物理子步（`substepping` / `max_substep_delta_time` / `max_substeps`）保证高步长下的仿真稳定性。
 
 CARLA Server（0.9.16）的启动参数与模式选型详见《部署运维手册》§3.1（`docs/deployment_and_operations.md`）。
+
+## 车辆控制模式（VIL / SIL）
+
+L1 `VehicleController` 提供两种主车驱动方式（`ControlMode`），控制接口与 `simulation_mode` 步进模式配合使用：
+
+- **VIL（实车在环，直接位姿控制）**：`set_transform` / `set_velocity` / `set_angular_velocity` 或一次性
+  `set_kinematic_state(VehicleKinematicState)` 直接注入真实位姿与速度，虚拟车辆完全跟随实车状态、不经仿真物理；
+  `spawn(..., mode=ControlMode.VIL)` 时自动关闭 Traffic Manager。通常与 `synchronous` 步进搭配保证时序对齐。
+- **SIL（仿真在环，控制指令控制）**：`apply_control(VehicleCommand)` 下发油门/刹车/转向/档位，
+  由 CARLA 物理引擎积分计算车辆运动。可配合 `asynchronous` 接近实时推进。
+
+车辆控制 API 与示例详见《用户手册》§4.6。
 
 ## 地图系统
 

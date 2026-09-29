@@ -19,7 +19,15 @@ from hunter_sim.simulation.maps import (
     OpenDriveOptions,
     OpenDriveVersion,
 )
-from hunter_sim.simulation.models import Location, Rotation, Transform, VehicleCommand
+from hunter_sim.simulation.models import (
+    ControlMode,
+    Location,
+    Rotation,
+    Transform,
+    Vector3D,
+    VehicleCommand,
+    VehicleKinematicState,
+)
 from hunter_sim.simulation.protocols import (
     CarlaConnectionManager,
     MapManager,
@@ -36,6 +44,7 @@ __all__ = [
     "BuiltInMap",
     "CarlaConnectionManager",
     "CarlaConnectionManagerImpl",
+    "ControlMode",
     "CoordinateFrame",
     "Location",
     "MapCategory",
@@ -50,7 +59,9 @@ __all__ = [
     "ScenarioManagerImpl",
     "ScenarioState",
     "Transform",
+    "Vector3D",
     "VehicleCommand",
     "VehicleController",
     "VehicleControllerImpl",
+    "VehicleKinematicState",
 ]

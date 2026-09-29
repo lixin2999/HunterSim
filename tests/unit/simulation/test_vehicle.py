@@ -9,7 +9,13 @@ import pytest
 
 from hunter_sim.core.contracts import VehicleState
 from hunter_sim.core.exceptions import CarlaSimulationError
-from hunter_sim.simulation.models import Location, Transform
+from hunter_sim.simulation.models import (
+    ControlMode,
+    Location,
+    Transform,
+    Vector3D,
+    VehicleKinematicState,
+)
 from hunter_sim.simulation.protocols import VehicleController
 from hunter_sim.simulation.vehicle import VehicleControllerImpl
 
@@ -117,3 +123,88 @@ async def test_operations_before_spawn_raise() -> None:
 
     with pytest.raises(CarlaSimulationError):
         await controller.apply_control(VehicleCommand())
+
+
+async def test_default_control_mode_is_sil() -> None:
+    controller = VehicleControllerImpl(_connection(MagicMock()))
+    assert controller.control_mode is ControlMode.SIL
+
+
+async def test_spawn_vil_mode_disables_autopilot() -> None:
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn(
+        "vehicle.tesla.model3", Transform(), autopilot=True, mode=ControlMode.VIL
+    )
+    assert controller.control_mode is ControlMode.VIL
+    # VIL 下强制关闭 Traffic Manager，以便直接位姿注入。
+    actor.set_autopilot.assert_called_with(False)
+
+
+async def test_set_transform_calls_actor() -> None:
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn("vehicle.tesla.model3", Transform(), mode=ControlMode.VIL)
+    await controller.set_transform(Transform(location=Location(3.0, 4.0, 0.5)))
+    actor.set_transform.assert_called_once()
+
+
+async def test_set_velocity_calls_actor() -> None:
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn("vehicle.tesla.model3", Transform(), mode=ControlMode.VIL)
+    await controller.set_velocity(Vector3D(x=10.0, y=1.0, z=0.0))
+    actor.set_velocity.assert_called_once()
+
+
+async def test_set_angular_velocity_calls_actor() -> None:
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn("vehicle.tesla.model3", Transform(), mode=ControlMode.VIL)
+    await controller.set_angular_velocity(Vector3D(x=0.0, y=0.0, z=0.5))
+    actor.set_angular_velocity.assert_called_once()
+
+
+async def test_set_kinematic_state_sets_all_three() -> None:
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn("vehicle.tesla.model3", Transform(), mode=ControlMode.VIL)
+    state = VehicleKinematicState(
+        transform=Transform(location=Location(1.0, 2.0, 0.3)),
+        velocity=Vector3D(x=8.0, y=0.0, z=0.0),
+        angular_velocity=Vector3D(x=0.0, y=0.0, z=0.2),
+    )
+    await controller.set_kinematic_state(state)
+    actor.set_transform.assert_called_once()
+    actor.set_velocity.assert_called_once()
+    actor.set_angular_velocity.assert_called_once()
+
+
+async def test_vil_operations_before_spawn_raise() -> None:
+    controller = VehicleControllerImpl(_connection(MagicMock()))
+    with pytest.raises(CarlaSimulationError):
+        await controller.set_transform(Transform())
+    with pytest.raises(CarlaSimulationError):
+        await controller.set_velocity(Vector3D())
+    with pytest.raises(CarlaSimulationError):
+        await controller.set_angular_velocity(Vector3D())
+    with pytest.raises(CarlaSimulationError):
+        await controller.set_kinematic_state(VehicleKinematicState())
+
+
+async def test_apply_control_passes_gear() -> None:
+    import carla
+
+    world, actor = _world_with_actor()
+    controller = VehicleControllerImpl(_connection(world))
+    await controller.spawn("vehicle.tesla.model3", Transform())
+
+    from hunter_sim.simulation.models import VehicleCommand
+
+    carla.VehicleControl.reset_mock()
+    await controller.apply_control(VehicleCommand(throttle=0.5, gear=3))
+    # apply_control 将高层 gear 透传给底层 carla.VehicleControl 构造。
+    kwargs = carla.VehicleControl.call_args.kwargs
+    assert kwargs["gear"] == 3
+    assert kwargs["manual_gear_shift"] is True
+    actor.apply_control.assert_called_once()

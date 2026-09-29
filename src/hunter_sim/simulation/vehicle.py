@@ -15,7 +15,13 @@ import carla
 from hunter_sim.core.contracts import VehicleState
 from hunter_sim.core.exceptions import CarlaSimulationError
 from hunter_sim.core.logging import logger
-from hunter_sim.simulation.models import Transform, VehicleCommand
+from hunter_sim.simulation.models import (
+    ControlMode,
+    Transform,
+    Vector3D,
+    VehicleCommand,
+    VehicleKinematicState,
+)
 from hunter_sim.simulation.protocols import CarlaConnectionManager
 
 
@@ -32,6 +38,7 @@ class VehicleControllerImpl:
         self._vehicle: Any | None = None
         self._last_command = VehicleCommand()
         self._autopilot = False
+        self._control_mode = ControlMode.SIL
 
     @property
     def is_alive(self) -> bool:
@@ -42,6 +49,11 @@ class VehicleControllerImpl:
     def autopilot_enabled(self) -> bool:
         """当前是否处于自动驾驶（Traffic Manager）模式。"""
         return self._autopilot
+
+    @property
+    def control_mode(self) -> ControlMode:
+        """当前控制模式（VIL 直接位姿 / SIL 控制指令）。"""
+        return self._control_mode
 
     def get_actor(self) -> Any | None:
         """返回底层 ``carla`` 车辆演员（未生成时为 ``None``），供传感器附着。"""
@@ -63,6 +75,10 @@ class VehicleControllerImpl:
             ),
         )
 
+    @staticmethod
+    def _to_carla_vector3d(vec: Vector3D) -> Any:
+        return carla.Vector3D(x=vec.x, y=vec.y, z=vec.z)
+
     def _select_blueprint(self, world: Any, blueprint: str, color: str | None) -> Any:
         lib = world.get_blueprint_library()
         matches = lib.filter(blueprint)
@@ -80,6 +96,7 @@ class VehicleControllerImpl:
         *,
         autopilot: bool = False,
         color: str | None = None,
+        mode: ControlMode = ControlMode.SIL,
     ) -> None:
         """在主车生成点生成车辆。
 
@@ -88,6 +105,7 @@ class VehicleControllerImpl:
             spawn_point: 生成位姿。
             autopilot: 是否启用 Traffic Manager 自动驾驶。
             color: 可选车身颜色 "R,G,B"。
+            mode: 控制模式；VIL 下自动关闭自动驾驶以允许直接位姿注入。
 
         Raises:
             CarlaSimulationError: 生成失败（位姿被占用或蓝图非法）。
@@ -102,14 +120,21 @@ class VehicleControllerImpl:
                 f"{spawn_point.location.y}, {spawn_point.location.z})"
             )
         self._vehicle = actor
-        logger.bind(component="vehicle").info("主车已生成: {}", blueprint)
-        await self.set_autopilot(autopilot)
+        self._control_mode = mode
+        logger.bind(component="vehicle").info("主车已生成: {} (mode={})", blueprint, mode.value)
+        # VIL 模式下虚拟车辆跟随实车状态，不使用 Traffic Manager。
+        await self.set_autopilot(autopilot and mode != ControlMode.VIL)
 
     async def apply_control(self, control: VehicleCommand) -> None:
-        """下发油门/刹车/转向/手刹控制。
+        """SIL 模式：下发油门/刹车/转向/手刹/档位控制。
+
+        由仿真物理引擎积分计算车辆运动。档位需配合 ``manual_gear_shift`` 生效。
 
         Args:
             control: 高层控制指令。档位信息记录于最近指令，供 :meth:`get_state` 回报。
+
+        Raises:
+            CarlaSimulationError: 主车未生成。
         """
         vehicle = self._require_vehicle()
         vc = carla.VehicleControl(
@@ -118,9 +143,65 @@ class VehicleControllerImpl:
             brake=control.brake,
             hand_brake=control.hand_brake,
             reverse=control.reverse,
+            manual_gear_shift=control.gear > 0,
+            gear=control.gear,
         )
         await asyncio.to_thread(vehicle.apply_control, vc)
         self._last_command = control
+
+    async def set_transform(self, transform: Transform) -> None:
+        """VIL 模式：直接设置车辆位姿（位置 + 朝向）。
+
+        虚拟车辆完全跟随外部注入的真实位姿，不经过仿真物理积分。
+
+        Args:
+            transform: 目标位姿。
+
+        Raises:
+            CarlaSimulationError: 主车未生成。
+        """
+        vehicle = self._require_vehicle()
+        carla_tf = await asyncio.to_thread(self._to_carla_transform, transform)
+        await asyncio.to_thread(vehicle.set_transform, carla_tf)
+
+    async def set_velocity(self, velocity: Vector3D) -> None:
+        """VIL 模式：直接设置线速度 (m/s，世界坐标系)。
+
+        Args:
+            velocity: 目标线速度向量。
+
+        Raises:
+            CarlaSimulationError: 主车未生成。
+        """
+        vehicle = self._require_vehicle()
+        vec = await asyncio.to_thread(self._to_carla_vector3d, velocity)
+        await asyncio.to_thread(vehicle.set_velocity, vec)
+
+    async def set_angular_velocity(self, angular_velocity: Vector3D) -> None:
+        """VIL 模式：直接设置角速度 (rad/s)。
+
+        Args:
+            angular_velocity: 目标角速度向量。
+
+        Raises:
+            CarlaSimulationError: 主车未生成。
+        """
+        vehicle = self._require_vehicle()
+        vec = await asyncio.to_thread(self._to_carla_vector3d, angular_velocity)
+        await asyncio.to_thread(vehicle.set_angular_velocity, vec)
+
+    async def set_kinematic_state(self, state: VehicleKinematicState) -> None:
+        """VIL 模式：一次性设置位姿 + 线速度 + 角速度。
+
+        Args:
+            state: 完整运动学状态快照。
+
+        Raises:
+            CarlaSimulationError: 主车未生成。
+        """
+        await self.set_transform(state.transform)
+        await self.set_velocity(state.velocity)
+        await self.set_angular_velocity(state.angular_velocity)
 
     async def set_autopilot(self, enabled: bool) -> None:
         """切换自动驾驶（Traffic Manager）与手动控制模式。"""

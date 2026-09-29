@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,46 @@ class Transform:
     rotation: Rotation = Rotation()
 
 
+class ControlMode(StrEnum):
+    """车辆控制模式（开发提示词 §3.3.2）。
+
+    Attributes:
+        VIL: 实车在环（Vehicle-in-the-Loop）。直接位姿控制：外部提供实车真实
+            位姿与速度，虚拟车辆逐帧跟随，不依赖仿真物理引擎。
+        SIL: 仿真在环（Simulation-in-the-Loop）。控制指令控制：自动驾驶算法输出
+            油门/刹车/转向等指令，由仿真物理引擎积分计算车辆运动。
+    """
+
+    VIL = "vil"
+    SIL = "sil"
+
+
+@dataclass(frozen=True, slots=True)
+class Vector3D:
+    """三维向量（线速度 m/s 或角速度 rad/s）。"""
+
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleKinematicState:
+    """VIL 模式下的运动学状态：位姿 + 线速度 + 角速度。
+
+    用于实车在环时直接将真实车辆状态注入虚拟车辆，绕过仿真物理积分。
+
+    Attributes:
+        transform: 目标位姿（位置 + 朝向）。
+        velocity: 线速度 (x, y, z)，单位 m/s（世界坐标系）。
+        angular_velocity: 角速度 (x, y, z)，单位 rad/s。
+    """
+
+    transform: Transform = Transform()
+    velocity: Vector3D = Vector3D()
+    angular_velocity: Vector3D = Vector3D()
+
+
 @dataclass(frozen=True, slots=True)
 class VehicleCommand:
     """高层控制指令，映射到 ``carla.VehicleControl`` / ``GearControl``。
@@ -74,4 +115,12 @@ class VehicleCommand:
             raise ValueError(f"gear 不能为负: {self.gear}")
 
 
-__all__ = ["Location", "Rotation", "Transform", "VehicleCommand"]
+__all__ = [
+    "ControlMode",
+    "Location",
+    "Rotation",
+    "Transform",
+    "Vector3D",
+    "VehicleCommand",
+    "VehicleKinematicState",
+]

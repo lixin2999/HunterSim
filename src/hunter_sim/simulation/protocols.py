@@ -17,7 +17,13 @@ from hunter_sim.simulation.maps import (
     MapInfo,
     OpenDriveOptions,
 )
-from hunter_sim.simulation.models import Transform, VehicleCommand
+from hunter_sim.simulation.models import (
+    ControlMode,
+    Transform,
+    Vector3D,
+    VehicleCommand,
+    VehicleKinematicState,
+)
 
 
 @runtime_checkable
@@ -46,20 +52,56 @@ class CarlaConnectionManager(Protocol):
 
 @runtime_checkable
 class VehicleController(Protocol):
-    """主车生命周期与控制契约（模块 1.2）。"""
+    """主车生命周期与控制契约（模块 1.2）。
+
+    支持两种控制模式（§3.3.2）：
+
+    - **SIL 模式**：通过 :meth:`apply_control` 下发油门/刹车/转向指令，由物理引擎驱动。
+    - **VIL 模式**：通过 :meth:`set_transform`、:meth:`set_velocity`、
+      :meth:`set_angular_velocity` 或 :meth:`set_kinematic_state` 直接设置
+      虚拟车辆位姿与速度，绕过仿真物理。
+    """
 
     @property
     def is_alive(self) -> bool: ...
+
+    @property
+    def control_mode(self) -> ControlMode:
+        """当前控制模式。"""
+        ...
 
     def get_actor(self) -> Any:
         """返回底层 ``carla`` 车辆演员（未生成时 ``None``），供传感器附着。"""
         ...
 
     async def spawn(
-        self, blueprint: str, spawn_point: Transform, *, autopilot: bool = False
+        self,
+        blueprint: str,
+        spawn_point: Transform,
+        *,
+        autopilot: bool = False,
+        mode: ControlMode = ControlMode.SIL,
     ) -> None: ...
 
-    async def apply_control(self, control: VehicleCommand) -> None: ...
+    async def apply_control(self, control: VehicleCommand) -> None:
+        """SIL 模式：下发控制指令（油门/刹车/转向），由仿真物理驱动。"""
+        ...
+
+    async def set_transform(self, transform: Transform) -> None:
+        """VIL 模式：直接设置车辆位姿（位置 + 朝向）。"""
+        ...
+
+    async def set_velocity(self, velocity: Vector3D) -> None:
+        """VIL 模式：直接设置线速度 (m/s)。"""
+        ...
+
+    async def set_angular_velocity(self, angular_velocity: Vector3D) -> None:
+        """VIL 模式：直接设置角速度 (rad/s)。"""
+        ...
+
+    async def set_kinematic_state(self, state: VehicleKinematicState) -> None:
+        """VIL 模式：一次性设置位姿 + 线速度 + 角速度。"""
+        ...
 
     async def set_autopilot(self, enabled: bool) -> None: ...
 
