@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual env / uv
+.venv/
+venv/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Runtime data / 采集与评估产物（不上传）
+data/runs/
+data/
+*.h5
+*.hdf5
+*.pcd
+*.npy
+*.msgpack
+reports/
+*.png
+!docs/**/*.png
+
+# 日志
+logs/
+*.log
+
+# 环境变量 / 密钥（切勿提交）
+.env
+.env.*
+*.pem
+*.key
+
+# 文档 / 打包构建产物
+site/
+docs/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 编辑器 / 工具本地缓存
+.qoder/
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# release.md、user_manual.md、deployment_and_operations.md保持同步更新但不追踪管理
+release.md
+user_manual.md
+deployment_and_operations.md

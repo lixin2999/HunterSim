@@ -1,0 +1,58 @@
+scenario:
+  name: "default_highway"
+  map: "Town04"
+  duration_seconds: 120
+  tick_rate: 20  # Hz
+
+vehicle:
+  blueprint: "vehicle.tesla.model3"
+  spawn_point_index: 0
+  color: "255,0,0"
+  physics:
+    mass: 1840
+    drag_coefficient: 0.23
+
+sensors:
+  - id: "rgb_front"
+    type: "camera.rgb"
+    position: [0, 0, 1.6]  # x, y, z relative to vehicle
+    rotation: [0, 0, 0]    # pitch, yaw, roll
+    width: 1920
+    height: 1080
+    fov: 90
+    tick_rate: 10
+  - id: "lidar_top"
+    type: "lidar.ray_cast"
+    position: [0, 0, 2.0]
+    rotation: [0, 0, 0]
+    channels: 64
+    range: 100
+    points_per_second: 1300000
+    rotation_frequency: 10
+  - id: "imu"
+    type: "other.imu"
+    position: [0, 0, 1.0]
+    rotation: [0, 0, 0]
+    tick_rate: 20
+  - id: "gnss"
+    type: "other.gnss"
+    position: [0, 0, 1.0]
+    rotation: [0, 0, 0]
+    tick_rate: 10
+
+weather:
+  cloudiness: 0.0
+  precipitation: 0.0
+  sun_altitude_angle: 45.0
+
+traffic:
+  npc_vehicles: 50
+  npc_walkers: 20
+  traffic_manager_port: 8000
+
+output:
+  base_dir: "./data/runs"
+  formats:
+    camera: "png"
+    lidar: "hdf5"
+    telemetry: "msgpack"
