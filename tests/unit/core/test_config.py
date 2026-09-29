@@ -26,6 +26,59 @@ def test_output_formats(default_scenario_path: Path) -> None:
     assert cfg.output.formats.lidar == "hdf5"
 
 
+def test_simulation_mode_defaults(default_scenario_path: Path) -> None:
+    """默认场景使用同步（VIL）模式，子步参数已就绪。"""
+    cfg = load_scenario_config(default_scenario_path)
+    mode = cfg.scenario.simulation_mode
+    assert mode.mode == "synchronous"
+    assert mode.is_synchronous is True
+    assert mode.substepping is True
+    assert mode.max_substep_delta_time == 0.01
+    assert mode.max_substeps == 8
+    # fixed_delta_seconds 为 null → 由实现层按 tick_rate 推算
+    assert mode.fixed_delta_seconds is None
+
+
+def test_asynchronous_mode_roundtrip(tmp_path: Path) -> None:
+    data = {
+        "scenario": {
+            "name": "x",
+            "map": "Town01",
+            "duration_seconds": 10,
+            "tick_rate": 50,
+            "simulation_mode": {"mode": "asynchronous", "fixed_delta_seconds": None},
+        },
+        "vehicle": {"blueprint": "vehicle.a"},
+        "sensors": [
+            {"id": "a", "type": "imu", "position": [0, 0, 0], "rotation": [0, 0, 0]},
+        ],
+    }
+    p = tmp_path / "async.yaml"
+    p.write_text(yaml.safe_dump(data), encoding="utf-8")
+    cfg = load_scenario_config(p)
+    assert cfg.scenario.simulation_mode.is_synchronous is False
+
+
+def test_invalid_simulation_mode_rejected(tmp_path: Path) -> None:
+    data = {
+        "scenario": {
+            "name": "x",
+            "map": "Town01",
+            "duration_seconds": 10,
+            "tick_rate": 20,
+            "simulation_mode": {"mode": "realtime"},
+        },
+        "vehicle": {"blueprint": "vehicle.a"},
+        "sensors": [
+            {"id": "a", "type": "imu", "position": [0, 0, 0], "rotation": [0, 0, 0]},
+        ],
+    }
+    p = tmp_path / "bad_mode.yaml"
+    p.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ConfigurationError):
+        load_scenario_config(p)
+
+
 def test_full_suite_sensors_valid(sensors_suite_path: Path) -> None:
     raw = yaml.safe_load(sensors_suite_path.read_text(encoding="utf-8"))
     sensors = [SensorConfig.model_validate(item) for item in raw["sensors"]]

@@ -45,6 +45,7 @@ logs/
 site/
 docs/
 *.egg-info/
+HunterSim.ai-rules.md
 
 # IDE / OS
 .idea/

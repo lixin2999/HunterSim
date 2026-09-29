@@ -23,7 +23,19 @@ from hunter_sim.simulation.scenario import ScenarioManagerImpl
 def _config() -> ScenarioConfig:
     return ScenarioConfig.model_validate(
         {
-            "scenario": {"name": "s", "map": "Town04", "duration_seconds": 10, "tick_rate": 20},
+            "scenario": {
+                "name": "s",
+                "map": "Town04",
+                "duration_seconds": 10,
+                "tick_rate": 20,
+                "simulation_mode": {
+                    "mode": "synchronous",
+                    "fixed_delta_seconds": 0.02,
+                    "substepping": True,
+                    "max_substep_delta_time": 0.01,
+                    "max_substeps": 4,
+                },
+            },
             "vehicle": {"blueprint": "vehicle.tesla.model3", "spawn_point_index": 0},
             "sensors": [
                 {
@@ -156,6 +168,37 @@ async def test_start_from_idle_invalid_transition(sample_vehicle_state: object) 
     scenario, _, _, _ = _build(sample_vehicle_state)
     with pytest.raises(SimulationError):
         await scenario.start()
+
+
+async def test_configure_applies_synchronous_mode_settings(sample_vehicle_state: object) -> None:
+    """同步（VIL）模式：固定步长与子步参数应写入并应用 WorldSettings。"""
+    scenario, conn, _, _ = _build(sample_vehicle_state)
+    world = conn.get_world()
+    settings = world.get_settings()
+    await scenario.configure()
+    assert settings.synchronous_mode is True
+    assert settings.fixed_delta_seconds == 0.02
+    assert settings.substepping is True
+    assert settings.max_substep_delta_time == 0.01
+    assert settings.max_substeps == 4
+    world.apply_settings.assert_called_with(settings)
+
+
+async def test_configure_asynchronous_mode_clears_delta(sample_vehicle_state: object) -> None:
+    """异步（回放/SIL）模式：synchronous_mode=False 且 fixed_delta_seconds=None。"""
+    cfg = _config()
+    cfg.scenario.simulation_mode.mode = "asynchronous"  # type: ignore[misc]
+    world = _world()
+    conn = MagicMock()
+    conn.get_world.return_value = world
+    conn.load_world = AsyncMock(return_value=world)
+    vehicle = MagicMock()
+    vehicle.spawn = AsyncMock()
+    scenario = ScenarioManagerImpl(cfg, conn, vehicle, InMemoryEventBus())
+    settings = world.get_settings()
+    await scenario.configure()
+    assert settings.synchronous_mode is False
+    assert settings.fixed_delta_seconds is None
 
 
 async def test_register_hook_invalid_name(sample_vehicle_state: object) -> None:

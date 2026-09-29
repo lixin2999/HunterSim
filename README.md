@@ -19,17 +19,34 @@
 
 ## 开发状态
 
-当前完成 **项目脚手架 + `core` 基础层**：
+**V0.1.0 已完成严格五层架构（L1–L5）端到端贯通**，质量门禁全绿（`ruff` / `mypy --strict` / `pytest`，覆盖率 98%）：
 
 - `core/contracts.py` — 不可变数据契约（`VehicleState` / `CameraFrame` / `LidarFrame` / `SynchronizedFrame` 等）
 - `core/events.py` — 事件类型 + `core/event_bus.py` 线程安全的进程内事件总线
 - `core/protocols.py` — 跨层 `Protocol`（`EventBus`）
-- `core/config.py` — pydantic 配置模型 + YAML/JSON 加载器
+- `core/config.py` — pydantic 配置模型 + YAML/JSON 加载器（含仿真步进模式 `simulation_mode`）
 - `core/logging.py` — loguru 结构化日志与 `run_id`/`frame_id` 上下文
 - `core/exceptions.py` — 统一异常体系
 - `container.py` — 轻量依赖注入容器
+- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制、场景状态机与交通流生成
+- `acquisition/` — 传感器生命周期、环形缓冲（背压 + 跨线程投递）、异步原子写入器
+- `processing/` — 原始测量→契约帧转换、最近邻时间同步、数组清洗去噪
+- `evaluation/` — 轨迹/舒适/安全/覆盖指标、报告生成与图表渲染、数据回放
+- `app/` — 采集调度器、运行编排器、组合根装配容器、惰性 `typer` CLI
 
-L1–L5 各层为占位，按开发提示词 §11 的任务序列增量实现。
+详见《发布说明》（`release.md`）与《用户手册》（`docs/user_manual.md`）。
+
+## 仿真模式（同步 / 异步）
+
+CARLA 世界步进模式在 `scenario.simulation_mode` 中声明，采集启动时由 `ScenarioManagerImpl` 自动写入
+`carla.WorldSettings`：
+
+- **`synchronous`（默认，VIL 实时）**：仿真由客户端 `world.tick()` 驱动，固定步长（`fixed_delta_seconds`，
+  为 `null` 时由 `tick_rate` 推算），时序严格对齐且可复现——数据采集用它。
+- **`asynchronous`（回放 / SIL）**：`fixed_delta_seconds=None` 可变步长，按真实时间自动推进——在线 SIL/交互调试用它。
+- 物理子步（`substepping` / `max_substep_delta_time` / `max_substeps`）保证高步长下的仿真稳定性。
+
+CARLA Server（0.9.16）的启动参数与模式选型详见《部署运维手册》§3.1（`docs/deployment_and_operations.md`）。
 
 ## 环境准备
 

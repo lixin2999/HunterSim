@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,13 +34,43 @@ class ConnectionConfig(_ConfigModel):
     traffic_manager_port: int = 8000
 
 
+class SimulationModeConfig(_ConfigModel):
+    """仿真步进模式配置（映射到 ``carla.WorldSettings``）。
+
+    - ``synchronous_mode=True``（VIL 实时模式）：仿真由客户端 ``world.tick()`` 驱动，
+      步长固定为 ``fixed_delta_seconds``，与实车控制频率对齐；
+    - ``synchronous_mode=False``（回放 / SIL 模式）：仿真按真实时间自动推进，
+      ``fixed_delta_seconds`` 置 ``None`` 表示可变步长。
+
+    物理子步（``substepping``）用于在高步长下保证碰撞与动力学稳定性。
+    """
+
+    mode: Literal["synchronous", "asynchronous"] = Field(
+        default="synchronous", description="仿真模式：synchronous=VIL实时；asynchronous=回放/SIL"
+    )
+    fixed_delta_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="固定步长（秒）；为 None 时由 tick_rate 推算（1/tick_rate）",
+    )
+    substepping: bool = Field(default=True, description="启用物理子步（仅同步模式生效）")
+    max_substep_delta_time: float = Field(default=0.01, gt=0, description="单个子步最大时间（秒）")
+    max_substeps: int = Field(default=4, ge=1, description="每帧最大子步数")
+
+    @property
+    def is_synchronous(self) -> bool:
+        """是否为同步（VIL 实时）模式。"""
+        return self.mode == "synchronous"
+
+
 class ScenarioSection(_ConfigModel):
-    """场景基本参数（地图、时长、步进频率）。"""
+    """场景基本参数（地图、时长、步进频率、仿真模式）。"""
 
     name: str
     map: str
     duration_seconds: float = Field(gt=0)
     tick_rate: float = Field(gt=0, description="仿真步进频率 Hz")
+    simulation_mode: SimulationModeConfig = Field(default_factory=SimulationModeConfig)
 
 
 class PhysicsConfig(_ConfigModel):
@@ -184,6 +214,7 @@ __all__ = [
     "ScenarioConfig",
     "ScenarioSection",
     "SensorConfig",
+    "SimulationModeConfig",
     "TrafficConfig",
     "VehicleSection",
     "WeatherConfig",

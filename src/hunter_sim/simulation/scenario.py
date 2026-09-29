@@ -183,9 +183,36 @@ class ScenarioManagerImpl:
         )
 
     def _apply_tick_settings(self, world: Any) -> None:
+        """根据 ``simulation_mode`` 配置 CARLA 世界步进（``WorldSettings``）。
+
+        - 同步模式（VIL 实时）：启用 ``synchronous_mode``，固定步长由客户端 ``world.tick()`` 驱动；
+          按配置启用物理子步以保证稳定性。
+        - 异步模式（回放 / SIL）：关闭 ``synchronous_mode``，``fixed_delta_seconds`` 置 ``None``
+          表示可变步长（按真实时间推进）。
+        """
+        mode = self._config.scenario.simulation_mode
         settings = world.get_settings()
-        settings.fixed_delta_seconds = 1.0 / self._config.scenario.tick_rate
+        settings.synchronous_mode = mode.is_synchronous
+        if mode.is_synchronous:
+            # 未显式指定步长时由 tick_rate 推算（1/tick_rate），与实车控制频率对齐。
+            settings.fixed_delta_seconds = (
+                mode.fixed_delta_seconds
+                if mode.fixed_delta_seconds is not None
+                else 1.0 / self._config.scenario.tick_rate
+            )
+            settings.substepping = mode.substepping
+            settings.max_substep_delta_time = mode.max_substep_delta_time
+            settings.max_substeps = mode.max_substeps
+        else:
+            # 异步模式：可变步长，子步设置对推进无实质影响，保留默认。
+            settings.fixed_delta_seconds = None
         world.apply_settings(settings)
+        logger.bind(component="scenario").debug(
+            "已应用步进设置: mode={} fixed_delta={} substepping={}",
+            mode.mode,
+            settings.fixed_delta_seconds,
+            settings.substepping,
+        )
 
     def _spawn_traffic(self, world: Any) -> None:
         traffic = self._config.traffic

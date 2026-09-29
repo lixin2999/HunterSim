@@ -3,6 +3,13 @@ scenario:
   map: "Town04"
   duration_seconds: 120
   tick_rate: 20  # Hz
+  # 仿真步进模式（映射到 carla.WorldSettings）
+  simulation_mode:
+    mode: "synchronous"          # synchronous=VIL实时（客户端 tick 驱动）; asynchronous=回放/SIL
+    fixed_delta_seconds: null    # null → 由 tick_rate 推算 (1/20 = 0.05s)；显式设为 0.02 即为 50Hz
+    substepping: true            # 启用物理子步（保证高速/高步长下稳定性）
+    max_substep_delta_time: 0.01 # 单个子步最大时间（秒）
+    max_substeps: 8              # 每帧最大子步数（需满足 max_substeps*max_substep_delta_time >= fixed_delta_seconds）
 
 vehicle:
   blueprint: "vehicle.tesla.model3"
