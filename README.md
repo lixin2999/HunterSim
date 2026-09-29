@@ -19,7 +19,7 @@
 
 ## 开发状态
 
-**V0.1.0 已完成严格五层架构（L1–L5）端到端贯通**，质量门禁全绿（`ruff` / `mypy --strict` / `pytest`，覆盖率 98%）：
+**V0.1.0–V0.6.0 已完成严格五层架构（L1–L5）端到端贯通 + VIL 虚实映射模块**，质量门禁全绿（`ruff` / `mypy --strict` / `pytest`，覆盖率 94%，275 项测试通过）：
 
 - `core/contracts.py` — 不可变数据契约（`VehicleState` / `CameraFrame` / `LidarFrame` / `SynchronizedFrame` 等）
 - `core/events.py` — 事件类型 + `core/event_bus.py` 线程安全的进程内事件总线
@@ -33,6 +33,7 @@
 - `processing/` — 原始测量→契约帧转换、最近邻时间同步、数组清洗去噪
 - `evaluation/` — 轨迹/舒适/安全/覆盖指标、报告生成与图表渲染、数据回放
 - `app/` — 采集调度器、运行编排器、组合根装配容器、惰性 `typer` CLI
+- `app/vil/` — VIL 虚实映射模块（Kafka 遥测消费、坐标映射、状态同步、可视化、同步控制、VIL 引擎）
 
 详见《发布说明》（`release.md`）与《用户手册》（`docs/user_manual.md`）。
 
@@ -42,7 +43,7 @@ CARLA 世界步进模式在 `scenario.simulation_mode` 中声明，采集启动�
 `carla.WorldSettings`：
 
 - **`synchronous`（默认，VIL 实时）**：仿真由客户端 `world.tick()` 驱动，固定步长（`fixed_delta_seconds`，
-  为 `null` 时由 `tick_rate` 推算），时序严格对齐且可复现——数据采集用它。
+  为 `null` 时由 `tick_rate` 推算），时序严格对齐且可复现——数据采集与 VIL 实车在环用它。
 - **`asynchronous`（回放 / SIL）**：`fixed_delta_seconds=None` 可变步长，按真实时间自动推进——在线 SIL/交互调试用它。
 - 物理子步（`substepping` / `max_substep_delta_time` / `max_substeps`）保证高步长下的仿真稳定性。
 
@@ -70,9 +71,22 @@ L1 `simulation` 提供地图系统（`MapManager` 契约 + `MapManagerImpl`，�
 - **自定义地图**：`load_opendrive(path)` / `load_opendrive_xml(str)` 从 OpenDRIVE 1.4 / 1.6
   （`.xodr` 或 XML）经 `client.generate_opendrive_world` 生成世界，参数由 `OpenDriveOptions` 配置。
 - **坐标系**：`CARLA_COORDINATE_FRAME` 描述左手系（X 东 / Y 北 / Z 上，单位米）；与实车坐标系的
-  转换由 VIL 映射模块处理。
+  转换由 VIL 映射模块处理（见下方「VIL 虚实映射模块」）。
 
 内置地图清单、自定义 OpenDRIVE 用法与配置详见《用户手册》§4.5。
+
+## VIL 虚实映射模块
+
+L5 `app/vil` 提供实车在环（Vehicle-in-the-Loop）全链路映射（开发提示词 §4）：
+
+- **数据接入**：从 Kafka `telemetry_clean` topic 消费实车遥测（定位/底盘/感知/IMU），独立 daemon 线程 + 最新帧缓存。
+- **坐标映射**：实车 odom 右手系 → CARLA 地图左手系的仿射变换（旋转 + 平移 + yaw 取反）。
+- **状态同步**：位姿/线速度/角速度实时注入虚拟车辆（VIL 直接位姿控制）。
+- **可视化**：CARLA `world.debug` 叠加浮动文字（速度/行为状态）、感知包围盒、规划轨迹线。
+- **同步控制**：20ms 固定步长 tick；延迟 >500ms 暂停场景；>50ms 外推补偿（仅影响可视化）。
+
+启用方式：在场景 YAML 中配置 `vil.enabled: true` 并提供标定参数，运行 `huntersim vil-run --config configs/vil_scenario.yaml`。
+详细配置与算法说明见《用户手册》§4.8。
 
 ## 天气与环境
 
@@ -94,6 +108,7 @@ L1 `simulation` 提供天气与环境模型（`simulation/weather.py`），场�
 ```bash
 # 安装 uv 后（本项目使用 uv 管理）
 uv sync --group dev          # 创建 3.12 虚拟环境并安装依赖
+uv sync --extra vil          # VIL 实车在环（额外安装 kafka-python）
 
 uv run ruff check .          # lint
 uv run ruff format .         # 格式化
@@ -106,6 +121,6 @@ uv run pytest                # 运行测试
 ```
 src/hunter_sim/     # 源码（src 布局）
 tests/              # 单元 / 集成测试（CARLA 全部 mock）
-configs/            # 场景与传感器配置示例
+configs/            # 场景与传感器配置示例（含 vil_scenario.yaml）
 data/runs/          # 运行数据输出（gitignore）
 ```

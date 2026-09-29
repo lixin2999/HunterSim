@@ -177,6 +177,62 @@ class OutputConfig(_ConfigModel):
     formats: OutputFormats = Field(default_factory=OutputFormats)
 
 
+class VILCalibrationConfig(_ConfigModel):
+    """VIL 初始标定（§4.3.2）：实车启动点在仿真地图中的对应位姿。
+
+    ``yaw0_rad`` 采用弧度以与引擎内部一致；提供 ``yaw0_deg`` 写入时自动换算，
+    两者互斥，同时提供时以弧度为准。
+    """
+
+    x0: float = Field(description="仿真地图起始 X（米）")
+    y0: float = Field(description="仿真地图起始 Y（米）")
+    yaw0_rad: float = Field(default=0.0, description="起始航向（弧度）")
+    yaw0_deg: float | None = Field(default=None, description="起始航向（度）可选写入形式")
+
+    @property
+    def yaw0(self) -> float:
+        """归一化后的弧度制 yaw0（优先取 ``yaw0_deg``）。"""
+        import math
+
+        if self.yaw0_deg is not None:
+            return math.radians(self.yaw0_deg)
+        return self.yaw0_rad
+
+
+class VILSectionConfig(_ConfigModel):
+    """VIL 实车在环运行参数（模块 4）。``enabled=False`` 时编排器不装配 VIL 引擎。"""
+
+    enabled: bool = False
+    kafka_bootstrap_servers: str = "kafka:9092"
+    kafka_group_id: str = "carla-vil"
+    telemetry_topic: str = "telemetry_clean"
+    command_topic_pattern: str = "hunter.{vehicle_id}.command_result"
+    target_vehicle_id: str = ""
+    calibration: VILCalibrationConfig | None = None
+    delay_compensation_ms: float = Field(default=150.0, ge=0)
+    data_timeout_ms: float = Field(default=500.0, ge=0)
+    extrapolation_threshold_ms: float = Field(default=50.0, ge=0)
+    ego_z_offset: float = Field(default=0.3, ge=0)
+
+    @field_validator("target_vehicle_id")
+    @classmethod
+    def _require_vehicle_id_when_enabled(cls, v: str, info: Any) -> str:
+        enabled = info.data.get("enabled", False)
+        if enabled and not v.strip():
+            raise ValueError("vil.enabled=True 时必须提供 target_vehicle_id")
+        return v
+
+    @field_validator("calibration")
+    @classmethod
+    def _require_calibration_when_enabled(
+        cls, v: VILCalibrationConfig | None, info: Any
+    ) -> VILCalibrationConfig | None:
+        enabled = info.data.get("enabled", False)
+        if enabled and v is None:
+            raise ValueError("vil.enabled=True 时必须提供 calibration")
+        return v
+
+
 class ScenarioConfig(_ConfigModel):
     """一次采集任务的完整场景配置根模型。"""
 
@@ -186,6 +242,7 @@ class ScenarioConfig(_ConfigModel):
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    vil: VILSectionConfig = Field(default_factory=VILSectionConfig)
 
     @field_validator("sensors")
     @classmethod
@@ -239,6 +296,8 @@ __all__ = [
     "SensorConfig",
     "SimulationModeConfig",
     "TrafficConfig",
+    "VILCalibrationConfig",
+    "VILSectionConfig",
     "VehicleSection",
     "WeatherConfig",
     "load_scenario_config",

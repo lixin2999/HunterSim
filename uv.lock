@@ -670,6 +670,9 @@ storage = [
     { name = "h5py" },
     { name = "msgpack" },
 ]
+vil = [
+    { name = "kafka-python" },
+]
 viz = [
     { name = "matplotlib" },
     { name = "open3d" },
@@ -688,6 +691,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "h5py", marker = "extra == 'storage'", specifier = ">=3.11" },
+    { name = "kafka-python", marker = "extra == 'vil'", specifier = ">=2.0,<3.0" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
     { name = "msgpack", marker = "extra == 'storage'", specifier = ">=1.0" },
@@ -700,7 +704,7 @@ requires-dist = [
     { name = "scipy", marker = "extra == 'processing'", specifier = ">=1.13" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.12" },
 ]
-provides-extras = ["processing", "storage", "cli", "viz", "imaging"]
+provides-extras = ["processing", "storage", "cli", "viz", "imaging", "vil"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -880,6 +884,15 @@ source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/21/8b/e739cf9066ad5037a2d4b0a403f06da374fdccb9748221661c8b492d3dbc/jupyterlab_widgets-3.0.17.tar.gz", hash = "sha256:6e61fe21ca8a66039180a5cc52a433e07279d2fee79c8be963e00d55193f17a8", size = 213919, upload-time = "2026-08-18T08:52:17.511Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/33/ef/6d27fc118f58cb24886da413545a7efb0853d405fddbfd8b2d9ac09fbed4/jupyterlab_widgets-3.0.17-py3-none-any.whl", hash = "sha256:40ac1e9955acf116c4d995d9bfa082d86ad9ec6d91c4f134827cf5e0a5eb75e0", size = 217292, upload-time = "2026-08-18T08:52:15.47Z" },
+]
+
+[[package]]
+name = "kafka-python"
+version = "2.3.2"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c6/7e/9eb4363e5018b71edf77de3d2fbd687f1e3a55d43101138a5b7f2ca56d97/kafka_python-2.3.2.tar.gz", hash = "sha256:2d2469bcabc2551be7eaf7fb512e1241484d358800f2665b90e7e24fea84259d", size = 357589, upload-time = "2026-06-03T22:46:49.022Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/4f/db/cfe23cfacc9aabeef59e349aa6c2738d195df1d56ccf8c31362abdd68ddb/kafka_python-2.3.2-py2.py3-none-any.whl", hash = "sha256:e8a5e6f2c4ce13a8041669337038d5125e0e09e6d6f0911902ae5939e5b9595e", size = 326623, upload-time = "2026-06-03T22:46:47.417Z" },
 ]
 
 [[package]]

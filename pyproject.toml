@@ -21,6 +21,7 @@ storage = ["msgpack>=1.0", "h5py>=3.11"]
 cli = ["typer>=0.12"]
 viz = ["matplotlib>=3.8", "open3d>=0.18"]
 imaging = ["pillow>=10"]
+vil = ["kafka-python>=2.0,<3.0"]
 
 [dependency-groups]
 dev = [
@@ -72,7 +73,7 @@ warn_unused_ignores = true
 exclude = ["data/"]
 
 [[tool.mypy.overrides]]
-module = ["carla.*", "msgpack.*", "h5py.*", "open3d.*", "matplotlib.*", "PIL.*", "typer.*"]
+module = ["carla.*", "msgpack.*", "h5py.*", "open3d.*", "matplotlib.*", "PIL.*", "typer.*", "kafka.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

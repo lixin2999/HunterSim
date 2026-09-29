@@ -20,6 +20,21 @@ from hunter_sim.acquisition.writer import DiskDataWriterImpl
 from hunter_sim.app.orchestrator import RunOrchestratorImpl
 from hunter_sim.app.protocols import Orchestrator, Scheduler
 from hunter_sim.app.scheduler import CollectionSchedulerImpl
+from hunter_sim.app.vil.coordinate_mapper import CoordinateMapperImpl
+from hunter_sim.app.vil.models import VILCalibration, VILConfig
+from hunter_sim.app.vil.orchestrator import VILEngineImpl
+from hunter_sim.app.vil.protocols import (
+    CoordinateMapper,
+    StateSynchronizer,
+    SyncController,
+    TelemetrySource,
+    VILEngine,
+    VILVisualizer,
+)
+from hunter_sim.app.vil.state_synchronizer import StateSynchronizerImpl
+from hunter_sim.app.vil.sync_controller import SyncControllerImpl
+from hunter_sim.app.vil.telemetry_consumer import KafkaTelemetryConsumerImpl
+from hunter_sim.app.vil.visualizer import CARLAVisualizerImpl
 from hunter_sim.container import Container
 from hunter_sim.core.config import ConnectionConfig, ScenarioConfig
 from hunter_sim.core.event_bus import InMemoryEventBus
@@ -47,6 +62,32 @@ from hunter_sim.simulation.vehicle import VehicleControllerImpl
 _IMAGE_FORMATS = frozenset({"npy", "png", "jpeg"})
 _POINTCLOUD_FORMATS = frozenset({"pcd", "npy", "hdf5"})
 _TELEMETRY_FORMATS = frozenset({"json", "msgpack"})
+
+
+def _build_vil_config(scenario_cfg: ScenarioConfig) -> VILConfig | None:
+    """从场景配置的 ``vil`` 节派生 :class:`VILConfig`；未启用时返回 ``None``。"""
+    vil = scenario_cfg.vil
+    if not vil.enabled or vil.calibration is None:
+        return None
+    calibration = VILCalibration(
+        x0=vil.calibration.x0,
+        y0=vil.calibration.y0,
+        yaw0=vil.calibration.yaw0,
+    )
+    tick_interval = 1.0 / scenario_cfg.scenario.tick_rate
+    return VILConfig(
+        kafka_bootstrap_servers=vil.kafka_bootstrap_servers,
+        kafka_group_id=vil.kafka_group_id,
+        telemetry_topic=vil.telemetry_topic,
+        command_topic_pattern=vil.command_topic_pattern,
+        target_vehicle_id=vil.target_vehicle_id,
+        calibration=calibration,
+        delay_compensation_ms=vil.delay_compensation_ms,
+        data_timeout_ms=vil.data_timeout_ms,
+        extrapolation_threshold_ms=vil.extrapolation_threshold_ms,
+        sync_tick_interval_s=tick_interval,
+        ego_z_offset=vil.ego_z_offset,
+    )
 
 
 def _resolve_formats(formats: Any) -> tuple[str, str, str]:
@@ -158,6 +199,42 @@ def build_container(
         (Scheduler, scheduler),
         (Orchestrator, orchestrator),
     ]
+
+    # 可选 VIL 装配：仅当 ``config.vil.enabled`` 且校准完整时注入。
+    vil_config = _build_vil_config(config)
+    if vil_config is not None:
+        mapper = CoordinateMapperImpl(vil_config.calibration)
+        sync_ctrl = SyncControllerImpl(vil_config)
+        telemetry_source: TelemetrySource = KafkaTelemetryConsumerImpl(vil_config)
+        state_sync: StateSynchronizer = StateSynchronizerImpl(
+            vehicle=vehicle, mapper=mapper, sync_ctrl=sync_ctrl, config=vil_config
+        )
+        visualizer: VILVisualizer = CARLAVisualizerImpl(
+            connection=connection, mapper=mapper
+        )
+        vil_engine: VILEngine = VILEngineImpl(
+            scenario=scenario,
+            telemetry_source=telemetry_source,
+            synchronizer=state_sync,
+            visualizer=visualizer,  # type: ignore[arg-type]  # 契约包含 adraw_all
+            sync_ctrl=sync_ctrl,
+            config=vil_config,
+        )
+        bindings.extend(
+            [
+                (VILConfig, vil_config),
+                (CoordinateMapper, mapper),
+                (SyncController, sync_ctrl),
+                (TelemetrySource, telemetry_source),
+                (StateSynchronizer, state_sync),
+                (VILVisualizer, visualizer),
+                (VILEngine, vil_engine),
+            ]
+        )
+        logger.bind(component="bootstrap", run_id=run_id).info(
+            "VIL 引擎已装配: target_vehicle_id={}", vil_config.target_vehicle_id
+        )
+
     for interface, instance in bindings:
         container.register_instance(interface, instance)
     logger.bind(component="bootstrap", run_id=run_id).info("依赖容器装配完成")
