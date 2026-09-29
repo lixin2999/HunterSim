@@ -1,7 +1,7 @@
 """L1 仿真核心层 (Simulation Core)。
 
 模块：connection（连接管理）/ vehicle（车辆控制）/ scenario（场景管理）/
-maps（地图系统）。对外暴露各层 Protocol 与实现类，供上层通过依赖注入使用。
+maps（地图系统）/ weather（天气与环境）。对外暴露各层 Protocol 与实现类，供上层通过依赖注入使用。
 """
 
 from __future__ import annotations
@@ -37,10 +37,19 @@ from hunter_sim.simulation.protocols import (
 )
 from hunter_sim.simulation.scenario import ScenarioManagerImpl
 from hunter_sim.simulation.vehicle import VehicleControllerImpl
+from hunter_sim.simulation.weather import (
+    WEATHER_PRESET_REGISTRY,
+    PresetEnvironment,
+    WeatherParameters,
+    WeatherPreset,
+    list_presets,
+    resolve_preset,
+)
 
 __all__ = [
     "BUILTIN_MAP_REGISTRY",
     "CARLA_COORDINATE_FRAME",
+    "WEATHER_PRESET_REGISTRY",
     "BuiltInMap",
     "CarlaConnectionManager",
     "CarlaConnectionManagerImpl",
@@ -54,6 +63,7 @@ __all__ = [
     "MapSource",
     "OpenDriveOptions",
     "OpenDriveVersion",
+    "PresetEnvironment",
     "Rotation",
     "ScenarioManager",
     "ScenarioManagerImpl",
@@ -64,4 +74,8 @@ __all__ = [
     "VehicleController",
     "VehicleControllerImpl",
     "VehicleKinematicState",
+    "WeatherParameters",
+    "WeatherPreset",
+    "list_presets",
+    "resolve_preset",
 ]

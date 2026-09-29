@@ -32,6 +32,7 @@ from hunter_sim.simulation.protocols import (
     ScenarioState,
     VehicleController,
 )
+from hunter_sim.simulation.weather import WeatherParameters, resolve_preset
 
 _VALID_HOOKS = frozenset({"on_start", "on_tick", "on_end"})
 
@@ -172,14 +173,43 @@ class ScenarioManagerImpl:
             "场景配置完成: map={} ego={}", map_name, ego_transform.location
         )
 
-    def _apply_weather(self, world: Any) -> None:
+    def _resolve_weather(self) -> WeatherParameters:
+        """将配置的天气解析为引擎层参数（§3.4）。
+
+        指定 ``preset`` 时以预设注册表为准（未知预设抛
+        :class:`~hunter_sim.core.exceptions.ConfigurationError`）；
+        否则由显式数值字段构建。
+        """
         weather = self._config.weather
+        if weather.preset:
+            return resolve_preset(weather.preset)
+        return WeatherParameters(
+            cloudiness=weather.cloudiness,
+            precipitation=weather.precipitation,
+            precipitation_deposits=weather.precipitation_deposits,
+            wind_intensity=weather.wind_intensity,
+            sun_azimuth_angle=weather.sun_azimuth_angle,
+            sun_altitude_angle=weather.sun_altitude_angle,
+        )
+
+    def _apply_weather(self, world: Any) -> None:
+        params = self._resolve_weather()
         world.set_weather(
             carla.WeatherParameters(
-                cloudiness=weather.cloudiness,
-                precipitation=weather.precipitation,
-                sun_altitude_angle=weather.sun_altitude_angle,
+                cloudiness=params.cloudiness,
+                precipitation=params.precipitation,
+                precipitation_deposits=params.precipitation_deposits,
+                wind_intensity=params.wind_intensity,
+                sun_azimuth_angle=params.sun_azimuth_angle,
+                sun_altitude_angle=params.sun_altitude_angle,
             )
+        )
+        logger.bind(component="scenario").debug(
+            "已应用天气: preset={} cloudiness={} precipitation={} sun_altitude={}",
+            self._config.weather.preset,
+            params.cloudiness,
+            params.precipitation,
+            params.sun_altitude_angle,
         )
 
     def _apply_tick_settings(self, world: Any) -> None:

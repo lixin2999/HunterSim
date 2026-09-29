@@ -13,8 +13,7 @@ tasks:
       port: 2000
       override:
         weather:
-          precipitation: 0.6
-          cloudiness: 0.9
+          preset: "heavy_rain"   # 预设环境（§3.4.2）：大雨，能见度降低
 
 execution:
   mode: "sequential"   # sequential / parallel

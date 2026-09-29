@@ -10,7 +10,7 @@
 
 | 层 | 包 | 职责 |
 |----|----|------|
-| L1 | `hunter_sim.simulation` | CARLA 连接 / 车辆控制 / 场景管理 / 地图系统 |
+| L1 | `hunter_sim.simulation` | CARLA 连接 / 车辆控制 / 场景管理 / 地图系统 / 天气与环境 |
 | L2 | `hunter_sim.acquisition` | 传感器管理 / 数据缓冲 / 写入器 |
 | L3 | `hunter_sim.processing` | 时间同步 / 数据转换 / 算法对接 |
 | L4 | `hunter_sim.evaluation` | 指标计算 / 报告生成 / 数据回放 |
@@ -28,7 +28,7 @@
 - `core/logging.py` — loguru 结构化日志与 `run_id`/`frame_id` 上下文
 - `core/exceptions.py` — 统一异常体系
 - `container.py` — 轻量依赖注入容器
-- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制（VIL 直接位姿 / SIL 控制指令双模式）、场景状态机与交通流生成、地图系统（内置地图注册表 / OpenDRIVE 自定义地图 / 坐标系元数据）
+- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制（VIL 直接位姿 / SIL 控制指令双模式）、场景状态机与交通流生成、地图系统（内置地图注册表 / OpenDRIVE 自定义地图 / 坐标系元数据）、天气与环境（全参数 + 8 套预设环境）
 - `acquisition/` — 传感器生命周期、环形缓冲（背压 + 跨线程投递）、异步原子写入器
 - `processing/` — 原始测量→契约帧转换、最近邻时间同步、数组清洗去噪
 - `evaluation/` — 轨迹/舒适/安全/覆盖指标、报告生成与图表渲染、数据回放
@@ -73,6 +73,21 @@ L1 `simulation` 提供地图系统（`MapManager` 契约 + `MapManagerImpl`，�
   转换由 VIL 映射模块处理。
 
 内置地图清单、自定义 OpenDRIVE 用法与配置详见《用户手册》§4.5。
+
+## 天气与环境
+
+L1 `simulation` 提供天气与环境模型（`simulation/weather.py`），场景启动时由 `ScenarioManagerImpl`
+加载地图后经 `world.set_weather(...)` 应用到 `carla.WeatherParameters`：
+
+- **全参数（§3.4.1）**：`cloudiness` / `precipitation` / `precipitation_deposits` / `wind_intensity` /
+  `sun_azimuth_angle` / `sun_altitude_angle` 六项，量程对齐 CARLA（0-100 / 0-360 / -90~90），由不可变
+  `WeatherParameters` 携带并在构造点校验。
+- **预设环境（§3.4.2）**：`PresetEnvironment` + `WEATHER_PRESET_REGISTRY` 提供 `clear_noon` / `overcast` /
+  `light_rain` / `heavy_rain` / `foggy` / `night` / `dusk` / `dawn` 共 8 套预设，由 `list_presets()` /
+  `resolve_preset()` 查询。
+- **配置驱动**：`weather.preset` 指定预设名（设置时优先于显式字段）；未指定时逐项应用 `weather` 下的显式参数。
+
+参数表、预设表与配置/API 示例详见《用户手册》§4.7。
 
 ## 环境准备
 

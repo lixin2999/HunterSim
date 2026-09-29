@@ -124,11 +124,34 @@ class SensorConfig(_ConfigModel):
 
 
 class WeatherConfig(_ConfigModel):
-    """天气与环境光照参数。"""
+    """天气与环境光照参数（§3.4.1，量程与 CARLA ``WeatherParameters`` 对齐）。
 
-    cloudiness: float = Field(ge=0, le=1, default=0.0)
-    precipitation: float = Field(ge=0, le=1, default=0.0)
-    sun_altitude_angle: float = Field(ge=-90, le=90, default=45.0)
+    ``preset`` 指向预设环境名（§3.4.2，由引擎层 ``simulation.weather`` 解析）；
+    指定预设时以预设参数为准，忽略下方显式数值字段。
+    """
+
+    preset: str | None = Field(
+        default=None, description="预设环境名（如 clear_noon/heavy_rain/night）；设置时覆盖显式字段"
+    )
+    cloudiness: float = Field(ge=0, le=100, default=0.0, description="云量 0-100")
+    precipitation: float = Field(ge=0, le=100, default=0.0, description="降雨量 0-100")
+    precipitation_deposits: float = Field(
+        ge=0, le=100, default=0.0, description="路面积水 0-100"
+    )
+    wind_intensity: float = Field(ge=0, le=100, default=0.0, description="风力 0-100")
+    sun_azimuth_angle: float = Field(
+        ge=0, le=360, default=0.0, description="太阳方位角 0-360"
+    )
+    sun_altitude_angle: float = Field(
+        ge=-90, le=90, default=45.0, description="太阳高度角 -90~90"
+    )
+
+    @field_validator("preset")
+    @classmethod
+    def _normalize_preset(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("preset 不能为空白字符串")
+        return v
 
 
 class TrafficConfig(_ConfigModel):

@@ -16,6 +16,7 @@ from hunter_sim.core.events import (
     SimulationTickEvent,
 )
 from hunter_sim.core.exceptions import ConfigurationError, SimulationError
+from hunter_sim.simulation import scenario as scenario_module
 from hunter_sim.simulation.protocols import ScenarioManager, ScenarioState
 from hunter_sim.simulation.scenario import ScenarioManagerImpl
 
@@ -215,3 +216,104 @@ async def test_reset_returns_to_idle(sample_vehicle_state: object) -> None:
     assert scenario.state is ScenarioState.IDLE
     assert scenario.tick_count == 0
     vehicle.destroy.assert_awaited()
+
+
+def _config_with_weather(weather: dict[str, float | str]) -> ScenarioConfig:
+    raw = {
+        "scenario": {"name": "s", "map": "Town04", "duration_seconds": 10, "tick_rate": 20},
+        "vehicle": {"blueprint": "vehicle.tesla.model3", "spawn_point_index": 0},
+        "sensors": [
+            {
+                "id": "cam",
+                "type": "camera.rgb",
+                "position": [0.0, 0.0, 1.6],
+                "rotation": [0.0, 0.0, 0.0],
+                "width": 8,
+                "height": 8,
+                "fov": 90,
+            }
+        ],
+        "weather": weather,
+    }
+    return ScenarioConfig.model_validate(raw)
+
+
+def _capture_weather_params(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """拦截 ``carla.WeatherParameters`` 构造，记录传入的车参数字。"""
+    captured: dict[str, float] = {}
+
+    def _fake(**kwargs: float) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(scenario_module.carla, "WeatherParameters", _fake)
+    return captured
+
+
+async def test_configure_applies_full_explicit_weather(
+    monkeypatch: pytest.MonkeyPatch, sample_vehicle_state: object
+) -> None:
+    """§3.4.1：无 preset 时，六项显式天气参数均应下发到 world.set_weather。"""
+    cfg = _config_with_weather(
+        {
+            "cloudiness": 30.0,
+            "precipitation": 40.0,
+            "precipitation_deposits": 50.0,
+            "wind_intensity": 60.0,
+            "sun_azimuth_angle": 90.0,
+            "sun_altitude_angle": 20.0,
+        }
+    )
+    world = _world()
+    conn = MagicMock()
+    conn.get_world.return_value = world
+    conn.load_world = AsyncMock(return_value=world)
+    vehicle = MagicMock()
+    vehicle.spawn = AsyncMock()
+    scenario = ScenarioManagerImpl(cfg, conn, vehicle, InMemoryEventBus())
+
+    captured = _capture_weather_params(monkeypatch)
+    await scenario.configure()
+
+    assert captured == {
+        "cloudiness": 30.0,
+        "precipitation": 40.0,
+        "precipitation_deposits": 50.0,
+        "wind_intensity": 60.0,
+        "sun_azimuth_angle": 90.0,
+        "sun_altitude_angle": 20.0,
+    }
+    world.set_weather.assert_called_once()
+
+
+async def test_configure_applies_preset_overrides_explicit(
+    monkeypatch: pytest.MonkeyPatch, sample_vehicle_state: object
+) -> None:
+    """§3.4.2：指定 preset 时以预设参数为准（night：云量 100 / 高度角 -15）。"""
+    cfg = _config_with_weather({"preset": "night", "cloudiness": 5.0, "sun_altitude_angle": 80.0})
+    world = _world()
+    conn = MagicMock()
+    conn.get_world.return_value = world
+    conn.load_world = AsyncMock(return_value=world)
+    vehicle = MagicMock()
+    vehicle.spawn = AsyncMock()
+    scenario = ScenarioManagerImpl(cfg, conn, vehicle, InMemoryEventBus())
+
+    captured = _capture_weather_params(monkeypatch)
+    await scenario.configure()
+
+    assert captured["cloudiness"] == 100.0
+    assert captured["sun_altitude_angle"] == -15.0
+
+
+async def test_configure_unknown_preset_raises(sample_vehicle_state: object) -> None:
+    cfg = _config_with_weather({"preset": "blizzard"})
+    world = _world()
+    conn = MagicMock()
+    conn.get_world.return_value = world
+    conn.load_world = AsyncMock(return_value=world)
+    vehicle = MagicMock()
+    vehicle.spawn = AsyncMock()
+    scenario = ScenarioManagerImpl(cfg, conn, vehicle, InMemoryEventBus())
+    with pytest.raises(ConfigurationError):
+        await scenario.configure()
