@@ -11,6 +11,12 @@ from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from hunter_sim.core.contracts import VehicleState
+from hunter_sim.simulation.maps import (
+    CoordinateFrame,
+    MapCategory,
+    MapInfo,
+    OpenDriveOptions,
+)
 from hunter_sim.simulation.models import Transform, VehicleCommand
 
 
@@ -106,9 +112,61 @@ class ScenarioManager(Protocol):
     def register_hook(self, name: str, hook: Hook) -> None: ...
 
 
+@runtime_checkable
+class MapManager(Protocol):
+    """地图系统契约（模块 3.2）。
+
+    统一封装内置地图注册表查询、内置地图加载、自定义 OpenDRIVE 地图生成，
+    以及坐标系元数据访问。CARLA 原生句柄（``World``）以 ``Any`` 返回。
+    """
+
+    @property
+    def current_map(self) -> MapInfo | None:
+        """当前已加载地图的元数据；未加载时为 ``None``。"""
+        ...
+
+    @property
+    def coordinate_frame(self) -> CoordinateFrame:
+        """CARLA 坐标系元数据（左手系，单位米）。"""
+        ...
+
+    def list_builtin_maps(self) -> list[MapInfo]:
+        """返回全部内置地图元数据（§3.2.1）。"""
+        ...
+
+    def list_maps_by_category(self, category: MapCategory) -> list[MapInfo]:
+        """按场景类别过滤内置地图。"""
+        ...
+
+    def get_map_info(self, map_name: str) -> MapInfo:
+        """按名称查询内置地图元数据，未找到时抛出异常。"""
+        ...
+
+    def is_known_map(self, map_name: str) -> bool:
+        """名称是否为合法内置地图。"""
+        ...
+
+    async def load_map(self, map_name: str) -> Any:
+        """按名称加载内置地图并刷新当前地图上下文。"""
+        ...
+
+    async def load_opendrive(
+        self, xodr_path: str, *, options: OpenDriveOptions | None = None
+    ) -> Any:
+        """从本地 OpenDRIVE 文件生成自定义地图世界（§3.2.2）。"""
+        ...
+
+    async def load_opendrive_xml(
+        self, opendrive_xml: str, *, options: OpenDriveOptions | None = None
+    ) -> Any:
+        """从 OpenDRIVE XML 字符串生成自定义地图世界。"""
+        ...
+
+
 __all__ = [
     "CarlaConnectionManager",
     "Hook",
+    "MapManager",
     "ScenarioManager",
     "ScenarioState",
     "VehicleController",

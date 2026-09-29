@@ -18,6 +18,7 @@ from hunter_sim.evaluation.protocols import MetricsEngine, Replayer, Reporter
 from hunter_sim.processing.protocols import Cleaner, Converter, Synchronizer
 from hunter_sim.simulation.protocols import (
     CarlaConnectionManager,
+    MapManager,
     ScenarioManager,
     VehicleController,
 )
@@ -66,6 +67,7 @@ async def test_build_container_registers_all_protocols() -> None:
     for interface in (
         EventBus,
         CarlaConnectionManager,
+        MapManager,
         VehicleController,
         ScenarioManager,
         BufferRegistry,

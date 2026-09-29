@@ -34,8 +34,10 @@ from hunter_sim.processing.converter import ConverterImpl
 from hunter_sim.processing.protocols import Cleaner, Converter, Synchronizer
 from hunter_sim.processing.synchronizer import SynchronizerImpl
 from hunter_sim.simulation.connection import CarlaConnectionManagerImpl
+from hunter_sim.simulation.map_manager import MapManagerImpl
 from hunter_sim.simulation.protocols import (
     CarlaConnectionManager,
+    MapManager,
     ScenarioManager,
     VehicleController,
 )
@@ -96,6 +98,7 @@ def build_container(
 
     event_bus = InMemoryEventBus()
     connection = CarlaConnectionManagerImpl(conn_cfg)
+    map_manager = MapManagerImpl(connection)
     vehicle = VehicleControllerImpl(connection)
     scenario = ScenarioManagerImpl(config, connection, vehicle, event_bus)
     registry = BufferRegistryImpl(loop)
@@ -140,6 +143,7 @@ def build_container(
     bindings: list[tuple[type[Any], Any]] = [
         (EventBus, event_bus),
         (CarlaConnectionManager, connection),
+        (MapManager, map_manager),
         (VehicleController, vehicle),
         (ScenarioManager, scenario),
         (BufferRegistry, registry),
