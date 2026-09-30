@@ -1,0 +1,111 @@
+{
+  "version": "1.0",
+  "description": "HunterSim 预设天气环境配置（PROMPT-ENG-001-D）",
+  "presets": {
+    "sunny_noon": {
+      "name": "晴天正午",
+      "description": "光照充足，高对比度，适合感知算法基线测试",
+      "cloudiness": 5.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 10.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": 75.0,
+      "fog_density": 0.0,
+      "fog_distance": 0.0,
+      "wetness": 0.0
+    },
+    "cloudy": {
+      "name": "阴天",
+      "description": "漫射光照，低对比度，测试相机白平衡",
+      "cloudiness": 80.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 20.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": 45.0,
+      "fog_density": 0.0,
+      "fog_distance": 0.0,
+      "wetness": 0.0
+    },
+    "light_rain": {
+      "name": "小雨",
+      "description": "路面微湿，LiDAR 轻微衰减，测试雨天感知鲁棒性",
+      "cloudiness": 70.0,
+      "precipitation": 20.0,
+      "precipitation_deposits": 30.0,
+      "wind_intensity": 25.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": 40.0,
+      "fog_density": 0.05,
+      "fog_distance": 0.0,
+      "wetness": 0.3
+    },
+    "heavy_rain": {
+      "name": "大雨",
+      "description": "路面积水，LiDAR 明显衰减，相机雨滴干扰",
+      "cloudiness": 100.0,
+      "precipitation": 80.0,
+      "precipitation_deposits": 90.0,
+      "wind_intensity": 70.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": 30.0,
+      "fog_density": 0.15,
+      "fog_distance": 0.0,
+      "wetness": 0.9
+    },
+    "foggy": {
+      "name": "雾天",
+      "description": "能见度低于50m，LiDAR 回波散射，相机对比度极低",
+      "cloudiness": 60.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 5.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": 45.0,
+      "fog_density": 0.8,
+      "fog_distance": 0.5,
+      "wetness": 0.0
+    },
+    "night": {
+      "name": "夜间",
+      "description": "无自然光照，依赖车灯和红外，测试夜间感知",
+      "cloudiness": 10.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 10.0,
+      "sun_azimuth_angle": 0.0,
+      "sun_altitude_angle": -80.0,
+      "fog_density": 0.0,
+      "fog_distance": 0.0,
+      "wetness": 0.0,
+      "vehicle_lights_on": true
+    },
+    "dusk": {
+      "name": "黄昏",
+      "description": "低角度暖色光照，逆光场景测试",
+      "cloudiness": 30.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 15.0,
+      "sun_azimuth_angle": 90.0,
+      "sun_altitude_angle": 5.0,
+      "fog_density": 0.02,
+      "fog_distance": 0.0,
+      "wetness": 0.0
+    },
+    "dawn": {
+      "name": "黎明",
+      "description": "低角度冷色光照，可能有晨雾",
+      "cloudiness": 40.0,
+      "precipitation": 0.0,
+      "precipitation_deposits": 0.0,
+      "wind_intensity": 10.0,
+      "sun_azimuth_angle": 270.0,
+      "sun_altitude_angle": 8.0,
+      "fog_density": 0.1,
+      "fog_distance": 0.0,
+      "wetness": 0.1
+    }
+  }
+}

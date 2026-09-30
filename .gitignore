@@ -1,19 +1,41 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+*.egg
 .eggs/
 dist/
 build/
+sdist/
+wheels/
+share/python-wheels/
+pip-wheel-metadata/
+.Cython/
+*.so
+*.pyd
+*.dll
+.Python
 
 # Virtual env / uv
 .venv/
 venv/
+ENV/
+env/
+env.bak/
+venv.bak/
 
 # Tool caches
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.hypothesis/
+.tox/
+.dmypy.json
+dmypy.json
+.benchmarks/
+profile_default/
+ipython_config.py
 .coverage
 .coverage.*
 coverage.xml
@@ -67,3 +89,20 @@ Desktop.ini
 release.md
 user_manual.md
 deployment_and_operations.md
+
+# 临时 / 本地脚本产物（调试输出、备份、本地覆盖）
+*.tmp
+*.bak
+*.orig
+*~
+cov_*.txt
+coverage_*.txt
+coverage.txt
+docker-compose.override.yml
+
+# CARLA / 仿真本地大文件与临时录制
+*.bag
+*.mcap
+*.mp4
+captures/
+recordings/

@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "description": "HUNTER SE 传感器配置模板（PROMPT-ENG-004-A）",
+  "lidar": {
+    "type": "lidar",
+    "blueprint": "sensor.lidar.ray_cast",
+    "channels": 16,
+    "range_m": 150.0,
+    "points_per_second": 300000,
+    "rotation_frequency_hz": 10.0,
+    "upper_fov_deg": 15.0,
+    "lower_fov_deg": -15.0,
+    "horizontal_fov_deg": 360.0,
+    "noise_stddev_m": 0.02,
+    "dropoff_general_rate": 0.0,
+    "dropoff_intensity_limit": 0.0,
+    "dropoff_zero_intensity": 0.0,
+    "mount": {
+      "x": 0.23,
+      "y": 0.0,
+      "z": 0.35,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "ros_topic": "/carla/lidar_points",
+    "real_topic": "/lidar_points",
+    "msg_type": "sensor_msgs/PointCloud2"
+  },
+  "rgb_camera": {
+    "type": "rgb_camera",
+    "blueprint": "sensor.camera.rgb",
+    "width": 1280,
+    "height": 720,
+    "fov_deg": 69.0,
+    "fps": 30.0,
+    "noise_stddev": 0.0,
+    "motion_blur_intensity": 0.0,
+    "mount": {
+      "x": 0.40,
+      "y": 0.0,
+      "z": 0.30,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "ros_topic": "/carla/camera/color/image_raw",
+    "real_topic": "/camera/color/image_raw",
+    "msg_type": "sensor_msgs/Image",
+    "corresponding_real_sensor": "Intel RealSense D435 RGB"
+  },
+  "depth_camera": {
+    "type": "depth_camera",
+    "blueprint": "sensor.camera.depth",
+    "width": 1280,
+    "height": 720,
+    "fov_deg": 85.0,
+    "fps": 30.0,
+    "min_depth_m": 0.3,
+    "max_depth_m": 10.0,
+    "mount": {
+      "x": 0.40,
+      "y": 0.0,
+      "z": 0.30,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "ros_topic": "/carla/camera/depth/image_rect_raw",
+    "real_topic": "/camera/depth/image_rect_raw",
+    "msg_type": "sensor_msgs/Image",
+    "corresponding_real_sensor": "Intel RealSense D435 Depth"
+  },
+  "imu": {
+    "type": "imu",
+    "blueprint": "sensor.imu",
+    "frequency_hz": 100.0,
+    "accel_noise_stddev": 0.01,
+    "gyro_noise_stddev": 0.001,
+    "accel_bias_stddev": 0.001,
+    "gyro_bias_stddev": 0.0001,
+    "mount": {
+      "x": 0.23,
+      "y": 0.0,
+      "z": 0.15,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "ros_topic": "/carla/imu/data",
+    "real_topic": "/imu/data",
+    "msg_type": "sensor_msgs/Imu"
+  },
+  "gnss": {
+    "type": "gnss",
+    "blueprint": "sensor.other.gnss",
+    "frequency_hz": 10.0,
+    "altitude_noise_stddev_m": 0.5,
+    "latitude_noise_stddev": 0.0001,
+    "longitude_noise_stddev": 0.0001,
+    "enabled": false,
+    "mount": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.33,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "ros_topic": "/carla/gnss/fix",
+    "real_topic": "/localization/gnss",
+    "msg_type": "sensor_msgs/NavSatFix"
+  },
+  "collision": {
+    "type": "collision",
+    "blueprint": "sensor.other.collision",
+    "ros_topic": "/carla/collision_event",
+    "msg_type": "custom_msgs/CollisionEvent"
+  },
+  "lane_invasion": {
+    "type": "lane_invasion",
+    "blueprint": "sensor.other.lane_invasion",
+    "ros_topic": "/carla/lane_invasion_event",
+    "msg_type": "custom_msgs/LaneInvasionEvent"
+  }
+}

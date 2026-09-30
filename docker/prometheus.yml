@@ -1,0 +1,17 @@
+# HunterSim Prometheus 抓取配置
+# 由 docker-compose 挂载至 /etc/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # HunterSim 仿真服务指标（免鉴权端点）
+  - job_name: "hunter-sim"
+    metrics_path: /api/v1/sim/metrics
+    static_configs:
+      - targets: ["sim-service:8080"]
+
+  # Prometheus 自监控
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

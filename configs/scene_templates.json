@@ -1,0 +1,142 @@
+{
+  "version": "1.0",
+  "description": "常用场景配置模板（PROMPT-ENG-003-A）",
+  "templates": {
+    "empty_road_basic": {
+      "scene_name": "基础空旷道路",
+      "description": "无交通参与者，用于算法基线测试",
+      "map_id": "Town01",
+      "mode": "sil",
+      "quality": "low",
+      "weather": {"preset": "sunny_noon"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 10.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
+      },
+      "traffic_participants": [],
+      "scene_events": [],
+      "duration_seconds": 30.0,
+      "timeout_seconds": 60.0
+    },
+    "urban_with_traffic": {
+      "scene_name": "城市道路标准交通流",
+      "description": "Town03 + 随机交通流 20车10人，测试常规城市行驶",
+      "map_id": "Town03",
+      "mode": "sil",
+      "quality": "medium",
+      "weather": {"preset": "sunny_noon"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
+      },
+      "traffic_flow": {
+        "enabled": true,
+        "num_vehicles": 20,
+        "num_walkers": 10
+      },
+      "scene_events": [],
+      "duration_seconds": 120.0,
+      "timeout_seconds": 180.0
+    },
+    "cut_in_hazard": {
+      "scene_name": "切入危险场景",
+      "description": "旁车快速切入自车前方，触发紧急制动",
+      "map_id": "Town03",
+      "mode": "sil",
+      "quality": "medium",
+      "weather": {"preset": "sunny_noon"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 100.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
+      },
+      "traffic_participants": [
+        {
+          "participant_id": "cut_in_vehicle",
+          "actor_type": "vehicle",
+          "blueprint": "vehicle.tesla.model3",
+          "spawn_point": {"x": 110.0, "y": 3.5, "z": 0.0, "yaw_deg": 0.0},
+          "behavior": "cut_in",
+          "speed_ms": 6.0
+        }
+      ],
+      "scene_events": [
+        {
+          "event_id": "collision_check",
+          "trigger_type": "distance",
+          "trigger_params": {"target": "ego_vehicle", "distance_m": 2.0},
+          "action": "emergency_brake"
+        }
+      ],
+      "duration_seconds": 30.0,
+      "timeout_seconds": 60.0
+    },
+    "pedestrian_crossing": {
+      "scene_name": "行人横穿斑马线",
+      "description": "测试行人检测和避让人行横道场景",
+      "map_id": "Town03",
+      "mode": "sil",
+      "quality": "medium",
+      "weather": {"preset": "sunny_noon"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 50.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
+      },
+      "traffic_participants": [
+        {
+          "participant_id": "pedestrian_01",
+          "actor_type": "walker",
+          "blueprint": "walker.pedestrian.0001",
+          "spawn_point": {"x": 75.0, "y": -3.0, "z": 0.0, "yaw_deg": 90.0},
+          "behavior": "pedestrian_cross",
+          "speed_ms": 1.2
+        }
+      ],
+      "scene_events": [],
+      "duration_seconds": 30.0,
+      "timeout_seconds": 60.0
+    },
+    "heavy_rain_perception": {
+      "scene_name": "大雨环境感知测试",
+      "description": "大雨条件下测试 LiDAR/相机感知鲁棒性",
+      "map_id": "Town03",
+      "mode": "sil",
+      "quality": "medium",
+      "weather": {"preset": "heavy_rain"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0}
+      },
+      "traffic_flow": {"enabled": true, "num_vehicles": 10, "num_walkers": 0},
+      "scene_events": [],
+      "duration_seconds": 60.0,
+      "timeout_seconds": 120.0
+    },
+    "night_driving": {
+      "scene_name": "夜间行驶测试",
+      "description": "无自然光环境，测试夜间感知和车灯控制",
+      "map_id": "Town01",
+      "mode": "sil",
+      "quality": "medium",
+      "weather": {"preset": "night"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 10.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0},
+        "lights_on": true
+      },
+      "traffic_participants": [],
+      "scene_events": [],
+      "duration_seconds": 60.0,
+      "timeout_seconds": 120.0
+    },
+    "vil_real_car_sync": {
+      "scene_name": "VIL 实车同步测试",
+      "description": "VIL 模式，接收实车 Kafka 数据同步虚拟车",
+      "map_id": "Town03",
+      "mode": "vil",
+      "quality": "medium",
+      "weather": {"preset": "sunny_noon"},
+      "ego_vehicle": {
+        "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0},
+        "vehicle_id": "hunter_se_001"
+      },
+      "traffic_flow": {"enabled": false},
+      "scene_events": [],
+      "duration_seconds": 300.0,
+      "timeout_seconds": 360.0
+    }
+  }
+}

@@ -1,0 +1,22 @@
+# HunterSim 运行时依赖（与 pyproject.toml [project.dependencies] 保持一致）
+# 明确指定版本范围，禁止使用 latest（HunterSim.ai-rules.md 1.2 依赖管理）
+# 安装：pip install -r requirements.txt
+
+fastapi>=0.100,<0.110
+uvicorn[standard]>=0.23,<0.30
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
+python-jose[cryptography]>=3.3,<4.0
+numpy>=1.24,<2.0
+scipy>=1.11,<2.0
+kafka-python>=2.0,<3.0
+websockets>=11.0,<13.0
+httpx>=0.24,<0.28
+aiofiles>=23.0,<24.0
+python-multipart>=0.0.6,<0.1
+orjson>=3.9,<4.0
+structlog>=23.0,<24.0
+prometheus-client>=0.17,<0.27
+PyYAML>=6.0,<7.0
+defusedxml>=0.7,<1.0
+Jinja2>=3.1,<4.0

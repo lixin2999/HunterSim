@@ -1,126 +1,185 @@
-# HunterSim
+# HunterSim · HUNTER SE 车辆在环（VIL）虚拟仿真平台
 
-基于 [CARLA](https://carla.org/) 的自动驾驶仿真**数据采集 + 算法分析 + 场景评估**一体化系统。
+HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
 
-- 语言：Python 3.12
-- 仿真引擎：CARLA 0.9.16（以独立进程运行，通过 `carla.Client` 连接）
-- 架构：严格五层分层（L1 仿真核心 → L5 应用调度），上层依赖下层，禁止反向依赖
+- **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
+- **当前版本**：`2.0.0`（基于 `HunterSim_AI辅助开发提示词工程` 规范从零重构）
+- **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
-## 分层架构
+---
 
-| 层 | 包 | 职责 |
-|----|----|------|
-| L1 | `hunter_sim.simulation` | CARLA 连接 / 车辆控制 / 场景管理 / 地图系统 / 天气与环境 |
-| L2 | `hunter_sim.acquisition` | 传感器管理 / 数据缓冲 / 写入器 |
-| L3 | `hunter_sim.processing` | 时间同步 / 数据转换 / 算法对接 |
-| L4 | `hunter_sim.evaluation` | 指标计算 / 报告生成 / 数据回放 |
-| L5 | `hunter_sim.app` | CLI / 场景编排 / 任务调度 |
-| 基础 | `hunter_sim.core` | 契约 / 事件 / 配置 / 日志 / 异常 |
+## 1. 系统定位
 
-## 开发状态
+| 能力 | 说明 |
+|------|------|
+| VIL 虚实映射 | 订阅实车遥测（Kafka），经位姿外推 + 坐标标定驱动 CARLA 虚拟车，实现虚实同步 |
+| SIL 场景驱动 | 加载 OpenDRIVE / 场景 JSON，在 CARLA 中自动生成交通流与事件，驱动被测算法 |
+| 传感器仿真 | LiDAR / RGB / Depth / IMU / GNSS / Collision / LaneInvasion，对齐 ROS2 话题 |
+| 数据录制与回放 | mcap/自定义容器录制，数字孪生回放，支持变速与跳帧 |
+| 场景评估 | 轨迹、舒适性、安全性、覆盖率四维评分（S/A/B/C/D） |
+| 资源编排 | GPU 资源池 + 实例生命周期管理，按画质限制单 GPU 并发 |
 
-**V0.1.0–V0.6.0 已完成严格五层架构（L1–L5）端到端贯通 + VIL 虚实映射模块**，质量门禁全绿（`ruff` / `mypy --strict` / `pytest`，覆盖率 94%，275 项测试通过）：
+---
 
-- `core/contracts.py` — 不可变数据契约（`VehicleState` / `CameraFrame` / `LidarFrame` / `SynchronizedFrame` 等）
-- `core/events.py` — 事件类型 + `core/event_bus.py` 线程安全的进程内事件总线
-- `core/protocols.py` — 跨层 `Protocol`（`EventBus`）
-- `core/config.py` — pydantic 配置模型 + YAML/JSON 加载器（含仿真步进模式 `simulation_mode`）
-- `core/logging.py` — loguru 结构化日志与 `run_id`/`frame_id` 上下文
-- `core/exceptions.py` — 统一异常体系
-- `container.py` — 轻量依赖注入容器
-- `simulation/` — CARLA 连接管理（指数退避重连）、主车控制（VIL 直接位姿 / SIL 控制指令双模式）、场景状态机与交通流生成、地图系统（内置地图注册表 / OpenDRIVE 自定义地图 / 坐标系元数据）、天气与环境（全参数 + 8 套预设环境）
-- `acquisition/` — 传感器生命周期、环形缓冲（背压 + 跨线程投递）、异步原子写入器
-- `processing/` — 原始测量→契约帧转换、最近邻时间同步、数组清洗去噪
-- `evaluation/` — 轨迹/舒适/安全/覆盖指标、报告生成与图表渲染、数据回放
-- `app/` — 采集调度器、运行编排器、组合根装配容器、惰性 `typer` CLI
-- `app/vil/` — VIL 虚实映射模块（Kafka 遥测消费、坐标映射、状态同步、可视化、同步控制、VIL 引擎）
+## 2. 分层架构（C/S 三层）
 
-详见《发布说明》（`release.md`）与《用户手册》（`docs/user_manual.md`）。
+```
+┌─────────────────────────────────────────────────────────────┐
+│  接口层  api/  —— FastAPI 应用、路由、中间件、统一响应/异常      │
+│    health · instances · scenes · resources · websocket        │
+├─────────────────────────────────────────────────────────────┤
+│  服务层  —— 业务编排（无 CARLA/ROS2 直接依赖，可单测）           │
+│    scene_runner  ·  vil_mapper  ·  sensor_sim  ·  traffic_sim  │
+│    replay_service ·  eval_service ·  resource_manager          │
+├─────────────────────────────────────────────────────────────┤
+│  引擎层  engine/ —— CARLA 原子能力封装（依赖 carla 模块）        │
+│    map_manager · weather_manager · hunter_se_vehicle ·          │
+│    vehicle_blueprint_generator · coordinate_converter ·         │
+│    opendrive_parser · vehicle_controller · carla_server_config  │
+├─────────────────────────────────────────────────────────────┤
+│  公共层  common/ —— 配置模型、领域数据类、异常、日志工具          │
+└─────────────────────────────────────────────────────────────┘
+```
 
-## 仿真模式（同步 / 异步）
+`common/` 为所有层的共享基础：`models.py`（pydantic 配置与数据类）、`exceptions.py`（分层异常体系）、`utils.py`（日志与工具）。
 
-CARLA 世界步进模式在 `scenario.simulation_mode` 中声明，采集启动时由 `ScenarioManagerImpl` 自动写入
-`carla.WorldSettings`：
+---
 
-- **`synchronous`（默认，VIL 实时）**：仿真由客户端 `world.tick()` 驱动，固定步长（`fixed_delta_seconds`，
-  为 `null` 时由 `tick_rate` 推算），时序严格对齐且可复现——数据采集与 VIL 实车在环用它。
-- **`asynchronous`（回放 / SIL）**：`fixed_delta_seconds=None` 可变步长，按真实时间自动推进——在线 SIL/交互调试用它。
-- 物理子步（`substepping` / `max_substep_delta_time` / `max_substeps`）保证高步长下的仿真稳定性。
+## 3. 目录结构
 
-CARLA Server（0.9.16）的启动参数与模式选型详见《部署运维手册》§3.1（`docs/deployment_and_operations.md`）。
+```
+HunterSim/
+├── src/hunter_sim/          # 主包（见下方模块职责）
+│   ├── api/                 # 接口层：main, deps, error_handlers, middleware, models, routers
+│   ├── common/              # 公共层：models, exceptions, utils
+│   ├── engine/              # 引擎层：CARLA 原子能力 + 环境检查 + 服务端配置
+│   ├── scene_runner/        # 场景加载、校验、状态机、事件检测、自定义场景
+│   ├── vil_mapper/          # 遥测缓冲、位姿外推、坐标标定、虚实同步
+│   ├── sensor_sim/          # 传感器工厂、安装位、数据转换、ROS2 桥接、录制
+│   ├── traffic_sim/         # 交通流、Actor 行为、行为树、行人、触发条件
+│   ├── replay_service/      # 数据加载、回放引擎、数字孪生
+│   ├── eval_service/        # 评估引擎、评估报告
+│   └── resource_manager/    # 实例管理、GPU 资源池、健康监控
+├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
+├── docker/                  # Dockerfile / docker-compose / prometheus / grafana provisioning
+├── k8s/                     # namespace / configmap / secret / deployment / service
+├── tests/                   # 单元 + 集成测试（覆盖率门禁 ≥80%）
+├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / ruff / mypy / coverage）
+└── requirements.txt         # 运行依赖清单
+```
 
-## 车辆控制模式（VIL / SIL）
+---
 
-L1 `VehicleController` 提供两种主车驱动方式（`ControlMode`），控制接口与 `simulation_mode` 步进模式配合使用：
+## 4. 快速开始
 
-- **VIL（实车在环，直接位姿控制）**：`set_transform` / `set_velocity` / `set_angular_velocity` 或一次性
-  `set_kinematic_state(VehicleKinematicState)` 直接注入真实位姿与速度，虚拟车辆完全跟随实车状态、不经仿真物理；
-  `spawn(..., mode=ControlMode.VIL)` 时自动关闭 Traffic Manager。通常与 `synchronous` 步进搭配保证时序对齐。
-- **SIL（仿真在环，控制指令控制）**：`apply_control(VehicleCommand)` 下发油门/刹车/转向/档位，
-  由 CARLA 物理引擎积分计算车辆运动。可配合 `asynchronous` 接近实时推进。
+### 4.1 环境准备
 
-车辆控制 API 与示例详见《用户手册》§4.6。
+- **GPU 主机（推荐 Windows，CARLA 原生平台）**：安装 NVIDIA 驱动（≥510）、CUDA（≥11.0）、CARLA 0.9.16。
+- **服务主机（Linux 或 Windows）**：Python 3.12、Kafka 3.6、（可选）ROS2 Humble。
 
-## 地图系统
-
-L1 `simulation` 提供地图系统（`MapManager` 契约 + `MapManagerImpl`，已在组合根注册供上层解析）：
-
-- **内置地图**：`Town01`~`Town10` 共 8 张（简单城市 / 复杂城市 / 高速 / 乡村 / CBD），由
-  `BUILTIN_MAP_REGISTRY` 提供说明与适用场景，支持按类别检索与 `load_map` 加载；场景配置的
-  `scenario.map` 取其中地图名。
-- **自定义地图**：`load_opendrive(path)` / `load_opendrive_xml(str)` 从 OpenDRIVE 1.4 / 1.6
-  （`.xodr` 或 XML）经 `client.generate_opendrive_world` 生成世界，参数由 `OpenDriveOptions` 配置。
-- **坐标系**：`CARLA_COORDINATE_FRAME` 描述左手系（X 东 / Y 北 / Z 上，单位米）；与实车坐标系的
-  转换由 VIL 映射模块处理（见下方「VIL 虚实映射模块」）。
-
-内置地图清单、自定义 OpenDRIVE 用法与配置详见《用户手册》§4.5。
-
-## VIL 虚实映射模块
-
-L5 `app/vil` 提供实车在环（Vehicle-in-the-Loop）全链路映射（开发提示词 §4）：
-
-- **数据接入**：从 Kafka `telemetry_clean` topic 消费实车遥测（定位/底盘/感知/IMU），独立 daemon 线程 + 最新帧缓存。
-- **坐标映射**：实车 odom 右手系 → CARLA 地图左手系的仿射变换（旋转 + 平移 + yaw 取反）。
-- **状态同步**：位姿/线速度/角速度实时注入虚拟车辆（VIL 直接位姿控制）。
-- **可视化**：CARLA `world.debug` 叠加浮动文字（速度/行为状态）、感知包围盒、规划轨迹线。
-- **同步控制**：20ms 固定步长 tick；延迟 >500ms 暂停场景；>50ms 外推补偿（仅影响可视化）。
-
-启用方式：在场景 YAML 中配置 `vil.enabled: true` 并提供标定参数，运行 `huntersim vil-run --config configs/vil_scenario.yaml`。
-详细配置与算法说明见《用户手册》§4.8。
-
-## 天气与环境
-
-L1 `simulation` 提供天气与环境模型（`simulation/weather.py`），场景启动时由 `ScenarioManagerImpl`
-加载地图后经 `world.set_weather(...)` 应用到 `carla.WeatherParameters`：
-
-- **全参数（§3.4.1）**：`cloudiness` / `precipitation` / `precipitation_deposits` / `wind_intensity` /
-  `sun_azimuth_angle` / `sun_altitude_angle` 六项，量程对齐 CARLA（0-100 / 0-360 / -90~90），由不可变
-  `WeatherParameters` 携带并在构造点校验。
-- **预设环境（§3.4.2）**：`PresetEnvironment` + `WEATHER_PRESET_REGISTRY` 提供 `clear_noon` / `overcast` /
-  `light_rain` / `heavy_rain` / `foggy` / `night` / `dusk` / `dawn` 共 8 套预设，由 `list_presets()` /
-  `resolve_preset()` 查询。
-- **配置驱动**：`weather.preset` 指定预设名（设置时优先于显式字段）；未指定时逐项应用 `weather` 下的显式参数。
-
-参数表、预设表与配置/API 示例详见《用户手册》§4.7。
-
-## 环境准备
+验证运行环境（在 CARLA 主机上执行，检查 OS / Python≥3.12 / 驱动 / CUDA / 显存）：
 
 ```bash
-# 安装 uv 后（本项目使用 uv 管理）
-uv sync --group dev          # 创建 3.12 虚拟环境并安装依赖
-uv sync --extra vil          # VIL 实车在环（额外安装 kafka-python）
-
-uv run ruff check .          # lint
-uv run ruff format .         # 格式化
-uv run mypy                  # 严格类型检查
-uv run pytest                # 运行测试
+python -c "from hunter_sim.engine.check_environment import check_environment as c; r=c(); print(r); raise SystemExit(0 if r.passed else 1)"
 ```
 
-## 目录结构
+启动 CARLA 服务端（Windows）：
 
+```bash
+# 由 engine/carla_server_config.py 生成启动命令，示例：
+CarlaUE4.exe -carla-rpc-port=2000 -RenderOffScreen -quality
 ```
-src/hunter_sim/     # 源码（src 布局）
-tests/              # 单元 / 集成测试（CARLA 全部 mock）
-configs/            # 场景与传感器配置示例（含 vil_scenario.yaml）
-data/runs/          # 运行数据输出（gitignore）
+
+### 4.2 安装与启动服务
+
+```bash
+# 创建虚拟环境并安装
+python -m venv .venv
+.venv\Scripts\activate                       # Windows
+pip install -e ".[dev]"                       # 或 pip install -r requirements.txt
+
+# 配置 JWT 密钥（生产必须覆盖默认值）
+set API_JWT_SECRET=your-strong-secret         # Windows CMD
+# export API_JWT_SECRET=your-strong-secret    # PowerShell / Linux
+
+# 启动 API 服务
+uvicorn hunter_sim.api.main:app --host 0.0.0.0 --port 8080
 ```
+
+启动后访问交互式文档：<http://localhost:8080/api/v1/sim/docs>
+
+### 4.3 容器化 / 编排
+
+```bash
+# 本地依赖编排（Kafka + 仿真服务 + Prometheus + Grafana，CARLA 仍跑在宿主机）
+docker-compose -f docker/docker-compose.yml up -d
+
+# Kubernetes（需 NVIDIA GPU Operator）
+kubectl apply -f k8s/
+```
+
+详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
+
+---
+
+## 5. 配置
+
+配置优先级：**环境变量 > `.env` / 配置文件 > 默认值**。所有配置由 `common/models.py` 的 pydantic `BaseSettings` 聚合，按前缀分组：
+
+| 前缀 | 组 | 关键项（默认值） |
+|------|------|------------------|
+| `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) |
+| `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) |
+| `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) |
+| `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
+| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) |
+| `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `gpu_memory_warning_threshold`(0.90) · `docker_image`(carlasim/carla:0.9.16) |
+
+预设资源文件位于 `configs/`：8 种天气环境、7 类传感器、7 个场景模板、5 套交通流档位。
+
+---
+
+## 6. API 一览
+
+统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）。
+
+| 分组 | 方法与路径 |
+|------|-----------|
+| 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /metrics` |
+| 实例 | `POST /instances` · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}` |
+| 场景 | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
+| 资源 | `GET /maps` · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
+| 实时推送 | `WS /ws/sim/{instance_id}/status` |
+
+完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
+
+---
+
+## 7. 开发与测试
+
+```bash
+pytest tests -q --cov=hunter_sim --cov-report=term-missing   # 覆盖率门禁 fail_under=80
+ruff check src tests
+mypy src
+```
+
+- CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
+- 代码规范：Ruff + mypy（`pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
+
+---
+
+## 8. 文档索引
+
+| 文件 | 内容 |
+|------|------|
+| `README.md` | 项目总览与快速开始（本文件） |
+| [`user_manual.md`](user_manual.md) | API 使用方法、场景/天气/标定示例、错误码 |
+| [`deployment_and_operations.md`](deployment_and_operations.md) | 环境准备、部署、监控、故障排查 |
+| [`release.md`](release.md) | 版本发布说明 |
+| `HunterSim.ai-rules.md` | 工程约束与开发规范 |
+
+---
+
+## 9. 许可
+
+本项目基于 [LICENSE](LICENSE) 发布。

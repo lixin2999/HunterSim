@@ -1,0 +1,91 @@
+# HunterSim K8s Deployment
+# 命名空间：hunter-sim
+# 适用环境：Kubernetes 1.25+ with NVIDIA GPU Operator
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hunter-sim-service
+  namespace: hunter-sim
+  labels:
+    app: hunter-sim
+    component: sim-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hunter-sim
+      component: sim-service
+  template:
+    metadata:
+      labels:
+        app: hunter-sim
+        component: sim-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/api/v1/sim/metrics"
+    spec:
+      containers:
+        - name: sim-service
+          image: hunter-sim:2.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: HUNTER_SIM_ENV
+              value: "prod"
+            - name: HUNTER_SIM_LOG_LEVEL
+              value: "INFO"
+            - name: CARLA_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: carla_host
+            - name: CARLA_RPC_PORT
+              value: "2000"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: kafka_bootstrap_servers
+            - name: API_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: jwt_secret
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          livenessProbe:
+            http:
+              path: /api/v1/sim/health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            http:
+              path: /api/v1/sim/health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: configs
+              mountPath: /home/hunter/app/configs
+              readOnly: true
+      volumes:
+        - name: configs
+          configMap:
+            name: hunter-sim-configs
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

@@ -1,91 +1,177 @@
-"""pytest 公共 fixtures。
+"""pytest 测试配置和 fixtures（PROMPT-TEST-001）。
 
-CARLA 相关代码在本阶段不涉及；后续层的 fixtures 将在此集中提供 mock。
+提供全局 fixture：
+- MockCarlaClient / MockWorld / MockVehicle
+- HunterSimSettings（测试环境）
+- FastAPI TestClient
+- 各模块服务实例
 """
 
 from __future__ import annotations
 
 import sys
-from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any, Generator
 
-import numpy as np
 import pytest
 
-# 注入伪 carla 模块：L1 实现引用 carla 原生类型，但测试环境无 CARLA 包/服务端。
-# 各实现均通过注入 mock world/client/vehicle 完成测试，构造函数仅需要存在即可。
-if "carla" not in sys.modules:
-    sys.modules["carla"] = MagicMock(name="carla")
+# 将 src 目录加入 Python 路径
+_src = Path(__file__).parent.parent / "src"
+if str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture()
-def configs_dir() -> Path:
-    """示例配置目录路径。"""
-    return PROJECT_ROOT / "configs"
-
-
-@pytest.fixture()
-def default_scenario_path(configs_dir: Path) -> Path:
-    return configs_dir / "default_scenario.yaml"
-
-
-@pytest.fixture()
-def sensors_suite_path(configs_dir: Path) -> Path:
-    return configs_dir / "sensors" / "full_suite.yaml"
-
-
-@pytest.fixture()
-def sample_image() -> np.ndarray:
-    """构造一张合法的 RGB 测试图像 (H, W, 3) uint8。"""
-    return np.zeros((8, 8, 3), dtype=np.uint8)
+from hunter_sim.common.models import (  # noqa: E402
+    CarlaSettings,
+    HunterSimSettings,
+    KafkaSettings,
+    ResourceSettings,
+    SimMode,
+    Transform,
+    VILSettings,
+    VehicleState,
+    QualityLevel,
+)
+from hunter_sim.common.utils import RingBuffer  # noqa: E402
+from tests.mocks.carla_mocks import (  # noqa: E402
+    MockActor,
+    MockCarlaClient,
+    MockTransform as MT,
+    MockVehicle,
+    MockWorld,
+)
 
 
-@pytest.fixture()
-def sample_points() -> np.ndarray:
-    """构造一段合法的 LiDAR 点云 (N, 4) float64。"""
-    return np.zeros((16, 4), dtype=np.float64)
+# ─── 配置 Fixtures ────────────────────────────────────────────────────────────
 
 
-@pytest.fixture()
-def sample_start_time() -> datetime:
-    return datetime(2026, 1, 1, 12, 0, 0)
+@pytest.fixture(scope="session")
+def test_settings() -> HunterSimSettings:
+    """测试环境全局配置（不连接真实服务）。"""
+    return HunterSimSettings(
+        env="dev",
+        log_level="DEBUG",
+        carla=CarlaSettings(host="127.0.0.1", rpc_port=2000),
+        kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+        vil=VILSettings(extrapolation_ms=150),
+        resource=ResourceSettings(instance_max_lifetime_seconds=60),
+    )
 
 
-@pytest.fixture()
-def sample_vehicle_state() -> object:
-    """一个填充完整的 VehicleState 样本，供 L1/L2 测试复用。"""
-    from hunter_sim.core.contracts import VehicleState
+# ─── CARLA Mock Fixtures ──────────────────────────────────────────────────────
 
+
+@pytest.fixture
+def mock_client() -> MockCarlaClient:
+    """CARLA Client Mock。"""
+    return MockCarlaClient()
+
+
+@pytest.fixture
+def mock_world() -> MockWorld:
+    """CARLA World Mock（Town03）。"""
+    return MockWorld("Town03")
+
+
+@pytest.fixture
+def mock_vehicle() -> MockVehicle:
+    """CARLA Vehicle Actor Mock。"""
+    return MockVehicle("vehicle.hunter_se")
+
+
+# ─── 数据模型 Fixtures ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def sample_transform() -> Transform:
+    """标准测试位姿。"""
+    return Transform(x=10.0, y=5.0, z=0.0, pitch=0.0, yaw=0.5, roll=0.0)
+
+
+@pytest.fixture
+def sample_vehicle_state(sample_transform: Transform) -> VehicleState:
+    """标准测试车辆状态。"""
     return VehicleState(
-        timestamp=1.0,
-        frame_id=0,
-        x=1.0,
-        y=2.0,
-        z=0.0,
-        roll=0.0,
-        pitch=0.0,
-        yaw=90.0,
-        velocity_x=5.0,
-        velocity_y=0.0,
-        velocity_z=0.0,
-        acceleration_x=0.0,
-        acceleration_y=0.0,
-        acceleration_z=9.8,
-        throttle=0.0,
+        time_stamp=1000000.0,
+        transform=sample_transform,
+        velocity=(1.0, 0.5, 0.0),
+        acceleration=(0.1, 0.0, 0.0),
+        angular_velocity=(0.0, 0.0, 0.1),
+        steering=0.2,
+        throttle=0.5,
         brake=0.0,
-        steer=0.0,
         gear=1,
+        vehicle_speed=3.0,
     )
 
 
-@pytest.fixture()
-def fake_carla_transform() -> SimpleNamespace:
-    """模拟 carla.Transform 的读取结构（location/rotation 为数值属性）。"""
-    return SimpleNamespace(
-        location=SimpleNamespace(x=10.0, y=20.0, z=0.5),
-        rotation=SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
+@pytest.fixture
+def sample_telemetry_frames() -> list[dict[str, Any]]:
+    """10 帧模拟遥测数据（匀加速直线运动）。"""
+    frames = []
+    for i in range(10):
+        t = i * 0.1
+        x = 0.5 * 1.0 * t * t  # 匀加速 1 m/s²
+        frames.append(
+            {
+                "timestamp": 1000.0 + t,
+                "position": {"x": x, "y": 0.0, "z": 0.0},
+                "rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+                "velocity": {"x": 1.0 * t, "y": 0.0, "z": 0.0, "speed": 1.0 * t},
+                "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "steering": 0.0,
+                "throttle": 0.5,
+                "brake": 0.0,
+                "gear": 1,
+            }
+        )
+    return frames
+
+
+# ─── RingBuffer Fixture ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def ring_buffer() -> RingBuffer[int]:
+    """测试用 RingBuffer，大小 5。"""
+    return RingBuffer(max_size=5)
+
+
+# ─── FastAPI TestClient ───────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def app():
+    """FastAPI 应用实例（module 级别复用）。
+
+    注入真实的 SimInstanceManager（基于内存 GPU 池，不依赖 CARLA），
+    以便实例管理路由可被完整测试。
+    """
+    from hunter_sim.api.main import create_app
+    from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
+    from hunter_sim.resource_manager.instance_manager import SimInstanceManager
+
+    settings = HunterSimSettings(env="dev")
+    application = create_app(settings)
+    gpu_pool = GPUResourcePool(gpu_count=2, total_memory_gb=64.0)
+    application.state.instance_manager = SimInstanceManager(
+        settings=ResourceSettings(), gpu_pool=gpu_pool
     )
+    return application
+
+
+@pytest.fixture(scope="module")
+def client(app) -> Any:
+    """同步 HTTP 测试客户端。"""
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def auth_headers(test_settings: HunterSimSettings) -> dict[str, str]:
+    """生成测试 JWT header。"""
+    from hunter_sim.api.deps import create_access_token
+
+    token = create_access_token("test_user", test_settings.api)
+    return {"Authorization": f"Bearer {token}"}

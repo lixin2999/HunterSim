@@ -1,88 +1,75 @@
 [project]
-name = "huntersim"
-version = "0.1.0"
-description = "HunterSim — CARLA 自动驾驶仿真数据采集与分析系统"
+name = "hunter-sim"
+version = "2.0.0"
+description = "HunterSim - VIL Virtual Simulation Platform for HUNTER SE Autonomous Driving"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
-authors = [{ name = "HunterSim Team" }]
+authors = [
+    {name = "HunterPilot Team"}
+]
 
 dependencies = [
-    "pydantic>=2.7,<3.0",
-    "numpy>=2.0,<3.0",
-    "loguru>=0.7",
-    "pyyaml>=6.0",
+    "fastapi>=0.100,<0.110",
+    "uvicorn[standard]>=0.23,<0.30",
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "python-jose[cryptography]>=3.3,<4.0",
+    "numpy>=1.24,<2.0",
+    "scipy>=1.11,<2.0",
+    "kafka-python>=2.0,<3.0",
+    "websockets>=11.0,<13.0",
+    "httpx>=0.24,<0.28",
+    "aiofiles>=23.0,<24.0",
+    "python-multipart>=0.0.6,<0.1",
+    "orjson>=3.9,<4.0",
+    "structlog>=23.0,<24.0",
+    "prometheus-client>=0.17,<0.27",
+    "PyYAML>=6.0,<7.0",
+    "defusedxml>=0.7,<1.0",
+    "Jinja2>=3.1,<4.0",
 ]
 
 [project.optional-dependencies]
-# 分层重型依赖：仅在实现对应层时安装，避免 core 阶段引入大体积包。
-processing = ["scipy>=1.13", "pandas>=2.2"]
-storage = ["msgpack>=1.0", "h5py>=3.11"]
-cli = ["typer>=0.12"]
-viz = ["matplotlib>=3.8", "open3d>=0.18"]
-imaging = ["pillow>=10"]
-vil = ["kafka-python>=2.0,<3.0"]
-
-[dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=5.0",
-    "ruff>=0.5",
-    "mypy>=1.10",
-    "types-pyyaml>=6.0",
+    "pytest>=7.4,<9.0",
+    "pytest-asyncio>=0.21,<0.24",
+    "pytest-cov>=4.1,<5.0",
+    "httpx>=0.24,<0.28",
+    "mypy>=1.5,<2.0",
+    "flake8>=6.1,<7.0",
+    "flake8-docstrings>=1.7,<2.0",
 ]
 
-[project.scripts]
-huntersim = "hunter_sim.app.cli:app"
-
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/hunter_sim"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-src = ["src", "tests"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "W", "RUF", "D"]
-# 项目文档/注释使用中文，禁用对全角标点与中文句号的误报规则。
-# RUF001/002/003: 中文全角括号/逗号等被判为 "ambiguous unicode"。
-# D415: 中文句号「。」不被识别为终止标点。
-ignore = ["D203", "D213", "RUF001", "RUF002", "RUF003", "D415"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D"]
-# Protocol 方法为接口声明，方法体以 ... 占位，不强制写 docstring。
-"**/protocols.py" = ["D102"]
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"
-
-[tool.mypy]
-python_version = "3.12"
-strict = true
-files = ["src"]
-mypy_path = "src"
-plugins = ["pydantic.mypy"]
-warn_unused_ignores = true
-exclude = ["data/"]
-
-[[tool.mypy.overrides]]
-module = ["carla.*", "msgpack.*", "h5py.*", "open3d.*", "matplotlib.*", "PIL.*", "typer.*", "kafka.*"]
-ignore_missing_imports = true
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra"
+addopts = "--strict-markers --tb=short"
+markers = [
+    "unit: Unit tests (MockCarla only)",
+    "integration: Integration tests",
+    "e2e: End-to-end tests",
+    "slow: Slow running tests",
+]
 
-[tool.uv]
-[[tool.uv.index]]
-name = "tsinghua"
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-default = true
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
+
+[tool.coverage.run]
+source = ["src/hunter_sim"]
+branch = true
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
