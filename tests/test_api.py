@@ -34,6 +34,28 @@ class TestHealthEndpoints:
         assert "huntersim_carla_connected" in body
         assert "huntersim_active_instances" in body
 
+    def test_metrics_exports_monitored_gauges(self, client: TestClient) -> None:
+        """§15.4 告警监控项：服务注册实时值后 /metrics 输出对应 gauge。"""
+        client.app.state.vil_latency_ms = 420.0
+        client.app.state.simulation_fps = 18.5
+        try:
+            body = client.get("/api/v1/sim/metrics").text
+            assert "huntersim_vil_latency_ms 420.0000" in body
+            assert "huntersim_simulation_fps 18.5000" in body
+        finally:
+            client.app.state.vil_latency_ms = None
+            client.app.state.simulation_fps = None
+
+    def test_performance_targets(self, client: TestClient) -> None:
+        """§13.1 性能目标与 §15.4 告警阈值查询端点（免鉴权）。"""
+        resp = client.get("/api/v1/sim/health/performance-targets")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["performance_targets"]["simulation_fps"]["target"] == ">= 30"
+        assert data["performance_targets"]["vil_end_to_end_latency"]["unit"] == "ms"
+        assert data["alert_thresholds"]["carla_rpc_response_time"] == "> 5s"
+        assert data["alert_thresholds"]["disk_usage"] == "> 85%"
+
 
 class TestAuthEndpoints:
     """认证相关测试。"""
@@ -100,6 +122,123 @@ class TestResourceEndpoints:
     def test_gpu_status(self, client: TestClient, auth_headers: dict) -> None:
         resp = client.get("/api/v1/sim/resources/gpu", headers=auth_headers)
         assert resp.status_code == 200
+
+
+_VALID_XODR = """<?xml version="1.0"?>
+<OpenDRIVE>
+  <header revHeader="1.6" name="CustomTown">
+    <geoReference><![CDATA[[+proj=tmerc]]]></geoReference>
+  </header>
+  <road id="1" name="R1" length="100.0" junction="-1">
+    <lanes>
+      <laneSection id="0">
+        <lane id="-1" type="driving"/>
+      </laneSection>
+    </lanes>
+  </road>
+</OpenDRIVE>
+"""
+
+
+class TestMapUploadEndpoint:
+    """自定义地图上传端点测试（设计文档 §10.4.2）。"""
+
+    def test_upload_valid_map_and_list(self, client: TestClient, auth_headers: dict, tmp_path) -> None:
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "myTown", "content": _VALID_XODR},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["map_id"] == "myTown"
+        assert data["is_custom"] is True
+        assert data["road_count"] == 1
+        assert data["reference"] == "custom/myTown"  # 附录 B：创建实例时引用名
+        assert data["review_status"] == "approved"  # §14.3 格式审核通过
+        assert (tmp_path / "maps" / "custom" / "myTown.xodr").exists()
+
+        # 自定义地图应出现在地图列表中，引用名为 custom/{map_name}（附录 B）
+        resp2 = client.get("/api/v1/sim/maps", headers=auth_headers)
+        maps = {m["map_id"]: m for m in resp2.json()["data"]["maps"]}
+        assert maps["custom/myTown"]["is_custom"] is True
+        assert maps["custom/myTown"]["name"] == "myTown"
+
+    def test_upload_multipart_form_data(self, client: TestClient, auth_headers: dict, tmp_path) -> None:
+        """附录 B 主接口形式：multipart/form-data（file + map_id 字段）。"""
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            files={"file": ("park.xodr", _VALID_XODR, "application/xml")},
+            data={"map_id": "park"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["map_id"] == "park"
+        assert data["reference"] == "custom/park"
+        assert (tmp_path / "maps" / "custom" / "park.xodr").exists()
+
+    def test_upload_multipart_map_id_from_filename(
+        self, client: TestClient, auth_headers: dict, tmp_path
+    ) -> None:
+        """multipart 未提供 map_id 时从文件名推导。"""
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            files={"file": ("garage_v2.xodr", _VALID_XODR, "application/xml")},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["map_id"] == "garage_v2"
+
+    def test_upload_multipart_missing_file_422(self, client: TestClient, auth_headers: dict) -> None:
+        # 仅含普通字段的 multipart 请求（无 file 文件部分）
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            files={"map_id": (None, "nope")},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422
+
+    def test_upload_form_urlencoded_rejected(self, client: TestClient, auth_headers: dict) -> None:
+        """既非 multipart 也非 JSON 的请求体 → 400。"""
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            data={"map_id": "nope"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+
+    def test_upload_invalid_xodr_rejected(self, client: TestClient, auth_headers: dict, tmp_path) -> None:
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "badTown", "content": "<OpenDRIVE><unclosed>"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422
+        # 非法文件不应落盘
+        assert not (tmp_path / "maps" / "custom" / "badTown.xodr").exists()
+
+    def test_upload_path_traversal_map_id_rejected(
+        self, client: TestClient, auth_headers: dict, tmp_path
+    ) -> None:
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "../evil", "content": _VALID_XODR},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422
+
+    def test_upload_requires_auth(self, client: TestClient) -> None:
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "town", "content": _VALID_XODR},
+        )
+        assert resp.status_code == 401
 
 
 class TestApiDocEndpoint:

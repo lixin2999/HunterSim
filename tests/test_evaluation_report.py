@@ -58,6 +58,83 @@ class TestGenerateJson:
         report = gen.generate_json(_evaluator())
         assert report["report_id"].startswith("report_")
 
+    def test_scenes_use_doc_format(self) -> None:
+        """scenes 条目应符合设计文档 §9.4 字段结构。"""
+        gen = EvaluationReportGenerator()
+        report = gen.generate_json(_evaluator(), report_id="rid-doc")
+        assert len(report["scenes"]) == 4
+        scene = report["scenes"][0]
+        assert scene["result"] == "passed"
+        assert set(scene["safety_metrics"]) == {
+            "collisions", "min_ttc", "min_distance",
+            "emergency_brakes", "lane_invasions", "red_light_runs",
+        }
+        assert set(scene["efficiency_metrics"]) == {
+            "avg_speed", "max_speed", "distance", "completion_time",
+        }
+        assert set(scene["comfort_metrics"]) == {
+            "avg_acceleration", "max_acceleration", "avg_jerk", "steering_smoothness",
+        }
+        assert "success_criteria" in scene and "grade" in scene
+
+    def test_trend_with_previous_summary(self) -> None:
+        """提供历史摘要时输出趋势对比（文档 §9.5）。"""
+        gen = EvaluationReportGenerator()
+        previous = {"pass_rate": 0.5, "collision_rate": 0.5, "overall_grade": "C"}
+        report = gen.generate_json(_evaluator(), previous_summary=previous)
+        trend = report["trend"]
+        assert trend["pass_rate_delta"] == pytest.approx(0.25)
+        assert trend["collision_rate_delta"] == pytest.approx(-0.25)
+        assert trend["grade_change"] == "C -> D"
+
+
+class TestGenerateSceneReport:
+    """单场景报告测试（设计文档 §9.4）。"""
+
+    def test_full_structure(self) -> None:
+        result = SceneEvaluationResult(
+            scene_id="scene_001",
+            grade=EvalGrade.A,
+            safety=SafetyMetrics(collision_count=0, min_ttc_s=4.2, min_distance_m=5.1),
+            efficiency=EfficiencyMetrics(
+                avg_speed_ms=3.5, max_speed_ms=5.0,
+                total_distance_m=105.2, scene_duration_s=28.5,
+            ),
+            comfort=ComfortMetrics(
+                avg_acceleration_ms2=0.8, max_acceleration_ms2=1.5,
+                avg_jerk_ms3=1.2, steering_smoothness_rad_s=0.2,
+            ),
+            passed=True,
+            success_criteria={"no_collision": True, "max_speed_deviation": 1.2, "min_safe_distance": 5.1},
+            events=[{"time": 5.2, "type": "actor_decelerate", "description": "前车开始减速"}],
+        )
+        gen = EvaluationReportGenerator()
+        report = gen.generate_scene_report(
+            result, sim_instance_id="sim_001", scene_name="城市道路跟车场景",
+            start_time="2026-08-19T10:00:00Z", end_time="2026-08-19T10:00:30Z",
+        )
+        assert report["sim_instance_id"] == "sim_001"
+        assert report["scene_name"] == "城市道路跟车场景"
+        assert report["start_time"] == "2026-08-19T10:00:00Z"
+        assert report["duration"] == 28.5
+        assert report["result"] == "passed"
+        assert report["safety_metrics"]["min_ttc"] == 4.2
+        assert report["efficiency_metrics"]["max_speed"] == 5.0
+        assert report["comfort_metrics"]["steering_smoothness"] == 0.2
+        assert report["success_criteria"]["no_collision"] is True
+        assert report["grade"] == "A"
+
+    def test_inf_metrics_render_as_none(self) -> None:
+        """无采样数据（inf/None）时安全指标输出 None。"""
+        result = SceneEvaluationResult(
+            scene_id="s", grade=EvalGrade.D, safety=SafetyMetrics(),
+            efficiency=EfficiencyMetrics(), comfort=ComfortMetrics(), passed=False,
+        )
+        gen = EvaluationReportGenerator()
+        report = gen.generate_scene_report(result)
+        assert report["safety_metrics"]["min_ttc"] is None
+        assert report["safety_metrics"]["min_distance"] is None
+
 
 class TestGenerateHtml:
     def test_contains_summary_and_rows(self) -> None:

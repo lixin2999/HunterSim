@@ -1,10 +1,10 @@
 """评估报告生成器（PROMPT-ENG-007-A）。
 
 支持生成 JSON 和 HTML 格式的评估报告，包含：
-- 完整的指标数值
-- 等级判定（S/A/B/C/D）
-- 事件时间线
-- 批量评估趋势对比
+- 单场景报告结构（设计文档 §9.4：safety_metrics / efficiency_metrics /
+  comfort_metrics / success_criteria / events / grade）
+- 批量汇总与趋势对比（设计文档 §9.5）
+- 等级判定（S/A/B/C/D）与事件时间线
 """
 
 from __future__ import annotations
@@ -88,19 +88,110 @@ class EvaluationReportGenerator:
         if report_dir:
             report_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _scene_to_doc_format(
+        result: SceneEvaluationResult,
+        sim_instance_id: str = "",
+        scene_name: str = "",
+        start_time: str = "",
+        end_time: str = "",
+    ) -> dict[str, Any]:
+        """将单场景评估结果转换为设计文档 §9.4 报告字段结构。
+
+        Args:
+            result: 单场景评估结果。
+            sim_instance_id: 仿真实例 ID。
+            scene_name: 场景名称。
+            start_time: 场景开始时间（空则用评估时间）。
+            end_time: 场景结束时间（空则用评估时间）。
+
+        Returns:
+            符合 §9.4 结构的报告字典。
+        """
+        ts = result.timestamp
+        safety = result.safety
+        efficiency = result.efficiency
+        comfort = result.comfort
+
+        def _num(value: Optional[float], digits: int) -> Optional[float]:
+            """inf/None 统一输出为 None，其余四舍五入。"""
+            if value is None or value == float("inf"):
+                return None
+            return round(value, digits)
+
+        return {
+            "sim_instance_id": sim_instance_id,
+            "scene_id": result.scene_id,
+            "scene_name": scene_name,
+            "start_time": start_time or ts,
+            "end_time": end_time or ts,
+            "duration": round(efficiency.scene_duration_s, 2),
+            "result": "passed" if result.passed else "failed",
+            "safety_metrics": {
+                "collisions": safety.collision_count,
+                "min_ttc": _num(safety.min_ttc_s, 2),
+                "min_distance": _num(safety.min_distance_m, 2),
+                "emergency_brakes": safety.emergency_brake_count,
+                "lane_invasions": safety.lane_invasion_count,
+                "red_light_runs": safety.red_light_count,
+            },
+            "efficiency_metrics": {
+                "avg_speed": round(efficiency.avg_speed_ms, 2),
+                "max_speed": round(efficiency.max_speed_ms, 2),
+                "distance": round(efficiency.total_distance_m, 2),
+                "completion_time": round(efficiency.scene_duration_s, 2),
+            },
+            "comfort_metrics": {
+                "avg_acceleration": round(comfort.avg_acceleration_ms2, 2),
+                "max_acceleration": round(comfort.max_acceleration_ms2, 2),
+                "avg_jerk": round(comfort.avg_jerk_ms3, 2),
+                "steering_smoothness": round(comfort.steering_smoothness_rad_s, 3),
+            },
+            "success_criteria": result.success_criteria,
+            "events": result.events,
+            "grade": result.grade.value,
+        }
+
+    def generate_scene_report(
+        self,
+        result: SceneEvaluationResult,
+        sim_instance_id: str = "",
+        scene_name: str = "",
+        start_time: str = "",
+        end_time: str = "",
+    ) -> dict[str, Any]:
+        """生成单场景评估报告（设计文档 §9.4 结构）。
+
+        Args:
+            result: 单场景评估结果。
+            sim_instance_id: 仿真实例 ID。
+            scene_name: 场景名称。
+            start_time: 场景开始时间。
+            end_time: 场景结束时间。
+
+        Returns:
+            报告字典。
+        """
+        return self._scene_to_doc_format(
+            result, sim_instance_id, scene_name, start_time, end_time
+        )
+
     def generate_json(
         self,
         evaluator: BatchEvaluator,
         report_id: str = "",
+        previous_summary: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """生成 JSON 格式报告数据。
+        """生成 JSON 格式批量评估报告。
 
         Args:
             evaluator: 已包含所有场景结果的批量评估器。
             report_id: 报告唯一 ID（空则自动生成时间戳 ID）。
+            previous_summary: 上一版本批量评估摘要，提供时输出趋势对比
+                （文档 §9.5 “与历史版本对比”）。
 
         Returns:
-            报告字典。
+            报告字典，含 summary 字段与 §9.4 格式的 scenes 列表。
         """
         if not report_id:
             report_id = f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -109,8 +200,30 @@ class EvaluationReportGenerator:
             "report_id": report_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             **summary,
+            # 逐场景报告（§9.4 结构）
+            "scenes": [
+                self._scene_to_doc_format(r) for r in evaluator.results()
+            ],
         }
+        if previous_summary:
+            report["trend"] = self._build_trend(summary, previous_summary)
         return report
+
+    @staticmethod
+    def _build_trend(
+        current: dict[str, Any],
+        previous: dict[str, Any],
+    ) -> dict[str, Any]:
+        """计算当前与历史评估摘要的趋势对比（文档 §9.5）。"""
+        return {
+            "pass_rate_delta": round(
+                current.get("pass_rate", 0) - previous.get("pass_rate", 0), 4
+            ),
+            "collision_rate_delta": round(
+                current.get("collision_rate", 0) - previous.get("collision_rate", 0), 4
+            ),
+            "grade_change": f"{previous.get('overall_grade', 'D')} -> {current.get('overall_grade', 'D')}",
+        }
 
     def generate_html(
         self,

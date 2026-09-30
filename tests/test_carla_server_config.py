@@ -42,25 +42,55 @@ class TestBuildArgs:
         assert any("DefaultMap=Town05" in a for a in args)
         assert "-RenderOffScreen" in args
 
+    def test_streaming_port_included(self) -> None:
+        # 设计文档 §3.1.1：启动参数包含数据流端口
+        args = CarlaServerConfig(stream_port=2001).build_carla_exe_args()
+        assert "-carla-streaming-port=2001" in args
+
+    def test_nosound_fps_benchmark(self) -> None:
+        # 设计文档 §3.1.1：-nosound / -fps=50 / -benchmark
+        args = CarlaServerConfig().build_carla_exe_args()
+        assert "-nosound" in args
+        assert "-fps=50" in args
+        assert "-benchmark" in args
+
     def test_no_rendering_and_gpu(self) -> None:
         args = CarlaServerConfig(no_rendering=True, gpu_id=1).build_carla_exe_args()
         assert "-nullrhi" in args
-        assert "-graphicsadapter=1" in args
+        assert "-gpu=1" in args
 
     def test_auto_gpu_no_adapter_flag(self) -> None:
         args = CarlaServerConfig(gpu_id=-1).build_carla_exe_args()
-        assert not any(a.startswith("-graphicsadapter") for a in args)
+        assert not any(a.startswith("-gpu=") for a in args)
 
     def test_epic_quality_flag(self) -> None:
         args = CarlaServerConfig(quality=QualityLevel.EPIC).build_carla_exe_args()
-        assert "-epic" in args
+        assert "-quality-level=Epic" in args
 
     def test_low_medium_quality_flag(self) -> None:
-        assert "-quality" in CarlaServerConfig(quality=QualityLevel.LOW).build_carla_exe_args()
+        assert "-quality-level=Low" in CarlaServerConfig(quality=QualityLevel.LOW).build_carla_exe_args()
+        assert "-quality-level=Medium" in CarlaServerConfig(quality=QualityLevel.MEDIUM).build_carla_exe_args()
 
     def test_extra_args_appended(self) -> None:
         args = CarlaServerConfig(extra_args=["-fov=90", "-x"]).build_carla_exe_args()
         assert args[-2:] == ["-fov=90", "-x"]
+
+
+class TestSimulationModeSettings:
+    def test_sync_settings_match_doc(self) -> None:
+        # 设计文档 §3.1.2：同步模式固定步长 20ms + 子步 0.01s × 4
+        s = CarlaServerConfig().build_sync_settings()
+        assert s["synchronous_mode"] is True
+        assert s["fixed_delta_seconds"] == 0.02
+        assert s["substepping"] is True
+        assert s["max_substep_delta_time"] == 0.01
+        assert s["max_substeps"] == 4
+
+    def test_async_settings_match_doc(self) -> None:
+        # 设计文档 §3.1.2：异步模式可变步长
+        s = CarlaServerConfig().build_async_settings()
+        assert s["synchronous_mode"] is False
+        assert s["fixed_delta_seconds"] is None
 
 
 class TestCommandStrings:

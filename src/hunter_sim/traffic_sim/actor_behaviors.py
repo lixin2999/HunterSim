@@ -2,6 +2,7 @@
 
 定义行为基类和具体行为实现，供场景化参与者控制器使用。
 行为统一接口：update(elapsed_time, ego_vehicle) -> Action
+支持行为类型（设计文档 §7.4.1）：constant_speed / decelerate / cut_in 等。
 """
 
 from __future__ import annotations
@@ -106,6 +107,7 @@ class DecelerateBehavior(ActorBehavior):
         initial_speed_ms: 初始速度（m/s）。
         deceleration_ms2: 减速度大小（m/s²，正值）。
         target_speed_ms: 最终目标速度（停止时为 0）。
+        trigger_time_s: 减速触发时刻（文档 §7.4.1：elapsed_time > trigger_time 后才减速）。
     """
 
     def __init__(
@@ -113,15 +115,21 @@ class DecelerateBehavior(ActorBehavior):
         initial_speed_ms: float = 8.0,
         deceleration_ms2: float = 2.0,
         target_speed_ms: float = 0.0,
+        trigger_time_s: float = 0.0,
         behavior_id: str = "decelerate",
     ) -> None:
         super().__init__(behavior_id)
         self._initial = initial_speed_ms
         self._decel = deceleration_ms2
         self._target = target_speed_ms
+        self._trigger_time = trigger_time_s
 
     def update(self, elapsed_time: float, actor: Any, ego_vehicle: Any, delta_seconds: float) -> ActorAction:
-        current = self._initial - self._decel * elapsed_time
+        if elapsed_time < self._trigger_time:
+            # 触发前保持初速匀速行驶
+            return ActorAction(target_speed_ms=self._initial)
+        decel_elapsed = elapsed_time - self._trigger_time
+        current = self._initial - self._decel * decel_elapsed
         speed = max(self._target, current)
         brake = 0.0 if current <= self._target else min(1.0, self._decel / 5.0)
         return ActorAction(
@@ -195,3 +203,110 @@ class PedestrianCrossBehavior(ActorBehavior):
             target_speed_ms=0.0 if done else self._speed,
             is_stop=done,
         )
+
+
+# ─── 行为工厂与场景化控制器（设计文档 §7.4） ───────────────────────────────
+
+
+def create_behavior_from_config(config: dict[str, Any]) -> ActorBehavior:
+    """从行为配置字典创建行为实例（文档 §7.4.1 type 字段）。
+
+    Args:
+        config: 行为配置，必含 'type' 字段：
+            - constant_speed: {'type','speed'}
+            - decelerate: {'type','trigger_time','deceleration','initial_speed'?,'target_speed'?}
+            - cut_in: {'type','speed','duration'?}
+            - static / pedestrian_cross 亦支持。
+
+    Returns:
+        ActorBehavior 实例。
+
+    Raises:
+        ValueError: 未知行为类型。
+    """
+    btype = str(config.get("type", ""))
+    if btype == "constant_speed":
+        return ConstantSpeedBehavior(target_speed_ms=float(config.get("speed", 5.0)))
+    if btype == "decelerate":
+        return DecelerateBehavior(
+            initial_speed_ms=float(config.get("initial_speed", 8.0)),
+            deceleration_ms2=float(config.get("deceleration", 2.0)),
+            target_speed_ms=float(config.get("target_speed", 0.0)),
+            trigger_time_s=float(config.get("trigger_time", 0.0)),
+        )
+    if btype == "cut_in":
+        return CutInBehavior(
+            speed_ms=float(config.get("speed", 6.0)),
+            duration_s=float(config.get("duration", 4.0)),
+        )
+    if btype == "static":
+        return StaticBehavior()
+    if btype == "pedestrian_cross":
+        return PedestrianCrossBehavior(
+            speed_ms=float(config.get("speed", 1.2)),
+            crossing_duration_s=float(config.get("duration", 15.0)),
+        )
+    raise ValueError(f"Unknown actor behavior type: '{btype}'")
+
+
+class ScriptedActorController:
+    """场景化参与者控制器：触发条件 + 行为组合执行（文档 §7.4）。
+
+    触发条件满足前参与者保持静止（或默认行为）；
+    触发后每 tick 执行绑定行为并输出指令。
+
+    Args:
+        actor: CARLA Actor 对象（Any）。
+        behavior: 行为实例。
+        trigger: 触发条件实例（None 表示立即激活）。
+    """
+
+    def __init__(
+        self,
+        actor: Any,
+        behavior: ActorBehavior,
+        trigger: Optional[Any] = None,
+    ) -> None:
+        self._actor = actor
+        self._behavior = behavior
+        self._trigger = trigger
+        self._triggered = trigger is None
+        self._elapsed: float = 0.0
+
+    @property
+    def is_triggered(self) -> bool:
+        """触发条件是否已满足。"""
+        return self._triggered
+
+    @property
+    def behavior(self) -> ActorBehavior:
+        """绑定的行为实例。"""
+        return self._behavior
+
+    def update(self, ego_vehicle: Any, delta_seconds: float) -> Optional[ActorAction]:
+        """每 tick 更新：满足触发后执行行为。
+
+        Args:
+            ego_vehicle: 自车 Actor（用于触发判断与行为上下文）。
+            delta_seconds: 仿真步长（秒）。
+
+        Returns:
+            本帧行为指令；未触发时返回 None。
+        """
+        self._elapsed += delta_seconds
+        if not self._triggered and self._trigger is not None:
+            if self._trigger.check(self._elapsed, self._actor, ego_vehicle):
+                self._triggered = True
+                self._behavior.start()
+                logger.debug(f"ScriptedActorController triggered: {self._behavior.behavior_id}")
+        if not self._triggered:
+            return None
+        return self._behavior.update(self._elapsed, self._actor, ego_vehicle, delta_seconds)
+
+    def reset(self) -> None:
+        """重置控制器与触发器状态（场景重启时调用）。"""
+        self._elapsed = 0.0
+        self._triggered = self._trigger is None
+        if self._trigger is not None:
+            self._trigger.reset()
+        self._behavior.stop()

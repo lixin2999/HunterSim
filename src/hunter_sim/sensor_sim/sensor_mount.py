@@ -110,6 +110,14 @@ _HUNTER_SE_MOUNTS: list[SensorMountSpec] = [
         y=0.0,
         z=0.1,
     ),
+    SensorMountSpec(
+        # 设计文档 §6.2.5 障碍物传感器：前向探测，与碰撞传感器同位安装
+        mount_id="obstacle_front",
+        sensor_type=SensorType.OBSTACLE,
+        x=HunterSESpec.LENGTH * 0.5,
+        y=0.0,
+        z=0.1,
+    ),
 ]
 
 

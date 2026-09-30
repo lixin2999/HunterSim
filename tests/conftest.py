@@ -170,8 +170,17 @@ def client(app) -> Any:
 
 @pytest.fixture
 def auth_headers(test_settings: HunterSimSettings) -> dict[str, str]:
-    """生成测试 JWT header。"""
+    """生成测试 JWT header（管理员角色，创建/销毁实例需管理员权限，见 §14.2）。"""
     from hunter_sim.api.deps import create_access_token
 
-    token = create_access_token("test_user", test_settings.api)
+    token = create_access_token("test_user", test_settings.api, extra_claims={"role": "admin"})
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def user_headers(test_settings: HunterSimSettings) -> dict[str, str]:
+    """生成普通用户 JWT header（无管理员角色，用于权限测试）。"""
+    from hunter_sim.api.deps import create_access_token
+
+    token = create_access_token("plain_user", test_settings.api, extra_claims={"role": "user"})
     return {"Authorization": f"Bearer {token}"}

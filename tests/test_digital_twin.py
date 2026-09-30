@@ -97,6 +97,15 @@ class TestSceneReconstructor:
         assert by_id["reconstructed_1"]["actor_type"] == "vehicle"
         assert by_id["reconstructed_2"]["actor_type"] == "walker"
 
+    def test_cyclist_type_mapping(self) -> None:
+        # 文档 §7.2：非机动车映射为 cyclist + 自行车蓝图
+        traj = [_frame(0.0, 0.0, 0.0)]
+        perception = [{"objects": [{"id": 7, "type": "bicycle", "x": 2.0, "y": 1.0}]}]
+        config = SceneReconstructor().reconstruct(traj, perception, map_id="Town03")
+        part = config["traffic_participants"][0]
+        assert part["actor_type"] == "cyclist"
+        assert part["blueprint"] == "vehicle.diamondback.century"
+
     def test_participants_capped_at_50(self) -> None:
         traj = [_frame(0.0, 0.0, 0.0)]
         objects = [{"id": i, "type": "vehicle"} for i in range(80)]

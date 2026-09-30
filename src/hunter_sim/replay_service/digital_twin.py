@@ -99,13 +99,15 @@ class TrajectoryComparator:
 
 
 class SceneReconstructor:
-    """从实车历史数据自动重建仿真场景。
+    """从实车历史数据自动重建仿真场景（设计文档 §8.6 场景自动重建）。
 
     流程：
-    1. 提取自车轨迹 → 转换为 CARLA 地图坐标
-    2. 识别使用地图 → 加载地图
-    3. 提取交通参与者轨迹 → 转化为参与者行为脚本
-    4. 生成 SceneConfig 配置
+    1. 提取实车运行时间段的轨迹和环境数据（调用方通过 DataLoader 完成）
+    2. 识别运行区域对应的仿真地图（map_id 由调用方传入）
+    3. 从感知结果提取周边交通参与者轨迹
+    4. 将感知目标轨迹转化为仿真参与者行为脚本
+    5. 生成可在 CARLA 中重新执行的场景配置（SceneConfig 兼容字典）
+    6. 场景可用于 SIL 算法回归测试（mode=sil）
     """
 
     def reconstruct(
@@ -132,17 +134,28 @@ class SceneReconstructor:
                 if oid in seen_ids:
                     continue
                 seen_ids.add(oid)
+                obj_type = str(obj.get("type", ""))
+                # 参与者类型映射（文档 §7.2：车辆/行人/非机动车）
+                if obj_type in ("bicycle", "cyclist"):
+                    actor_type = "cyclist"
+                    blueprint = "vehicle.diamondback.century"
+                elif obj_type == "vehicle":
+                    actor_type = "vehicle"
+                    blueprint = "vehicle.tesla.model3"
+                else:
+                    actor_type = "walker"
+                    blueprint = "walker.pedestrian.0001"
                 participants.append({
                     "participant_id": f"reconstructed_{oid}",
-                    "actor_type": "vehicle" if obj.get("type") == "vehicle" else "walker",
-                    "blueprint": "vehicle.tesla.model3",
+                    "actor_type": actor_type,
+                    "blueprint": blueprint,
                     "spawn_point": {
                         "x": obj.get("x", 0.0),
                         "y": obj.get("y", 0.0),
-                        "yaw_deg": obj.get("yaw", 0.0),
+                        "yaw_deg": obj.get("heading", obj.get("yaw", 0.0)),
                     },
                     "behavior": "constant_speed",
-                    "speed_ms": obj.get("speed", 5.0),
+                    "speed_ms": obj.get("speed", obj.get("vx", 5.0)),
                 })
 
         ego_start = trajectory[0]["position"] if trajectory else {"x": 0.0, "y": 0.0}

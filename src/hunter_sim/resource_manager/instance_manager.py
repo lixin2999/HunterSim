@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
@@ -38,7 +39,29 @@ _TRANSITIONS: dict[InstanceStatus, set[InstanceStatus]] = {
 
 @dataclass
 class SimInstance:
-    """仿真实例数据模型。"""
+    """仿真实例数据模型（设计文档 §10.2.2）。
+
+    Attributes:
+        sim_instance_id: 实例唯一 ID。
+        status: 生命周期状态。
+        mode: 仿真模式（vil/sil/replay）。
+        map_id: 当前地图。
+        quality: 渲染画质（过载降级后为实际画质）。
+        gpu_id: 分配到的 GPU 编号。
+        carla_host: CARLA RPC 主机地址。
+        carla_rpc_port: RPC 端口（默认 2000）。
+        carla_stream_port: 视频流端口（默认 2001）。
+        scene_id: 关联场景 ID。
+        vehicle_id: 关联实车 ID。
+        user_id: 操作用户 ID。
+        create_time: 创建时间戳（epoch 秒）。
+        start_time: 启动时间戳（未启动为 0）。
+        docker_container_id: 容器 ID（§10.2.3 容器化部署）。
+        resource_limits: 容器资源限额（cpu/memory/gpu limit）。
+        max_lifetime_s: 最大运行时长。
+        retry_count: 异常重试次数。
+        error_message: 失败原因。
+    """
 
     sim_instance_id: str
     status: InstanceStatus
@@ -48,12 +71,18 @@ class SimInstance:
     gpu_id: int
     carla_host: str = "127.0.0.1"
     carla_rpc_port: int = 2000
+    carla_stream_port: int = 2001
     scene_id: str = ""
     vehicle_id: str = ""
+    vehicle_model: str = "hunter.se"
+    replay_config: dict[str, Any] = field(default_factory=dict)
     user_id: str = ""
     create_time: float = field(default_factory=time.time)
     start_time: float = 0.0
     docker_container_id: str = ""
+    resource_limits: dict[str, str] = field(
+        default_factory=lambda: {"cpu_limit": "4", "memory_limit": "8Gi", "gpu_limit": "1"}
+    )
     max_lifetime_s: float = 7200.0
     retry_count: int = 0
     error_message: str = ""
@@ -63,6 +92,34 @@ class SimInstance:
         if self.start_time == 0.0:
             return False
         return (time.time() - self.start_time) > self.max_lifetime_s
+
+    def to_dict(self) -> dict[str, Any]:
+        """按设计文档 §10.2.2 实例数据模型序列化。"""
+
+        def _iso(ts: float) -> Optional[str]:
+            """epoch 秒转 ISO8601（UTC），未设置时返回 None。"""
+            if ts <= 0:
+                return None
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+        return {
+            "sim_instance_id": self.sim_instance_id,
+            "status": self.status.value,
+            "carla_server": {
+                "host": self.carla_host,
+                "rpc_port": self.carla_rpc_port,
+                "stream_port": self.carla_stream_port,
+                "container_id": self.docker_container_id,
+            },
+            "map": self.map_id,
+            "scene_id": self.scene_id,
+            "mode": self.mode.value,
+            "vehicle_id": self.vehicle_id,
+            "create_time": _iso(self.create_time),
+            "start_time": _iso(self.start_time),
+            "gpu_id": self.gpu_id,
+            "resources": dict(self.resource_limits),
+        }
 
 
 class SimInstanceManager:
@@ -92,6 +149,8 @@ class SimInstanceManager:
         user_id: str = "",
         vehicle_id: str = "",
         scene_id: str = "",
+        vehicle_model: str = "hunter.se",
+        replay_config: Optional[dict[str, Any]] = None,
     ) -> SimInstance:
         """创建新仿真实例。
 
@@ -102,6 +161,8 @@ class SimInstanceManager:
             user_id: 操作用户 ID。
             vehicle_id: 关联实车 ID（VIL 模式）。
             scene_id: 关联场景 ID。
+            vehicle_model: 自车模型 ID（文档 §12.2）。
+            replay_config: replay 模式回放配置（文档 §12.2）。
 
         Returns:
             创建的 SimInstance。
@@ -113,7 +174,15 @@ class SimInstanceManager:
         gpu_id: int = -1
 
         if self._gpu_pool is not None:
-            gpu_id = self._gpu_pool.allocate(quality)
+            # 过载降级：支持降低画质以提高并发数（文档 §10.3.1）
+            allocate_ex = getattr(self._gpu_pool, "allocate_ex", None)
+            if (
+                self._settings.gpu_allow_overload_downgrade
+                and callable(allocate_ex)
+            ):
+                gpu_id, quality = allocate_ex(quality, allow_downgrade=True)
+            else:
+                gpu_id = self._gpu_pool.allocate(quality)
             if gpu_id < 0:
                 raise ResourceError(
                     "gpu",
@@ -131,6 +200,8 @@ class SimInstanceManager:
             user_id=user_id,
             vehicle_id=vehicle_id,
             scene_id=scene_id,
+            vehicle_model=vehicle_model,
+            replay_config=dict(replay_config or {}),
             max_lifetime_s=self._settings.instance_max_lifetime_seconds,
         )
 

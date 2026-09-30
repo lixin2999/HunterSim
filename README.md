@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.0.0`（基于 `HunterSim_AI辅助开发提示词工程` 规范从零重构）
+- **当前版本**：`2.1.0`（全面对齐《Carla 仿真系统详细设计文档》V4.0，见 [`release.md`](release.md)）
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -16,8 +16,9 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | SIL 场景驱动 | 加载 OpenDRIVE / 场景 JSON，在 CARLA 中自动生成交通流与事件，驱动被测算法 |
 | 传感器仿真 | LiDAR / RGB / Depth / IMU / GNSS / Collision / LaneInvasion，对齐 ROS2 话题 |
 | 数据录制与回放 | mcap/自定义容器录制，数字孪生回放，支持变速与跳帧 |
-| 场景评估 | 轨迹、舒适性、安全性、覆盖率四维评分（S/A/B/C/D） |
-| 资源编排 | GPU 资源池 + 实例生命周期管理，按画质限制单 GPU 并发 |
+| 场景评估 | 轨迹、舒适性、安全性、覆盖率四维评分（S/A/B/C/D），支持批量场景测试与汇总报告 |
+| 资源编排 | GPU 资源池 + 实例生命周期管理，按画质限制单 GPU 并发；单用户/全局并发配额与实例守护（崩溃重试、超时回收） |
+| 安全治理 | JWT 角色分级（创建/销毁需 admin）、车辆模型白名单、场景安全审核、地图上传审核、审计日志 |
 
 ---
 
@@ -61,8 +62,9 @@ HunterSim/
 │   ├── eval_service/        # 评估引擎、评估报告
 │   └── resource_manager/    # 实例管理、GPU 资源池、健康监控
 ├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
-├── docker/                  # Dockerfile / docker-compose / prometheus / grafana provisioning
-├── k8s/                     # namespace / configmap / secret / deployment / service
+├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / grafana
+├── k8s/                     # namespace / configmap / secret / deployment（含 CARLA GPU Pod + PVC）/ service
+├── hunter_assets/           # CARLA 引擎镜像构建资源（Dockerfile.carla COPY 上下文）
 ├── tests/                   # 单元 + 集成测试（覆盖率门禁 ≥80%）
 ├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / ruff / mypy / coverage）
 └── requirements.txt         # 运行依赖清单
@@ -111,10 +113,13 @@ uvicorn hunter_sim.api.main:app --host 0.0.0.0 --port 8080
 ### 4.3 容器化 / 编排
 
 ```bash
-# 本地依赖编排（Kafka + 仿真服务 + Prometheus + Grafana，CARLA 仍跑在宿主机）
+# 依赖编排（Kafka + 仿真服务 + Prometheus + Grafana，CARLA 跑在宿主机）
 docker-compose -f docker/docker-compose.yml up -d
 
-# Kubernetes（需 NVIDIA GPU Operator）
+# Linux + NVIDIA GPU 主机可额外启用容器化 CARLA 引擎（profile，需 NVIDIA Container Toolkit）
+docker-compose -f docker/docker-compose.yml --profile carla up -d
+
+# Kubernetes（需 NVIDIA GPU Operator；含 sim-service + carla-engine GPU Pod + 共享 PVC）
 kubectl apply -f k8s/
 ```
 
@@ -132,8 +137,8 @@ kubectl apply -f k8s/
 | `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) |
 | `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) |
 | `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
-| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) |
-| `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `gpu_memory_warning_threshold`(0.90) · `docker_image`(carlasim/carla:0.9.16) |
+| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) |
+| `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
 
 预设资源文件位于 `configs/`：8 种天气环境、7 类传感器、7 个场景模板、5 套交通流档位。
 
@@ -141,14 +146,16 @@ kubectl apply -f k8s/
 
 ## 6. API 一览
 
-统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）。
+统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）；**创建/销毁实例额外要求 Token 载荷 `role=admin`**（§14.2）。
 
 | 分组 | 方法与路径 |
 |------|-----------|
-| 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /metrics` |
-| 实例 | `POST /instances` · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}` |
-| 场景 | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
-| 资源 | `GET /maps` · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
+| 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /health/performance-targets` · `GET /metrics` |
+| 实例 | `POST /instances`⁺ · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}`⁺（⁺ 需 admin） |
+| 实例子资源 | `GET /instances/{id}/status` · `POST /instances/{id}/scene` · `POST /instances/{id}/weather` · `POST /instances/{id}/vil/calibrate` · `GET /instances/{id}/screenshot` · `GET /instances/{id}/stream` |
+| 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
+| 批量测试 | `POST /scenarios/batch` · `GET /scenarios/{task_id}/report` |
+| 资源 | `GET /maps` · `POST /maps/upload`（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
 | 实时推送 | `WS /ws/sim/{instance_id}/status` |
 
 完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
@@ -163,6 +170,7 @@ ruff check src tests
 mypy src
 ```
 
+- **测试**：557 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：Ruff + mypy（`pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

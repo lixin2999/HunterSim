@@ -17,7 +17,10 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
-# 支持的车型蓝图列表
+# 行人最大步速（文档 §7.5：set_max_speed(1.4)）
+_WALKER_MAX_SPEED_MS = 1.4
+
+# 支持的车型蓝图列表（设计文档 §7.2：乘用车/商用车/摩托车/自行车）
 _VEHICLE_BLUEPRINTS: list[str] = [
     "vehicle.tesla.model3",
     "vehicle.carlamotors.carlacola",
@@ -27,6 +30,8 @@ _VEHICLE_BLUEPRINTS: list[str] = [
     "vehicle.nissan.patrol_2021",
     "vehicle.mini.cooper_s_2021",
     "vehicle.ford.ambulance",
+    "vehicle.vespa.vespa",           # 摩托车（两轮机动车）
+    "vehicle.diamondback.century",   # 自行车（非机动车）
 ]
 
 _WALKER_BLUEPRINTS: list[str] = [
@@ -37,18 +42,27 @@ _WALKER_BLUEPRINTS: list[str] = [
     "walker.pedestrian.0014",
 ]
 
+# 静态障碍物蓝图（文档 §7.2：锥桶、路障等 static.prop.*）
+_STATIC_PROP_BLUEPRINTS: list[str] = [
+    "static.prop.constructioncone",
+    "static.prop.trafficcone",
+    "static.prop.barrier",
+    "static.prop.warningtriangle",
+]
+
 
 class TrafficFlowConfig(BaseModel):
-    """交通流配置参数。
+    """交通流配置参数（默认值对齐设计文档 §7.3.2 参数化交通流表）。
 
     Attributes:
-        num_vehicles: 自动生成车辆数量。
-        num_walkers: 自动生成行人数量。
-        follow_distance_m: 跟车距离（米）。
+        num_vehicles: 自动生成车辆数量（文档默认 20）。
+        num_walkers: 自动生成行人数量（文档默认 10）。
+        follow_distance_m: 全局跟车距离（文档默认 2.0m）。
+        speed_limit_percentage: 全局速度限制百分比（文档默认 80%）。
+        allow_lane_change: 是否允许自动变道（文档默认 True）。
+        use_mixed_blueprints: 车型多样性（文档默认 True）。
         ignore_traffic_light_rate: 忽略红绿灯概率 (0~1)。
-        ignore_lane_change_rate: 禁止车道变更比例 (0~1)。
         aggressive_driving_rate: 激进驾驶比例 (0~1)。
-        use_mixed_blueprints: 是否使用混合车型。
         tm_port: Traffic Manager 端口。
         synchronous_mode: 是否启用同步模式。
     """
@@ -56,10 +70,11 @@ class TrafficFlowConfig(BaseModel):
     num_vehicles: int = Field(20, ge=0, le=200)
     num_walkers: int = Field(10, ge=0, le=100)
     follow_distance_m: float = Field(2.0, ge=0.5, le=10.0)
-    ignore_traffic_light_rate: float = Field(0.0, ge=0.0, le=1.0)
-    ignore_lane_change_rate: float = Field(0.3, ge=0.0, le=1.0)
-    aggressive_driving_rate: float = Field(0.1, ge=0.0, le=1.0)
+    speed_limit_percentage: float = Field(80.0, ge=10.0, le=200.0)
+    allow_lane_change: bool = True
     use_mixed_blueprints: bool = True
+    ignore_traffic_light_rate: float = Field(0.0, ge=0.0, le=1.0)
+    aggressive_driving_rate: float = Field(0.1, ge=0.0, le=1.0)
     tm_port: int = Field(8000, ge=1024, le=65535)
     synchronous_mode: bool = True
 
@@ -88,24 +103,25 @@ class TrafficFlowManager:
         self._tm: Any = None
         self._spawned_vehicles: list[Any] = []
         self._spawned_walkers: list[Any] = []
+        self._spawned_props: list[Any] = []
         self._lock: threading.Lock = threading.Lock()
         self._rng = random.Random(42)
 
     def initialize(self) -> None:
-        """初始化 TrafficManager 并配置同步模式和参数。"""
+        """初始化 TrafficManager 并配置同步模式和参数（文档 §7.3.1）。"""
         try:
             self._tm = self._client.get_trafficmanager(self._config.tm_port)
             if self._config.synchronous_mode:
                 self._tm.set_synchronous_mode(True)
-            self._tm.set_global_percentage_distance_to_leading_vehicle(
-                int(self._config.follow_distance_m * 10)
-            )
+            # 文档 §7.3.1：全局跟车距离（米）
+            self._tm.set_global_distance_to_leading_vehicle(self._config.follow_distance_m)
+            # 文档 §7.3.2：全局速度限制百分比（默认 80%）
+            self._tm.set_global_percentage_speed_limits(int(self._config.speed_limit_percentage))
             self._tm.set_global_percentage_ignore_lights(
                 int(self._config.ignore_traffic_light_rate * 100)
             )
-            self._tm.set_global_percentage_change_lane(
-                int((1.0 - self._config.ignore_lane_change_rate) * 100)
-            )
+            # 文档 §7.3.2：是否允许自动变道（默认 True → 100%）
+            self._tm.set_global_percentage_change_lane(100 if self._config.allow_lane_change else 0)
             self._tm.set_global_percentage_aggressive_driving(
                 int(self._config.aggressive_driving_rate * 100)
             )
@@ -141,13 +157,14 @@ class TrafficFlowManager:
     def cleanup(self) -> None:
         """销毁所有已生成的交通参与者。"""
         with self._lock:
-            for actor in self._spawned_vehicles + self._spawned_walkers:
+            for actor in self._spawned_vehicles + self._spawned_walkers + self._spawned_props:
                 try:
                     actor.destroy()
                 except Exception:
                     pass
             self._spawned_vehicles.clear()
             self._spawned_walkers.clear()
+            self._spawned_props.clear()
         logger.info("Traffic flow cleaned up")
 
     @property
@@ -217,11 +234,11 @@ class TrafficFlowManager:
                         continue
                     walker = self._world.spawn_actor(bp, transform)
                     controller = self._world.spawn_actor(controller_bp, transform, attach_to=walker)
+                    # 文档 §7.5：start → go_to_location → set_max_speed（行人速度 1.4 m/s）
                     controller.start()
-                    controller.go_to(
-                        self._world.get_random_location_from_navigation(),
-                        speed=self._rng.uniform(0.5, 1.4),
-                    )
+                    controller.set_max_speed(_WALKER_MAX_SPEED_MS)
+                    target = self._world.get_random_location_from_navigation()
+                    controller.go_to_location(target)
                     self._spawned_walkers.extend([walker, controller])
                     spawned += 1
                 except Exception:
@@ -229,3 +246,38 @@ class TrafficFlowManager:
             return spawned
         except Exception as exc:
             raise CarlaSimulationError("spawn_walkers", str(exc)) from exc
+
+    def spawn_static_obstacles(self, count: int = 5) -> int:
+        """生成静态障碍物（锥桶、路障等，文档 §7.2）。
+
+        Args:
+            count: 障碍物数量。
+
+        Returns:
+            实际生成的障碍物数量。
+        """
+        if count <= 0:
+            return 0
+        try:
+            bp_lib = self._world.get_blueprint_library()
+            spawn_points = self._world.get_map().get_spawn_points()
+            if not spawn_points:
+                logger.warning("No spawn points available for static props")
+                return 0
+            self._rng.shuffle(spawn_points)
+            spawned = 0
+            for i in range(min(count, len(spawn_points))):
+                bp_name = self._rng.choice(_STATIC_PROP_BLUEPRINTS)
+                bp = bp_lib.find(bp_name)
+                if bp is None:
+                    continue
+                try:
+                    prop = self._world.spawn_actor(bp, spawn_points[i])
+                    self._spawned_props.append(prop)
+                    spawned += 1
+                except Exception:
+                    pass
+            logger.info(f"Static obstacles spawned: {spawned}")
+            return spawned
+        except Exception as exc:
+            raise CarlaSimulationError("spawn_static_obstacles", str(exc)) from exc

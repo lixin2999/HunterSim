@@ -1,21 +1,42 @@
 """资源管理路由（PROMPT-API-001）。
 
 路由组：/maps /vehicles /environments /resources
-提供地图列表、车辆蓝图列表、天气预设查询等只读接口。
+对应设计文档 §10.4.2 资源 API：
+- GET  /resources/maps          获取可用地图列表（含自定义地图）
+- POST /resources/maps/upload   上传自定义 OpenDRIVE 地图（附录 B：multipart/form-data）
+- GET  /resources/vehicles      获取可用车辆模型
+- GET  /resources/environments  获取环境预设列表
 """
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import ValidationError as PydanticValidationError
 
 from hunter_sim.api.deps import get_current_user
-from hunter_sim.api.models import ApiResponse, MapInfo, VehicleInfo, WeatherPresetInfo
+from hunter_sim.api.models import (
+    ApiResponse,
+    MapInfo,
+    MapUploadRequest,
+    VehicleInfo,
+    WeatherPresetInfo,
+)
+from hunter_sim.common.exceptions import ValidationError
+from hunter_sim.common.models import ResourceSettings
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+# map_id 安全字符集（防路径穿越，与 MapUploadRequest.pattern 一致）
+_MAP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# 上传地图文件大小上限（§14.3 内容安全：防止恶意超大内容）
+_MAX_MAP_SIZE_BYTES = 50 * 1024 * 1024
 
 # 内置地图列表（CARLA 0.9.16）
 _BUILTIN_MAPS = [
@@ -42,6 +63,12 @@ _WEATHER_PRESETS = [
 ]
 
 
+def _custom_maps_dir(request: Request) -> Path:
+    """返回资源仓库自定义地图目录（设计文档 §10.4.1）。"""
+    root = getattr(request.app.state, "resources_dir", None) or ResourceSettings().resources_dir
+    return Path(root) / "maps" / "custom"
+
+
 @router.get("/maps", response_model=ApiResponse, summary="查询可用地图列表")
 async def list_maps(
     request: Request,
@@ -51,14 +78,130 @@ async def list_maps(
 
     返回 CARLA 服务器当前可用的地图列表（含内置地图和自定义地图）。
     """
+    entries: dict[str, MapInfo] = {}
     map_mgr = getattr(request.app.state, "map_manager", None)
     if map_mgr is not None:
         # 从运行中的 CARLA 服务获取实时地图列表
         live_maps = map_mgr.get_available_maps()
-        maps = [MapInfo(map_id=m, name=m, is_custom=False) for m in live_maps]
+        entries.update({m: MapInfo(map_id=m, name=m, is_custom=False) for m in live_maps})
     else:
-        maps = [MapInfo(**m) for m in _BUILTIN_MAPS]
+        entries.update({m["map_id"]: MapInfo(**m) for m in _BUILTIN_MAPS})
+
+    # 叠加资源仓库中的自定义 OpenDRIVE 地图（§10.4.1 maps/custom）
+    # 附录 B：创建实例时通过 "custom/{map_name}" 引用自定义地图
+    custom_dir = _custom_maps_dir(request)
+    if custom_dir.is_dir():
+        for xodr in sorted(custom_dir.glob("*.xodr")):
+            stem = xodr.stem
+            entries[f"custom/{stem}"] = MapInfo(
+                map_id=f"custom/{stem}", name=stem, is_custom=True
+            )
+
+    maps = list(entries.values())
     return ApiResponse(data={"maps": [m.model_dump() for m in maps], "total": len(maps)})
+
+
+@router.post("/maps/upload", response_model=ApiResponse, summary="上传自定义 OpenDRIVE 地图")
+async def upload_map(
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """POST /api/v1/sim/maps/upload
+
+    上传自定义 OpenDRIVE 地图到资源仓库 maps/custom 目录。
+    主接口形式为 multipart/form-data（设计文档附录 B：file + map_id 表单字段），
+    同时兼容 JSON body（{map_id, content}）传参。
+    入库前执行内容安全检查与格式解析审核（§14.3），非法文件拒绝并返回错误详情。
+    """
+    from hunter_sim.engine.opendrive_parser import OpenDriveParser  # noqa: PLC0415
+
+    map_id, content = await _parse_upload_request(request)
+
+    if not _MAP_ID_PATTERN.match(map_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid map_id '{map_id}' (allowed: letters, digits, '_', '-')",
+        )
+    if len(content.encode("utf-8")) > _MAX_MAP_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Map file exceeds size limit ({_MAX_MAP_SIZE_BYTES // 1024 // 1024} MB)",
+        )
+
+    custom_dir = _custom_maps_dir(request)
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    target = custom_dir / f"{map_id}.xodr"
+    target.write_text(content, encoding="utf-8")
+
+    summary = OpenDriveParser(target).parse()
+    if not summary.valid:
+        target.unlink(missing_ok=True)
+        raise ValidationError(
+            field="content",
+            value=map_id,
+            rule="; ".join(summary.errors) or "invalid OpenDRIVE file",
+            module="resource_manager",
+        )
+
+    logger.info(f"Custom map uploaded: {map_id} ({summary.total_road_count} roads)")
+    return ApiResponse(
+        data={
+            "map_id": map_id,
+            "reference": f"custom/{map_id}",
+            "is_custom": True,
+            "review_status": "approved",
+            "path": str(target),
+            "road_count": summary.total_road_count,
+            "junction_count": summary.total_junction_count,
+            "total_length_m": summary.total_length_m,
+        },
+        message="map uploaded",
+    )
+
+
+async def _parse_upload_request(request: Request) -> tuple[str, str]:
+    """解析地图上传请求，返回 (map_id, 文件内容字符串)。
+
+    multipart/form-data 为主形式（附录 B）；JSON body 为兼容形式。
+
+    Raises:
+        HTTPException: 400 请求体缺失/格式错误；422 缺少必要字段。
+    """
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        form: dict[str, Any] = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Missing multipart field 'file' (.xodr file upload)",
+            )
+        map_id = str(form.get("map_id") or Path(str(upload.filename or "")).stem)
+        raw = await upload.read()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Map file is not valid UTF-8 text",
+            ) from exc
+        return map_id, content
+
+    try:
+        payload = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid upload payload (expected multipart/form-data or JSON): {exc}",
+        ) from exc
+    try:
+        body = MapUploadRequest(**payload)
+    except PydanticValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid upload payload: {exc}",
+        ) from exc
+    return body.map_id, body.content
 
 
 @router.get("/vehicles", response_model=ApiResponse, summary="查询车辆蓝图列表")

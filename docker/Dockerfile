@@ -1,5 +1,8 @@
-# HunterSim 仿真服务镜像
+# HunterSim 仿真服务镜像（设计文档 §15.3 「仿真服务镜像」）
 # 基于 Python 3.12 slim，安装 hunter-sim 包及所有依赖
+# 注：文档示例基于 python:3.8-slim，但本项目代码使用 3.10+ 语法与 pydantic v2，
+#     为保持可构建性升级基础镜像；镜像结构（requirements + uvicorn 启动）与文档一致。
+# CARLA 引擎镜像另见 docker/Dockerfile.carla（§15.3）。
 # 使用：docker build -f docker/Dockerfile -t hunter-sim:2.0.0 .
 
 FROM python:3.12-slim AS base

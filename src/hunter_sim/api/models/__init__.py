@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from hunter_sim.common.models import (
     EvalGrade,
@@ -37,14 +37,45 @@ class ApiResponse(BaseModel):
 # ─── 实例管理 ─────────────────────────────────────────────────────────────────
 
 
+class ReplayWindow(BaseModel):
+    """replay 模式数据回放时间窗口（设计文档 §12.2）。
+
+    Attributes:
+        vehicle_id: 回放实车 ID。
+        start_time: 回放起始时间（ISO8601）。
+        end_time: 回放结束时间（ISO8601）。
+    """
+
+    vehicle_id: str = Field("", description="回放实车 ID")
+    start_time: str = Field("", description="回放起始时间（ISO8601）")
+    end_time: str = Field("", description="回放结束时间（ISO8601）")
+
+
 class CreateInstanceRequest(BaseModel):
-    """POST /instances 请求体。"""
+    """POST /instances 请求体（设计文档 §12.2）。
+
+    兼容旧字段名 `map_id`（与 `map` 等效）。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     mode: SimMode = Field(..., description="仿真模式（vil/sil/replay）")
-    map_id: str = Field("Town03", description="地图 ID")
-    quality: QualityLevel = Field(QualityLevel.MEDIUM, description="渲染画质")
-    vehicle_id: str = Field("", description="关联实车 ID（VIL 模式必填）")
-    scene_id: str = Field("", description="关联场景 ID")
+    map: str = Field(
+        "Town03",
+        validation_alias=AliasChoices("map", "map_id"),
+        description="地图 ID（如 Town03）",
+    )
+    vehicle_model: str = Field("hunter.se", description="自车模型 ID")
+    quality: QualityLevel = Field(QualityLevel.MEDIUM, description="渲染画质（Low/Medium/Epic，不区分大小写）")
+    scene_id: str = Field("", description="可选，预加载场景 ID")
+    vehicle_id: str = Field("", description="VIL 模式必填，关联实车 ID")
+    replay_config: Optional[ReplayWindow] = Field(None, description="replay 模式回放配置")
+
+    @field_validator("quality", mode="before")
+    @classmethod
+    def _normalize_quality(cls, v: object) -> object:
+        """画质大小写不敏感（文档示例为 Medium）。"""
+        return v.lower() if isinstance(v, str) else v
 
 
 class InstanceResponse(BaseModel):
@@ -70,10 +101,36 @@ class InstanceResponse(BaseModel):
 
 
 class LoadSceneRequest(BaseModel):
-    """POST /scenes/load 请求体。"""
+    """POST /scenes/load 请求体（内部扩展路径，兼容保留）。"""
 
     instance_id: str = Field(..., description="目标仿真实例 ID")
     scene_config: dict[str, Any] = Field(..., description="场景配置 JSON（SceneConfig 格式）")
+
+
+class InstanceSceneRequest(BaseModel):
+    """POST /instances/{id}/scene 请求体（设计文档 §12.4）。
+
+    Attributes:
+        scene_id: 场景 ID。
+        scene_config: 完整场景配置 JSON（见数据采集系统 4.2.2 节）。
+    """
+
+    scene_id: str = Field(..., description="场景 ID")
+    scene_config: dict[str, Any] = Field(..., description="完整场景配置 JSON")
+
+
+class BatchScenarioRequest(BaseModel):
+    """POST /scenarios/batch 请求体（设计文档 §12.1 / §9.5）。
+
+    Attributes:
+        task_id: 任务 ID（空则自动生成）。
+        instance_id: 指定执行实例（空由调度器分配）。
+        scenes: 场景配置列表。
+    """
+
+    task_id: str = Field("", description="批量任务 ID（空自动生成）")
+    instance_id: str = Field("", description="执行实例 ID（可选）")
+    scenes: list[dict[str, Any]] = Field(..., min_length=1, description="场景配置列表")
 
 
 class SceneStatusResponse(BaseModel):
@@ -109,19 +166,32 @@ class SetWeatherRequest(BaseModel):
 
 
 class CalibrationRequest(BaseModel):
-    """POST /instances/{id}/calibrate 请求体。"""
+    """POST /instances/{id}/vil/calibrate 请求体（设计文档 §12.3）。
 
-    x0: float = Field(..., description="CARLA 地图初始 X 坐标（米）")
-    y0: float = Field(..., description="CARLA 地图初始 Y 坐标（米）")
-    yaw0_deg: float = Field(..., ge=-180.0, le=180.0, description="CARLA 地图初始航向（度）")
+    标定实车 odom 原点在仿真地图中的对应位置和朝向：
+    odom 位姿 (odom_x, odom_y, odom_heading) 与地图位姿
+    (map_x, map_y, map_heading) 建立映射关系。
+    """
+
+    map_x: float = Field(..., description="odom 原点对应的地图 X 坐标（米）")
+    map_y: float = Field(..., description="odom 原点对应的地图 Y 坐标（米）")
+    map_heading: float = Field(
+        ..., ge=-360.0, le=360.0, description="odom 原点对应的地图航向（度）"
+    )
+    odom_x: float = Field(0.0, description="标定时刻实车 odom X（米，通常为原点 0）")
+    odom_y: float = Field(0.0, description="标定时刻实车 odom Y（米）")
+    odom_heading: float = Field(0.0, ge=-360.0, le=360.0, description="标定时刻 odom 航向（度）")
 
 
 class CalibrationResponse(BaseModel):
-    """标定结果响应。"""
+    """标定结果响应（含推导出的内部变换参数）。"""
 
-    x0: float
-    y0: float
-    yaw0_rad: float
+    x0: float = Field(..., description="内部标定参数：地图 X 偏移（米）")
+    y0: float = Field(..., description="内部标定参数：地图 Y 偏移（米）")
+    yaw0_rad: float = Field(..., description="内部标定参数：初始航向（弧度）")
+    map_x: float = Field(..., description="回显：地图 X（米）")
+    map_y: float = Field(..., description="回显：地图 Y（米）")
+    map_heading: float = Field(..., description="回显：地图航向（度）")
     message: str = "Calibration applied"
 
 
@@ -134,6 +204,18 @@ class MapInfo(BaseModel):
     map_id: str
     name: str
     is_custom: bool = False
+
+
+class MapUploadRequest(BaseModel):
+    """POST /maps/upload 请求体（设计文档 §10.4.2）。
+
+    Attributes:
+        map_id: 自定义地图 ID，仅允许字母/数字/下划线/中划线。
+        content: OpenDRIVE (.xodr) XML 文本内容。
+    """
+
+    map_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]+$", description="地图 ID（防路径穿越）")
+    content: str = Field(..., min_length=1, description="OpenDRIVE xodr XML 内容")
 
 
 class VehicleInfo(BaseModel):
@@ -172,7 +254,7 @@ class HealthResponse(BaseModel):
     """健康检查响应体。"""
 
     status: str = Field(..., description="healthy / degraded / unhealthy")
-    version: str = "2.0.0"
+    version: str = "2.1.0"
     uptime_seconds: float = 0.0
     carla_connected: bool = False
     active_instances: int = 0

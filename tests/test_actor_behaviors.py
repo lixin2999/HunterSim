@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from typing import Optional
 
+import pytest
+
 from hunter_sim.traffic_sim.actor_behaviors import (
     ActorAction,
     ConstantSpeedBehavior,
     CutInBehavior,
     DecelerateBehavior,
     PedestrianCrossBehavior,
+    ScriptedActorController,
     StaticBehavior,
+    create_behavior_from_config,
 )
+from hunter_sim.traffic_sim.trigger_conditions import EventTrigger, TimeTrigger
 
 
 class _Vec3:
@@ -117,3 +122,67 @@ class TestPedestrianCrossBehavior:
         action = b.update(6.0, None, None, 0.02)
         assert action.is_stop is True
         assert action.target_speed_ms == 0.0
+
+
+class TestDecelerateTriggerTime:
+    """文档 §7.4.1：decelerate 行为在 trigger_time 后才开始减速。"""
+
+    def test_holds_initial_speed_before_trigger(self) -> None:
+        b = DecelerateBehavior(initial_speed_ms=8.0, deceleration_ms2=2.0, trigger_time_s=3.0)
+        action = b.update(1.0, None, None, 0.02)
+        assert action.target_speed_ms == 8.0
+        assert action.brake == 0.0
+
+    def test_decelerates_after_trigger(self) -> None:
+        b = DecelerateBehavior(initial_speed_ms=8.0, deceleration_ms2=2.0, trigger_time_s=3.0)
+        action = b.update(4.0, None, None, 0.02)  # 触发后 1s: 8 - 2*1 = 6
+        assert action.target_speed_ms == pytest.approx(6.0)
+
+
+class TestBehaviorFactory:
+    """create_behavior_from_config（文档 §7.4.1 type 字段）。"""
+
+    def test_constant_speed(self) -> None:
+        b = create_behavior_from_config({"type": "constant_speed", "speed": 6.0})
+        assert isinstance(b, ConstantSpeedBehavior)
+
+    def test_decelerate(self) -> None:
+        b = create_behavior_from_config(
+            {"type": "decelerate", "trigger_time": 2.0, "deceleration": 3.0}
+        )
+        assert isinstance(b, DecelerateBehavior)
+
+    def test_cut_in(self) -> None:
+        b = create_behavior_from_config({"type": "cut_in", "speed": 5.0})
+        assert isinstance(b, CutInBehavior)
+
+    def test_unknown_type_raises(self) -> None:
+        with pytest.raises(ValueError):
+            create_behavior_from_config({"type": "fly_away"})
+
+
+class TestScriptedActorController:
+    """触发 + 行为组合执行（文档 §7.4）。"""
+
+    def test_no_action_before_trigger(self) -> None:
+        ctrl = ScriptedActorController(
+            object(), ConstantSpeedBehavior(5.0), trigger=TimeTrigger(5.0)
+        )
+        assert ctrl.update(None, 1.0) is None  # t=1s 未触发
+        action = ctrl.update(None, 5.0)  # t=6s 已触发
+        assert action is not None
+        assert action.target_speed_ms == 5.0
+
+    def test_no_trigger_acts_immediately(self) -> None:
+        ctrl = ScriptedActorController(object(), StaticBehavior())
+        action = ctrl.update(None, 0.02)
+        assert action is not None and action.is_stop is True
+
+    def test_reset_clears_trigger_state(self) -> None:
+        trig = EventTrigger("prev_event")
+        trig.fire()
+        ctrl = ScriptedActorController(object(), ConstantSpeedBehavior(5.0), trigger=trig)
+        ctrl.update(None, 0.02)
+        assert ctrl.is_triggered is True
+        ctrl.reset()
+        assert ctrl.is_triggered is False

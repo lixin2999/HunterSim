@@ -33,10 +33,10 @@ class _FakeWeather:
 
 class _FakeCoord:
     def __init__(self) -> None:
-        self.calibration: Optional[tuple] = None
+        self.calibration: Optional[Any] = None
 
-    def set_calibration(self, x0: float, y0: float, yaw0_rad: float) -> None:
-        self.calibration = (x0, y0, yaw0_rad)
+    def update_calibration(self, params: Any) -> None:
+        self.calibration = params
 
 
 class _FakeRunner:
@@ -191,18 +191,44 @@ class TestWeatherControl:
 
 
 class TestCalibration:
-    def test_calibrate(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+    def test_calibrate_origin_odom(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+        """odom 为默认原点时 x0/y0 直接等于地图坐标（文档 §12.3）。"""
         inst, fake = runner
         resp = client.post(
             f"/api/v1/sim/scenes/{inst}/calibrate",
-            json={"x0": 10.0, "y0": 20.0, "yaw0_deg": 45.0},
+            json={"map_x": 100.5, "map_y": 50.2, "map_heading": 90.0},
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        assert fake.coordinate_transformer.calibration is not None
-        x0, y0, yaw = fake.coordinate_transformer.calibration
-        assert (x0, y0) == (10.0, 20.0)
-        assert round(yaw, 4) == 0.7854
+        params = fake.coordinate_transformer.calibration
+        assert params is not None
+        assert params.x0 == 100.5
+        assert params.y0 == 50.2
+        # CARLA 左手系约定：yaw0 = -radians(map_heading)
+        assert round(params.yaw0, 4) == -1.5708
+        data = resp.json()["data"]
+        assert data["map_heading"] == 90.0
+        assert round(data["yaw0_rad"], 4) == -1.5708
+
+    def test_calibrate_with_odom_offset(
+        self, client: TestClient, auth_headers: dict, runner: tuple
+    ) -> None:
+        """非零 odom 位姿时推导偏移量。"""
+        inst, fake = runner
+        resp = client.post(
+            f"/api/v1/sim/scenes/{inst}/calibrate",
+            json={
+                "map_x": 100.0, "map_y": 50.0, "map_heading": 0.0,
+                "odom_x": 10.0, "odom_y": 5.0, "odom_heading": 0.0,
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        params = fake.coordinate_transformer.calibration
+        # yaw0=0 → x0 = 100-10, y0 = 50+5（Y 轴翻转补偿）
+        assert params.x0 == 90.0
+        assert params.y0 == 55.0
+        assert params.yaw0 == 0.0
 
     def test_calibrate_no_transformer_503(
         self, client: TestClient, auth_headers: dict, app: Any
@@ -213,7 +239,7 @@ class TestCalibration:
         app.state.scene_runners = {inst: fake}
         resp = client.post(
             f"/api/v1/sim/scenes/{inst}/calibrate",
-            json={"x0": 1.0, "y0": 1.0, "yaw0_deg": 0.0},
+            json={"map_x": 1.0, "map_y": 1.0, "map_heading": 0.0},
             headers=auth_headers,
         )
         assert resp.status_code == 503

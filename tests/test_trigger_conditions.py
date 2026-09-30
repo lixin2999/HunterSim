@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from typing import Optional
 
+import pytest
+
 from hunter_sim.traffic_sim.trigger_conditions import (
     DistanceTrigger,
     EventTrigger,
     PositionTrigger,
     TimeTrigger,
     VelocityTrigger,
+    create_trigger_from_config,
 )
 
 
@@ -112,3 +115,34 @@ class TestEventTrigger:
         assert trig.check(0.0, None, None) is True
         trig.reset()
         assert trig.check(0.0, None, None) is False
+
+
+class TestTriggerFactory:
+    """create_trigger_from_config（文档 §7.4.2 五种触发条件）。"""
+
+    def test_time(self) -> None:
+        assert isinstance(create_trigger_from_config({"type": "time", "value": 3.0}), TimeTrigger)
+
+    def test_distance(self) -> None:
+        assert isinstance(
+            create_trigger_from_config({"type": "distance", "value": 10.0}), DistanceTrigger
+        )
+
+    def test_position(self) -> None:
+        assert isinstance(
+            create_trigger_from_config({"type": "position", "x": 1.0, "y": 2.0}), PositionTrigger
+        )
+
+    def test_velocity(self) -> None:
+        assert isinstance(
+            create_trigger_from_config({"type": "velocity", "value": 5.0}), VelocityTrigger
+        )
+
+    def test_event(self) -> None:
+        trig = create_trigger_from_config({"type": "event", "event_name": "prev_done"})
+        assert isinstance(trig, EventTrigger)
+        assert trig.check(0.0, None, None) is False
+
+    def test_unknown_type_raises(self) -> None:
+        with pytest.raises(ValueError):
+            create_trigger_from_config({"type": "magic"})

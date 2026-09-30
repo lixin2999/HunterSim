@@ -58,7 +58,7 @@ class SceneStatus(str, enum.Enum):
 
 
 class SensorType(str, enum.Enum):
-    """支持的传感器类型。"""
+    """支持的传感器类型（含文档 §6.3.1 状态类话题发布类型）。"""
 
     LIDAR = "lidar"
     RGB_CAMERA = "rgb_camera"
@@ -68,6 +68,8 @@ class SensorType(str, enum.Enum):
     COLLISION = "collision"
     LANE_INVASION = "lane_invasion"
     OBSTACLE = "obstacle"
+    ODOMETRY = "odometry"
+    VEHICLE_STATUS = "vehicle_status"
 
 
 class EvalGrade(str, enum.Enum):
@@ -202,6 +204,7 @@ class CarlaSettings(BaseSettings):
     max_reconnect_attempts: int = Field(3, ge=0, description="最大重连次数")
     fixed_delta_seconds: float = Field(0.02, description="同步模式固定步长（秒），0.02=50Hz")
     substepping: bool = Field(True, description="是否启用 substepping")
+    max_substep_delta_time: float = Field(0.01, gt=0.0, le=0.1, description="子步最大时间（秒，设计文档 §3.1.2）")
     max_substeps: int = Field(4, ge=1, le=10, description="最大子步数")
 
 
@@ -211,7 +214,7 @@ class KafkaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="KAFKA_")
 
     bootstrap_servers: str = Field("localhost:9092")
-    group_id: str = Field("hunter_sim_consumer")
+    group_id: str = Field("carla-vil", description="VIL 消费组 ID（设计文档 §4.2.2）")
     auto_offset_reset: str = Field("latest", pattern="^(earliest|latest|none)$")
     enable_auto_commit: bool = True
     telemetry_topic: str = Field("telemetry_clean")
@@ -250,6 +253,9 @@ class APISettings(BaseSettings):
     jwt_expire_minutes: int = Field(1440, ge=1, le=10080)
     cors_allow_origins: list[str] = Field(default=["*"])
     rate_limit_per_minute: int = Field(1000, ge=1)
+    stream_base_url: str = Field(
+        "webrtc://localhost:8080", description="仿真画面 WebRTC 视频流基础地址（设计文档 §12.2）"
+    )
     max_concurrent_instances: int = Field(2, ge=1, le=16, description="单 GPU 最大并发实例数")
 
 
@@ -258,11 +264,17 @@ class ResourceSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="RESOURCE_")
 
-    instance_max_lifetime_seconds: int = Field(7200, ge=60, description="实例最大运行时间（2小时）")
-    max_retry_count: int = Field(3, ge=0, le=10, description="实例异常重启最大次数")
+    instance_max_lifetime_seconds: int = Field(7200, ge=60, description="实例最大运行时间（2小时，设计文档 §14.1）")
+    max_retry_count: int = Field(3, ge=0, le=10, description="实例异常重启最大次数（设计文档 §14.1）")
+    max_instances_per_user: int = Field(5, ge=1, description="单用户最大并发实例数（设计文档 §14.2 默认5个）")
+    max_instances_total: int = Field(50, ge=1, description="全局最大并发实例数")
     health_check_interval_seconds: int = Field(10, ge=1)
-    gpu_memory_warning_threshold: float = Field(0.90, ge=0.0, le=1.0, description="显存告警阈值")
+    gpu_memory_warning_threshold: float = Field(0.90, ge=0.0, le=1.0, description="显存告警阈值（设计文档 §15.4 >90%）")
     docker_image: str = Field("carlasim/carla:0.9.16", description="CARLA Docker 镜像")
+    resources_dir: str = Field("resources", description="资源仓库根目录（设计文档 §10.4.1）")
+    gpu_allow_overload_downgrade: bool = Field(
+        False, description="GPU 过载时是否自动降低画质以提高并发数（设计文档 §10.3.1，默认关闭）"
+    )
 
 
 class HunterSimSettings(BaseSettings):

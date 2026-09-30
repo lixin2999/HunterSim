@@ -79,7 +79,10 @@ class TestMountQueries:
         assert lidar is not None
         assert lidar.mount_id == "lidar_top"
         assert lidar.x == pytest.approx(0.23)
-        assert mgr.get_mount(SensorType.OBSTACLE) is None
+        # 文档 §6.2.5：障碍物传感器默认前向安装
+        obstacle = mgr.get_mount(SensorType.OBSTACLE)
+        assert obstacle is not None
+        assert obstacle.mount_id == "obstacle_front"
 
     def test_custom_mounts_override(self) -> None:
         custom = [SensorMountSpec("cx", SensorType.LIDAR, 1.0, 2.0, 3.0)]
@@ -100,7 +103,9 @@ class TestAttachDetach:
         assert mgr._attached["lidar_top"] is actor
 
     def test_attach_unknown_type_raises(self) -> None:
-        mgr = SensorMountManager(object())
+        # 自定义安装列表中无 OBSTACLE 位置时报错
+        custom = [SensorMountSpec("only_lidar", SensorType.LIDAR, 0.0, 0.0, 0.0)]
+        mgr = SensorMountManager(object(), custom_mounts=custom)
         with pytest.raises(SensorSimulationError):
             mgr.attach_sensor(SensorType.OBSTACLE, blueprint="bp", world=_FakeWorld())
 

@@ -156,6 +156,9 @@ class SceneEventType(str, Enum):
     EMERGENCY_BRAKE = "emergency_brake"
     SPEED_VIOLATION = "speed_violation"
     RED_LIGHT = "red_light"
+    MIN_SAFE_DISTANCE = "min_safe_distance"
+    TARGET_REACHED = "target_reached"
+    SCENE_TIMEOUT = "scene_timeout"
     OBSTACLE_AVOID = "obstacle_avoid"
     CUSTOM = "custom"
 

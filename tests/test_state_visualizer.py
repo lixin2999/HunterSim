@@ -38,6 +38,16 @@ class _Rot:
         self.pitch, self.yaw, self.roll = pitch, yaw, roll
 
 
+class _LightState(int):
+    """模拟 carla.VehicleLightState 位标志枚举。"""
+
+    NONE = 0
+    LowBeam = 1
+    LeftTurnLight = 128
+    RightTurnLight = 256
+    Brake = 512
+
+
 @pytest.fixture(autouse=True)
 def fake_carla(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = types.ModuleType("carla")
@@ -45,6 +55,7 @@ def fake_carla(monkeypatch: pytest.MonkeyPatch) -> None:
     mod.Color = _Color  # type: ignore[attr-defined]
     mod.Vector3D = _Vec3  # type: ignore[attr-defined]
     mod.Rotation = _Rot  # type: ignore[attr-defined]
+    mod.VehicleLightState = _LightState  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "carla", mod)
 
 
@@ -95,6 +106,37 @@ class TestStateVisualizer:
             debug = None  # 触发 AttributeError
 
         StateVisualizer(_Bad()).draw_vehicle_state(_state(speed=5.0))  # 不应抛出
+
+    def test_apply_vehicle_lights(self) -> None:
+        # 设计文档 §4.4.2：刹车灯/转向灯同步
+        class _Vehicle:
+            def __init__(self) -> None:
+                self.light_state: Any = None
+
+            def set_light_state(self, state: Any) -> None:
+                self.light_state = state
+
+        v = _Vehicle()
+        StateVisualizer(_World()).apply_vehicle_lights(v, brake=0.8, left_turn=True)
+        assert v.light_state & _LightState.Brake
+        assert v.light_state & _LightState.LeftTurnLight
+
+    def test_apply_vehicle_lights_disabled_or_none(self) -> None:
+        StateVisualizer(_World(), enabled=False).apply_vehicle_lights(object(), brake=1.0)
+        StateVisualizer(_World()).apply_vehicle_lights(None)  # 不应抛出
+
+    def test_draw_planned_trajectory(self) -> None:
+        # 设计文档 §4.4.2：规划轨迹彩色折线
+        world = _World()
+        pts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)]
+        drawn = StateVisualizer(world).draw_planned_trajectory(pts)
+        assert drawn == 2
+        assert len(world.debug.lines) == 2
+
+    def test_draw_planned_trajectory_too_few_points(self) -> None:
+        world = _World()
+        assert StateVisualizer(world).draw_planned_trajectory([(0.0, 0.0, 0.0)]) == 0
+        assert world.debug.lines == []
 
 
 class TestPerceptionOverlay:

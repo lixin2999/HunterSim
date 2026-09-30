@@ -18,6 +18,9 @@ from hunter_sim.common.utils import get_logger
 logger = get_logger(__name__)
 _bearer_scheme = HTTPBearer(auto_error=False)
 
+# 管理员角色名（设计文档 §14.2：创建/销毁实例需管理员权限）
+_ADMIN_ROLE = "admin"
+
 # 全局配置实例（由 main.py 在 create_app 时设置）
 _settings: Optional[HunterSimSettings] = None
 
@@ -127,6 +130,46 @@ async def get_current_user(
     user_id: Optional[str] = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing 'sub' claim")
+    return user_id
+
+
+def get_user_role(payload: dict[str, Any]) -> str:
+    """从 JWT payload 中提取用户角色，未声明时默认 guest（无管理员权限）。"""
+    return str(payload.get("role", "guest"))
+
+
+async def require_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+) -> str:
+    """FastAPI Dependency：要求当前用户具备管理员角色（设计文档 §14.2）。
+
+    创建/销毁仿真实例等高危操作需 role=admin 的 JWT token。
+
+    Args:
+        credentials: HTTP Bearer 凭证。
+
+    Returns:
+        管理员用户 ID。
+
+    Raises:
+        HTTPException: 401 凭证无效；403 角色不足。
+    """
+    api_settings = get_api_settings()
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    payload = decode_token(credentials.credentials, api_settings)
+    user_id: Optional[str] = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing 'sub' claim")
+    if get_user_role(payload) != _ADMIN_ROLE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Admin role required for this operation (current role: '{get_user_role(payload)}')",
+        )
     return user_id
 
 

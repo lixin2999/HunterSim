@@ -10,6 +10,8 @@ from hunter_sim.common.exceptions import SensorSimulationError
 from hunter_sim.common.models import SensorType
 from hunter_sim.sensor_sim.sensor_factory import (
     DepthCameraConfig,
+    EventSensorConfig,
+    GNSSConfig,
     IMUConfig,
     LidarConfig,
     RGBCameraConfig,
@@ -57,6 +59,10 @@ class TestSensorConfigs:
         assert b.rgb_camera is not None
         assert b.imu is not None
         assert b.gnss is None
+        # 文档 §6.2.5：默认含三种事件传感器
+        assert b.collision is not None
+        assert b.lane_invasion is not None
+        assert b.obstacle is not None
 
 
 class TestSensorBlueprintFactory:
@@ -79,17 +85,49 @@ class TestSensorBlueprintFactory:
         assert bp.attributes["image_size_x"] == "1920"
         assert bp.attributes["image_size_y"] == "1080"
         assert bp.attributes["fov"] == "90.0"
+        # 文档 §6.2.2：默认 fps=30
+        assert bp.attributes["fps"] == "30.0"
+
+    def test_create_rgb_motion_blur(self) -> None:
+        factory = SensorBlueprintFactory(_StubLib())
+        bp = factory.create(SensorType.RGB_CAMERA, RGBCameraConfig(motion_blur=True))
+        # 文档 §6.4：运动模糊可配置
+        assert "motion_blur_intensity" in bp.attributes
 
     def test_create_depth(self) -> None:
         factory = SensorBlueprintFactory(_StubLib())
         bp = factory.create(SensorType.DEPTH_CAMERA, DepthCameraConfig())
         assert bp.id == "sensor.camera.depth"
+        assert bp.attributes["fps"] == "30.0"
 
-    def test_create_imu_no_attributes(self) -> None:
+    def test_create_imu_sets_noise_attributes(self) -> None:
         factory = SensorBlueprintFactory(_StubLib())
         bp = factory.create(SensorType.IMU, IMUConfig())
         assert bp.id == "sensor.other.imu"
-        assert bp.attributes == {}
+        # 文档 §6.2.3：三轴噪声 + sensor_tick=0.01（100Hz）
+        assert bp.attributes["noise_accel_stddev_x"] == "0.01"
+        assert bp.attributes["noise_accel_stddev_y"] == "0.01"
+        assert bp.attributes["noise_accel_stddev_z"] == "0.01"
+        assert bp.attributes["noise_gyro_stddev_x"] == "0.001"
+        assert bp.attributes["noise_gyro_stddev_y"] == "0.001"
+        assert bp.attributes["noise_gyro_stddev_z"] == "0.001"
+        assert bp.attributes["sensor_tick"] == "0.01"
+
+    def test_create_gnss_sets_noise_attributes(self) -> None:
+        factory = SensorBlueprintFactory(_StubLib())
+        bp = factory.create(SensorType.GNSS, GNSSConfig())
+        assert bp.id == "sensor.other.gnss"
+        # 文档 §6.2.4
+        assert bp.attributes["noise_alt_stddev"] == "0.5"
+        assert bp.attributes["noise_lat_stddev"] == "0.0001"
+        assert bp.attributes["noise_lon_stddev"] == "0.0001"
+
+    def test_create_obstacle_uses_doc_blueprint(self) -> None:
+        factory = SensorBlueprintFactory(_StubLib())
+        bp = factory.create(SensorType.OBSTACLE, EventSensorConfig())
+        # 文档 §6.2.5：sensor.other.obstacle，distance=50
+        assert bp.id == "sensor.other.obstacle"
+        assert bp.attributes["distance"] == "50.0"
 
     def test_missing_blueprint_raises(self) -> None:
         factory = SensorBlueprintFactory(_StubLib(missing={"sensor.lidar.ray_cast"}))
@@ -107,6 +145,13 @@ class TestSensorBlueprintFactory:
         assert SensorType.LIDAR in result
         assert SensorType.IMU in result
         assert SensorType.RGB_CAMERA not in result
+
+    def test_create_bundle_includes_obstacle(self) -> None:
+        factory = SensorBlueprintFactory(_StubLib())
+        result = factory.create_bundle(SensorConfigBundle.hunter_se_default())
+        assert SensorType.OBSTACLE in result
+        assert SensorType.COLLISION in result
+        assert SensorType.LANE_INVASION in result
 
     def test_create_bundle_swallows_blueprint_error(self) -> None:
         factory = SensorBlueprintFactory(_StubLib(missing={"sensor.other.imu"}))

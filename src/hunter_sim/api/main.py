@@ -17,9 +17,10 @@ from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
 from hunter_sim.api.middleware.logging import RequestLogMiddleware
-from hunter_sim.api.routers import health, instances, resources, scenes, websocket
+from hunter_sim.api.routers import health, instances, resources, scenarios, scenes, websocket
 from hunter_sim.common.models import HunterSimSettings
 from hunter_sim.common.utils import get_logger
+from hunter_sim.resource_manager.health_monitor import ResourceQuotaManager
 
 logger = get_logger(__name__)
 
@@ -47,7 +48,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="HunterSim API",
-        version="2.0.0",
+        version="2.1.0",
         description="HUNTER SE VIL 仿真平台 REST API",
         default_response_class=ORJSONResponse,
         lifespan=lifespan,
@@ -73,11 +74,18 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     # ── 异常处理 ──────────────────────────────────────────────────────────────
     register_exception_handlers(app)
 
+    # 用户级并发配额（设计文档 §14.2：单用户默认 5 个实例）
+    app.state.quota_manager = ResourceQuotaManager(
+        max_per_user=settings.resource.max_instances_per_user,
+        max_total=settings.resource.max_instances_total,
+    )
+
     # ── 路由注册 ──────────────────────────────────────────────────────────────
     api_prefix = "/api/v1/sim"
     app.include_router(health.router, prefix=api_prefix, tags=["health"])
     app.include_router(instances.router, prefix=f"{api_prefix}/instances", tags=["instances"])
     app.include_router(scenes.router, prefix=f"{api_prefix}/scenes", tags=["scenes"])
+    app.include_router(scenarios.router, prefix=f"{api_prefix}/scenarios", tags=["scenarios"])
     app.include_router(resources.router, prefix=api_prefix, tags=["resources"])
     app.include_router(websocket.router, prefix=api_prefix, tags=["websocket"])
 

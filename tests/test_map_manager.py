@@ -113,6 +113,23 @@ class TestOpenDriveImport:
         world = mgr.load_map("city")
         assert world.get_map().name == "custom"
 
+    def test_auto_load_custom_reference(self, tmp_path: Path) -> None:
+        """附录 B：未注册的 "custom/{name}" 引用自动从 custom_map_dir 导入并加载。"""
+        p = tmp_path / "garage.xodr"
+        p.write_text("<OpenDRIVE/>", encoding="utf-8")
+        mgr = MapManager(MockCarlaClient(), custom_map_dir=tmp_path)
+        assert not mgr.is_map_available("custom/garage")
+        world = mgr.load_map("custom/garage")
+        assert world.get_map().name == "custom"
+        assert mgr.current_map_id == "custom/garage"
+        assert mgr.is_map_available("custom/garage")
+
+    def test_custom_reference_missing_file(self, tmp_path: Path) -> None:
+        """custom/ 引用对应文件不存在时仍报 ConfigurationError。"""
+        mgr = MapManager(MockCarlaClient(), custom_map_dir=tmp_path)
+        with pytest.raises(ConfigurationError):
+            mgr.load_map("custom/nonexistent")
+
     def test_read_xodr_none(self) -> None:
         with pytest.raises(ConfigurationError):
             MapManager._read_xodr_file(None)

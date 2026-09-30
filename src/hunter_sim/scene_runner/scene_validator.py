@@ -1,7 +1,8 @@
 """场景配置校验器（PROMPT-ENG-003-A）。
 
 对 SceneConfig 进行业务级校验（超出 pydantic 字段验证的范围），
-包括地图存在性、生成点合法性、参数合理性等。
+包括地图存在性、生成点合法性、参数合理性，
+以及设计文档 §14.3 场景安全审核（防止危险参数）。
 """
 
 from __future__ import annotations
@@ -10,12 +11,16 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hunter_sim.common.exceptions import ValidationError
-from hunter_sim.common.models import SimMode
+from hunter_sim.common.models import HunterSESpec, SimMode
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.map_manager import BUILTIN_MAPS, MapManager
 from hunter_sim.scene_runner.scene_config import SceneConfig
 
 logger = get_logger(__name__)
+
+# 安全审核阈值（设计文档 §14.3：场景配置安全审核，防止危险参数）
+MAX_PARTICIPANTS_ERROR = 200  # 参与者数量硬上限（防资源耗尽）
+SPEED_ERROR_FACTOR = 2.0  # 初始速度超过车辆物理极限的倍数上限
 
 
 @dataclass
@@ -111,6 +116,9 @@ class SceneConfigValidator:
 
         # 5. 场景时长
         self._check_duration(config, errors, warnings)
+
+        # 6. 安全审核（设计文档 §14.3：防止危险参数）
+        self._check_safety_review(config, errors, warnings)
 
         valid = len(errors) == 0
         result = ValidationResult(valid=valid, errors=errors, warnings=warnings)
@@ -228,5 +236,38 @@ class SceneConfigValidator:
                 message=(
                     f"duration_seconds ({config.duration_seconds}) exceeds "
                     f"timeout_seconds ({config.timeout_seconds})"
+                ),
+            ))
+
+    def _check_safety_review(
+        self,
+        config: SceneConfig,
+        errors: list[ValidationIssue],
+        warnings: list[ValidationIssue],
+    ) -> None:
+        """场景安全审核（设计文档 §14.3）：拦截物理非法/资源耗尽类危险参数。"""
+        speed = config.ego_vehicle.initial_speed_ms
+        if speed < 0:
+            errors.append(ValidationIssue(
+                field_path="ego_vehicle.initial_speed_ms",
+                level="error",
+                message=f"Negative initial speed ({speed} m/s) is not allowed",
+            ))
+        elif speed > SPEED_ERROR_FACTOR * HunterSESpec.MAX_SPEED_MS:
+            errors.append(ValidationIssue(
+                field_path="ego_vehicle.initial_speed_ms",
+                level="error",
+                message=(
+                    f"Initial speed {speed} m/s exceeds safe limit "
+                    f"({SPEED_ERROR_FACTOR}x vehicle max {HunterSESpec.MAX_SPEED_MS} m/s)"
+                ),
+            ))
+        if len(config.traffic_participants) > MAX_PARTICIPANTS_ERROR:
+            errors.append(ValidationIssue(
+                field_path="traffic_participants",
+                level="error",
+                message=(
+                    f"{len(config.traffic_participants)} participants exceed hard safety limit "
+                    f"({MAX_PARTICIPANTS_ERROR}), possible resource-exhaustion config"
                 ),
             ))

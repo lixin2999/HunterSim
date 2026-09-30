@@ -40,7 +40,8 @@ class DataRecorder:
         bag_format: str = "mcap",
     ) -> None:
         self._output_dir = output_dir
-        self._topics: list[str] = topics or [m.real_topic for m in ROS2_TOPIC_MAP]
+        # 默认录制仿真话题（/carla/*，设计文档 §6.3.2 ros2 bag record 示例）
+        self._topics: list[str] = topics or [m.sim_topic for m in ROS2_TOPIC_MAP]
         self._bag_format = bag_format
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._lock: threading.Lock = threading.Lock()

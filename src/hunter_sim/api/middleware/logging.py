@@ -1,6 +1,7 @@
-"""请求日志中间件（PROMPT-API-001）。
+"""请求日志与审计日志（PROMPT-API-001）。
 
-记录每个 HTTP 请求的方法、路径、耗时、状态码。
+记录每个 HTTP 请求的方法、路径、耗时、状态码；
+并提供 audit_log() 记录实例创建/销毁等关键操作（设计文档 §14.2 审计日志）。
 """
 
 from __future__ import annotations
@@ -15,6 +16,30 @@ from starlette.responses import Response
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
+
+# 审计日志专用 logger，便于独立输出/采集
+_audit_logger = get_logger("hunter_sim.audit")
+
+
+def audit_log(action: str, user_id: str, target: str, detail: str = "") -> None:
+    """记录一条审计日志（设计文档 §14.2：所有实例操作记录审计日志）。
+
+    Args:
+        action: 操作类型，如 instance.create / instance.destroy。
+        user_id: 操作用户 ID（JWT sub）。
+        target: 操作对象，如实例 ID。
+        detail: 附加信息。
+    """
+    _audit_logger.info(
+        {
+            "audit": True,
+            "action": action,
+            "user_id": user_id,
+            "target": target,
+            "detail": detail,
+            "timestamp": time.time(),
+        }
+    )
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):

@@ -139,16 +139,21 @@ class MockWalker(MockActor):
 
 
 class MockActorControl:
-    """controller.ai.walker Mock。"""
+    """controller.ai.walker Mock（文档 §7.5：start/go_to_location/set_max_speed）。"""
 
     def __init__(self) -> None:
         self._started = False
+        self.max_speed: float = 0.0
+        self.destination: MockLocation | None = None
 
     def start(self) -> None:
         self._started = True
 
-    def go_to(self, location: MockLocation, speed: float) -> None:
-        pass
+    def go_to_location(self, location: MockLocation) -> None:
+        self.destination = location
+
+    def set_max_speed(self, speed: float) -> None:
+        self.max_speed = speed
 
     def stop(self) -> None:
         self._started = False
@@ -193,10 +198,16 @@ class MockBlueprintLibrary:
             MockBlueprint("sensor.lidar.ray_cast"),
             MockBlueprint("sensor.camera.rgb"),
             MockBlueprint("sensor.camera.depth"),
-            MockBlueprint("sensor.imu"),
+            MockBlueprint("sensor.other.imu"),
+            MockBlueprint("sensor.other.gnss"),
             MockBlueprint("sensor.other.collision"),
             MockBlueprint("sensor.other.lane_invasion"),
+            MockBlueprint("sensor.other.obstacle"),
             MockBlueprint("controller.ai.walker"),
+            MockBlueprint("static.prop.constructioncone"),
+            MockBlueprint("static.prop.trafficcone"),
+            MockBlueprint("static.prop.barrier"),
+            MockBlueprint("static.prop.warningtriangle"),
         ]
 
     def find(self, type_id: str) -> Optional[MockBlueprint]:
@@ -320,8 +331,11 @@ class MockTrafficManager:
     def set_synchronous_mode(self, enabled: bool) -> None:
         self.settings["synchronous_mode"] = enabled
 
-    def set_global_percentage_distance_to_leading_vehicle(self, pct: int) -> None:
-        self.settings["follow_distance_pct"] = pct
+    def set_global_distance_to_leading_vehicle(self, distance_m: float) -> None:
+        self.settings["follow_distance_m"] = distance_m
+
+    def set_global_percentage_speed_limits(self, pct: int) -> None:
+        self.settings["speed_limit_pct"] = pct
 
     def set_global_percentage_ignore_lights(self, pct: int) -> None:
         self.settings["ignore_lights_pct"] = pct

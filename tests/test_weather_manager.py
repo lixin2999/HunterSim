@@ -37,10 +37,11 @@ class TestWeatherProfile:
         assert WeatherProfile(precipitation=50.0).is_rainy is True
         assert WeatherProfile(precipitation=5.0).is_rainy is False
 
-    def test_to_carla_dict_normalizes(self) -> None:
+    def test_to_carla_dict_passthrough(self) -> None:
+        # CARLA WeatherParameters 使用 0-100 原生刻度（设计文档 §3.4.1），直接透传
         d = WeatherProfile(cloudiness=80.0, fog_density=20.0, fog_distance=15.0).to_carla_dict()
-        assert d["cloudiness"] == pytest.approx(0.8)
-        assert d["fog_density"] == pytest.approx(0.2)
+        assert d["cloudiness"] == pytest.approx(80.0)
+        assert d["fog_density"] == pytest.approx(20.0)
         assert d["fog_distance"] == 15.0
 
     def test_range_validation(self) -> None:
@@ -62,6 +63,22 @@ class TestPresetProfile:
     def test_unknown_raises(self) -> None:
         with pytest.raises(ConfigurationError):
             get_preset_profile("blizzard")
+
+    def test_presets_match_design_doc(self) -> None:
+        # 预设值对齐设计文档 §3.4.2 表格（cloudiness / rain / sun_altitude）
+        expected: dict[str, tuple[float, float, float]] = {
+            "sunny_noon": (0.0, 0.0, 60.0),
+            "cloudy": (80.0, 0.0, 45.0),
+            "light_rain": (30.0, 30.0, 45.0),
+            "heavy_rain": (50.0, 80.0, 30.0),
+            "foggy": (100.0, 0.0, 20.0),
+            "night": (100.0, 0.0, -15.0),
+            "dusk": (20.0, 0.0, 5.0),
+            "dawn": (20.0, 0.0, 10.0),
+        }
+        for name, (cloud, rain, alt) in expected.items():
+            p = get_preset_profile(name)
+            assert (p.cloudiness, p.precipitation, p.sun_altitude_angle) == (cloud, rain, alt), name
 
 
 class TestWeatherManager:

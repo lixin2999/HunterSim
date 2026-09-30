@@ -97,7 +97,7 @@ class VelocityTrigger(TriggerCondition):
 
 
 class EventTrigger(TriggerCondition):
-    """事件触发：由外部事件系统设置标志位激活。"""
+    """事件触发：由外部事件系统设置标志位激活（上一事件完成后触发）。"""
 
     def __init__(self, event_name: str) -> None:
         self._event_name = event_name
@@ -113,3 +113,42 @@ class EventTrigger(TriggerCondition):
 
     def reset(self) -> None:
         self._triggered = False
+
+
+def create_trigger_from_config(config: dict[str, Any]) -> TriggerCondition:
+    """从触发配置字典创建触发条件实例（设计文档 §7.4.2 五种触发条件）。
+
+    Args:
+        config: 触发配置，必含 'type' 字段：
+            - time: {'type','value'} 场景运行到指定时间（秒）
+            - distance: {'type','value'} 与自车距离小于阈值（米）
+            - position: {'type','x','y','radius'?} 到达指定坐标范围
+            - velocity: {'type','value','use_ego'?} 速度达到阈值（m/s）
+            - event: {'type','event_name'} 上一事件完成后触发
+
+    Returns:
+        TriggerCondition 实例。
+
+    Raises:
+        ValueError: 未知触发类型。
+    """
+    ttype = str(config.get("type", ""))
+    value = float(config.get("value", 0.0))
+    if ttype == "time":
+        return TimeTrigger(trigger_time_s=value)
+    if ttype == "distance":
+        return DistanceTrigger(distance_m=value)
+    if ttype == "position":
+        return PositionTrigger(
+            x=float(config.get("x", 0.0)),
+            y=float(config.get("y", 0.0)),
+            radius_m=float(config.get("radius", 5.0)),
+        )
+    if ttype == "velocity":
+        return VelocityTrigger(
+            speed_threshold_ms=value,
+            use_ego=bool(config.get("use_ego", True)),
+        )
+    if ttype == "event":
+        return EventTrigger(event_name=str(config.get("event_name", "")))
+    raise ValueError(f"Unknown trigger type: '{ttype}'")

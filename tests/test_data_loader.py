@@ -45,6 +45,44 @@ class TestRosbagSource:
         with pytest.raises(ConfigurationError):
             loader.load_trajectory(tmp_path / "bag")
 
+    def test_perception_frames_unavailable_raises(self, tmp_path: Path) -> None:
+        # 文档 §8.2：感知结果从 ROS Bag 加载；非 ROS 环境应报 ConfigurationError
+        loader = DataLoader(data_source="rosbag")
+        with pytest.raises(ConfigurationError):
+            loader.load_perception_frames(tmp_path / "bag")
+
+    def test_planned_trajectory_unavailable_raises(self, tmp_path: Path) -> None:
+        loader = DataLoader(data_source="rosbag")
+        with pytest.raises(ConfigurationError):
+            loader.load_planned_trajectory(tmp_path / "bag")
+
+    def test_control_commands_unavailable_raises(self, tmp_path: Path) -> None:
+        loader = DataLoader(data_source="rosbag")
+        with pytest.raises(ConfigurationError):
+            loader.load_control_commands(tmp_path / "bag")
+
+
+class TestDbSource:
+    """文档 §8.2：轨迹来自 TimescaleDB，事件来自 PostgreSQL。"""
+
+    def test_trajectory_from_db_no_driver_raises(self) -> None:
+        try:
+            import psycopg2  # noqa: F401
+            pytest.skip("psycopg2 available in this environment")
+        except ImportError:
+            pass
+        with pytest.raises(ConfigurationError):
+            DataLoader.load_trajectory_from_db("dsn", "v01", 0.0, 100.0)
+
+    def test_events_from_db_no_driver_raises(self) -> None:
+        try:
+            import psycopg2  # noqa: F401
+            pytest.skip("psycopg2 available in this environment")
+        except ImportError:
+            pass
+        with pytest.raises(ConfigurationError):
+            DataLoader.load_events_from_db("dsn", "v01", 0.0, 100.0)
+
 
 class TestQuatToYaw:
     def test_zero_quaternion(self) -> None:

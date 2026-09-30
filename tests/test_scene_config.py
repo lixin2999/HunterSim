@@ -104,6 +104,26 @@ class TestSceneConfigValidator:
         result = self.validator.validate(cfg)
         assert any(w.field_path == "ego_vehicle.initial_speed_ms" for w in result.warnings)
 
+    def test_safety_review_excessive_speed_error(self) -> None:
+        """§14.3 安全审核：速度超过物理极限 2 倍 → error 拒绝。"""
+        cfg = _config(ego_vehicle=EgoVehicleConfig(spawn_point=_spawn(), initial_speed_ms=50.0))
+        result = self.validator.validate(cfg)
+        assert result.valid is False
+        assert any(
+            e.field_path == "ego_vehicle.initial_speed_ms" and "safe limit" in e.message
+            for e in result.errors
+        )
+
+    def test_safety_review_participant_hard_limit(self) -> None:
+        """§14.3 安全审核：参与者超过硬上限 200 → error（防资源耗尽）。"""
+        tps = [
+            TrafficParticipantConfig(participant_id=f"p{i}", spawn_point=_spawn())
+            for i in range(201)
+        ]
+        result = self.validator.validate(_config(traffic_participants=tps))
+        assert result.valid is False
+        assert any("hard safety limit" in e.message for e in result.errors)
+
     def test_unknown_weather_preset_warning(self) -> None:
         cfg = _config(weather=WeatherConfig(preset_name="monsoon"))
         result = self.validator.validate(cfg)

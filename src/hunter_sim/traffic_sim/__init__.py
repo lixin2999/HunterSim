@@ -10,7 +10,9 @@ from hunter_sim.traffic_sim.actor_behaviors import (
     CutInBehavior,
     DecelerateBehavior,
     PedestrianCrossBehavior,
+    ScriptedActorController,
     StaticBehavior,
+    create_behavior_from_config,
 )
 from hunter_sim.traffic_sim.traffic_flow_manager import (
     TrafficFlowConfig,
@@ -23,15 +25,17 @@ from hunter_sim.traffic_sim.trigger_conditions import (
     TimeTrigger,
     TriggerCondition,
     VelocityTrigger,
+    create_trigger_from_config,
 )
 from hunter_sim.traffic_sim.walker_controller import WalkerControllerWrapper
 
 __all__ = [
     "ActorAction", "ActorBehavior",
     "ConstantSpeedBehavior", "CutInBehavior", "DecelerateBehavior",
-    "PedestrianCrossBehavior", "StaticBehavior",
+    "PedestrianCrossBehavior", "ScriptedActorController", "StaticBehavior",
+    "create_behavior_from_config",
     "TrafficFlowConfig", "TrafficFlowManager",
     "DistanceTrigger", "EventTrigger", "PositionTrigger", "TimeTrigger",
-    "TriggerCondition", "VelocityTrigger",
+    "TriggerCondition", "VelocityTrigger", "create_trigger_from_config",
     "WalkerControllerWrapper",
 ]

@@ -1,4 +1,7 @@
-"""资源配额与健康监控单元测试（PROMPT-TEST-001）。"""
+"""资源配额与健康监控单元测试（PROMPT-TEST-001）。
+
+覆盖设计文档 §14.1/§14.2：超时自动销毁、崩溃重试≤3、单用户配额默认 5。
+"""
 
 from __future__ import annotations
 
@@ -52,6 +55,15 @@ class TestResourceQuotaManager:
         assert usage["max_total"] == 8
         assert usage["users"] == {"dave": 1}
 
+    def test_quota_default_per_user(self) -> None:
+        """§14.2：单用户最大并发实例数默认 5 个。"""
+        q = ResourceQuotaManager()
+        for _ in range(5):
+            q.check_and_reserve("heavy_user")
+        with pytest.raises(ResourceError):
+            q.check_and_reserve("heavy_user")
+        assert q.get_usage("heavy_user")["max"] == 5
+
 
 class TestInstanceHealthMonitor:
     def test_default_retry_count(self) -> None:
@@ -68,3 +80,58 @@ class TestInstanceHealthMonitor:
         assert mon._thread is not None
         mon.stop()
         assert mon._running is False
+
+    def test_crash_restart_up_to_max_retries(self) -> None:
+        """§14.1：CARLA 崩溃自动重启，最多重试 3 次，超出后不再重启。"""
+        restarted: list[str] = []
+        mon = InstanceHealthMonitor(
+            settings=ResourceSettings(max_retry_count=3),
+            check_callback=lambda iid: False,
+            restart_callback=lambda iid: restarted.append(iid),
+        )
+        mon.register_instance("i1")
+        for _ in range(3):
+            cycle = mon.run_check_cycle()
+            assert cycle["failed"] == ["i1"]
+        assert restarted == ["i1", "i1", "i1"]
+        assert mon.get_retry_count("i1") == 3
+        # 第 4 轮：超出最大重试次数，标记不可恢复，不再重启
+        cycle = mon.run_check_cycle()
+        assert cycle["exhausted"] == ["i1"]
+        assert mon.is_unrecoverable("i1") is True
+        assert len(restarted) == 3
+
+    def test_healthy_resets_retry_count(self) -> None:
+        """探针恢复健康后重试计数归零。"""
+        flags = {"ok": False}
+        mon = InstanceHealthMonitor(
+            settings=ResourceSettings(max_retry_count=3),
+            check_callback=lambda iid: flags["ok"],
+        )
+        mon.register_instance("i2")
+        mon.run_check_cycle()
+        assert mon.get_retry_count("i2") == 1
+        flags["ok"] = True
+        cycle = mon.run_check_cycle()
+        assert cycle["failed"] == []
+        assert mon.get_retry_count("i2") == 0
+
+    def test_expired_cleanup_callback(self) -> None:
+        """§14.1/§15.5：超时（默认 2 小时）实例由监控周期自动销毁。"""
+        mon = InstanceHealthMonitor(
+            expired_cleanup_callback=lambda: ["zombie-1", "zombie-2"],
+        )
+        cycle = mon.run_check_cycle()
+        assert cycle["expired_destroyed"] == ["zombie-1", "zombie-2"]
+
+    def test_unregister_clears_state(self) -> None:
+        mon = InstanceHealthMonitor(
+            settings=ResourceSettings(max_retry_count=0),
+            check_callback=lambda iid: False,
+        )
+        mon.register_instance("i3")
+        mon.run_check_cycle()
+        assert mon.is_unrecoverable("i3") is True
+        mon.unregister_instance("i3")
+        assert mon.is_unrecoverable("i3") is False
+        assert mon.get_retry_count("i3") == 0

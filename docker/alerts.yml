@@ -1,0 +1,73 @@
+# HunterSim Prometheus 告警规则（设计文档 §15.4 监控与告警）
+groups:
+  - name: huntersim-alerts
+    rules:
+      # CARLA 健康：RPC 响应时间 > 5s
+      - alert: CarlaRpcResponseHigh
+        expr: huntersim_carla_rpc_latency_seconds > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CARLA RPC 响应时间超过 5s"
+          description: "仿真服务 CARLA RPC 延迟 {{ $value | printf \"%.1f\" }}s，超过告警阈值 5s。"
+
+      # 实例状态：运行中实例数异常减少（较 1 小时前下降 > 50%）
+      - alert: ActiveInstancesDrop
+        expr: huntersim_active_instances < 0.5 * avg_over_time(huntersim_active_instances[1h])
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "运行中实例数异常减少"
+          description: "当前实例数 {{ $value }}，显著低于过去 1 小时均值。"
+
+      # GPU 利用率 > 95% 持续 10min（来自 nvidia_gpu_exporter）
+      - alert: GpuUtilizationHigh
+        expr: DCGM_FI_DEV_GPU_UTIL > 95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU 利用率 > 95% 持续 10 分钟"
+          description: "GPU {{ $labels.gpu_id }} 利用率 {{ $value }}%。"
+
+      # 显存使用 > 90%
+      - alert: GpuMemoryUsageHigh
+        expr: DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU 显存占用超过 90%"
+          description: "GPU 显存使用率 {{ $value | humanizePercentage }}。"
+
+      # 仿真帧率 < 20 FPS
+      - alert: SimulationLowFps
+        expr: huntersim_simulation_fps < 20
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "仿真平均帧率低于 20 FPS"
+          description: "当前 FPS {{ $value }}，低于告警阈值 20（性能目标 ≥ 30，§13.1）。"
+
+      # VIL 端到端延迟 > 500ms
+      - alert: VilLatencyHigh
+        expr: huntersim_vil_latency_ms > 500
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "VIL 端到端延迟超过 500ms"
+          description: "当前延迟 {{ $value }}ms，超过告警阈值 500ms（性能目标 < 300ms，§13.1）。"
+
+      # 磁盘空间使用率 > 85%
+      - alert: DiskUsageHigh
+        expr: huntersim_disk_usage_ratio > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "存储使用率超过 85%"
+          description: "磁盘使用率 {{ $value | humanizePercentage }}，请及时清理仿真记录。"

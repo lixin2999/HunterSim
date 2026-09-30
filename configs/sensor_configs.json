@@ -73,7 +73,7 @@
   },
   "imu": {
     "type": "imu",
-    "blueprint": "sensor.imu",
+    "blueprint": "sensor.other.imu",
     "frequency_hz": 100.0,
     "accel_noise_stddev": 0.01,
     "gyro_noise_stddev": 0.001,
@@ -122,5 +122,12 @@
     "blueprint": "sensor.other.lane_invasion",
     "ros_topic": "/carla/lane_invasion_event",
     "msg_type": "custom_msgs/LaneInvasionEvent"
+  },
+  "obstacle": {
+    "type": "obstacle",
+    "blueprint": "sensor.other.obstacle",
+    "distance_m": 50.0,
+    "ros_topic": "/carla/obstacle_event",
+    "msg_type": "custom_msgs/ObstacleDetectionEvent"
   }
 }

@@ -27,6 +27,10 @@ class VehicleActorProtocol(Protocol):
 
     def set_transform(self, transform: Any) -> None: ...
 
+    def set_velocity(self, vector: Any) -> None: ...
+
+    def set_angular_velocity(self, vector: Any) -> None: ...
+
 
 class WorldProtocol(Protocol):
     """CARLA World 协议（供类型检查）。"""
@@ -214,8 +218,9 @@ class VILSyncService:
                 carla_transform, speed, yaw_rate
             )
 
-        # 6. 设置 CARLA 车辆位姿（VIL 模式，直接设置）
+        # 6. 设置 CARLA 车辆位姿与速度（VIL 模式，直接设置，设计文档 §4.4.1）
         self._apply_carla_transform(carla_transform)
+        self._apply_carla_velocity(frame.vehicle_state, carla_transform.yaw)
 
         latency_ms = (time.perf_counter() - t_start) * 1000.0
         self._latency_samples.append(latency_ms)
@@ -235,6 +240,33 @@ class VILSyncService:
             ),
         )
         self._vehicle.set_transform(carla_tf)
+
+    def _apply_carla_velocity(self, state: VehicleState, yaw_map: float) -> None:
+        """同步车辆速度/角速度（设计文档 §4.4.1/§3.3.2）。
+
+        vx = v * cos(yaw_map)，vy = v * sin(yaw_map)，vz = 0。
+        失败仅记日志，不中断同步循环（部分 Mock/后端不支持速度设置）。
+
+        Args:
+            state: 实车状态帧。
+            yaw_map: 换算后的 CARLA 地图航向角（弧度）。
+        """
+        import carla  # noqa: PLC0415
+        import math
+        try:
+            v = state.vehicle_speed
+            self._vehicle.set_velocity(carla.Vector3D(
+                x=v * math.cos(yaw_map),
+                y=v * math.sin(yaw_map),
+                z=0.0,
+            ))
+            self._vehicle.set_angular_velocity(carla.Vector3D(
+                x=state.angular_velocity[0],
+                y=state.angular_velocity[1],
+                z=state.angular_velocity[2],
+            ))
+        except Exception as exc:
+            logger.debug(f"apply velocity skipped: {exc}")
 
     def _estimate_fps(self) -> float:
         """估算当前 tick FPS。"""

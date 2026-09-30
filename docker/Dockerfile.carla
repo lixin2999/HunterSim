@@ -1,0 +1,20 @@
+# CARLA 仿真引擎镜像（设计文档 §15.3）
+# 基于官方 carlasim/carla:0.9.16 + HUNTER 自定义资源
+# 使用：docker build -f docker/Dockerfile.carla -t hunter-carla:0.9.16 .
+# 运行（NVIDIA Container Toolkit 分配 GPU）：
+#   docker run --gpus '"device=0"' -p 2000:2000 -p 2001:2001 hunter-carla:0.9.16
+
+FROM carlasim/carla:0.9.16
+
+# 安装 HUNTER 自定义资源（车辆/地图/传感器模型）
+COPY hunter_assets/ /home/carla/carla/PythonAPI/hunter_assets/
+
+# 安装 Python 依赖（API 侧桥接与 Kafka 客户端）
+RUN pip install --no-cache-dir fastapi uvicorn kafka-python
+
+# 暴露 RPC 与数据流端口（§10.2.2 carla_server.rpc_port / stream_port）
+EXPOSE 2000 2001
+
+# 启动命令：离屏渲染 + Medium 画质（§13.4 性能优化策略 2「离屏渲染」）
+# 批量 SIL 测试可覆盖为 -quality-level=Low（§13.4 策略 1「画质分级」）
+CMD ["./CarlaUE4.sh", "-RenderOffScreen", "-quality-level=Medium"]

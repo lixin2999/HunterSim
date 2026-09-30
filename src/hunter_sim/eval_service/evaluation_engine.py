@@ -17,6 +17,15 @@ from hunter_sim.common.utils import get_logger, rmse
 
 logger = get_logger(__name__)
 
+# ─── 评估目标阈值（设计文档 §9.2 指标表） ────────────────────────────
+MIN_TTC_TARGET_S = 3.0           # 最小 TTC > 3.0s
+MIN_DISTANCE_TARGET_M = 3.0      # 最小车距 > 3.0m
+EMERGENCY_BRAKE_LIMIT = 2        # 紧急制动 < 2 次/场景
+AVG_ACCEL_TARGET_MS2 = 1.0       # 平均加速度 < 1.0 m/s²
+MAX_ACCEL_TARGET_MS2 = 2.0       # 最大加速度 < 2.0 m/s²
+AVG_JERK_TARGET_MS3 = 2.0        # 平均加加速度 < 2.0 m/s³
+STEERING_SMOOTHNESS_TARGET = 0.3  # 转向平滑度 < 0.3 rad/s
+
 # 评估等级标准
 _EVAL_THRESHOLDS: list[tuple[EvalGrade, float, float]] = [
     (EvalGrade.S, 0.95, 0.00),   # 通过率 >= 95%, 碰撞率 0%
@@ -67,20 +76,33 @@ class SafetyMetrics:
             "red_light_count": self.red_light_count,
         }
 
+    def meets_targets(self) -> bool:
+        """安全指标是否全部达到文档 §9.2.1 目标值。"""
+        return (
+            self.collision_count == 0
+            and (self.min_ttc_s == float("inf") or self.min_ttc_s > MIN_TTC_TARGET_S)
+            and (self.min_distance_m == float("inf") or self.min_distance_m > MIN_DISTANCE_TARGET_M)
+            and self.emergency_brake_count < EMERGENCY_BRAKE_LIMIT
+            and self.lane_invasion_count == 0
+            and self.red_light_count == 0
+        )
+
 
 @dataclass
 class EfficiencyMetrics:
-    """效率指标计算结果。
+    """效率指标计算结果（文档 §9.2.2）。
 
     Attributes:
         avg_speed_ms: 平均速度（m/s）。
+        max_speed_ms: 最大速度（m/s）。
         total_distance_m: 总行驶距离（米）。
-        scene_duration_s: 场景实际运行时长（秒）。
+        scene_duration_s: 场景实际运行时长（秒，即场景完成时间）。
         waiting_time_s: 等待（停止）时间（秒）。
         completion_rate: 场景完成率 (0~1)。
     """
 
     avg_speed_ms: float = 0.0
+    max_speed_ms: float = 0.0
     total_distance_m: float = 0.0
     scene_duration_s: float = 0.0
     waiting_time_s: float = 0.0
@@ -89,6 +111,7 @@ class EfficiencyMetrics:
     def to_dict(self) -> dict[str, Any]:
         return {
             "avg_speed_ms": round(self.avg_speed_ms, 3),
+            "max_speed_ms": round(self.max_speed_ms, 3),
             "total_distance_m": round(self.total_distance_m, 2),
             "scene_duration_s": round(self.scene_duration_s, 2),
             "waiting_time_s": round(self.waiting_time_s, 2),
@@ -123,10 +146,32 @@ class ComfortMetrics:
             "steering_smoothness_rad_s": round(self.steering_smoothness_rad_s, 4),
         }
 
+    def meets_targets(self) -> bool:
+        """舒适性指标是否全部达到文档 §9.2.3 目标值。"""
+        return (
+            self.avg_acceleration_ms2 < AVG_ACCEL_TARGET_MS2
+            and self.max_acceleration_ms2 < MAX_ACCEL_TARGET_MS2
+            and self.avg_jerk_ms3 < AVG_JERK_TARGET_MS3
+            and self.steering_smoothness_rad_s < STEERING_SMOOTHNESS_TARGET
+        )
+
 
 @dataclass
 class SceneEvaluationResult:
-    """单场景完整评估结果。"""
+    """单场景完整评估结果。
+
+    Attributes:
+        scene_id: 场景 ID。
+        grade: 评估等级。
+        safety: 安全指标。
+        efficiency: 效率指标。
+        comfort: 舒适性指标。
+        passed: 是否通过（基于文档 §9.2 成功准则）。
+        timestamp: 评估时间。
+        events: 事件列表。
+        takeover: 是否发生人工接管（文档 §9.2.4 接管率统计）。
+        success_criteria: 成功准则明细（文档 §9.4）。
+    """
 
     scene_id: str
     grade: EvalGrade
@@ -138,6 +183,8 @@ class SceneEvaluationResult:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     events: list[dict[str, Any]] = field(default_factory=list)
+    takeover: bool = False
+    success_criteria: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +192,8 @@ class SceneEvaluationResult:
             "grade": self.grade.value,
             "passed": self.passed,
             "timestamp": self.timestamp,
+            "takeover": self.takeover,
+            "success_criteria": self.success_criteria,
             "safety": self.safety.to_dict(),
             "efficiency": self.efficiency.to_dict(),
             "comfort": self.comfort.to_dict(),
@@ -169,6 +218,7 @@ class EvaluationEngine:
         speed_limit_ms: float = 10.0,
         scene_duration_s: float = 60.0,
         completed: bool = True,
+        takeover: bool = False,
     ) -> SceneEvaluationResult:
         """计算单场景的完整评估结果。
 
@@ -182,6 +232,7 @@ class EvaluationEngine:
             speed_limit_ms: 限速值。
             scene_duration_s: 场景设定运行时长。
             completed: 场景是否正常完成。
+            takeover: 是否发生人工接管（文档 §9.2.4）。
 
         Returns:
             SceneEvaluationResult。
@@ -195,8 +246,20 @@ class EvaluationEngine:
         # 舒适性指标
         comfort = self._compute_comfort(vehicle_states)
 
-        # 任务指标
-        passed = completed and safety.collision_count == 0
+        # 成功准则（文档 §9.4 success_criteria）
+        max_speed_deviation = max(0.0, efficiency.max_speed_ms - speed_limit_ms)
+        success_criteria = {
+            "no_collision": safety.collision_count == 0,
+            "max_speed_deviation": round(max_speed_deviation, 3),
+            "min_safe_distance": (
+                safety.min_distance_m
+                if safety.min_distance_m != float("inf")
+                else None
+            ),
+        }
+
+        # 任务指标：基于成功准则判定通过/失败（文档 §9.3 步骤 5）
+        passed = completed and not takeover and safety.meets_targets()
 
         # 等级判定（单场景用 pass/fail，批量用 pass_rate）
         grade = EvalGrade.S if passed else EvalGrade.D
@@ -209,6 +272,8 @@ class EvaluationEngine:
             comfort=comfort,
             passed=passed,
             events=events,
+            takeover=takeover,
+            success_criteria=success_criteria,
         )
 
     @staticmethod
@@ -238,6 +303,7 @@ class EvaluationEngine:
     ) -> EfficiencyMetrics:
         speeds = [s.get("vehicle_speed", 0.0) for s in states]
         avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
+        max_speed = max(speeds) if speeds else 0.0
         total_dist = 0.0
         for i in range(1, len(states)):
             dt = states[i].get("timestamp", 0.0) - states[i - 1].get("timestamp", 0.0)
@@ -246,6 +312,7 @@ class EvaluationEngine:
         waiting = sum(1 for s in speeds if s < 0.2) * 0.02  # 50Hz 帧
         return EfficiencyMetrics(
             avg_speed_ms=avg_speed,
+            max_speed_ms=max_speed,
             total_distance_m=total_dist,
             scene_duration_s=duration_s,
             waiting_time_s=waiting,
@@ -302,6 +369,10 @@ class BatchEvaluator:
         """添加单场景评估结果。"""
         self._results.append(result)
 
+    def results(self) -> list[SceneEvaluationResult]:
+        """返回全部场景评估结果。"""
+        return list(self._results)
+
     def overall_grade(self) -> EvalGrade:
         """计算批量评估总体等级。"""
         if not self._results:
@@ -311,7 +382,7 @@ class BatchEvaluator:
         return determine_grade(pass_rate, collision_rate)
 
     def summary(self) -> dict[str, Any]:
-        """返回批量评估摘要。"""
+        """返回批量评估摘要（含文档 §9.2.4 任务指标与 §9.5 汇总项）。"""
         total = len(self._results)
         if total == 0:
             return {"total": 0}
@@ -321,8 +392,23 @@ class BatchEvaluator:
             "passed": passed,
             "failed": total - passed,
             "pass_rate": passed / total,
+            # 任务指标（文档 §9.2.4）
+            "collision_rate": sum(1 for r in self._results if r.safety.collision_count > 0) / total,
+            "takeover_rate": sum(1 for r in self._results if r.takeover) / total,
+            "target_achievement_rate": sum(
+                1 for r in self._results if r.efficiency.completion_rate >= 1.0
+            ) / total,
             "overall_grade": self.overall_grade().value,
             "avg_collision_count": sum(r.safety.collision_count for r in self._results) / total,
+            # 各指标均值（文档 §9.5 汇总报告）
+            "metric_averages": {
+                "avg_speed_ms": round(sum(r.efficiency.avg_speed_ms for r in self._results) / total, 3),
+                "avg_distance_m": round(sum(r.efficiency.total_distance_m for r in self._results) / total, 2),
+                "avg_acceleration_ms2": round(sum(r.comfort.avg_acceleration_ms2 for r in self._results) / total, 3),
+                "avg_jerk_ms3": round(sum(r.comfort.avg_jerk_ms3 for r in self._results) / total, 3),
+            },
+            # 失败场景列表（文档 §9.5 汇总报告）
+            "failed_scenes": [r.scene_id for r in self._results if not r.passed],
             "results": [r.to_dict() for r in self._results],
         }
 

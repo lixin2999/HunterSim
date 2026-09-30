@@ -74,6 +74,8 @@ class EventDetector:
         self._prev_speed: float = 0.0
         self._prev_accel: float = 0.0
         self._collision_count: int = 0
+        self._target_reached: bool = False
+        self._timeout_emitted: bool = False
 
     @property
     def detected_events(self) -> list[DetectedEvent]:
@@ -164,11 +166,109 @@ class EventDetector:
             )
             self._emit(event)
 
+    def check_red_light_violation(
+        self, timestamp: float, light_is_red: bool, in_intersection: bool
+    ) -> None:
+        """检查闯红灯（通过路口时信号灯为红灯，设计文档 §5.5.2）。
+
+        Args:
+            timestamp: 当前仿真时间戳。
+            light_is_red: 前方信号灯是否为红灯。
+            in_intersection: 车辆是否正在通过路口。
+        """
+        if light_is_red and in_intersection:
+            event = DetectedEvent(
+                event_id="red_light_violation",
+                event_type=SceneEventType.RED_LIGHT.value,
+                time_stamp=timestamp,
+                description="Ran red light while crossing intersection",
+                data={"light_is_red": True},
+            )
+            self._emit(event)
+
+    def check_min_safe_distance(
+        self, timestamp: float, gap_m: Optional[float], min_safe_gap_m: float = 3.0
+    ) -> None:
+        """检查未保持安全距离（与前车距离 < 安全距离，设计文档 §5.5.2）。
+
+        Args:
+            timestamp: 当前仿真时间戳。
+            gap_m: 与前车实际距离（米），None 表示前方无车。
+            min_safe_gap_m: 最小安全距离阈值（米，设计文档 §9.2.1 默认 3.0）。
+        """
+        if gap_m is not None and gap_m < min_safe_gap_m:
+            event = DetectedEvent(
+                event_id="min_safe_distance_violation",
+                event_type=SceneEventType.MIN_SAFE_DISTANCE.value,
+                time_stamp=timestamp,
+                description=f"Unsafe gap to leading vehicle: {gap_m:.2f} m < {min_safe_gap_m:.2f} m",
+                data={"gap_m": gap_m, "min_safe_gap_m": min_safe_gap_m},
+            )
+            self._emit(event)
+
+    def check_target_reached(
+        self,
+        timestamp: float,
+        x: float,
+        y: float,
+        target_x: float,
+        target_y: float,
+        radius_m: float = 2.0,
+    ) -> bool:
+        """检查到达目标点（车辆位置在目标点半径内，设计文档 §5.5.2）。
+
+        Args:
+            timestamp: 当前仿真时间戳。
+            x: 车辆当前 X 坐标（米）。
+            y: 车辆当前 Y 坐标（米）。
+            target_x: 目标点 X 坐标（米）。
+            target_y: 目标点 Y 坐标（米）。
+            radius_m: 到达判定半径（米）。
+
+        Returns:
+            True 表示已到达目标点（首次到达时同时发出事件）。
+        """
+        distance = math.hypot(x - target_x, y - target_y)
+        if distance <= radius_m and not self._target_reached:
+            self._target_reached = True
+            event = DetectedEvent(
+                event_id="target_reached",
+                event_type=SceneEventType.TARGET_REACHED.value,
+                time_stamp=timestamp,
+                description=f"Target reached, distance={distance:.2f} m (radius {radius_m:.1f} m)",
+                data={"distance_m": distance, "radius_m": radius_m},
+            )
+            self._emit(event)
+        return self._target_reached
+
+    def check_scene_timeout(self, timestamp: float, elapsed_s: float, duration_s: float) -> None:
+        """检查场景超时（运行时间 > 场景设定时长，设计文档 §5.5.2）。
+
+        Args:
+            timestamp: 当前仿真时间戳。
+            elapsed_s: 已运行时间（秒）。
+            duration_s: 场景设定时长（秒）。
+        """
+        if elapsed_s > duration_s and not self._timeout_emitted:
+            self._timeout_emitted = True
+            event = DetectedEvent(
+                event_id="scene_timeout",
+                event_type=SceneEventType.SCENE_TIMEOUT.value,
+                time_stamp=timestamp,
+                description=f"Scene timeout: elapsed {elapsed_s:.1f}s > duration {duration_s:.1f}s",
+                data={"elapsed_s": elapsed_s, "duration_s": duration_s},
+            )
+            self._emit(event)
+
     def check_tick(
         self,
         timestamp: float,
         vehicle_state: VehicleState,
         speed_limit_ms: float = 10.0,
+        leading_gap_m: Optional[float] = None,
+        min_safe_gap_m: float = 3.0,
+        light_is_red: bool = False,
+        in_intersection: bool = False,
     ) -> None:
         """每 tick 统一调用，执行所有自定义事件检查。
 
@@ -176,8 +276,14 @@ class EventDetector:
             timestamp: 当前仿真时间戳。
             vehicle_state: 当前车辆状态。
             speed_limit_ms: 当前路段限速（m/s）。
+            leading_gap_m: 与前车距离（米），None 表示前方无车。
+            min_safe_gap_m: 最小安全距离阈值（米）。
+            light_is_red: 前方信号灯是否为红灯。
+            in_intersection: 车辆是否正在通过路口。
         """
         self.check_speed_violation(timestamp, vehicle_state.vehicle_speed, speed_limit_ms)
+        self.check_min_safe_distance(timestamp, leading_gap_m, min_safe_gap_m)
+        self.check_red_light_violation(timestamp, light_is_red, in_intersection)
         accel = vehicle_state.acceleration
         forward_accel = math.sqrt(accel[0] ** 2 + accel[1] ** 2)
         # 只在制动时传入负值
@@ -201,4 +307,6 @@ class EventDetector:
         with self._lock:
             self._detected.clear()
         self._collision_count = 0
+        self._target_reached = False
+        self._timeout_emitted = False
         logger.debug("EventDetector reset")

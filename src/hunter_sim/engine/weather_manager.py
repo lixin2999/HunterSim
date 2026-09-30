@@ -81,73 +81,77 @@ class WeatherProfile(BaseModel):
         return self.precipitation > 10.0
 
     def to_carla_dict(self) -> dict[str, float]:
-        """转换为 CARLA WeatherParameters 字典（0-1 范围归一化）。
+        """转换为 CARLA WeatherParameters 字典。
+
+        CARLA API 使用原生 0-100 百分比刻度与度制角度（设计文档 §3.4.1），
+        直接透传内部参数，不做归一化。
 
         Returns:
             CARLA API 参数字典。
         """
         return {
-            "cloudiness": self.cloudiness / 100.0,
-            "precipitation": self.precipitation / 100.0,
-            "precipitation_deposits": self.precipitation_deposits / 100.0,
-            "wind_intensity": self.wind_intensity / 100.0,
+            "cloudiness": self.cloudiness,
+            "precipitation": self.precipitation,
+            "precipitation_deposits": self.precipitation_deposits,
+            "wind_intensity": self.wind_intensity,
             "sun_azimuth_angle": self.sun_azimuth_angle,
             "sun_altitude_angle": self.sun_altitude_angle,
-            "fog_density": self.fog_density / 100.0,
+            "fog_density": self.fog_density,
             "fog_distance": self.fog_distance,
         }
 
 
 # ─── 预设环境配置字典 ─────────────────────────────────────────────────────────
 
+# 预设参数值严格对齐设计文档 §3.4.2 表格（cloudiness / rain / sun_altitude）
 _PRESET_PROFILES: dict[str, WeatherProfile] = {
     "sunny_noon": WeatherProfile(
         preset_name="sunny_noon",
-        cloudiness=5.0, precipitation=0.0, precipitation_deposits=0.0,
-        wind_intensity=5.0, sun_azimuth_angle=0.0, sun_altitude_angle=75.0,
+        cloudiness=0.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=5.0, sun_azimuth_angle=45.0, sun_altitude_angle=60.0,
         fog_density=0.0, rayleigh_scattering=1.0, mie_scattering=0.03,
     ),
     "cloudy": WeatherProfile(
         preset_name="cloudy",
         cloudiness=80.0, precipitation=0.0, precipitation_deposits=0.0,
-        wind_intensity=20.0, sun_azimuth_angle=0.0, sun_altitude_angle=30.0,
+        wind_intensity=20.0, sun_azimuth_angle=45.0, sun_altitude_angle=45.0,
         fog_density=5.0, rayleigh_scattering=1.5, mie_scattering=0.05,
     ),
     "light_rain": WeatherProfile(
         preset_name="light_rain",
-        cloudiness=80.0, precipitation=20.0, precipitation_deposits=40.0,
-        wind_intensity=30.0, sun_azimuth_angle=0.0, sun_altitude_angle=30.0,
+        cloudiness=30.0, precipitation=30.0, precipitation_deposits=30.0,
+        wind_intensity=30.0, sun_azimuth_angle=45.0, sun_altitude_angle=45.0,
         fog_density=10.0, rayleigh_scattering=1.5, mie_scattering=0.1,
     ),
     "heavy_rain": WeatherProfile(
         preset_name="heavy_rain",
-        cloudiness=95.0, precipitation=80.0, precipitation_deposits=90.0,
-        wind_intensity=70.0, sun_azimuth_angle=0.0, sun_altitude_angle=15.0,
+        cloudiness=50.0, precipitation=80.0, precipitation_deposits=90.0,
+        wind_intensity=70.0, sun_azimuth_angle=45.0, sun_altitude_angle=30.0,
         fog_density=20.0, rayleigh_scattering=2.0, mie_scattering=0.2,
     ),
     "foggy": WeatherProfile(
         preset_name="foggy",
-        cloudiness=60.0, precipitation=0.0, precipitation_deposits=0.0,
-        wind_intensity=5.0, sun_azimuth_angle=0.0, sun_altitude_angle=20.0,
+        cloudiness=100.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=5.0, sun_azimuth_angle=45.0, sun_altitude_angle=20.0,
         fog_density=60.0, fog_distance=20.0,
         rayleigh_scattering=2.0, mie_scattering=0.5,
     ),
     "night": WeatherProfile(
         preset_name="night",
-        cloudiness=10.0, precipitation=0.0, precipitation_deposits=0.0,
-        wind_intensity=5.0, sun_azimuth_angle=0.0, sun_altitude_angle=-80.0,
+        cloudiness=100.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=5.0, sun_azimuth_angle=0.0, sun_altitude_angle=-15.0,
         fog_density=0.0, rayleigh_scattering=0.5, mie_scattering=0.0,
     ),
     "dusk": WeatherProfile(
         preset_name="dusk",
-        cloudiness=30.0, precipitation=0.0, precipitation_deposits=0.0,
+        cloudiness=20.0, precipitation=0.0, precipitation_deposits=0.0,
         wind_intensity=10.0, sun_azimuth_angle=90.0, sun_altitude_angle=5.0,
         fog_density=5.0, rayleigh_scattering=3.0, mie_scattering=0.1,
     ),
     "dawn": WeatherProfile(
         preset_name="dawn",
         cloudiness=20.0, precipitation=0.0, precipitation_deposits=0.0,
-        wind_intensity=10.0, sun_azimuth_angle=270.0, sun_altitude_angle=5.0,
+        wind_intensity=10.0, sun_azimuth_angle=270.0, sun_altitude_angle=10.0,
         fog_density=15.0, rayleigh_scattering=3.0, mie_scattering=0.1,
     ),
 }
@@ -290,17 +294,20 @@ class WeatherManager:
 
     @staticmethod
     def _apply_profile(profile: WeatherProfile) -> None:
-        """将 WeatherProfile 应用到 CARLA World（内部实现）。"""
+        """将 WeatherProfile 应用到 CARLA World（内部实现）。
+
+        CARLA WeatherParameters 使用 0-100 原生刻度，直接透传参数。
+        """
         try:
             import carla  # noqa: PLC0415
             wp = carla.WeatherParameters(
-                cloudiness=profile.cloudiness / 100.0,
-                precipitation=profile.precipitation / 100.0,
-                precipitation_deposits=profile.precipitation_deposits / 100.0,
-                wind_intensity=profile.wind_intensity / 100.0,
+                cloudiness=profile.cloudiness,
+                precipitation=profile.precipitation,
+                precipitation_deposits=profile.precipitation_deposits,
+                wind_intensity=profile.wind_intensity,
                 sun_azimuth_angle=profile.sun_azimuth_angle,
                 sun_altitude_angle=profile.sun_altitude_angle,
-                fog_density=profile.fog_density / 100.0,
+                fog_density=profile.fog_density,
                 fog_distance=profile.fog_distance,
             )
             logger.debug(f"Applying weather: {profile.preset_name or 'custom'}")

@@ -38,7 +38,8 @@ def _patch(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestInit:
     def test_default_topics_from_map(self) -> None:
         rec = DataRecorder()
-        assert rec._topics == [m.real_topic for m in ROS2_TOPIC_MAP]
+        # 文档 §6.3.2：默认录制仿真话题 /carla/*
+        assert rec._topics == [m.sim_topic for m in ROS2_TOPIC_MAP]
 
     def test_custom_topics(self) -> None:
         rec = DataRecorder(topics=["/a", "/b"], bag_format="sqlite3")

@@ -84,6 +84,8 @@ class CarlaVehicleActorProtocol(Protocol):
     """CARLA Vehicle Actor 协议。"""
 
     def set_transform(self, transform: Any) -> None: ...
+    def set_velocity(self, vector: Any) -> None: ...
+    def set_angular_velocity(self, vector: Any) -> None: ...
     def apply_control(self, control: Any) -> None: ...
     def get_velocity(self) -> Any: ...
     def get_location(self) -> Any: ...
@@ -148,17 +150,43 @@ class HunterSEVehicleController:
             raise CarlaSimulationError("apply_transform", str(exc)) from exc
 
     def apply_velocity(self, vx: float, vy: float, vz: float) -> None:
-        """设置车辆速度向量（VIL 模式下仅用于可视化，不影响运动）。
+        """设置车辆速度向量（VIL 模式下同步实车速度，设计文档 §4.4.1）。
 
         Args:
             vx: X 方向速度（m/s）。
             vy: Y 方向速度（m/s）。
             vz: Z 方向速度（m/s）。
+
+        Raises:
+            CarlaSimulationError: Actor 已销毁或 CARLA 调用失败。
         """
         self._check_alive()
         speed = math.sqrt(vx * vx + vy * vy)
         if speed > self._params.max_speed_ms * 1.1:
             logger.warning(f"Speed {speed:.2f} m/s exceeds HUNTER SE max {self._params.max_speed_ms} m/s")
+        try:
+            vec = _make_carla_vector3d(vx, vy, vz)
+            self._actor.set_velocity(vec)
+        except Exception as exc:
+            raise CarlaSimulationError("apply_velocity", str(exc)) from exc
+
+    def apply_angular_velocity(self, wx: float, wy: float, wz: float) -> None:
+        """设置车辆角速度（设计文档 §3.3.2 直接位姿控制）。
+
+        Args:
+            wx: X 方向角速度（rad/s）。
+            wy: Y 方向角速度（rad/s）。
+            wz: Z 方向角速度（rad/s）。
+
+        Raises:
+            CarlaSimulationError: Actor 已销毁或 CARLA 调用失败。
+        """
+        self._check_alive()
+        try:
+            vec = _make_carla_vector3d(wx, wy, wz)
+            self._actor.set_angular_velocity(vec)
+        except Exception as exc:
+            raise CarlaSimulationError("apply_angular_velocity", str(exc)) from exc
 
     def get_state(self) -> VehicleState:
         """从仿真 Actor 读取当前车辆状态。
@@ -338,6 +366,12 @@ def _make_carla_transform(transform: Transform) -> Any:
             roll=math.degrees(transform.roll),
         ),
     )
+
+
+def _make_carla_vector3d(x: float, y: float, z: float) -> Any:
+    """创建 carla.Vector3D 对象（延迟导入）。"""
+    import carla  # noqa: PLC0415
+    return carla.Vector3D(x=x, y=y, z=z)
 
 
 def _make_carla_vehicle_control(cmd: VehicleControlCommand) -> Any:

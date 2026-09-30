@@ -52,6 +52,14 @@ _MAX_CONCURRENT_INSTANCES: dict[QualityLevel, int] = {
 }
 
 
+# 画质等级 → CarlaUE4 命令行 -quality-level 参数值（设计文档 §3.1.1）
+_QUALITY_LEVEL_FLAGS: dict[QualityLevel, str] = {
+    QualityLevel.LOW: "Low",
+    QualityLevel.MEDIUM: "Medium",
+    QualityLevel.EPIC: "Epic",
+}
+
+
 class CarlaServerConfig(BaseModel):
     """CARLA 服务端启动参数配置。
 
@@ -66,8 +74,12 @@ class CarlaServerConfig(BaseModel):
         world_map: 默认加载地图名称。
         offscreen: 是否使用离屏渲染（无窗口模式）。
         no_rendering: 是否禁用渲染（纯物理仿真）。
+        fps: 目标帧率（设计文档默认 50）。
+        benchmark: 基准模式（禁用帧率限制）。
+        nosound: 禁用声音。
         fixed_delta_seconds: 同步模式固定步长（秒）。
         substepping: 是否启用子步。
+        max_substep_delta_time: 子步最大时间（秒，设计文档 §3.1.2 为 0.01）。
         max_substeps: 最大子步数。
         extra_args: 额外的 CarlaUE4.exe 命令行参数。
     """
@@ -85,8 +97,12 @@ class CarlaServerConfig(BaseModel):
     world_map: str = Field("Town03", description="默认地图")
     offscreen: bool = Field(True, description="离屏渲染模式")
     no_rendering: bool = Field(False, description="禁用渲染（仅物理）")
+    fps: int = Field(50, ge=1, le=100, description="目标帧率（设计文档 §3.1.1）")
+    benchmark: bool = Field(True, description="基准模式（禁用帧率限制）")
+    nosound: bool = Field(True, description="禁用声音")
     fixed_delta_seconds: float = Field(0.02, gt=0.0, le=0.1, description="50Hz 步长")
     substepping: bool = True
+    max_substep_delta_time: float = Field(0.01, gt=0.0, le=0.1, description="子步最大时间（秒）")
     max_substeps: int = Field(4, ge=1, le=10)
     extra_args: list[str] = Field(default_factory=list)
 
@@ -106,25 +122,56 @@ class CarlaServerConfig(BaseModel):
         """返回当前画质下单 GPU 最大并发实例数。"""
         return _MAX_CONCURRENT_INSTANCES[self.quality]
 
+    def build_sync_settings(self) -> dict[str, object]:
+        """构建同步模式（VIL 实时）world settings 参数字典（设计文档 §3.1.2）。
+
+        Returns:
+            可直接应用于 carla.WorldSettings 属性的键值字典：
+            同步模式 + 固定步长 20ms + 物理子步（0.01s × 4）。
+        """
+        return {
+            "synchronous_mode": True,
+            "fixed_delta_seconds": self.fixed_delta_seconds,
+            "substepping": self.substepping,
+            "max_substep_delta_time": self.max_substep_delta_time,
+            "max_substeps": self.max_substeps,
+        }
+
+    def build_async_settings(self) -> dict[str, object]:
+        """构建异步模式（回放/SIL）world settings 参数字典（设计文档 §3.1.2）。
+
+        Returns:
+            异步模式键值字典，步长可变（None = 按真实时间推进）。
+        """
+        return {
+            "synchronous_mode": False,
+            "fixed_delta_seconds": None,
+        }
+
     def build_carla_exe_args(self) -> list[str]:
         """构建 CarlaUE4.exe 命令行参数列表。
 
         Returns:
             命令行参数字符串列表。
         """
+        # 设计文档 §3.1.1 标准启动参数：RPC/流端口、画质、音频、帧率、基准模式
         args: list[str] = [
             f"-carla-rpc-port={self.rpc_port}",
+            f"-carla-streaming-port={self.stream_port}",
+            f"-quality-level={_QUALITY_LEVEL_FLAGS[self.quality]}",
             f"-ini:Script/Carla.Config.DefaultGeneralSettings:[/Script/Carla.CarlaSettings]DefaultMap={self.world_map}",
         ]
+        if self.nosound:
+            args.append("-nosound")
+        args.append(f"-fps={self.fps}")
+        if self.benchmark:
+            args.append("-benchmark")
         if self.offscreen:
             args.append("-RenderOffScreen")
         if self.no_rendering:
             args.append("-nullrhi")
         if self.gpu_id >= 0:
-            args.append(f"-graphicsadapter={self.gpu_id}")
-        profile = self.get_quality_profile()
-        quality_flag_map = {"low": "-quality", "medium": "-quality", "epic": "-epic"}
-        args.append(quality_flag_map[self.quality.value])
+            args.append(f"-gpu={self.gpu_id}")
         args.extend(self.extra_args)
         return args
 

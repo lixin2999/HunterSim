@@ -5,8 +5,9 @@
     "num_vehicles": 20,
     "num_walkers": 10,
     "follow_distance_m": 2.0,
+    "speed_limit_percentage": 80.0,
+    "allow_lane_change": true,
     "ignore_traffic_light_rate": 0.0,
-    "ignore_lane_change_rate": 0.3,
     "aggressive_driving_rate": 0.1,
     "use_mixed_blueprints": true,
     "tm_port": 8000,
@@ -27,7 +28,7 @@
       "description": "高密度（城市中心/交叉口）",
       "num_vehicles": 50,
       "num_walkers": 20,
-      "ignore_lane_change_rate": 0.6
+      "allow_lane_change": false
     },
     "pedestrian_heavy": {
       "description": "行人密集（学校/商业区）",
@@ -58,6 +59,15 @@
     ],
     "emergency": [
       "vehicle.ford.ambulance"
+    ]
+  },
+  "static_obstacles": {
+    "description": "静态障碍物蓝图（锥桶、路障等，设计文档 §7.2）",
+    "props": [
+      "static.prop.constructioncone",
+      "static.prop.trafficcone",
+      "static.prop.barrier",
+      "static.prop.warningtriangle"
     ]
   }
 }

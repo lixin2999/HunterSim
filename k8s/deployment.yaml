@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.0.0
+          image: hunter-sim:2.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -83,9 +83,77 @@ spec:
             - name: configs
               mountPath: /home/hunter/app/configs
               readOnly: true
+            # 共享存储 PVC（设计文档 §15.1：地图资源/车辆模型/场景配置/仿真记录）
+            - name: shared-resources
+              mountPath: /home/hunter/app/resources
       volumes:
         - name: configs
           configMap:
             name: hunter-sim-configs
+        - name: shared-resources
+          persistentVolumeClaim:
+            claimName: hunter-sim-resources-pvc
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+# 共享存储 PVC（设计文档 §15.1）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hunter-sim-resources-pvc
+  namespace: hunter-sim
+spec:
+  accessModes:
+    - ReadWriteMany   # 仿真服务层与 CARLA GPU Pod 共享
+  resources:
+    requests:
+      storage: 500Gi  # §15.2 推荐存储配置
+---
+# CARLA 仿真引擎 GPU Pod（设计文档 §15.1/§10.2.3）
+# 需要 NVIDIA GPU Operator / Container Toolkit；每 Pod 分配 1 块 GPU，
+# 单 GPU 可承载 1-2 个实例（§10.3.2 并发限制由应用层 GPU 资源池调度）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carla-engine
+  namespace: hunter-sim
+  labels:
+    app: hunter-sim
+    component: carla-engine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hunter-sim
+      component: carla-engine
+  template:
+    metadata:
+      labels:
+        app: hunter-sim
+        component: carla-engine
+    spec:
+      containers:
+        - name: carla
+          image: hunter-carla:0.9.16   # docker/Dockerfile.carla（§15.3）
+          imagePullPolicy: IfNotPresent
+          args: ["-RenderOffScreen", "-quality-level=Medium", "-fps=30"]  # §13.4/附录 A
+          ports:
+            - containerPort: 2000
+              name: rpc
+            - containerPort: 2001
+              name: streaming
+          resources:
+            limits:
+              nvidia.com/gpu: "1"      # NVIDIA Container Toolkit 分配
+            requests:
+              memory: "8Gi"            # §13.3 单实例内存 4-8GB
+              cpu: "4"
+          volumeMounts:
+            - name: shared-resources
+              mountPath: /home/carla/carla/PythonAPI/hunter_assets/resources
+      volumes:
+        - name: shared-resources
+          persistentVolumeClaim:
+            claimName: hunter-sim-resources-pvc
       restartPolicy: Always
       terminationGracePeriodSeconds: 30

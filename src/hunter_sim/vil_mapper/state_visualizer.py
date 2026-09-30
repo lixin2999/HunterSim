@@ -1,7 +1,10 @@
 """VIL 状态可视化（PROMPT-ENG-002-C）。
 
-在 CARLA 仿真中可视化实车状态：速度、转向、刹车、感知目标。
-使用 world.debug.draw_box() 绘制半透明绿色感知框（life_time=0.1s）。
+在 CARLA 仿真中可视化实车状态（设计文档 §4.4.2）：
+- 速度：车辆中心向前的向量线（CARLA debug API 不支持浮动文字，速度数值由平台前端展示）
+- 刹车/转向灯：通过 vehicle.set_light_state 同步灯光状态
+- 规划轨迹：分段彩色折线叠加绘制
+- 感知目标：world.debug.draw_box() 绘制半透明绿色感知框（life_time=0.1s）
 """
 
 from __future__ import annotations
@@ -61,6 +64,79 @@ class StateVisualizer:
                 )
         except Exception as exc:
             logger.debug(f"draw_vehicle_state skipped: {exc}")
+
+    def apply_vehicle_lights(
+        self,
+        vehicle: Any,
+        brake: float = 0.0,
+        left_turn: bool = False,
+        right_turn: bool = False,
+        low_beam: bool = False,
+    ) -> None:
+        """同步实车灯光状态到虚拟车辆（设计文档 §4.4.2：刹车灯/转向灯）。
+
+        Args:
+            vehicle: CARLA Vehicle Actor。
+            brake: 刹车踏板开度 [0, 1]，> 0.05 视为踩下刹车。
+            left_turn: 左转向灯是否点亮。
+            right_turn: 右转向灯是否点亮。
+            low_beam: 近光灯是否点亮（夜间环境自动开启）。
+        """
+        if not self._enabled or vehicle is None:
+            return
+        try:
+            import carla  # noqa: PLC0415
+
+            vls = carla.VehicleLightState
+            state = vls.NONE
+            if brake > 0.05:
+                state = state | vls.Brake
+            if left_turn:
+                state = state | vls.LeftTurnLight
+            if right_turn:
+                state = state | vls.RightTurnLight
+            if low_beam:
+                state = state | vls.LowBeam
+            vehicle.set_light_state(state)
+        except Exception as exc:
+            logger.debug(f"apply_vehicle_lights skipped: {exc}")
+
+    def draw_planned_trajectory(
+        self,
+        points: list[tuple[float, float, float]],
+        color: tuple[int, int, int] = (255, 64, 64),
+        life_time: float = 0.1,
+    ) -> int:
+        """绘制规划轨迹（分段彩色折线，设计文档 §4.4.2）。
+
+        Args:
+            points: 轨迹点列表 (x, y, z)，CARLA 地图坐标。
+            color: 线条颜色 (R, G, B)。
+            life_time: 绘制存活时间（秒）。
+
+        Returns:
+            实际绘制的线段数量。
+        """
+        if not self._enabled or len(points) < 2:
+            return 0
+        drawn = 0
+        try:
+            import carla  # noqa: PLC0415
+
+            for (x1, y1, z1), (x2, y2, z2) in zip(points[:-1], points[1:]):
+                start = carla.Location(x=x1, y=y1, z=z1 + 0.2)
+                end = carla.Location(x=x2, y=y2, z=z2 + 0.2)
+                self._world.debug.draw_line(
+                    start, end,
+                    thickness=0.08,
+                    color=carla.Color(*color),
+                    life_time=life_time,
+                    persistent_lines=False,
+                )
+                drawn += 1
+        except Exception as exc:
+            logger.debug(f"draw_planned_trajectory interrupted: {exc}")
+        return drawn
 
 
 class PerceptionOverlay:

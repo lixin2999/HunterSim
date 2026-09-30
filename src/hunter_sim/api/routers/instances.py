@@ -1,7 +1,8 @@
 """实例管理路由（PROMPT-API-001）。
 
-路由组：/instances
-提供仿真实例的创建、查询、启动、停止、暂停、恢复、销毁操作。
+路由组：/instances，对应设计文档 §12.1 接口表：
+创建/列表/详情/销毁、start/stop/pause/resume、实时状态、
+场景下发（§12.4）、天气（§12.1）、VIL 标定（§12.3）、截图/视频流地址。
 """
 
 from __future__ import annotations
@@ -10,11 +11,21 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from hunter_sim.api.deps import get_current_user
+from hunter_sim.api.deps import get_current_user, get_settings, require_admin
+from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.models import (
     ApiResponse,
+    CalibrationRequest,
     CreateInstanceRequest,
     InstanceResponse,
+    InstanceSceneRequest,
+    SetWeatherRequest,
+)
+from hunter_sim.api.routers.scenes import (
+    calibrate_impl,
+    load_scene_impl,
+    screenshot_impl,
+    set_weather_impl,
 )
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
 from hunter_sim.common.models import InstanceStatus
@@ -64,30 +75,74 @@ def _instance_to_response(inst: Any) -> InstanceResponse:
 async def create_instance(
     body: CreateInstanceRequest,
     request: Request,
-    user_id: str = Depends(get_current_user),
+    user_id: str = Depends(require_admin),
 ) -> ApiResponse:
-    """POST /api/v1/sim/instances
+    """POST /api/v1/sim/instances（设计文档 §12.2）
 
     创建一个新的 CARLA 仿真实例，分配 GPU 资源并启动容器。
-
-    - **mode**: 仿真模式（vil/sil/replay）
-    - **map_id**: 地图 ID（如 Town03）
-    - **quality**: 画质等级（low/medium/epic）
+    安全约束（§14.2）：需管理员角色，并受单用户并发配额限制；
+    自车模型需在平台审核白名单内（§14.3）。
+    响应含 carla_server 连接信息与 WebRTC 视频流地址。
     """
     mgr = _get_instance_manager(request)
+
+    # 资源白名单：仅允许平台审核通过的车辆模型（§14.3）
+    from hunter_sim.engine.vehicle_blueprint_generator import SUPPORTED_VEHICLES  # noqa: PLC0415
+
+    allowed_models = {v["blueprint_id"] for v in SUPPORTED_VEHICLES} | {"hunter.se"}
+    if body.vehicle_model not in allowed_models:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Vehicle model '{body.vehicle_model}' is not in the platform-approved whitelist. "
+                f"Allowed: {sorted(allowed_models)}"
+            ),
+        )
+
+    # 单用户并发配额（§14.2 默认 5 个）
+    quota_mgr = getattr(request.app.state, "quota_manager", None)
+    if quota_mgr is not None:
+        try:
+            quota_mgr.check_and_reserve(user_id)
+        except ResourceError as exc:
+            logger.error(f"Quota check failed for user '{user_id}': {exc}")
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
     try:
         inst = mgr.create_instance(
             mode=body.mode,
-            map_id=body.map_id,
+            map_id=body.map,
             quality=body.quality,
             user_id=user_id,
             vehicle_id=body.vehicle_id,
             scene_id=body.scene_id,
+            vehicle_model=body.vehicle_model,
+            replay_config=body.replay_config.model_dump() if body.replay_config else None,
         )
     except ResourceError as exc:
+        if quota_mgr is not None:
+            quota_mgr.release(user_id)
         logger.error(f"Resource allocation failed: {exc}")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-    return ApiResponse(data=_instance_to_response(inst).model_dump())
+
+    audit_log(
+        "instance.create", user_id, inst.sim_instance_id,
+        f"map={body.map} mode={body.mode.value} quality={body.quality.value}",
+    )
+
+    # 文档 §12.2 创建响应结构
+    settings = get_settings()
+    data = {
+        "sim_instance_id": inst.sim_instance_id,
+        "status": inst.status.value,
+        "carla_server": {
+            "host": inst.carla_host,
+            "rpc_port": inst.carla_rpc_port,
+            "stream_port": inst.carla_stream_port,
+        },
+        "stream_url": f"{settings.api.stream_base_url}/sim/{inst.sim_instance_id}",
+    }
+    return ApiResponse(data=data)
 
 
 @router.get("", response_model=ApiResponse, summary="列出实例")
@@ -126,7 +181,7 @@ async def get_instance(
 async def start_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/start
 
@@ -137,6 +192,7 @@ async def start_instance(
         mgr.transition(instance_id, InstanceStatus.RUNNING)
     except InstanceStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    audit_log("instance.start", user_id, instance_id)
     inst = mgr.get_instance(instance_id)
     return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
 
@@ -145,7 +201,7 @@ async def start_instance(
 async def stop_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/stop
 
@@ -156,6 +212,7 @@ async def stop_instance(
         mgr.transition(instance_id, InstanceStatus.COMPLETED)
     except InstanceStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    audit_log("instance.stop", user_id, instance_id)
     inst = mgr.get_instance(instance_id)
     return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
 
@@ -196,15 +253,118 @@ async def resume_instance(
 async def destroy_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(require_admin),
 ) -> ApiResponse:
     """DELETE /api/v1/sim/instances/{instance_id}
 
-    销毁实例并释放 GPU 资源。
+    销毁实例并释放 GPU 资源与用户配额（§14.2 需管理员权限）。
     """
     mgr = _get_instance_manager(request)
     inst = mgr.get_instance(instance_id)
     if inst is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
+    owner_id = inst.user_id
     mgr.destroy_instance(instance_id)
+    # 释放用户配额名额（§14.2）
+    quota_mgr = getattr(request.app.state, "quota_manager", None)
+    if quota_mgr is not None and owner_id:
+        quota_mgr.release(owner_id)
+    audit_log("instance.destroy", user_id, instance_id, f"owner={owner_id or user_id}")
     return ApiResponse(data={"sim_instance_id": instance_id, "destroyed": True})
+
+
+@router.get("/{instance_id}/status", response_model=ApiResponse, summary="实例实时状态")
+async def get_instance_status(
+    instance_id: str,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """GET /api/v1/sim/instances/{instance_id}/status
+
+    返回实例实时状态，数据结构遵循设计文档 §10.2.2 实例数据模型。
+    """
+    mgr = _get_instance_manager(request)
+    inst = mgr.get_instance(instance_id)
+    if inst is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
+    return ApiResponse(data=inst.to_dict())
+
+
+@router.post("/{instance_id}/scene", response_model=ApiResponse, summary="下发场景配置")
+async def assign_scene(
+    instance_id: str,
+    body: InstanceSceneRequest,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """POST /api/v1/sim/instances/{instance_id}/scene（设计文档 §12.4）
+
+    向指定实例下发场景配置，scene_config 为完整场景 JSON。
+    """
+    data = load_scene_impl(request, instance_id, body.scene_config)
+    if body.scene_id and data["scene_id"] != body.scene_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"scene_id mismatch: request '{body.scene_id}' vs config '{data['scene_id']}'",
+        )
+    return ApiResponse(data=data)
+
+
+@router.post("/{instance_id}/weather", response_model=ApiResponse, summary="设置天气")
+async def set_instance_weather(
+    instance_id: str,
+    body: SetWeatherRequest,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """POST /api/v1/sim/instances/{instance_id}/weather（设计文档 §12.1）"""
+    return ApiResponse(data=set_weather_impl(request, instance_id, body))
+
+
+@router.post("/{instance_id}/vil/calibrate", response_model=ApiResponse, summary="VIL 初始位置标定")
+async def vil_calibrate(
+    instance_id: str,
+    body: CalibrationRequest,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """POST /api/v1/sim/instances/{instance_id}/vil/calibrate（设计文档 §12.3）
+
+    标定实车 odom 原点在仿真地图中的对应位置和朝向。
+    """
+    resp = calibrate_impl(request, instance_id, body)
+    return ApiResponse(data=resp.model_dump())
+
+
+@router.get("/{instance_id}/screenshot", response_model=ApiResponse, summary="获取仿真截图")
+async def get_instance_screenshot(
+    instance_id: str,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """GET /api/v1/sim/instances/{instance_id}/screenshot（设计文档 §12.1）"""
+    return ApiResponse(data=screenshot_impl(request, instance_id))
+
+
+@router.get("/{instance_id}/stream", response_model=ApiResponse, summary="获取视频流地址")
+async def get_instance_stream(
+    instance_id: str,
+    request: Request,
+    _: str = Depends(get_current_user),
+) -> ApiResponse:
+    """GET /api/v1/sim/instances/{instance_id}/stream（设计文档 §12.1）
+
+    返回 WebRTC 仿真画面视频流地址。
+    """
+    mgr = _get_instance_manager(request)
+    inst = mgr.get_instance(instance_id)
+    if inst is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
+    settings = get_settings()
+    return ApiResponse(
+        data={
+            "sim_instance_id": instance_id,
+            "stream_url": f"{settings.api.stream_base_url}/sim/{instance_id}",
+            "protocol": "webrtc",
+        }
+    )

@@ -137,6 +137,9 @@ class MapManager:
     def load_map(self, map_id: str) -> CarlaWorldProtocol:
         """加载内置地图或已注册的自定义地图。
 
+        支持 "custom/{map_name}" 引用形式（设计文档附录 B）：
+        若未注册，自动从 custom_map_dir 目录查找 {map_name}.xodr 并导入。
+
         Args:
             map_id: 地图 ID。
 
@@ -147,6 +150,13 @@ class MapManager:
             ConfigurationError: 地图 ID 未注册。
             CarlaSimulationError: 加载过程中发生错误。
         """
+        if map_id not in self._loaded_maps and map_id.startswith("custom/"):
+            # 附录 B：创建实例时指定 map: "custom/{map_name}"，动态导入后加载
+            name = map_id.split("/", 1)[1]
+            xodr_path = self._custom_map_dir / f"{name}.xodr"
+            if xodr_path.exists():
+                self.import_opendrive_map(map_id, xodr_path)
+
         if map_id not in self._loaded_maps:
             raise ConfigurationError(
                 operation="load_map",

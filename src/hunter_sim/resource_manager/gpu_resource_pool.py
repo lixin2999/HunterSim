@@ -15,11 +15,18 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
-# 单 GPU 并发实例上限（按画质）
+# 单 GPU 并发实例上限（按画质，设计文档 §10.3.2：1× RTX 3090 → Epic 2 / Medium 4 / Low 8）
 _QUALITY_CAPACITY: dict[QualityLevel, int] = {
     QualityLevel.LOW: 8,
     QualityLevel.MEDIUM: 4,
     QualityLevel.EPIC: 2,
+}
+
+# 过载降级顺序（文档 §10.3.1：降低画质以增加并发数）
+_DOWNGRADE_ORDER: dict[QualityLevel, list[QualityLevel]] = {
+    QualityLevel.EPIC: [QualityLevel.MEDIUM, QualityLevel.LOW],
+    QualityLevel.MEDIUM: [QualityLevel.LOW],
+    QualityLevel.LOW: [],
 }
 
 
@@ -84,15 +91,47 @@ class GPUResourcePool:
         self._lock: threading.Lock = threading.Lock()
         logger.info(f"GPUResourcePool initialized with {gpu_count} device(s)")
 
-    def allocate(self, quality: QualityLevel) -> int:
+    def allocate(self, quality: QualityLevel, allow_downgrade: bool = False) -> int:
         """分配一块 GPU，返回 gpu_id；无可用 GPU 时返回 -1。
 
         选择负载最低（active_instances 最少）且有容量的 GPU。
+
+        Args:
+            quality: 请求的渲染画质。
+            allow_downgrade: 过载时是否允许降级画质分配（文档 §10.3.1）。
         """
+        gpu_id, _ = self.allocate_ex(quality, allow_downgrade=allow_downgrade)
+        return gpu_id
+
+    def allocate_ex(
+        self,
+        quality: QualityLevel,
+        allow_downgrade: bool = True,
+    ) -> tuple[int, QualityLevel]:
+        """分配 GPU 并返回实际生效的画质。
+
+        Args:
+            quality: 请求的渲染画质。
+            allow_downgrade: 无容量时是否按 Epic→Medium→Low 顺序降级。
+
+        Returns:
+            (gpu_id, 实际画质)；分配失败时返回 (-1, 原始画质)。
+        """
+        tiers = [quality] + (_DOWNGRADE_ORDER.get(quality, []) if allow_downgrade else [])
+        for tier in tiers:
+            gpu_id = self._allocate_exact(tier)
+            if gpu_id >= 0:
+                if tier != quality:
+                    logger.info(f"GPU overload: quality downgraded {quality.value} -> {tier.value}")
+                return gpu_id, tier
+        logger.warning(f"No GPU capacity for quality={quality.value}")
+        return -1, quality
+
+    def _allocate_exact(self, quality: QualityLevel) -> int:
+        """按指定画质在负载最低的设备上分配，失败返回 -1。"""
         with self._lock:
             candidates = [d for d in self._devices if d.has_capacity(quality) and d.memory_ok(quality)]
             if not candidates:
-                logger.warning(f"No GPU capacity for quality={quality.value}")
                 return -1
             # 按总活跃实例数最少排序
             candidates.sort(key=lambda d: sum(d.active_instances.values()))

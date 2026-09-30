@@ -59,6 +59,24 @@ class TestGPUResourcePool:
         assert len(status) == 1
         assert status[0]["active_medium"] == 1
 
+    def test_allocate_ex_downgrades_on_overload(self) -> None:
+        """过载降级：EPIC 容量耗尽后自动降为 MEDIUM（文档 §10.3.1）。"""
+        pool = GPUResourcePool(gpu_count=1, total_memory_gb=64.0)
+        assert pool.allocate_ex(QualityLevel.EPIC) == (0, QualityLevel.EPIC)
+        assert pool.allocate_ex(QualityLevel.EPIC) == (0, QualityLevel.EPIC)
+        # EPIC 容量（2）已满，降级到 MEDIUM
+        gid, actual = pool.allocate_ex(QualityLevel.EPIC, allow_downgrade=True)
+        assert gid == 0
+        assert actual == QualityLevel.MEDIUM
+
+    def test_allocate_ex_no_downgrade_returns_minus_one(self) -> None:
+        pool = GPUResourcePool(gpu_count=1, total_memory_gb=64.0)
+        pool.allocate_ex(QualityLevel.EPIC)
+        pool.allocate_ex(QualityLevel.EPIC)
+        gid, actual = pool.allocate_ex(QualityLevel.EPIC, allow_downgrade=False)
+        assert gid == -1
+        assert actual == QualityLevel.EPIC
+
 
 class TestResourceQuotaManager:
     """配额管理测试。"""
@@ -153,3 +171,69 @@ class TestSimInstanceManager:
         mgr.destroy_instance(i1.sim_instance_id)
         i3 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
         assert i3.gpu_id >= 0
+
+    def test_overload_downgrade_creates_lower_quality(self) -> None:
+        """开启过载后，EPIC 满容时以 MEDIUM 画质创建实例（文档 §10.3.1）。"""
+        from hunter_sim.common.models import ResourceSettings
+        pool = GPUResourcePool(gpu_count=1, total_memory_gb=64.0)
+        mgr = SimInstanceManager(
+            settings=ResourceSettings(gpu_allow_overload_downgrade=True), gpu_pool=pool
+        )
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        inst = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        assert inst.quality == QualityLevel.MEDIUM
+        assert inst.gpu_id == 0
+
+    def test_overload_downgrade_disabled_by_default(self) -> None:
+        """默认不开启过载时保持严格分配语义。"""
+        from hunter_sim.common.models import ResourceSettings
+        pool = GPUResourcePool(gpu_count=1, total_memory_gb=64.0)
+        mgr = SimInstanceManager(settings=ResourceSettings(), gpu_pool=pool)
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        with pytest.raises(ResourceError):
+            mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+
+
+class TestSimInstanceDataModel:
+    """实例数据模型序列化测试（设计文档 §10.2.2）。"""
+
+    def test_to_dict_matches_doc_structure(self) -> None:
+        from hunter_sim.resource_manager.instance_manager import SimInstance
+        inst = SimInstance(
+            sim_instance_id="sim_001",
+            status=InstanceStatus.RUNNING,
+            mode=SimMode.VIL,
+            map_id="Town03",
+            quality=QualityLevel.MEDIUM,
+            gpu_id=0,
+            carla_host="10.0.0.10",
+            scene_id="scene_001",
+            vehicle_id="HUNTER-001",
+            create_time=1755597600.0,
+            start_time=1755597605.0,
+            docker_container_id="abc123",
+        )
+        d = inst.to_dict()
+        assert d["sim_instance_id"] == "sim_001"
+        assert d["status"] == "running"
+        assert d["carla_server"] == {
+            "host": "10.0.0.10", "rpc_port": 2000, "stream_port": 2001, "container_id": "abc123",
+        }
+        assert d["map"] == "Town03"
+        assert d["scene_id"] == "scene_001"
+        assert d["mode"] == "vil"
+        assert d["vehicle_id"] == "HUNTER-001"
+        assert d["create_time"].startswith("2025-08-19T10:00:00")
+        assert d["start_time"].startswith("2025-08-19T10:00:05")
+        assert d["gpu_id"] == 0
+        assert d["resources"] == {"cpu_limit": "4", "memory_limit": "8Gi", "gpu_limit": "1"}
+
+    def test_start_time_none_when_not_started(self) -> None:
+        from hunter_sim.resource_manager.instance_manager import SimInstance
+        inst = SimInstance(
+            sim_instance_id="sim_x", status=InstanceStatus.CREATED, mode=SimMode.SIL,
+            map_id="Town01", quality=QualityLevel.LOW, gpu_id=0,
+        )
+        assert inst.to_dict()["start_time"] is None

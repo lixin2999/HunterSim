@@ -20,6 +20,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from hunter_sim.common.exceptions import KafkaConnectionError, ValidationError
 from hunter_sim.common.models import (
+    DetectedObject,
     KafkaSettings,
     PerceptionResult,
     Transform,
@@ -172,6 +173,12 @@ class VILDataConsumer:
             self._error_count += 1
             return
 
+        # 只处理目标车辆数据（设计文档 §4.2.2：vehicle_id 过滤）
+        remote_vid = payload.get("vehicle_id")
+        if remote_vid is not None and str(remote_vid) != self._vehicle_id:
+            logger.debug(f"Skip message from non-target vehicle '{remote_vid}'")
+            return
+
         try:
             if topic == self._settings.telemetry_topic:
                 frame = self._parse_telemetry(payload)
@@ -227,9 +234,37 @@ class VILDataConsumer:
         perception: Optional[PerceptionResult] = None
         if "perception" in payload:
             perc_data = payload["perception"]
+            # 解析感知目标列表（设计文档 §4.4.3：x/y/length/width 等字段）
+            objects: list[DetectedObject] = []
+            for idx, obj in enumerate(perc_data.get("objects", [])):
+                if not isinstance(obj, dict):
+                    continue
+                objects.append(
+                    DetectedObject(
+                        object_id=int(obj.get("id", idx)),
+                        object_type=str(obj.get("type", "unknown")),
+                        transform=Transform(
+                            x=float(obj.get("x", 0.0)),
+                            y=float(obj.get("y", 0.0)),
+                            z=float(obj.get("z", 0.0)),
+                            yaw=float(obj.get("heading", 0.0)),
+                        ),
+                        size=(
+                            float(obj.get("length", 4.0)),
+                            float(obj.get("width", 2.0)),
+                            float(obj.get("height", 1.5)),
+                        ),
+                        velocity=(
+                            float(obj.get("vx", 0.0)),
+                            float(obj.get("vy", 0.0)),
+                            0.0,
+                        ),
+                        confidence=float(obj.get("confidence", 1.0)),
+                    )
+                )
             perception = PerceptionResult(
                 time_stamp=float(perc_data.get("timestamp", ts)),
-                objects=[],  # 目标列表由 perception_overlay 处理
+                objects=objects,
             )
 
         return TelemetryFrame(

@@ -31,7 +31,7 @@ class WalkerControllerWrapper:
         self._max_speed = _WALKER_MAX_SPEED_MS
 
     def start_navigation(self, destination: Any, speed_ms: float = 1.2) -> None:
-        """启动行人向目标点行走。
+        """启动行人向目标点行走（文档 §7.5：start → go_to_location → set_max_speed）。
 
         Args:
             destination: carla.Location 目标位置。
@@ -40,7 +40,8 @@ class WalkerControllerWrapper:
         speed = min(self._max_speed, max(0.1, speed_ms))
         try:
             self._controller.start()
-            self._controller.go_to(destination, speed)
+            self._controller.set_max_speed(speed)
+            self._controller.go_to_location(destination)
             logger.debug(f"Walker navigation started, speed={speed:.2f} m/s")
         except Exception as exc:
             raise CarlaSimulationError("walker_nav_start", str(exc)) from exc
@@ -56,7 +57,8 @@ class WalkerControllerWrapper:
         """更新行人目的地（不重启导航）。"""
         speed = min(self._max_speed, max(0.1, speed_ms))
         try:
-            self._controller.go_to(destination, speed)
+            self._controller.set_max_speed(speed)
+            self._controller.go_to_location(destination)
         except Exception as exc:
             logger.warning(f"Walker set destination error: {exc}")
 

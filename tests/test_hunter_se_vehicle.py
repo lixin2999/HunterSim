@@ -43,6 +43,8 @@ class _StubActor:
         self.destroyed = False
         self.last_transform: Any = None
         self.last_control: Any = None
+        self.last_velocity: Any = None
+        self.last_angular_velocity: Any = None
         self._loc = MockLocation(1.0, 2.0, 0.5)
         self._rot = _Rot(0.0, 90.0, 0.0)
         self._vel = _Vec3(speed, 0.0, 0.0)
@@ -51,6 +53,16 @@ class _StubActor:
         if self.destroyed:
             raise RuntimeError("destroyed")
         self.last_transform = tf
+
+    def set_velocity(self, vec: Any) -> None:
+        if self.destroyed:
+            raise RuntimeError("destroyed")
+        self.last_velocity = vec
+
+    def set_angular_velocity(self, vec: Any) -> None:
+        if self.destroyed:
+            raise RuntimeError("destroyed")
+        self.last_angular_velocity = vec
 
     def apply_control(self, ctrl: Any) -> None:
         if self.destroyed:
@@ -90,10 +102,15 @@ def fake_carla(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, **kw: Any) -> None:
             self.__dict__.update(kw)
 
+    class _Vector3D:
+        def __init__(self, x: float = 0, y: float = 0, z: float = 0) -> None:
+            self.x, self.y, self.z = x, y, z
+
     mod.Location = _Loc  # type: ignore[attr-defined]
     mod.Rotation = _Rotation  # type: ignore[attr-defined]
     mod.Transform = _Transform  # type: ignore[attr-defined]
     mod.VehicleControl = _VehicleControl  # type: ignore[attr-defined]
+    mod.Vector3D = _Vector3D  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "carla", mod)
 
 
@@ -123,8 +140,24 @@ class TestVILController:
         assert state.transform.yaw == pytest.approx(math.pi / 2)
 
     def test_apply_velocity_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        ctrl = HunterSEVehicleController(_StubActor())
+        actor = _StubActor()
+        ctrl = HunterSEVehicleController(actor)
         ctrl.apply_velocity(100.0, 0.0, 0.0)  # 超限速触发 warning（不抛异常）
+        assert actor.last_velocity is not None
+
+    def test_apply_velocity_sets_actor(self) -> None:
+        # 设计文档 §4.4.1：VIL 模式同步实车速度到虚拟车辆
+        actor = _StubActor()
+        ctrl = HunterSEVehicleController(actor)
+        ctrl.apply_velocity(2.0, 0.5, 0.0)
+        assert actor.last_velocity.x == pytest.approx(2.0)
+        assert actor.last_velocity.y == pytest.approx(0.5)
+
+    def test_apply_angular_velocity(self) -> None:
+        actor = _StubActor()
+        ctrl = HunterSEVehicleController(actor)
+        ctrl.apply_angular_velocity(0.0, 0.0, 0.3)
+        assert actor.last_angular_velocity.z == pytest.approx(0.3)
 
     def test_destroy_then_error(self) -> None:
         actor = _StubActor()

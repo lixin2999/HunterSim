@@ -1,7 +1,8 @@
 """场景管理路由（PROMPT-API-001）。
 
-路由组：/scenes
-提供场景下发、状态查询、天气控制、VIL 标定接口。
+路由组：/scenes（内部扩展路径，文档 §12.1 标准路径为 /instances/{id}/...）
+场景下发、天气控制、VIL 标定、截图的核心实现提取为 *_impl 函数，
+供 instances 路由（文档标准接口）复用。
 """
 
 from __future__ import annotations
@@ -38,6 +39,143 @@ def _get_scene_runner(request: Request, instance_id: str) -> Any:
     return runner
 
 
+# ─── 核心实现（供 /scenes 与 /instances 两组路由复用） ────────────────────
+
+
+def load_scene_impl(request: Request, instance_id: str, scene_config: dict[str, Any]) -> dict[str, Any]:
+    """校验并下发场景配置到指定实例的场景运行器。
+
+    Args:
+        request: FastAPI 请求（用于访问 app.state.scene_runners）。
+        instance_id: 目标仿真实例 ID。
+        scene_config: 场景配置 JSON（SceneConfig 格式）。
+
+    Returns:
+        包含 instance_id/scene_id/status 的响应数据。
+    """
+    from hunter_sim.scene_runner.scene_config import SceneConfig  # noqa: PLC0415
+
+    runner = _get_scene_runner(request, instance_id)
+
+    try:
+        config = SceneConfig(**scene_config)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Scene config validation failed: {exc}",
+        ) from exc
+
+    try:
+        runner.load_scene(config)
+    except Exception as exc:
+        logger.error(f"Scene load failed for instance {instance_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Scene load failed: {exc}",
+        ) from exc
+
+    return {"instance_id": instance_id, "scene_id": config.scene_id, "status": "ready"}
+
+
+def set_weather_impl(request: Request, instance_id: str, body: SetWeatherRequest) -> dict[str, Any]:
+    """设置实例天气（预设或自定义参数，支持渐变过渡）。"""
+    runner = _get_scene_runner(request, instance_id)
+    weather_mgr = getattr(runner, "weather_manager", None)
+    if weather_mgr is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Weather manager not available",
+        )
+
+    if body.preset:
+        # 使用预设环境
+        weather_mgr.apply_preset(body.preset, transition_seconds=body.transition_seconds)
+    else:
+        # 自定义参数
+        params: dict[str, float] = {}
+        if body.cloudiness is not None:
+            params["cloudiness"] = body.cloudiness
+        if body.precipitation is not None:
+            params["precipitation"] = body.precipitation
+        if body.road_wetness is not None:
+            params["road_wetness"] = body.road_wetness
+        if body.wind_intensity is not None:
+            params["wind_intensity"] = body.wind_intensity
+        if body.sun_altitude is not None:
+            params["sun_altitude"] = body.sun_altitude
+        if body.sun_azimuth is not None:
+            params["sun_azimuth"] = body.sun_azimuth
+
+        if not params:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No weather parameters specified",
+            )
+        weather_mgr.apply_custom(params, transition_seconds=body.transition_seconds)
+
+    return {"instance_id": instance_id, "applied": body.model_dump(exclude_none=True)}
+
+
+def calibrate_impl(request: Request, instance_id: str, body: CalibrationRequest) -> CalibrationResponse:
+    """VIL 坐标标定（设计文档 §12.3）。
+
+    建立 odom 位姿 (odom_x, odom_y, odom_heading) 到地图位姿
+    (map_x, map_y, map_heading) 的映射，推导 CoordinateTransformer
+    内部参数 (x0, y0, yaw0)：
+
+        yaw0 = -(map_heading + odom_heading)（弧度，含 CARLA 左手系取反约定）
+        (x0, y0) = (map_x, map_y) - R(yaw0) · (odom_x, odom_y)，Y 轴翻转补偿
+
+     odom 为默认原点 (0,0,0) 时退化为 x0=map_x, y0=map_y。
+    """
+    from hunter_sim.engine.coordinate_converter import CalibrationParams  # noqa: PLC0415
+
+    runner = _get_scene_runner(request, instance_id)
+    coord_transformer = getattr(runner, "coordinate_transformer", None)
+    if coord_transformer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Coordinate transformer not available (not VIL mode?)",
+        )
+
+    yaw0 = -math.radians(body.map_heading + body.odom_heading)
+    cos_y0 = math.cos(yaw0)
+    sin_y0 = math.sin(yaw0)
+    x_rot = body.odom_x * cos_y0 - body.odom_y * sin_y0
+    y_rot = body.odom_x * sin_y0 + body.odom_y * cos_y0
+    x0 = body.map_x - x_rot
+    y0 = body.map_y + y_rot  # CARLA 左手系 Y 翻转
+
+    coord_transformer.update_calibration(
+        CalibrationParams(x0=x0, y0=y0, yaw0=yaw0)
+    )
+
+    logger.info(
+        f"Calibration set for instance {instance_id}: "
+        f"x0={x0:.2f}, y0={y0:.2f}, yaw0={yaw0:.4f}rad"
+    )
+    return CalibrationResponse(
+        x0=round(x0, 6),
+        y0=round(y0, 6),
+        yaw0_rad=round(yaw0, 6),
+        map_x=body.map_x,
+        map_y=body.map_y,
+        map_heading=body.map_heading,
+    )
+
+
+def screenshot_impl(request: Request, instance_id: str) -> dict[str, Any]:
+    """获取实例当前帧 RGB 截图（Base64）。"""
+    runner = _get_scene_runner(request, instance_id)
+    screenshot: Optional[str] = getattr(runner, "get_latest_screenshot", lambda: None)()
+    if not screenshot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No screenshot available (RGB camera not active)",
+        )
+    return {"instance_id": instance_id, "image_base64": screenshot}
+
+
 # ─── 场景加载 ─────────────────────────────────────────────────────────────────
 
 
@@ -50,39 +188,8 @@ async def load_scene(
     """POST /api/v1/sim/scenes/load
 
     向指定实例下发场景配置。配置经过校验后转换为 CARLA 参数并加载。
-
-    - **instance_id**: 目标仿真实例 ID
-    - **scene_config**: 场景配置 JSON（SceneConfig 格式）
     """
-    from hunter_sim.scene_runner.scene_config import SceneConfig
-
-    runner = _get_scene_runner(request, body.instance_id)
-
-    # 解析并验证场景配置
-    try:
-        config = SceneConfig(**body.scene_config)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Scene config validation failed: {exc}",
-        ) from exc
-
-    try:
-        runner.load_scene(config)
-    except Exception as exc:
-        logger.error(f"Scene load failed for instance {body.instance_id}: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Scene load failed: {exc}",
-        ) from exc
-
-    return ApiResponse(
-        data={
-            "instance_id": body.instance_id,
-            "scene_id": config.scene_id,
-            "status": "ready",
-        }
-    )
+    return ApiResponse(data=load_scene_impl(request, body.instance_id, body.scene_config))
 
 
 @router.get("/{instance_id}/status", response_model=ApiResponse, summary="查询场景状态")
@@ -160,41 +267,7 @@ async def set_weather(
     设置仿真实例的天气参数，支持预设环境和自定义参数。
     渐变过渡时长可配置（transition_seconds），避免传感器数据跳变。
     """
-    runner = _get_scene_runner(request, instance_id)
-    weather_mgr = getattr(runner, "weather_manager", None)
-    if weather_mgr is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Weather manager not available",
-        )
-
-    if body.preset:
-        # 使用预设环境
-        weather_mgr.apply_preset(body.preset, transition_seconds=body.transition_seconds)
-    else:
-        # 自定义参数
-        params: dict[str, float] = {}
-        if body.cloudiness is not None:
-            params["cloudiness"] = body.cloudiness
-        if body.precipitation is not None:
-            params["precipitation"] = body.precipitation
-        if body.road_wetness is not None:
-            params["road_wetness"] = body.road_wetness
-        if body.wind_intensity is not None:
-            params["wind_intensity"] = body.wind_intensity
-        if body.sun_altitude is not None:
-            params["sun_altitude"] = body.sun_altitude
-        if body.sun_azimuth is not None:
-            params["sun_azimuth"] = body.sun_azimuth
-
-        if not params:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No weather parameters specified",
-            )
-        weather_mgr.apply_custom(params, transition_seconds=body.transition_seconds)
-
-    return ApiResponse(data={"instance_id": instance_id, "applied": body.model_dump(exclude_none=True)})
+    return ApiResponse(data=set_weather_impl(request, instance_id, body))
 
 
 # ─── VIL 标定 ─────────────────────────────────────────────────────────────────
@@ -209,26 +282,9 @@ async def set_calibration(
 ) -> ApiResponse:
     """POST /api/v1/sim/scenes/{instance_id}/calibrate
 
-    设置 VIL 虚实映射的初始坐标标定参数（实车启动点在 CARLA 地图中的位姿）。
-    标定后，实车 odom 坐标系与 CARLA 地图坐标系建立固定映射关系。
-
-    - **x0**: 初始 CARLA X 坐标（米）
-    - **y0**: 初始 CARLA Y 坐标（米）
-    - **yaw0_deg**: 初始 CARLA 航向（度，-180~180）
+    VIL 标定内部兼容路径，核心逻辑见 calibrate_impl（文档 §12.3）。
     """
-    runner = _get_scene_runner(request, instance_id)
-    coord_transformer = getattr(runner, "coordinate_transformer", None)
-    if coord_transformer is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Coordinate transformer not available (not VIL mode?)",
-        )
-
-    yaw0_rad = math.radians(body.yaw0_deg)
-    coord_transformer.set_calibration(body.x0, body.y0, yaw0_rad)
-
-    resp = CalibrationResponse(x0=body.x0, y0=body.y0, yaw0_rad=round(yaw0_rad, 6))
-    logger.info(f"Calibration set for instance {instance_id}: x0={body.x0}, y0={body.y0}, yaw0={yaw0_rad:.4f}rad")
+    resp = calibrate_impl(request, instance_id, body)
     return ApiResponse(data=resp.model_dump())
 
 
@@ -245,11 +301,4 @@ async def get_screenshot(
 
     获取当前帧的 RGB 相机截图（Base64 编码 PNG）。
     """
-    runner = _get_scene_runner(request, instance_id)
-    screenshot: Optional[str] = getattr(runner, "get_latest_screenshot", lambda: None)()
-    if not screenshot:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No screenshot available (RGB camera not active)",
-        )
-    return ApiResponse(data={"instance_id": instance_id, "image_base64": screenshot})
+    return ApiResponse(data=screenshot_impl(request, instance_id))

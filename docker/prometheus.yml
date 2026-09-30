@@ -4,6 +4,10 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# 告警规则（设计文档 §15.4 监控与告警阈值）
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   # HunterSim 仿真服务指标（免鉴权端点）
   - job_name: "hunter-sim"

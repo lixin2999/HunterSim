@@ -11,10 +11,13 @@ from hunter_sim.traffic_sim.walker_controller import WalkerControllerWrapper
 
 
 class _RecordingController:
+    """符合文档 §7.5 API 的控制器桩：start/go_to_location/set_max_speed。"""
+
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
-        self.go_calls: list[tuple[Any, float]] = []
+        self.go_calls: list[Any] = []
+        self.speed_calls: list[float] = []
 
     def start(self) -> None:
         self.started = True
@@ -22,8 +25,11 @@ class _RecordingController:
     def stop(self) -> None:
         self.stopped = True
 
-    def go_to(self, destination: Any, speed: float) -> None:
-        self.go_calls.append((destination, speed))
+    def go_to_location(self, destination: Any) -> None:
+        self.go_calls.append(destination)
+
+    def set_max_speed(self, speed: float) -> None:
+        self.speed_calls.append(speed)
 
 
 class _Walker:
@@ -47,20 +53,24 @@ class TestNavigation:
         wc = WalkerControllerWrapper(_Walker(), ctrl)
         wc.start_navigation("DEST", speed_ms=5.0)  # 超过上限
         assert ctrl.started is True
-        assert ctrl.go_calls[0][1] == pytest.approx(1.4)  # 最大步速
+        assert ctrl.go_calls == ["DEST"]
+        assert ctrl.speed_calls[0] == pytest.approx(1.4)  # 最大步速
 
     def test_start_navigation_min_speed(self) -> None:
         ctrl = _RecordingController()
         wc = WalkerControllerWrapper(_Walker(), ctrl)
         wc.start_navigation("DEST", speed_ms=0.01)
-        assert ctrl.go_calls[0][1] == pytest.approx(0.1)
+        assert ctrl.speed_calls[0] == pytest.approx(0.1)
 
     def test_start_error_wrapped(self) -> None:
         class _Boom:
             def start(self) -> None:
                 raise RuntimeError("attach failed")
 
-            def go_to(self, d: Any, s: float) -> None:
+            def go_to_location(self, d: Any) -> None:
+                pass
+
+            def set_max_speed(self, s: float) -> None:
                 pass
 
         wc = WalkerControllerWrapper(_Walker(), _Boom())
@@ -77,7 +87,8 @@ class TestNavigation:
         ctrl = _RecordingController()
         wc = WalkerControllerWrapper(_Walker(), ctrl)
         wc.set_destination("D2", speed_ms=1.0)
-        assert ctrl.go_calls == [("D2", 1.0)]
+        assert ctrl.go_calls == ["D2"]
+        assert ctrl.speed_calls == [1.0]
 
 
 class TestLocationAndDestroy:
