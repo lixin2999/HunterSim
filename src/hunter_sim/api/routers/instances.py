@@ -99,7 +99,8 @@ async def create_instance(
             ),
         )
 
-    # 单用户并发配额（§14.2 默认 5 个）
+    # 单用户并发配额（§14.2 默认 5 个）：预占名额，创建链路任意异常均须归还，
+    # 销毁/超时自动回收则由 SimInstanceManager.destroy_instance() 统一释放
     quota_mgr = getattr(request.app.state, "quota_manager", None)
     if quota_mgr is not None:
         try:
@@ -119,30 +120,36 @@ async def create_instance(
             vehicle_model=body.vehicle_model,
             replay_config=body.replay_config.model_dump() if body.replay_config else None,
         )
+
+        audit_log(
+            "instance.create", user_id, inst.sim_instance_id,
+            f"map={body.map} mode={body.mode.value} quality={body.quality.value}",
+        )
+
+        # 文档 §12.2 创建响应结构
+        settings = get_settings()
+        data = {
+            "sim_instance_id": inst.sim_instance_id,
+            "status": inst.status.value,
+            "carla_server": {
+                "host": inst.carla_host,
+                "rpc_port": inst.carla_rpc_port,
+                "stream_port": inst.carla_stream_port,
+            },
+            "stream_url": f"{settings.api.stream_base_url}/sim/{inst.sim_instance_id}",
+        }
+        return ApiResponse(data=data)
     except ResourceError as exc:
+        # GPU 等资源不足：释放预占配额并返回 503
         if quota_mgr is not None:
             quota_mgr.release(user_id)
         logger.error(f"Resource allocation failed: {exc}")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-    audit_log(
-        "instance.create", user_id, inst.sim_instance_id,
-        f"map={body.map} mode={body.mode.value} quality={body.quality.value}",
-    )
-
-    # 文档 §12.2 创建响应结构
-    settings = get_settings()
-    data = {
-        "sim_instance_id": inst.sim_instance_id,
-        "status": inst.status.value,
-        "carla_server": {
-            "host": inst.carla_host,
-            "rpc_port": inst.carla_rpc_port,
-            "stream_port": inst.carla_stream_port,
-        },
-        "stream_url": f"{settings.api.stream_base_url}/sim/{inst.sim_instance_id}",
-    }
-    return ApiResponse(data=data)
+    except Exception:
+        # 非 ResourceError 的任何失败（含审计/响应构造异常）同样归还配额名额，防名额永久泄漏
+        if quota_mgr is not None:
+            quota_mgr.release(user_id)
+        raise
 
 
 @router.get("", response_model=ApiResponse, summary="列出实例")
@@ -264,11 +271,8 @@ async def destroy_instance(
     if inst is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
     owner_id = inst.user_id
+    # destroy_instance 内部统一释放 GPU 与用户配额（§14.2，含超时自动回收路径）
     mgr.destroy_instance(instance_id)
-    # 释放用户配额名额（§14.2）
-    quota_mgr = getattr(request.app.state, "quota_manager", None)
-    if quota_mgr is not None and owner_id:
-        quota_mgr.release(owner_id)
     audit_log("instance.destroy", user_id, instance_id, f"owner={owner_id or user_id}")
     return ApiResponse(data={"sim_instance_id": instance_id, "destroyed": True})
 

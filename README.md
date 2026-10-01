@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.1.0`（全面对齐《Carla 仿真系统详细设计文档》V4.0，见 [`release.md`](release.md)）
+- **当前版本**：`2.1.1`（对齐《Carla 仿真系统详细设计文档》V4.0，并完成 PR 审查阻塞问题修复：天气端到端闭环、上传安全与配额账本收敛，见 [`release.md`](release.md)）
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -18,7 +18,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 数据录制与回放 | mcap/自定义容器录制，数字孪生回放，支持变速与跳帧 |
 | 场景评估 | 轨迹、舒适性、安全性、覆盖率四维评分（S/A/B/C/D），支持批量场景测试与汇总报告 |
 | 资源编排 | GPU 资源池 + 实例生命周期管理，按画质限制单 GPU 并发；单用户/全局并发配额与实例守护（崩溃重试、超时回收） |
-| 安全治理 | JWT 角色分级（创建/销毁需 admin）、车辆模型白名单、场景安全审核、地图上传审核、审计日志 |
+| 安全治理 | JWT 角色分级（创建/销毁实例与地图上传需 admin）、车辆模型白名单、场景安全审核、地图上传审核（含路径穿越双重校验）、审计日志 |
 
 ---
 
@@ -146,7 +146,7 @@ kubectl apply -f k8s/
 
 ## 6. API 一览
 
-统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）；**创建/销毁实例额外要求 Token 载荷 `role=admin`**（§14.2）。
+统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）；**创建/销毁实例与地图上传额外要求 Token 载荷 `role=admin`**（§14.2）。
 
 | 分组 | 方法与路径 |
 |------|-----------|
@@ -155,7 +155,7 @@ kubectl apply -f k8s/
 | 实例子资源 | `GET /instances/{id}/status` · `POST /instances/{id}/scene` · `POST /instances/{id}/weather` · `POST /instances/{id}/vil/calibrate` · `GET /instances/{id}/screenshot` · `GET /instances/{id}/stream` |
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch` · `GET /scenarios/{task_id}/report` |
-| 资源 | `GET /maps` · `POST /maps/upload`（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
+| 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
 | 实时推送 | `WS /ws/sim/{instance_id}/status` |
 
 完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
@@ -170,7 +170,7 @@ ruff check src tests
 mypy src
 ```
 
-- **测试**：557 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
+- **测试**：577 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：Ruff + mypy（`pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

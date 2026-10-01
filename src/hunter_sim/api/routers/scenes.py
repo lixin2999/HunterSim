@@ -78,7 +78,19 @@ def load_scene_impl(request: Request, instance_id: str, scene_config: dict[str, 
 
 
 def set_weather_impl(request: Request, instance_id: str, body: SetWeatherRequest) -> dict[str, Any]:
-    """设置实例天气（预设或自定义参数，支持渐变过渡）。"""
+    """设置实例天气（预设或自定义参数，支持渐变过渡）。
+
+    调用 WeatherManager 真实接口（engine/weather_manager.py）：
+    - transition_seconds > 0：start_transition 渐变（由场景运行循环每 tick 推进）；
+    - transition_seconds == 0：set_preset / set_weather 立即生效。
+    天气参数统一 0-100 刻度（设计文档 §3.4.1）。
+    """
+    from hunter_sim.engine.weather_manager import (  # noqa: PLC0415
+        PRESET_ENVIRONMENTS,
+        WeatherProfile,
+        get_preset_profile,
+    )
+
     runner = _get_scene_runner(request, instance_id)
     weather_mgr = getattr(runner, "weather_manager", None)
     if weather_mgr is None:
@@ -88,32 +100,50 @@ def set_weather_impl(request: Request, instance_id: str, body: SetWeatherRequest
         )
 
     if body.preset:
-        # 使用预设环境
-        weather_mgr.apply_preset(body.preset, transition_seconds=body.transition_seconds)
+        if body.preset not in PRESET_ENVIRONMENTS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown weather preset '{body.preset}'. Available: {list(PRESET_ENVIRONMENTS)}",
+            )
+        if body.transition_seconds > 0:
+            weather_mgr.start_transition(get_preset_profile(body.preset), body.transition_seconds)
+        else:
+            weather_mgr.set_preset(body.preset)
     else:
-        # 自定义参数
-        params: dict[str, float] = {}
-        if body.cloudiness is not None:
-            params["cloudiness"] = body.cloudiness
-        if body.precipitation is not None:
-            params["precipitation"] = body.precipitation
-        if body.road_wetness is not None:
-            params["road_wetness"] = body.road_wetness
-        if body.wind_intensity is not None:
-            params["wind_intensity"] = body.wind_intensity
-        if body.sun_altitude is not None:
-            params["sun_altitude"] = body.sun_altitude
-        if body.sun_azimuth is not None:
-            params["sun_azimuth"] = body.sun_azimuth
-
-        if not params:
+        # 自定义参数：API 字段名 → WeatherProfile 字段名映射，未提供字段保持当前天气
+        field_map: dict[str, Optional[float]] = {
+            "cloudiness": body.cloudiness,
+            "precipitation": body.precipitation,
+            "precipitation_deposits": body.road_wetness,
+            "wind_intensity": body.wind_intensity,
+            "sun_altitude_angle": body.sun_altitude,
+            "sun_azimuth_angle": body.sun_azimuth,
+        }
+        overrides = {k: v for k, v in field_map.items() if v is not None}
+        if not overrides:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No weather parameters specified",
             )
-        weather_mgr.apply_custom(params, transition_seconds=body.transition_seconds)
+        base = weather_mgr.current_profile.model_dump()
+        base.update(overrides, preset_name="")
+        try:
+            profile = WeatherProfile(**base)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid weather parameters: {exc}",
+            ) from exc
+        if body.transition_seconds > 0:
+            weather_mgr.start_transition(profile, body.transition_seconds)
+        else:
+            weather_mgr.set_weather(profile)
 
-    return {"instance_id": instance_id, "applied": body.model_dump(exclude_none=True)}
+    return {
+        "instance_id": instance_id,
+        "applied": body.model_dump(exclude_none=True),
+        "transitioning": body.transition_seconds > 0,
+    }
 
 
 def calibrate_impl(request: Request, instance_id: str, body: CalibrationRequest) -> CalibrationResponse:

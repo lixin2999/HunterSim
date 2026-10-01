@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,19 @@ class _MockWorld:
 
     def set_weather(self, weather: Any) -> None:
         self.calls.append(weather)
+
+
+@pytest.fixture
+def fake_carla(monkeypatch: pytest.MonkeyPatch) -> None:
+    """注入最小 carla 模块（WeatherParameters 关键字构造），使 _apply_profile 可达 world 下发路径。"""
+    mod = types.ModuleType("carla")
+
+    class _WeatherParameters:
+        def __init__(self, **kwargs: float) -> None:
+            self.__dict__.update(kwargs)
+
+    mod.WeatherParameters = _WeatherParameters  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "carla", mod)
 
 
 class TestWeatherProfile:
@@ -138,3 +153,56 @@ class TestWeatherManager:
         f.write_text("{ not json", encoding="utf-8")
         profiles = WeatherManager.load_profiles_from_file(f)
         assert "sunny_noon" in profiles
+
+
+class TestWeatherApplyToWorld:
+    """审查项 B：_apply_profile 必须真正调用 world.set_weather 下发（0-100 直通）。"""
+
+    def test_set_weather_dispatches_to_world(self, fake_carla: None) -> None:
+        world = _MockWorld()
+        mgr = WeatherManager(world)
+        mgr.set_weather(WeatherProfile(cloudiness=42.0, precipitation=42.0, preset_name="custom"))
+        assert len(world.calls) == 1
+        wp = world.calls[-1]
+        # CARLA 原生 0-100 刻度直通，不得出现 /100 归一
+        assert wp.cloudiness == pytest.approx(42.0)
+        assert wp.precipitation == pytest.approx(42.0)
+
+    def test_set_preset_dispatches_to_world(self, fake_carla: None) -> None:
+        world = _MockWorld()
+        mgr = WeatherManager(world)
+        mgr.set_preset("heavy_rain")
+        assert len(world.calls) == 1
+        wp = world.calls[-1]
+        assert wp.precipitation == pytest.approx(80.0)
+        assert wp.cloudiness == pytest.approx(50.0)
+        assert wp.sun_altitude_angle == pytest.approx(30.0)
+
+    def test_transition_applies_every_update(self, fake_carla: None) -> None:
+        world = _MockWorld()
+        mgr = WeatherManager(world)
+        mgr.start_transition(WeatherProfile(cloudiness=100.0, preset_name="storm"), duration_seconds=2.0)
+        assert mgr.update_transition() is True
+        assert len(world.calls) >= 1
+        # 过渡初始阶段云量应介于当前(0, sunny_noon)与目标(100)之间
+        assert 0.0 <= world.calls[-1].cloudiness <= 100.0
+
+    def test_carla_disconnect_runtimeerror_tolerated(self, fake_carla: None) -> None:
+        """CARLA 连接断开（RuntimeError）不应上抛中断调用方。"""
+
+        class _DeadWorld:
+            def set_weather(self, weather: Any) -> None:
+                raise RuntimeError("CARLA connection lost")
+
+        mgr = WeatherManager(_DeadWorld())
+        mgr.set_weather(WeatherProfile(cloudiness=10.0))  # 不应抛出
+        assert mgr.current_profile.cloudiness == 10.0
+
+    def test_no_carla_module_skips_world(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无 carla 模块时降级：仅记日志，不调用 world.set_weather，不抛异常。"""
+        monkeypatch.setitem(sys.modules, "carla", None)
+        world = _MockWorld()
+        mgr = WeatherManager(world)
+        mgr.set_weather(WeatherProfile(cloudiness=42.0))
+        assert world.calls == []
+        assert mgr.current_profile.cloudiness == 42.0

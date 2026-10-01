@@ -130,6 +130,16 @@ class TestOpenDriveImport:
         with pytest.raises(ConfigurationError):
             mgr.load_map("custom/nonexistent")
 
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["custom/../secret", "custom/../../evil", "custom/a/b", "custom/evil\n", "custom/..."],
+    )
+    def test_custom_name_traversal_rejected(self, tmp_path: Path, bad_id: str) -> None:
+        """审查项 E：custom/{name} 含路径分隔符/非法字符 → fullmatch 拒绝，防路径穿越。"""
+        mgr = MapManager(MockCarlaClient(), custom_map_dir=tmp_path)
+        with pytest.raises(ConfigurationError):
+            mgr.load_map(bad_id)
+
     def test_read_xodr_none(self) -> None:
         with pytest.raises(ConfigurationError):
             MapManager._read_xodr_file(None)

@@ -128,15 +128,19 @@ class SimInstanceManager:
     Args:
         settings: 资源管理配置。
         gpu_pool: GPU 资源池实例。
+        quota_manager: 用户配额管理器（可选）。注入后配额释放在
+            destroy_instance() 内统一收敛，覆盖 API 销毁与超时自动回收两条路径（§14.2）。
     """
 
     def __init__(
         self,
         settings: Optional[ResourceSettings] = None,
         gpu_pool: Optional[Any] = None,
+        quota_manager: Optional[Any] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._gpu_pool = gpu_pool
+        self._quota_manager = quota_manager
         self._instances: dict[str, SimInstance] = {}
         self._lock: threading.RLock = threading.RLock()
         logger.info("SimInstanceManager initialized")
@@ -251,7 +255,11 @@ class SimInstanceManager:
         logger.info(f"Instance '{instance_id}' status: {new_status.value}")
 
     def destroy_instance(self, instance_id: str) -> None:
-        """销毁实例并释放 GPU 资源。"""
+        """销毁实例并释放 GPU 资源与用户配额（§14.2 唯一释放出口）。
+
+        API 销毁（DELETE /instances/{id}）与超时自动回收
+        （check_expired_instances）均经由此方法，保证配额不泄漏。
+        """
         with self._lock:
             instance = self._instances.get(instance_id)
             if instance is None:
@@ -261,6 +269,9 @@ class SimInstanceManager:
             if self._gpu_pool is not None and instance.gpu_id >= 0:
                 self._gpu_pool.release(instance.gpu_id, instance.quality)
             del self._instances[instance_id]
+        # 配额释放在锁外执行（锁顺序：instance_manager → quota_manager，无反向路径，无死锁环）
+        if self._quota_manager is not None and instance.user_id:
+            self._quota_manager.release(instance.user_id)
         logger.info(f"Instance destroyed: {instance_id}")
 
     def check_expired_instances(self) -> list[str]:

@@ -21,6 +21,7 @@ from hunter_sim.common.exceptions import (
 )
 from hunter_sim.common.models import SceneStatus, SimMode
 from hunter_sim.common.utils import get_logger
+from hunter_sim.engine.weather_manager import WeatherManager
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
 from hunter_sim.scene_runner.event_detector import DetectedEvent, EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig
@@ -48,6 +49,9 @@ class SceneRunnerService:
         self._on_state_change = on_state_change
         self._on_event = on_event
 
+        # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
+        self._weather_manager = WeatherManager(world)
+
         self._lock: threading.RLock = threading.RLock()
         self._state_mgr: Optional[SceneStateManager] = None
         self._event_detector: Optional[EventDetector] = None
@@ -55,6 +59,11 @@ class SceneRunnerService:
         self._config: Optional[SceneConfig] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
+
+    @property
+    def weather_manager(self) -> WeatherManager:
+        """天气管理器（供 API 层天气控制与渐变过渡）。"""
+        return self._weather_manager
 
     @property
     def current_scene_id(self) -> Optional[str]:
@@ -226,6 +235,8 @@ class SceneRunnerService:
 
                 # 推进仿真
                 self._world.tick()
+                # 推进天气渐变过渡（文档 §3.4.1：每 tick 推进一步）
+                self._weather_manager.update_transition()
                 tick_count += 1
 
             except CarlaSimulationError as exc:

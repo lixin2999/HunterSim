@@ -254,7 +254,7 @@ class HealthResponse(BaseModel):
     """健康检查响应体。"""
 
     status: str = Field(..., description="healthy / degraded / unhealthy")
-    version: str = "2.1.0"
+    version: str = "2.1.1"
     uptime_seconds: float = 0.0
     carla_connected: bool = False
     active_instances: int = 0

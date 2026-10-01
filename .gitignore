@@ -19,6 +19,7 @@ pip-wheel-metadata/
 
 # Virtual env / uv
 .venv/
+.venv_*/
 venv/
 ENV/
 env/
@@ -106,3 +107,6 @@ docker-compose.override.yml
 *.mp4
 captures/
 recordings/
+
+# uv.lock
+uv.lock

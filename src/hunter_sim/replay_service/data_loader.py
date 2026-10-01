@@ -27,6 +27,9 @@ _PERCEPTION_TOPIC = "/perception/objects"
 _PLANNING_TOPIC = "/planning/trajectory"
 _CHASSIS_COMMAND_TOPIC = "/chassis/command"
 
+# DB 数据源表名白名单（文档 §8.2，防 SQL 注入：表名不接受任意输入）
+_ALLOWED_DB_TABLES: frozenset[str] = frozenset({"vehicle_telemetry", "scene_events"})
+
 
 class DataLoader:
     """历史数据加载器。
@@ -293,6 +296,19 @@ class DataLoader:
     # ─── TimescaleDB / PostgreSQL 数据源（文档 §8.2） ────────────────────
 
     @staticmethod
+    def _validate_db_table(method: str, table: str) -> None:
+        """表名白名单校验（先于驱动导入执行，防 SQL 注入）。
+
+        Raises:
+            ConfigurationError: 表名不在 §8.2 数据源表白名单内。
+        """
+        if table not in _ALLOWED_DB_TABLES:
+            raise ConfigurationError(
+                f"DataLoader.{method}",
+                f"Unsupported DB table '{table}' (allowed: {sorted(_ALLOWED_DB_TABLES)})",
+            )
+
+    @staticmethod
     def load_trajectory_from_db(
         dsn: str,
         vehicle_id: str,
@@ -313,24 +329,29 @@ class DataLoader:
             轨迹帧列表（与 load_trajectory 格式一致）。
 
         Raises:
-            ConfigurationError: 数据库驱动不可用或查询失败。
+            ConfigurationError: 表名不在白名单、数据库驱动不可用或查询失败。
         """
+        DataLoader._validate_db_table("load_trajectory_from_db", table)
         try:
             import psycopg2  # noqa: PLC0415
+            from psycopg2 import sql  # noqa: PLC0415
         except ImportError as exc:
             raise ConfigurationError(
                 "DataLoader.load_trajectory_from_db",
                 f"psycopg2 not available: {exc}",
             ) from exc
 
-        sql = (
-            f"SELECT ts, x, y, z, yaw, speed FROM {table} "
+        # 表名经白名单校验后用 sql.Identifier 引用，其余参数占位符绑定
+        query = sql.SQL(
+            "SELECT ts, x, y, z, yaw, speed FROM {} "
             "WHERE vehicle_id = %s AND ts >= %s AND ts <= %s ORDER BY ts"
-        )
+        ).format(sql.Identifier(table))
         frames: list[dict[str, Any]] = []
+        conn: Any = None
         try:
-            with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
-                cur.execute(sql, (vehicle_id, start_ts, end_ts))
+            conn = psycopg2.connect(dsn)
+            with conn.cursor() as cur:
+                cur.execute(query, (vehicle_id, start_ts, end_ts))
                 for ts, x, y, z, yaw, speed in cur.fetchall():
                     frames.append({
                         "timestamp": float(ts),
@@ -340,6 +361,9 @@ class DataLoader:
                     })
         except Exception as exc:
             raise ConfigurationError("DataLoader.load_trajectory_from_db", str(exc)) from exc
+        finally:
+            if conn is not None:
+                conn.close()  # psycopg2 连接上下文仅提交/回滚，必须显式关闭防连接泄漏
         logger.info(f"Loaded {len(frames)} trajectory frames from DB: {table}")
         return frames
 
@@ -351,23 +375,31 @@ class DataLoader:
         end_ts: float,
         table: str = "scene_events",
     ) -> list[dict[str, Any]]:
-        """从 PostgreSQL 加载事件数据列表（文档 §8.2 事件数据源）。"""
+        """从 PostgreSQL 加载事件数据列表（文档 §8.2 事件数据源）。
+
+        Raises:
+            ConfigurationError: 表名不在白名单、数据库驱动不可用或查询失败。
+        """
+        DataLoader._validate_db_table("load_events_from_db", table)
         try:
             import psycopg2  # noqa: PLC0415
+            from psycopg2 import sql  # noqa: PLC0415
         except ImportError as exc:
             raise ConfigurationError(
                 "DataLoader.load_events_from_db",
                 f"psycopg2 not available: {exc}",
             ) from exc
 
-        sql = (
-            f"SELECT ts, event_type, description FROM {table} "
+        query = sql.SQL(
+            "SELECT ts, event_type, description FROM {} "
             "WHERE vehicle_id = %s AND ts >= %s AND ts <= %s ORDER BY ts"
-        )
+        ).format(sql.Identifier(table))
         events: list[dict[str, Any]] = []
+        conn: Any = None
         try:
-            with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
-                cur.execute(sql, (vehicle_id, start_ts, end_ts))
+            conn = psycopg2.connect(dsn)
+            with conn.cursor() as cur:
+                cur.execute(query, (vehicle_id, start_ts, end_ts))
                 for ts, event_type, description in cur.fetchall():
                     events.append({
                         "timestamp": float(ts),
@@ -376,6 +408,9 @@ class DataLoader:
                     })
         except Exception as exc:
             raise ConfigurationError("DataLoader.load_events_from_db", str(exc)) from exc
+        finally:
+            if conn is not None:
+                conn.close()  # 显式关闭连接，防长时间回放泄漏服务端连接
         logger.info(f"Loaded {len(events)} events from DB: {table}")
         return events
 

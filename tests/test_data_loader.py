@@ -83,6 +83,17 @@ class TestDbSource:
         with pytest.raises(ConfigurationError):
             DataLoader.load_events_from_db("dsn", "v01", 0.0, 100.0)
 
+    @pytest.mark.parametrize("bad_table", ["evil; DROP TABLE t", "pg_shadow", "vehicle_telemetry2"])
+    def test_trajectory_from_db_rejects_unknown_table(self, bad_table: str) -> None:
+        """审查项 D：表名白名单先于驱动导入校验，任意表名拒绝防 SQL 注入。"""
+        with pytest.raises(ConfigurationError):
+            DataLoader.load_trajectory_from_db("dsn", "v01", 0.0, 1.0, table=bad_table)
+
+    @pytest.mark.parametrize("bad_table", ["evil; DROP TABLE t", "pg_shadow"])
+    def test_events_from_db_rejects_unknown_table(self, bad_table: str) -> None:
+        with pytest.raises(ConfigurationError):
+            DataLoader.load_events_from_db("dsn", "v01", 0.0, 1.0, table=bad_table)
+
 
 class TestQuatToYaw:
     def test_zero_quaternion(self) -> None:

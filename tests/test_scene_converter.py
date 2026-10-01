@@ -59,12 +59,14 @@ class TestConvert:
         assert params.participant_spawns[1].autopilot is False  # cut_in
         assert params.participant_spawns[1].actor_type == "walker"
 
-    def test_weather_normalized(self) -> None:
+    def test_weather_unified_0_100_scale(self) -> None:
+        # 审查项 C：0-100 统一刻度单一出口（WeatherProfile.to_carla_dict 直通），
+        # 与 API 层 set_weather_impl 一致，不再做 /100 归一
         wd = SceneConfigConverter().convert(_config()).weather_dict
-        assert wd["cloudiness"] == 0.5
-        assert wd["precipitation"] == 0.7
-        assert wd["fog_density"] == 0.2
-        assert wd["sun_altitude_angle"] == 45.0  # 不除 100
+        assert wd["cloudiness"] == 50.0
+        assert wd["precipitation"] == 70.0
+        assert wd["fog_density"] == 20.0
+        assert wd["sun_altitude_angle"] == 45.0
 
 
 class TestScenarioRunnerDict:

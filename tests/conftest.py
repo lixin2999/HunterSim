@@ -153,8 +153,11 @@ def app():
     settings = HunterSimSettings(env="dev")
     application = create_app(settings)
     gpu_pool = GPUResourcePool(gpu_count=2, total_memory_gb=64.0)
+    # 注入 quota_manager：配额释放收敛在 destroy_instance() 内统一执行（§14.2，见审查项 F）
     application.state.instance_manager = SimInstanceManager(
-        settings=ResourceSettings(), gpu_pool=gpu_pool
+        settings=ResourceSettings(),
+        gpu_pool=gpu_pool,
+        quota_manager=application.state.quota_manager,
     )
     return application
 

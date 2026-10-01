@@ -48,7 +48,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="HunterSim API",
-        version="2.1.0",
+        version="2.1.1",
         description="HUNTER SE VIL 仿真平台 REST API",
         default_response_class=ORJSONResponse,
         lifespan=lifespan,

@@ -240,6 +240,28 @@ class TestMapUploadEndpoint:
         )
         assert resp.status_code == 401
 
+    def test_upload_requires_admin(self, client: TestClient, user_headers: dict, tmp_path) -> None:
+        """审查项 E：非管理员上传 → 403（§14.2 资源入库需管理员）。"""
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "town", "content": _VALID_XODR},
+            headers=user_headers,
+        )
+        assert resp.status_code == 403
+
+    def test_upload_map_id_trailing_newline_rejected(
+        self, client: TestClient, auth_headers: dict, tmp_path
+    ) -> None:
+        """审查项 E：fullmatch 拒绝尾换行绕过（^...$ + match 可被 'evil\\n' 穿透）。"""
+        client.app.state.resources_dir = str(tmp_path)
+        resp = client.post(
+            "/api/v1/sim/maps/upload",
+            json={"map_id": "evil\n", "content": _VALID_XODR},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422
+
 
 class TestApiDocEndpoint:
     """API 文档端点测试。"""

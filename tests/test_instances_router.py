@@ -16,15 +16,12 @@ from hunter_sim.common.models import InstanceStatus
 
 @pytest.fixture(autouse=True)
 def _cleanup_instances(client: TestClient) -> Generator[None, None, None]:
-    """每个测试后销毁全部实例，释放 GPU 容量与用户配额名额。"""
+    """每个测试后销毁全部实例（destroy_instance 内部统一释放 GPU 容量与用户配额，§14.2）。"""
     yield
     app = client.app
     mgr = app.state.instance_manager
-    quota = getattr(app.state, "quota_manager", None)
     for inst in mgr.list_instances():
         mgr.destroy_instance(inst.sim_instance_id)
-        if quota is not None and inst.user_id:
-            quota.release(inst.user_id)
     app.state.scene_runners = {}
 
 
@@ -45,11 +42,28 @@ def _to_ready(app: Any, instance_id: str) -> None:
 
 
 class _FakeWeather:
+    """与真实 WeatherManager 接口对齐的桩（set_preset/start_transition/current_profile）。"""
+
     def __init__(self) -> None:
         self.preset_called = None
+        self.transition_target = None
+        self.transition_seconds = None
 
-    def apply_preset(self, name: str, transition_seconds: float = 0.0) -> None:
-        self.preset_called = name
+    def set_preset(self, preset_name: str) -> None:
+        self.preset_called = preset_name
+
+    def set_weather(self, profile: Any) -> None:
+        self.transition_target = profile  # 立即路径也记录，便于断言
+
+    def start_transition(self, target: Any, duration_seconds: float = 3.0) -> None:
+        self.transition_target = target
+        self.transition_seconds = duration_seconds
+
+    @property
+    def current_profile(self) -> Any:
+        from hunter_sim.engine.weather_manager import WeatherProfile
+
+        return WeatherProfile(preset_name="sunny_noon")
 
 
 class _FakeCoord:
@@ -262,6 +276,7 @@ class TestInstanceSceneOps:
     def test_weather_via_instances_path(
         self, client: TestClient, auth_headers: dict, app: Any
     ) -> None:
+        """默认 transition_seconds=2.0 → 走 start_transition（真实接口名）。"""
         iid = _create(client, auth_headers)
         fake = self._inject_runner(app, iid)
         resp = client.post(
@@ -270,7 +285,9 @@ class TestInstanceSceneOps:
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        assert fake.weather_manager.preset_called == "sunny_noon"
+        assert fake.weather_manager.transition_target is not None
+        assert fake.weather_manager.transition_target.preset_name == "sunny_noon"
+        assert fake.weather_manager.transition_seconds == 2.0
         app.state.scene_runners = {}
 
     def test_vil_calibrate(self, client: TestClient, auth_headers: dict, app: Any) -> None:

@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import ValidationError as PydanticValidationError
 
-from hunter_sim.api.deps import get_current_user
+from hunter_sim.api.deps import get_current_user, require_admin
 from hunter_sim.api.models import (
     ApiResponse,
     MapInfo,
@@ -32,8 +32,9 @@ from hunter_sim.common.utils import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
-# map_id 安全字符集（防路径穿越，与 MapUploadRequest.pattern 一致）
-_MAP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# map_id 安全字符集（防路径穿越，与 MapUploadRequest.pattern 一致；
+# 使用 fullmatch 而非 match+$，避免尾部换行绕过）
+_MAP_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 # 上传地图文件大小上限（§14.3 内容安全：防止恶意超大内容）
 _MAX_MAP_SIZE_BYTES = 50 * 1024 * 1024
@@ -104,20 +105,21 @@ async def list_maps(
 @router.post("/maps/upload", response_model=ApiResponse, summary="上传自定义 OpenDRIVE 地图")
 async def upload_map(
     request: Request,
-    _: str = Depends(get_current_user),
+    _: str = Depends(require_admin),
 ) -> ApiResponse:
     """POST /api/v1/sim/maps/upload
 
     上传自定义 OpenDRIVE 地图到资源仓库 maps/custom 目录。
     主接口形式为 multipart/form-data（设计文档附录 B：file + map_id 表单字段），
     同时兼容 JSON body（{map_id, content}）传参。
-    入库前执行内容安全检查与格式解析审核（§14.3），非法文件拒绝并返回错误详情。
+    安全约束（§14.2/§14.3）：需管理员角色；入库前执行内容安全检查与格式解析审核，
+    非法文件拒绝并返回错误详情。
     """
     from hunter_sim.engine.opendrive_parser import OpenDriveParser  # noqa: PLC0415
 
     map_id, content = await _parse_upload_request(request)
 
-    if not _MAP_ID_PATTERN.match(map_id):
+    if not _MAP_ID_PATTERN.fullmatch(map_id):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid map_id '{map_id}' (allowed: letters, digits, '_', '-')",

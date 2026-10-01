@@ -9,6 +9,7 @@ CARLA 内置地图：Town01 ~ Town07, Town10HD_Opt。
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Optional, Protocol
@@ -25,6 +26,9 @@ BUILTIN_MAPS: frozenset[str] = frozenset([
     "Town01", "Town02", "Town03", "Town04", "Town05",
     "Town06", "Town07", "Town10HD", "Town10HD_Opt",
 ])
+
+# custom/{map_name} 引用名称安全字符集（防路径穿越，与 API 层 _MAP_ID_PATTERN 一致）
+_CUSTOM_MAP_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class MapInfo(BaseModel):
@@ -153,7 +157,22 @@ class MapManager:
         if map_id not in self._loaded_maps and map_id.startswith("custom/"):
             # 附录 B：创建实例时指定 map: "custom/{map_name}"，动态导入后加载
             name = map_id.split("/", 1)[1]
-            xodr_path = self._custom_map_dir / f"{name}.xodr"
+            # 安全校验：名称仅限字母/数字/_/-（防 ../ 路径穿越读取任意文件）
+            if not _CUSTOM_MAP_NAME_PATTERN.fullmatch(name):
+                raise ConfigurationError(
+                    operation="load_map",
+                    message=(
+                        f"Invalid custom map name '{name}' in '{map_id}' "
+                        "(allowed: letters, digits, '_', '-')"
+                    ),
+                )
+            xodr_path = (self._custom_map_dir / f"{name}.xodr").resolve()
+            # 双重保险：解析后路径必须仍在自定义地图目录内
+            if not xodr_path.is_relative_to(self._custom_map_dir.resolve()):
+                raise ConfigurationError(
+                    operation="load_map",
+                    message=f"Custom map path escapes the resource directory: {map_id}",
+                )
             if xodr_path.exists():
                 self.import_opendrive_map(map_id, xodr_path)
 

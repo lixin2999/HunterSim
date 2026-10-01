@@ -11,6 +11,8 @@ from typing import Any, Optional
 import pytest
 from fastapi.testclient import TestClient
 
+from hunter_sim.engine.weather_manager import WeatherProfile
+
 _VALID_CONFIG: dict[str, Any] = {
     "scene_id": "scene-001",
     "scene_name": "测试场景",
@@ -20,15 +22,27 @@ _VALID_CONFIG: dict[str, Any] = {
 
 
 class _FakeWeather:
+    """与真实 WeatherManager 接口对齐的桩（set_preset/set_weather/start_transition/current_profile）。"""
+
     def __init__(self) -> None:
         self.preset_called: Optional[str] = None
-        self.custom_called: Optional[dict] = None
+        self.set_weather_called: Optional[Any] = None
+        self.transition_target: Optional[Any] = None
+        self.transition_seconds: Optional[float] = None
 
-    def apply_preset(self, name: str, transition_seconds: float = 0.0) -> None:
-        self.preset_called = name
+    def set_preset(self, preset_name: str) -> None:
+        self.preset_called = preset_name
 
-    def apply_custom(self, params: dict, transition_seconds: float = 0.0) -> None:
-        self.custom_called = params
+    def set_weather(self, profile: Any) -> None:
+        self.set_weather_called = profile
+
+    def start_transition(self, target: Any, duration_seconds: float = 3.0) -> None:
+        self.transition_target = target
+        self.transition_seconds = duration_seconds
+
+    @property
+    def current_profile(self) -> WeatherProfile:
+        return WeatherProfile(preset_name="sunny_noon")
 
 
 class _FakeCoord:
@@ -147,17 +161,44 @@ class TestSceneControls:
 
 
 class TestWeatherControl:
-    def test_preset(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+    def test_preset_with_transition(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+        """预设天气 + 过渡时长 > 0 → start_transition（真实 WeatherManager 接口）。"""
+        inst, fake = runner
+        resp = client.post(
+            f"/api/v1/sim/scenes/{inst}/weather",
+            json={"preset": "heavy_rain", "transition_seconds": 5.0},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["transitioning"] is True
+        assert fake.weather_manager.transition_target is not None
+        assert fake.weather_manager.transition_target.preset_name == "heavy_rain"
+        assert fake.weather_manager.transition_seconds == 5.0
+
+    def test_preset_immediate(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+        """过渡时长 0 → set_preset 立即生效。"""
+        inst, fake = runner
+        resp = client.post(
+            f"/api/v1/sim/scenes/{inst}/weather",
+            json={"preset": "night", "transition_seconds": 0.0},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        assert fake.weather_manager.preset_called == "night"
+
+    def test_unknown_preset_422(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+        """非 PRESET_ENVIRONMENTS 白名单预设 → 422。"""
         inst, fake = runner
         resp = client.post(
             f"/api/v1/sim/scenes/{inst}/weather",
             json={"preset": "rainy_night"},
             headers=auth_headers,
         )
-        assert resp.status_code == 200
-        assert fake.weather_manager.preset_called == "rainy_night"
+        assert resp.status_code == 422
+        assert fake.weather_manager.transition_target is None
 
     def test_custom(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
+        """自定义参数 0-100 刻度直通（审查项 C）。"""
         inst, fake = runner
         resp = client.post(
             f"/api/v1/sim/scenes/{inst}/weather",
@@ -165,7 +206,26 @@ class TestWeatherControl:
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        assert fake.weather_manager.custom_called == {"cloudiness": 60.0, "precipitation": 30.0}
+        target = fake.weather_manager.transition_target
+        assert target is not None
+        assert target.cloudiness == 60.0
+        assert target.precipitation == 30.0
+        assert target.preset_name == ""
+
+    def test_custom_road_wetness_mapping(
+        self, client: TestClient, auth_headers: dict, runner: tuple
+    ) -> None:
+        """API 字段 road_wetness → 内部 precipitation_deposits 映射。"""
+        inst, fake = runner
+        resp = client.post(
+            f"/api/v1/sim/scenes/{inst}/weather",
+            json={"road_wetness": 80.0, "transition_seconds": 0.0},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        profile = fake.weather_manager.set_weather_called
+        assert profile is not None
+        assert profile.precipitation_deposits == 80.0
 
     def test_no_params_400(self, client: TestClient, auth_headers: dict, runner: tuple) -> None:
         inst, _ = runner

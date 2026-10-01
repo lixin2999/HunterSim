@@ -292,27 +292,26 @@ class WeatherManager:
             return False
         return True
 
-    @staticmethod
-    def _apply_profile(profile: WeatherProfile) -> None:
+    def _apply_profile(self, profile: WeatherProfile) -> None:
         """将 WeatherProfile 应用到 CARLA World（内部实现）。
 
-        CARLA WeatherParameters 使用 0-100 原生刻度，直接透传参数。
+        CARLA WeatherParameters 使用 0-100 原生刻度，直接透传参数
+        （单一换算出口：WeatherProfile.to_carla_dict）。
+
+        Args:
+            profile: 目标天气配置。
         """
         try:
             import carla  # noqa: PLC0415
-            wp = carla.WeatherParameters(
-                cloudiness=profile.cloudiness,
-                precipitation=profile.precipitation,
-                precipitation_deposits=profile.precipitation_deposits,
-                wind_intensity=profile.wind_intensity,
-                sun_azimuth_angle=profile.sun_azimuth_angle,
-                sun_altitude_angle=profile.sun_altitude_angle,
-                fog_density=profile.fog_density,
-                fog_distance=profile.fog_distance,
-            )
-            logger.debug(f"Applying weather: {profile.preset_name or 'custom'}")
         except ImportError:
             logger.warning("carla package not available, weather not applied")
+            return
+        try:
+            wp = carla.WeatherParameters(**profile.to_carla_dict())
+            self._world.set_weather(wp)
+            logger.debug(f"Weather applied to world: {profile.preset_name or 'custom'}")
+        except RuntimeError as exc:  # CARLA 连接断开 / world 不可用
+            logger.warning(f"Failed to apply weather to CARLA world: {exc}")
 
     def to_json(self) -> str:
         """将当前天气配置序列化为 JSON 字符串。"""

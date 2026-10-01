@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from hunter_sim.common.models import SimMode
 from hunter_sim.common.utils import get_logger
+from hunter_sim.engine.weather_manager import WeatherProfile
 from hunter_sim.scene_runner.scene_config import SceneConfig, TrafficParticipantConfig
 
 logger = get_logger(__name__)
@@ -112,17 +113,20 @@ class SceneConfigConverter:
                 )
             )
 
-        # 转换天气参数
-        weather_dict: dict[str, float] = {
-            "cloudiness": config.weather.cloudiness / 100.0,
-            "precipitation": config.weather.precipitation / 100.0,
-            "precipitation_deposits": config.weather.precipitation_deposits / 100.0,
-            "wind_intensity": config.weather.wind_intensity / 100.0,
-            "sun_azimuth_angle": config.weather.sun_azimuth_angle,
-            "sun_altitude_angle": config.weather.sun_altitude_angle,
-            "fog_density": config.weather.fog_density / 100.0,
-            "fog_distance": config.weather.fog_distance,
-        }
+        # 转换天气参数：0-100 统一刻度，单一换算出口 WeatherProfile.to_carla_dict（文档 §3.4.1，
+        # 与 API 层 set_weather_impl 保持一致，避免两套刻度）
+        weather_profile = WeatherProfile(
+            cloudiness=config.weather.cloudiness,
+            precipitation=config.weather.precipitation,
+            precipitation_deposits=config.weather.precipitation_deposits,
+            wind_intensity=config.weather.wind_intensity,
+            sun_azimuth_angle=config.weather.sun_azimuth_angle,
+            sun_altitude_angle=config.weather.sun_altitude_angle,
+            fog_density=config.weather.fog_density,
+            fog_distance=config.weather.fog_distance,
+            preset_name=config.weather.preset_name,
+        )
+        weather_dict: dict[str, float] = weather_profile.to_carla_dict()
 
         return SceneRuntimeParams(
             map_id=config.map_id,
