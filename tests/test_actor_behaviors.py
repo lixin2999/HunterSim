@@ -8,6 +8,7 @@ import pytest
 
 from hunter_sim.traffic_sim.actor_behaviors import (
     ActorAction,
+    ActorBehavior,
     ConstantSpeedBehavior,
     CutInBehavior,
     DecelerateBehavior,
@@ -186,3 +187,38 @@ class TestScriptedActorController:
         assert ctrl.is_triggered is True
         ctrl.reset()
         assert ctrl.is_triggered is False
+
+
+class _ElapsedRecorder(ActorBehavior):
+    """记录行为收到的 elapsed_time（审查项 G 触发时间基准验证用行为桩）。"""
+
+    def __init__(self) -> None:
+        super().__init__("recorder")
+        self.elapsed_seen: list[float] = []
+
+    def update(
+        self, elapsed_time: float, actor: object, ego_vehicle: object, delta_seconds: float
+    ) -> ActorAction:
+        self.elapsed_seen.append(elapsed_time)
+        return ActorAction(target_speed_ms=1.0)
+
+
+class TestTriggerTimeBaseline:
+    """审查项 G：行为接收触发后的相对时间，而非全局时间轴。"""
+
+    def test_behavior_receives_relative_elapsed_after_trigger(self) -> None:
+        rec = _ElapsedRecorder()
+        ctrl = ScriptedActorController(object(), rec, trigger=TimeTrigger(5.0))
+        action = ctrl.update(None, 5.0)  # t=5.0 触发当帧
+        assert action is not None
+        assert rec.elapsed_seen[-1] == pytest.approx(0.0)  # 触发帧相对时间从 0 起
+        ctrl.update(None, 0.02)  # t=5.02
+        assert rec.elapsed_seen[-1] == pytest.approx(0.02)
+
+    def test_reset_restores_trigger_baseline(self) -> None:
+        rec = _ElapsedRecorder()
+        ctrl = ScriptedActorController(object(), rec, trigger=TimeTrigger(5.0))
+        ctrl.update(None, 5.0)
+        ctrl.reset()
+        ctrl.update(None, 5.0)  # 重启后再次触发
+        assert rec.elapsed_seen[-1] == pytest.approx(0.0)

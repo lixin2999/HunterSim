@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.1.1`（对齐《Carla 仿真系统详细设计文档》V4.0，并完成 PR 审查阻塞问题修复：天气端到端闭环、上传安全与配额账本收敛，见 [`release.md`](release.md)）
+- **当前版本**：`2.1.1`（对齐《Carla 仿真系统详细设计文档》V4.0，并完成 PR 审查阻塞问题修复（A–F）与建议级问题修复（G–T）：天气端到端闭环、上传安全与配额账本收敛、事件检测边沿闩锁、并发端口递增分配、lifespan 生产装配、评估步长推导、Alertmanager 接入、CARLA 启动参数修正等。详见 [`release.md`](release.md)）
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -62,11 +62,12 @@ HunterSim/
 │   ├── eval_service/        # 评估引擎、评估报告
 │   └── resource_manager/    # 实例管理、GPU 资源池、健康监控
 ├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
-├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / grafana
+├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / alertmanager / grafana
 ├── k8s/                     # namespace / configmap / secret / deployment（含 CARLA GPU Pod + PVC）/ service
 ├── hunter_assets/           # CARLA 引擎镜像构建资源（Dockerfile.carla COPY 上下文）
 ├── tests/                   # 单元 + 集成测试（覆盖率门禁 ≥80%）
-├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / ruff / mypy / coverage）
+├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / flake8 / mypy / coverage）
+├── setup.cfg                # flake8 质量门禁配置
 └── requirements.txt         # 运行依赖清单
 ```
 
@@ -166,13 +167,13 @@ kubectl apply -f k8s/
 
 ```bash
 pytest tests -q --cov=hunter_sim --cov-report=term-missing   # 覆盖率门禁 fail_under=80
-ruff check src tests
-mypy src
+flake8 src tests                                               # Lint（配置见 setup.cfg）
+mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：577 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
+- **测试**：593 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
-- 代码规范：Ruff + mypy（`pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
+- 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 
 ---
 

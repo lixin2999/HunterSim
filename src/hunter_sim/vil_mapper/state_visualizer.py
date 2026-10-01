@@ -9,12 +9,34 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import time
+from typing import Any
 
 from hunter_sim.common.models import DetectedObject, PerceptionResult, VehicleState
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
+
+# 审查项 T：绘制失败告警限流（同一上下文 30s 内最多一条 warning，防 50Hz 日志洪泛）
+_WARN_INTERVAL_S = 30.0
+_warn_last_ts: dict[str, float] = {}
+
+
+def _log_draw_issue(exc: BaseException, context: str) -> None:
+    """绘制路径异常统一处置。
+
+    ImportError 保持 debug（无 carla 环境降级特征），
+    其余真实绘制失败提级为限流 warning，不再被 DEBUG 级别静吞（审查项 T）。
+    """
+    if isinstance(exc, ImportError):
+        logger.debug(f"{context} skipped (carla SDK not available): {exc}")
+        return
+    now = time.monotonic()
+    if now - _warn_last_ts.get(context, 0.0) >= _WARN_INTERVAL_S:
+        _warn_last_ts[context] = now
+        logger.warning(f"{context} failed: {exc}")
+    else:
+        logger.debug(f"{context} failed: {exc}")
 
 
 class StateVisualizer:
@@ -63,7 +85,7 @@ class StateVisualizer:
                     persistent_lines=False,
                 )
         except Exception as exc:
-            logger.debug(f"draw_vehicle_state skipped: {exc}")
+            _log_draw_issue(exc, "draw_vehicle_state")
 
     def apply_vehicle_lights(
         self,
@@ -99,7 +121,7 @@ class StateVisualizer:
                 state = state | vls.LowBeam
             vehicle.set_light_state(state)
         except Exception as exc:
-            logger.debug(f"apply_vehicle_lights skipped: {exc}")
+            _log_draw_issue(exc, "apply_vehicle_lights")
 
     def draw_planned_trajectory(
         self,
@@ -135,7 +157,7 @@ class StateVisualizer:
                 )
                 drawn += 1
         except Exception as exc:
-            logger.debug(f"draw_planned_trajectory interrupted: {exc}")
+            _log_draw_issue(exc, "draw_planned_trajectory")
         return drawn
 
 
@@ -188,7 +210,7 @@ class PerceptionOverlay:
                 self._draw_object_box(obj)
                 count += 1
             except Exception as exc:
-                logger.debug(f"Failed to draw object {obj.object_id}: {exc}")
+                _log_draw_issue(exc, f"draw_perception_object {obj.object_id}")
 
         self._draw_count += count
         return count
@@ -208,7 +230,14 @@ class PerceptionOverlay:
         # CARLA debug.draw_box 参数：center, extent, rotation, color, life_time
         extent = carla.Vector3D(x=length / 2.0, y=width / 2.0, z=height / 2.0)
         rotation = carla.Rotation(pitch=0.0, yaw=math.degrees(t.yaw), roll=0.0)
-        color = carla.Color(*self._color, 128)
+        # 审查项 T：显式取前三通道 + 独立 alpha，避免 *解包与附加位置参数混用
+        # （box_color 被动改为 4 元组时原写法会展开成 5 参构造报 TypeError）
+        r, g, b = self._color[0], self._color[1], self._color[2]
+        try:
+            color = carla.Color(r, g, b, 128)  # 半透明（设计文档 §4.4.2）
+        except TypeError:
+            # 兼容不支持 alpha 通道的 carla 绑定版本
+            color = carla.Color(r, g, b)
 
         self._world.debug.draw_box(
             box_extent=extent,

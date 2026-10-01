@@ -63,7 +63,8 @@ def get_struct_logger(name: str) -> structlog.stdlib.BoundLogger:
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
     )
-    return structlog.get_logger(name)
+    bound_logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return bound_logger
 
 
 # ─── RingBuffer ───────────────────────────────────────────────────────────────

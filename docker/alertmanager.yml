@@ -1,0 +1,18 @@
+# Alertmanager 最小路由配置（审查项 S：补齐 Prometheus 告警投递链路）
+# 生产环境请将 receiver 替换为实际通知通道（企业微信/钉钉/邮件/Webhook）
+route:
+  receiver: "default"
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+
+receivers:
+  # 默认接收器：未配置外发通道时仅在 Alertmanager UI（:9093）可查看告警
+  - name: "default"
+
+inhibit_rules:
+  # 同一告警名升级时抑制低级重复通知
+  - source_matchers: ["severity = critical"]
+    target_matchers: ["severity = warning"]
+    equal: ["alertname"]

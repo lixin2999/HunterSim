@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 from hunter_sim.common.models import Transform, VehicleState
 from hunter_sim.common.utils import get_logger, normalize_angle_rad
@@ -67,7 +66,6 @@ class PoseExtrapolator:
         wx, wy, wz = state.angular_velocity
         ax, ay, _ = state.acceleration
         yaw = state.transform.yaw
-        speed = state.vehicle_speed
 
         # 速度外推
         vx_new = vx + ax * dt

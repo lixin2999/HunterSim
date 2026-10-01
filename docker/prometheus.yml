@@ -8,6 +8,13 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# 审查项 S：缺少 alerting 段时 alerts.yml 规则仅计算不投递；
+# 此处对接 Alertmanager（docker-compose 中的 alertmanager 服务）
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # HunterSim 仿真服务指标（免鉴权端点）
   - job_name: "hunter-sim"

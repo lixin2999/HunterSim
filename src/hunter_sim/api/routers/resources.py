@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import ValidationError as PydanticValidationError
@@ -171,9 +170,9 @@ async def _parse_upload_request(request: Request) -> tuple[str, str]:
     """
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("multipart/form-data"):
-        form: dict[str, Any] = await request.form()
+        form = await request.form()  # starlette FormData（MultiDict），支持 str 与 UploadFile 混合值
         upload = form.get("file")
-        if upload is None or not hasattr(upload, "read"):
+        if upload is None or isinstance(upload, str) or not hasattr(upload, "read"):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Missing multipart field 'file' (.xodr file upload)",

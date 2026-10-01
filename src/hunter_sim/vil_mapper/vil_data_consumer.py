@@ -14,17 +14,16 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from pydantic import ValidationError as PydanticValidationError
 
-from hunter_sim.common.exceptions import KafkaConnectionError, ValidationError
+from hunter_sim.common.exceptions import KafkaConnectionError
 from hunter_sim.common.models import (
     DetectedObject,
     KafkaSettings,
     PerceptionResult,
     Transform,
-    VehicleControlCommand,
     VehicleState,
     VILSettings,
 )
@@ -184,9 +183,9 @@ class VILDataConsumer:
                 frame = self._parse_telemetry(payload)
                 self._buffer.push(frame)
             else:
-                frame = self._parse_command_result(payload)
-                if frame is not None:
-                    self._buffer.push(frame)
+                cmd_frame = self._parse_command_result(payload)
+                if cmd_frame is not None:
+                    self._buffer.push(cmd_frame)
         except (KeyError, ValueError, PydanticValidationError) as exc:
             logger.warning(f"Parse error on topic {topic}: {exc}")
             self._error_count += 1

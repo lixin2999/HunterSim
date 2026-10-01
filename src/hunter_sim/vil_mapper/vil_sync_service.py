@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
 from hunter_sim.common.exceptions import CarlaSimulationError, SimTimeoutError
@@ -228,9 +229,16 @@ class VILSyncService:
             self._latency_samples.pop(0)
 
     def _apply_carla_transform(self, transform: Transform) -> None:
-        """将 Transform 应用到 CARLA Vehicle Actor。"""
-        import carla  # noqa: PLC0415
-        import math
+        """将 Transform 应用到 CARLA Vehicle Actor。
+
+        carla 模块惰性导入降级：无 carla 环境时记日志跳过，不每 tick 抛
+        ModuleNotFoundError 累加 sync_errors（可选依赖惰性导入与降级规范）。
+        """
+        try:
+            import carla  # noqa: PLC0415
+        except ImportError:
+            logger.debug("carla not available, transform application skipped (degraded mode)")
+            return
         carla_tf = carla.Transform(
             carla.Location(x=transform.x, y=transform.y, z=transform.z),
             carla.Rotation(
@@ -251,21 +259,21 @@ class VILSyncService:
             state: 实车状态帧。
             yaw_map: 换算后的 CARLA 地图航向角（弧度）。
         """
-        import carla  # noqa: PLC0415
-        import math
         try:
+            import carla  # noqa: PLC0415
             v = state.vehicle_speed
             self._vehicle.set_velocity(carla.Vector3D(
                 x=v * math.cos(yaw_map),
                 y=v * math.sin(yaw_map),
                 z=0.0,
             ))
+            # 内部 rad/s → CARLA 边界 deg/s（set_angular_velocity 期望 deg/s）
             self._vehicle.set_angular_velocity(carla.Vector3D(
-                x=state.angular_velocity[0],
-                y=state.angular_velocity[1],
-                z=state.angular_velocity[2],
+                x=math.degrees(state.angular_velocity[0]),
+                y=math.degrees(state.angular_velocity[1]),
+                z=math.degrees(state.angular_velocity[2]),
             ))
-        except Exception as exc:
+        except Exception as exc:  # 含无 carla 环境的 ImportError，降级不中断同步循环
             logger.debug(f"apply velocity skipped: {exc}")
 
     def _estimate_fps(self) -> float:

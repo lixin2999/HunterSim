@@ -9,17 +9,14 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import Future
-from dataclasses import dataclass
+
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.exceptions import (
     CarlaSimulationError,
     ConfigurationError,
-    InstanceStateError,
-    SimTimeoutError,
 )
-from hunter_sim.common.models import SceneStatus, SimMode
+from hunter_sim.common.models import SceneStatus
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.weather_manager import WeatherManager
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
@@ -75,6 +72,25 @@ class SceneRunnerService:
         """获取当前场景状态快照。"""
         with self._lock:
             return self._state_mgr.get_snapshot() if self._state_mgr else None
+
+    def get_scene_state(self) -> dict[str, Any]:
+        """当前场景状态的序列化字典（供 GET /scenes/{id}/status 端点，与测试桩接口对齐）。"""
+        snapshot = self.get_state_snapshot()
+        if snapshot is None:
+            return {
+                "scene_id": None,
+                "status": "none",
+                "elapsed_seconds": 0.0,
+                "progress": 0.0,
+                "error_message": None,
+            }
+        return {
+            "scene_id": snapshot.scene_id,
+            "status": snapshot.status.value,
+            "elapsed_seconds": round(snapshot.elapsed_seconds, 3),
+            "progress": round(snapshot.progress, 4),
+            "error_message": snapshot.error_message,
+        }
 
     def load_scene(self, config: SceneConfig, scenario: Optional[CustomScenarioBase] = None) -> None:
         """加载场景配置，初始化状态机和事件检测器。

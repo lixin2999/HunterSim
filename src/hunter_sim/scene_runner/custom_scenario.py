@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
-from hunter_sim.common.models import SceneStatus
+from hunter_sim.common.models import SceneStatus  # noqa: F401  # 保留：对外 re-export，下游按模块路径引用
 from hunter_sim.common.utils import get_logger
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig

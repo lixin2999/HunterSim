@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 
@@ -29,6 +29,18 @@ router = APIRouter()
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
 
+# 审查项 P：任务表有界，防止长期运行内存单调增长
+_MAX_TASKS = 1000
+
+
+def _evict_oldest_finished_locked() -> Optional[str]:
+    """【需在 _tasks_lock 内调用】按插入顺序淘汰一个非 running 任务，返回被淘汰的 task_id。"""
+    for tid, t in _tasks.items():
+        if t.get("status") != "running":
+            del _tasks[tid]
+            return tid
+    return None
+
 
 def get_batch_tasks() -> dict[str, dict[str, Any]]:
     """返回批量任务注册表（供执行器与测试访问）。"""
@@ -40,7 +52,7 @@ async def create_batch_task(
     body: BatchScenarioRequest,
     request: Request,
     background_tasks: BackgroundTasks,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/scenarios/batch（文档 §11.2 SIL 批量测试流程）
 
@@ -55,6 +67,8 @@ async def create_batch_task(
         "scenes": body.scenes,
         "results": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
+        # 审查项 P：记录任务归属，报告端点仅允许创建者查看
+        "owner": user_id,
     }
     with _tasks_lock:
         if task_id in _tasks:
@@ -62,11 +76,18 @@ async def create_batch_task(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Batch task '{task_id}' already exists",
             )
+        if len(_tasks) >= _MAX_TASKS and _evict_oldest_finished_locked() is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Batch task registry full ({_MAX_TASKS} running tasks)",
+            )
+        executor = getattr(request.app.state, "scenario_batch_executor", None)
+        if callable(executor):
+            # 锁内写状态：与报告端点的锁内读快照互斥，避免竞态下状态/进度不一致
+            task["status"] = "running"
         _tasks[task_id] = task
 
-    executor = getattr(request.app.state, "scenario_batch_executor", None)
     if callable(executor):
-        task["status"] = "running"
         background_tasks.add_task(executor, task)
     logger.info(f"Batch task registered: {task_id} ({len(body.scenes)} scenes)")
 
@@ -78,26 +99,31 @@ async def create_batch_task(
 @router.get("/{task_id}/report", response_model=ApiResponse, summary="获取批量测试报告")
 async def get_batch_report(
     task_id: str,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """GET /api/v1/sim/scenarios/{task_id}/report（文档 §9.5 汇总报告）
 
     返回任务状态、整体通过率与逐场景结果；未完成评估时仅返回任务进度。
+    审查项 P：仅任务创建者可查看（非归属返回 404，避免探测他人任务存在性）。
     """
     with _tasks_lock:
         task = _tasks.get(task_id)
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Batch task '{task_id}' not found",
-        )
+        if task is None or task.get("owner") != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Batch task '{task_id}' not found",
+            )
+        # 锁内取字段快照，执行器锁外回写不干扰本次读取一致性
+        status_value = task.get("status", "pending")
+        created_at = task.get("created_at", "")
+        total_scenes = len(task.get("scenes", []))
+        results = list(task.get("results", []))
 
-    results = task.get("results", [])
     data: dict[str, Any] = {
         "task_id": task_id,
-        "status": task["status"],
-        "created_at": task["created_at"],
-        "total_scenes": len(task["scenes"]),
+        "status": status_value,
+        "created_at": created_at,
+        "total_scenes": total_scenes,
         "evaluated": len(results),
         "results": results,
     }

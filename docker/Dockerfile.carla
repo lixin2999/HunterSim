@@ -9,8 +9,9 @@ FROM carlasim/carla:0.9.16
 # 安装 HUNTER 自定义资源（车辆/地图/传感器模型）
 COPY hunter_assets/ /home/carla/carla/PythonAPI/hunter_assets/
 
-# 安装 Python 依赖（API 侧桥接与 Kafka 客户端）
-RUN pip install --no-cache-dir fastapi uvicorn kafka-python
+# 审查项 S：不再安装 fastapi/uvicorn/kafka-python——本镜像仅承载 CARLA 引擎；
+# API 服务与 Kafka 桥接依赖属于 hunter-sim 主镜像（docker/Dockerfile），
+# 引入冗余依赖会膨胀镜像并引入额外 CVE 面
 
 # 暴露 RPC 与数据流端口（§10.2.2 carla_server.rpc_port / stream_port）
 EXPOSE 2000 2001

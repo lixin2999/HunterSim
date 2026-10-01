@@ -7,13 +7,11 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from hunter_sim.common.exceptions import ConfigurationError, SensorSimulationError
+from hunter_sim.common.exceptions import SensorSimulationError
 from hunter_sim.common.models import SensorType
 from hunter_sim.common.utils import get_logger
 
@@ -165,7 +163,6 @@ class SensorConfigBundle(BaseModel):
             lane_invasion=EventSensorConfig(),
             obstacle=EventSensorConfig(),
         )
-
 
 # ─── 蓝图工厂 ─────────────────────────────────────────────────────────────────
 

@@ -10,8 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from hunter_sim.common.exceptions import ValidationError
-from hunter_sim.common.models import HunterSESpec, SimMode
+from hunter_sim.common.models import HunterSESpec
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.map_manager import BUILTIN_MAPS, MapManager
 from hunter_sim.scene_runner.scene_config import SceneConfig

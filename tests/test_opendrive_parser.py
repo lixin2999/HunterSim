@@ -67,7 +67,7 @@ class TestParseValid:
         s = OpenDriveParser(_write(tmp_path, _VALID_XODR)).parse()
         r1 = next(r for r in s.roads if r.road_id == 1)
         assert len(r1.lanes) == 2
-        assert {l.lane_type for l in r1.lanes} == {"driving", "sidewalk"}
+        assert {lane.lane_type for lane in r1.lanes} == {"driving", "sidewalk"}
 
     def test_signal_fields(self, tmp_path: Path) -> None:
         s = OpenDriveParser(_write(tmp_path, _VALID_XODR)).parse()

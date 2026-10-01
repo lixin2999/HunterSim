@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Protocol
+from typing import Optional
 
 from hunter_sim.common.models import SimMode
 from hunter_sim.common.utils import get_logger
@@ -15,7 +15,6 @@ from hunter_sim.engine.hunter_se_vehicle import (
     HunterSEParameters,
     HunterSEVehicleController,
     HunterSESILController,
-    VehicleControllerProtocol,
 )
 
 logger = get_logger(__name__)

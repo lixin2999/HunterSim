@@ -13,7 +13,7 @@ from typing import Any, Optional
 from hunter_sim.common.exceptions import CarlaSimulationError, ConfigurationError
 from hunter_sim.common.utils import get_logger
 from hunter_sim.scene_runner.scene_config import SceneConfig
-from hunter_sim.scene_runner.scene_converter import SceneConfigConverter, SceneRuntimeParams
+from hunter_sim.scene_runner.scene_converter import SceneConfigConverter
 
 logger = get_logger(__name__)
 
@@ -115,7 +115,7 @@ class ScenarioRunnerAdapter:
     def _try_import_scenario_manager(self) -> None:
         """尝试导入 ScenarioRunner ScenarioManager。"""
         try:
-            from scenario_runner import ScenarioManager  # noqa: PLC0415
+            from scenario_runner import ScenarioManager  # type: ignore[import-not-found]  # noqa: PLC0415
             self._manager = ScenarioManager(timeout=30.0, debug_mode=False)
         except ImportError:
             self._manager = None

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import math
 import threading
-import time
+
+from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.models import VehicleState
@@ -58,19 +59,24 @@ class EventDetector:
     Args:
         event_definitions: 场景配置中的事件定义列表。
         on_event: 事件触发回调函数。
+        max_events: 事件环形缓冲上限（超出后淘汰最旧事件，防止 50Hz 长时间运行无界增长）。
     """
 
     def __init__(
         self,
         event_definitions: list[SceneEventDefinition],
         on_event: Optional[Callable[[DetectedEvent], None]] = None,
+        max_events: int = 1000,
     ) -> None:
         self._definitions: dict[str, SceneEventDefinition] = {
             d.event_id: d for d in event_definitions
         }
         self._on_event = on_event
         self._lock: threading.Lock = threading.Lock()
-        self._detected: list[DetectedEvent] = []
+        self._detected: deque[DetectedEvent] = deque(maxlen=max_events)
+        # 边沿触发闩锁：条件持续成立时仅在 False→True 跳变时上报一次，
+        # 避免 50Hz 每 tick 重复产生同类事件导致评估计数失真
+        self._latched: set[str] = set()
         self._prev_speed: float = 0.0
         self._prev_accel: float = 0.0
         self._collision_count: int = 0
@@ -127,17 +133,28 @@ class EventDetector:
         )
         self._emit(event)
 
+    def _edge_latch(self, key: str, condition: bool) -> bool:
+        """边沿触发闩锁：条件首次成立返回 True，持续成立返回 False，条件解除后重新加密。"""
+        with self._lock:
+            if not condition:
+                self._latched.discard(key)
+                return False
+            if key in self._latched:
+                return False
+            self._latched.add(key)
+            return True
+
     def check_speed_violation(
         self, timestamp: float, speed_ms: float, limit_ms: float
     ) -> None:
-        """检查超速事件（每 tick 调用）。
+        """检查超速事件（每 tick 调用，边沿触发只上报一次）。
 
         Args:
             timestamp: 当前仿真时间戳。
             speed_ms: 当前车速（m/s）。
             limit_ms: 限速值（m/s）。
         """
-        if speed_ms > limit_ms * 1.1:  # 超过限速 10% 才触发
+        if self._edge_latch("speed_violation", speed_ms > limit_ms * 1.1):  # 超过限速 10% 才触发
             event = DetectedEvent(
                 event_id="speed_violation",
                 event_type=SceneEventType.SPEED_VIOLATION.value,
@@ -150,13 +167,13 @@ class EventDetector:
     def check_emergency_brake(
         self, timestamp: float, acceleration_ms2: float
     ) -> None:
-        """检查紧急制动（减速度 > 3 m/s²，每 tick 调用）。
+        """检查紧急制动（减速度 > 3 m/s²，每 tick 调用，边沿触发）。
 
         Args:
             timestamp: 当前仿真时间戳。
             acceleration_ms2: 纵向加速度（m/s²，负值=制动）。
         """
-        if acceleration_ms2 < -3.0:
+        if self._edge_latch("emergency_brake", acceleration_ms2 < -3.0):
             event = DetectedEvent(
                 event_id="emergency_brake",
                 event_type=SceneEventType.EMERGENCY_BRAKE.value,
@@ -169,14 +186,14 @@ class EventDetector:
     def check_red_light_violation(
         self, timestamp: float, light_is_red: bool, in_intersection: bool
     ) -> None:
-        """检查闯红灯（通过路口时信号灯为红灯，设计文档 §5.5.2）。
+        """检查闯红灯（通过路口时信号灯为红灯，设计文档 §5.5.2，边沿触发）。
 
         Args:
             timestamp: 当前仿真时间戳。
             light_is_red: 前方信号灯是否为红灯。
             in_intersection: 车辆是否正在通过路口。
         """
-        if light_is_red and in_intersection:
+        if self._edge_latch("red_light_violation", light_is_red and in_intersection):
             event = DetectedEvent(
                 event_id="red_light_violation",
                 event_type=SceneEventType.RED_LIGHT.value,
@@ -189,14 +206,16 @@ class EventDetector:
     def check_min_safe_distance(
         self, timestamp: float, gap_m: Optional[float], min_safe_gap_m: float = 3.0
     ) -> None:
-        """检查未保持安全距离（与前车距离 < 安全距离，设计文档 §5.5.2）。
+        """检查未保持安全距离（与前车距离 < 安全距离，设计文档 §5.5.2，边沿触发）。
 
         Args:
             timestamp: 当前仿真时间戳。
             gap_m: 与前车实际距离（米），None 表示前方无车。
             min_safe_gap_m: 最小安全距离阈值（米，设计文档 §9.2.1 默认 3.0）。
         """
-        if gap_m is not None and gap_m < min_safe_gap_m:
+        if self._edge_latch(
+            "min_safe_distance", gap_m is not None and gap_m < min_safe_gap_m
+        ):
             event = DetectedEvent(
                 event_id="min_safe_distance_violation",
                 event_type=SceneEventType.MIN_SAFE_DISTANCE.value,
@@ -303,9 +322,10 @@ class EventDetector:
                 logger.warning(f"Event callback error: {exc}")
 
     def reset(self) -> None:
-        """清空已检测事件列表（场景重启时调用）。"""
+        """清空已检测事件列表与闩锁状态（场景重启时调用）。"""
         with self._lock:
             self._detected.clear()
+            self._latched.clear()
         self._collision_count = 0
         self._target_reached = False
         self._timeout_emitted = False

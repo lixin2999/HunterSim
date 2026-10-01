@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol, cast
 
 from pydantic import BaseModel, Field
 
@@ -257,7 +257,8 @@ class MapManager:
             Transform 列表。
         """
         try:
-            return world.get_map().get_spawn_points()  # type: ignore[union-attr]
+            carla_world: Any = world  # CARLA 对象无类型 stub，Any 间接层避免 suppress 真实错写
+            return cast(list[object], carla_world.get_map().get_spawn_points())
         except Exception as exc:
             raise CarlaSimulationError(
                 operation="get_spawn_points",
@@ -276,9 +277,10 @@ class MapManager:
             路面 Z 坐标（米）。
         """
         try:
-            map_obj = world.get_map()  # type: ignore[union-attr]
+            carla_world: Any = world
+            map_obj: Any = carla_world.get_map()
             loc = _make_carla_location(x, y, 100.0)
-            ground_loc = map_obj.get_waypoint_z(loc)  # type: ignore[union-attr]
+            ground_loc = map_obj.get_waypoint_z(loc)
             return float(ground_loc) if ground_loc is not None else 0.0
         except Exception:
             return 0.0

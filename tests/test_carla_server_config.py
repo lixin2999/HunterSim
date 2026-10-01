@@ -47,21 +47,29 @@ class TestBuildArgs:
         args = CarlaServerConfig(stream_port=2001).build_carla_exe_args()
         assert "-carla-streaming-port=2001" in args
 
-    def test_nosound_fps_benchmark(self) -> None:
-        # 设计文档 §3.1.1：-nosound / -fps=50 / -benchmark
+    def test_nosound_fps_default(self) -> None:
+        # 默认非 benchmark：含 -fps=50；benchmark 与同步定步互斥，默认关闭
         args = CarlaServerConfig().build_carla_exe_args()
         assert "-nosound" in args
         assert "-fps=50" in args
+        assert "-benchmark" not in args
+
+    def test_benchmark_excludes_fps(self) -> None:
+        # 显式启用 benchmark 时不再附加 -fps（审查项 M：互斥语义）
+        args = CarlaServerConfig(benchmark=True).build_carla_exe_args()
         assert "-benchmark" in args
+        assert not any(a.startswith("-fps=") for a in args)
 
     def test_no_rendering_and_gpu(self) -> None:
         args = CarlaServerConfig(no_rendering=True, gpu_id=1).build_carla_exe_args()
         assert "-nullrhi" in args
-        assert "-gpu=1" in args
+        # CARLA 0.9.16 选用显卡的正确参数为 -graphicsadapter（审查项 M）
+        assert "-graphicsadapter=1" in args
+        assert not any(a.startswith("-gpu=") for a in args)
 
     def test_auto_gpu_no_adapter_flag(self) -> None:
         args = CarlaServerConfig(gpu_id=-1).build_carla_exe_args()
-        assert not any(a.startswith("-gpu=") for a in args)
+        assert not any(a.startswith("-graphicsadapter=") for a in args)
 
     def test_epic_quality_flag(self) -> None:
         args = CarlaServerConfig(quality=QualityLevel.EPIC).build_carla_exe_args()

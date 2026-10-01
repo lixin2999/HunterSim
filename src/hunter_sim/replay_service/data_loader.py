@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from hunter_sim.common.exceptions import ConfigurationError
 from hunter_sim.common.utils import get_logger

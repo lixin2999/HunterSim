@@ -6,14 +6,10 @@
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 from pathlib import Path
-from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from hunter_sim.common.exceptions import ConfigurationError
 from hunter_sim.common.models import QualityLevel
 from hunter_sim.common.utils import get_logger
 
@@ -75,7 +71,8 @@ class CarlaServerConfig(BaseModel):
         offscreen: 是否使用离屏渲染（无窗口模式）。
         no_rendering: 是否禁用渲染（纯物理仿真）。
         fps: 目标帧率（设计文档默认 50）。
-        benchmark: 基准模式（禁用帧率限制）。
+        benchmark: 基准模式（禁用帧率限制）。⚠️ 与同步模式互斥：启用后
+            CARLA 自由跑帧，fixed_delta_seconds 定步推进失效，仅用于纯异步压力测试。
         nosound: 禁用声音。
         fixed_delta_seconds: 同步模式固定步长（秒）。
         substepping: 是否启用子步。
@@ -98,7 +95,10 @@ class CarlaServerConfig(BaseModel):
     offscreen: bool = Field(True, description="离屏渲染模式")
     no_rendering: bool = Field(False, description="禁用渲染（仅物理）")
     fps: int = Field(50, ge=1, le=100, description="目标帧率（设计文档 §3.1.1）")
-    benchmark: bool = Field(True, description="基准模式（禁用帧率限制）")
+    benchmark: bool = Field(
+        False,
+        description="基准模式（与同步模式互斥，默认关闭；仅异步压测时显式启用）",
+    )
     nosound: bool = Field(True, description="禁用声音")
     fixed_delta_seconds: float = Field(0.02, gt=0.0, le=0.1, description="50Hz 步长")
     substepping: bool = True
@@ -163,15 +163,20 @@ class CarlaServerConfig(BaseModel):
         ]
         if self.nosound:
             args.append("-nosound")
-        args.append(f"-fps={self.fps}")
         if self.benchmark:
+            # 审查项 M：-benchmark 禁用帧率限制，与同步定步推进互斥；
+            # 启用时不再附加 -fps（会被 benchmark 覆盖，避免配置意图歧义）
             args.append("-benchmark")
+        else:
+            args.append(f"-fps={self.fps}")
         if self.offscreen:
             args.append("-RenderOffScreen")
         if self.no_rendering:
             args.append("-nullrhi")
         if self.gpu_id >= 0:
-            args.append(f"-gpu={self.gpu_id}")
+            # CARLA 0.9.16（UE4 26.x 基线）选择显卡的正确参数是 -graphicsadapter，
+            # 旧式 -gpu= 在新版引擎上不生效
+            args.append(f"-graphicsadapter={self.gpu_id}")
         args.extend(self.extra_args)
         return args
 

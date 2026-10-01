@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 
@@ -253,7 +252,7 @@ class TestMapUploadEndpoint:
     def test_upload_map_id_trailing_newline_rejected(
         self, client: TestClient, auth_headers: dict, tmp_path
     ) -> None:
-        """审查项 E：fullmatch 拒绝尾换行绕过（^...$ + match 可被 'evil\\n' 穿透）。"""
+        r"""审查项 E：fullmatch 拒绝尾换行绕过（^...$ + match 可被 'evil\n' 穿透）。"""
         client.app.state.resources_dir = str(tmp_path)
         resp = client.post(
             "/api/v1/sim/maps/upload",

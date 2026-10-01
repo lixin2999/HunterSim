@@ -97,6 +97,9 @@ spec:
       terminationGracePeriodSeconds: 30
 ---
 # 共享存储 PVC（设计文档 §15.1）
+# 审查项 S：ReadWriteMany 必须绑定支持 RWX 的 StorageClass（NFS/CephFS/Longhorn 等）。
+# 留空会回落集群默认 StorageClass，而默认类多为 RWO（云盘/hostpath），
+# 多 Pod 挂载时卡在 FailedMount。集群需预先创建同名 RWX StorageClass。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -105,6 +108,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany   # 仿真服务层与 CARLA GPU Pod 共享
+  storageClassName: huntersim-rwx   # 指向支持 RWX 的 StorageClass（按集群实际名称修改）
   resources:
     requests:
       storage: 500Gi  # §15.2 推荐存储配置
@@ -112,6 +116,9 @@ spec:
 # CARLA 仿真引擎 GPU Pod（设计文档 §15.1/§10.2.3）
 # 需要 NVIDIA GPU Operator / Container Toolkit；每 Pod 分配 1 块 GPU，
 # 单 GPU 可承载 1-2 个实例（§10.3.2 并发限制由应用层 GPU 资源池调度）
+# 审查项 S：固定 RPC/流端口 2000/2001 + 应用层单端点假设（CARLA_HOST 单一），
+# Deployment 多副本会导致负载均衡到错误引擎且 load_world 互相重置。
+# 扩容需改 StatefulSet + per-Pod Service（配合应用层实例端口递增分配，见 instance_manager）。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -121,7 +128,7 @@ metadata:
     app: hunter-sim
     component: carla-engine
 spec:
-  replicas: 2
+  replicas: 1   # 审查项 S：单副本——多引擎扩容见上方注释（StatefulSet 方案）
   selector:
     matchLabels:
       app: hunter-sim
@@ -157,3 +164,23 @@ spec:
             claimName: hunter-sim-resources-pvc
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
+---
+# CARLA 引擎集群内访问入口（审查项 S：供 CARLA_HOST=carla-engine-svc 使用，
+# 优于 configmap 中硬编码宿主机 IP 的双机分离模式）
+apiVersion: v1
+kind: Service
+metadata:
+  name: carla-engine-svc
+  namespace: hunter-sim
+spec:
+  selector:
+    app: hunter-sim
+    component: carla-engine
+  ports:
+    - name: rpc
+      port: 2000
+      targetPort: 2000
+    - name: streaming
+      port: 2001
+      targetPort: 2001
+  type: ClusterIP

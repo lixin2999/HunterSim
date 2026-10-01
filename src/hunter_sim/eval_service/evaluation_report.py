@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from hunter_sim.common.models import EvalGrade
 from hunter_sim.common.utils import get_logger
 from hunter_sim.eval_service.evaluation_engine import (
     BatchEvaluator,

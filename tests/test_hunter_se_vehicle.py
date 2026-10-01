@@ -154,10 +154,11 @@ class TestVILController:
         assert actor.last_velocity.y == pytest.approx(0.5)
 
     def test_apply_angular_velocity(self) -> None:
+        # 审查项 I：内部 rad/s，CARLA set_angular_velocity 边界换算 deg/s
         actor = _StubActor()
         ctrl = HunterSEVehicleController(actor)
         ctrl.apply_angular_velocity(0.0, 0.0, 0.3)
-        assert actor.last_angular_velocity.z == pytest.approx(0.3)
+        assert actor.last_angular_velocity.z == pytest.approx(math.degrees(0.3))
 
     def test_destroy_then_error(self) -> None:
         actor = _StubActor()

@@ -124,6 +124,27 @@ class TestInstanceHealthMonitor:
         cycle = mon.run_check_cycle()
         assert cycle["expired_destroyed"] == ["zombie-1", "zombie-2"]
 
+    def test_expired_instances_auto_unregistered(self) -> None:
+        """审查项 K：过期销毁后自动注销监控，防 _watched 集合单调增长。"""
+        mon = InstanceHealthMonitor(
+            check_callback=lambda iid: True,
+            expired_cleanup_callback=lambda: ["gone-1"],
+        )
+        mon.register_instance("gone-1")
+        mon.register_instance("alive-1")
+        mon.run_check_cycle()
+        assert mon.watched_ids() == ["alive-1"]  # 过期项已注销，健康项保留
+
+    def test_watched_ids_is_sorted_snapshot(self) -> None:
+        """审查项 K：watched_ids 返回锁内拷贝快照（外部修改不影响内部集合）。"""
+        mon = InstanceHealthMonitor()
+        mon.register_instance("b")
+        mon.register_instance("a")
+        snap = mon.watched_ids()
+        assert snap == ["a", "b"]
+        snap.append("c")
+        assert mon.watched_ids() == ["a", "b"]
+
     def test_unregister_clears_state(self) -> None:
         mon = InstanceHealthMonitor(
             settings=ResourceSettings(max_retry_count=0),

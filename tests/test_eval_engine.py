@@ -258,3 +258,43 @@ class TestBatchEvaluator:
         avg = ev.summary()["metric_averages"]
         assert avg["avg_speed_ms"] == pytest.approx(3.0)
         assert avg["avg_acceleration_ms2"] == pytest.approx(2.0)
+
+
+class TestFrameDtDerivation:
+    """审查项 R：帧步长从数据推导 + time_stamp 规范字段兼容。"""
+
+    def test_waiting_time_uses_derived_dt(self) -> None:
+        # 10Hz 帧（time_stamp 规范字段）：等待时长 = 帧数 × 推导步长 0.1s
+        states = [
+            {"vehicle_speed": 0.1, "time_stamp": i * 0.1} for i in range(10)
+        ]
+        eff = EvaluationEngine._compute_efficiency(states, duration_s=1.0, completed=True)
+        assert eff.waiting_time_s == pytest.approx(10 * 0.1)
+
+    def test_waiting_time_falls_back_without_timestamps(self) -> None:
+        # 无时间戳时回退 50Hz 默认步长
+        states = [{"vehicle_speed": 0.1} for _ in range(10)]
+        eff = EvaluationEngine._compute_efficiency(states, duration_s=1.0, completed=True)
+        assert eff.waiting_time_s == pytest.approx(10 * 0.02)
+
+    def test_total_distance_reads_time_stamp_field(self) -> None:
+        # 旧实现只读 timestamp，规范字段 time_stamp 会得 0（审查项 R 核心缺陷）
+        states = [
+            {"vehicle_speed": 2.0, "time_stamp": i * 0.05} for i in range(10)
+        ]
+        eff = EvaluationEngine._compute_efficiency(states, duration_s=0.5, completed=True)
+        assert eff.total_distance_m == pytest.approx(2.0 * 0.05 * 9)
+
+    def test_jerk_uses_derived_dt(self) -> None:
+        # 10Hz：加速度每帧 +0.1 → jerk = 0.1/0.1 = 1.0 m/s³（硬编码 0.02 会得 5.0）
+        states = [
+            {
+                "vehicle_speed": 1.0,
+                "time_stamp": i * 0.1,
+                "acceleration": (0.1 * i, 0.0, 0.0),
+                "steering": 0.0,
+            }
+            for i in range(5)
+        ]
+        com = EvaluationEngine._compute_comfort(states)
+        assert com.avg_jerk_ms3 == pytest.approx(1.0)

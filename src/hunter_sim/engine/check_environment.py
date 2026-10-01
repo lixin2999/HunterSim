@@ -102,7 +102,9 @@ def _check_nvidia_smi() -> tuple[Optional[str], Optional[str], float, Optional[s
             text=True,
             timeout=5,
         )
-        cuda_version: Optional[str] = cuda_result.stdout.strip().splitlines()[0] if cuda_result.returncode == 0 and cuda_result.stdout.strip() else None
+        cuda_version: Optional[str] = None
+        if cuda_result.returncode == 0 and cuda_result.stdout.strip():
+            cuda_version = cuda_result.stdout.strip().splitlines()[0]
 
         return driver_version, cuda_version, memory_mb / 1024.0, gpu_name
 

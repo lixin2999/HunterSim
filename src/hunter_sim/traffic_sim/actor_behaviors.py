@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from hunter_sim.common.utils import get_logger
@@ -61,10 +61,14 @@ class ActorBehavior(ABC):
         """每 tick 调用，返回本帧行为指令。"""
         ...
 
-    def start(self) -> None:
-        """激活行为。"""
+    def start(self, now: float = 0.0) -> None:
+        """激活行为。
+
+        Args:
+            now: 激活时刻的仿真绝对时间（秒），记录到 `_start_time` 供需要时回查。
+        """
         self._active = True
-        self._start_time = 0.0
+        self._start_time = now
 
     def stop(self) -> None:
         """停用行为。"""
@@ -204,7 +208,6 @@ class PedestrianCrossBehavior(ActorBehavior):
             is_stop=done,
         )
 
-
 # ─── 行为工厂与场景化控制器（设计文档 §7.4） ───────────────────────────────
 
 
@@ -271,6 +274,9 @@ class ScriptedActorController:
         self._behavior = behavior
         self._trigger = trigger
         self._triggered = trigger is None
+        # 触发时刻基准：行为接收到的 elapsed_time 为触发后的相对时间，
+        # 避免触发发生在 t>0 时行为进度跳变（如 cut_in 首帧即 progress=1.0）
+        self._trigger_elapsed: float = 0.0
         self._elapsed: float = 0.0
 
     @property
@@ -297,15 +303,19 @@ class ScriptedActorController:
         if not self._triggered and self._trigger is not None:
             if self._trigger.check(self._elapsed, self._actor, ego_vehicle):
                 self._triggered = True
-                self._behavior.start()
+                self._trigger_elapsed = self._elapsed
+                self._behavior.start(self._elapsed)
                 logger.debug(f"ScriptedActorController triggered: {self._behavior.behavior_id}")
         if not self._triggered:
             return None
-        return self._behavior.update(self._elapsed, self._actor, ego_vehicle, delta_seconds)
+        return self._behavior.update(
+            self._elapsed - self._trigger_elapsed, self._actor, ego_vehicle, delta_seconds
+        )
 
     def reset(self) -> None:
         """重置控制器与触发器状态（场景重启时调用）。"""
         self._elapsed = 0.0
+        self._trigger_elapsed = 0.0
         self._triggered = self._trigger is None
         if self._trigger is not None:
             self._trigger.reset()

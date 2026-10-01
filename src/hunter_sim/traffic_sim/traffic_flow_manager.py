@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 import threading
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 

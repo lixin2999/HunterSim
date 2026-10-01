@@ -116,3 +116,35 @@ class TestFailureAndReset:
         det = EventDetector([], on_event=_boom)
         det.on_collision(1.0, 1, 50.0)  # 不应抛出
         assert len(det.detected_events) == 1
+
+
+class TestEdgeLatchAndBoundedBuffer:
+    """审查项 H：边沿触发闩锁 + 有界缓冲，防 50Hz 每 tick 检查事件洪泛。"""
+
+    def test_persistent_condition_reports_once(self) -> None:
+        det = EventDetector([])
+        for i in range(50):  # 超速条件持续成立 50 tick
+            det.check_speed_violation(1.0 + i * 0.02, speed_ms=12.0, limit_ms=10.0)
+        assert len(det.detected_events) == 1
+
+    def test_rearm_after_condition_clears(self) -> None:
+        det = EventDetector([])
+        det.check_speed_violation(1.0, speed_ms=12.0, limit_ms=10.0)  # 上升沿 → 上报
+        det.check_speed_violation(2.0, speed_ms=8.0, limit_ms=10.0)   # 条件消失 → 释闩
+        det.check_speed_violation(3.0, speed_ms=12.0, limit_ms=10.0)  # 再次上升沿 → 上报
+        assert len(det.detected_events) == 2
+
+    def test_reset_clears_latch(self) -> None:
+        det = EventDetector([])
+        det.check_emergency_brake(1.0, acceleration_ms2=-5.0)  # 上报并闩锁
+        det.reset()
+        det.check_emergency_brake(2.0, acceleration_ms2=-5.0)  # reset 后重新上报
+        assert len(det.detected_events) == 1
+
+    def test_buffer_is_bounded(self) -> None:
+        det = EventDetector([], max_events=5)
+        for i in range(10):  # 碰撞回调事件非闩锁，逐条入缓冲
+            det.on_collision(float(i), other_actor_id=i, impulse=10.0)
+        assert len(det.detected_events) == 5
+        # 保留最新事件（FIFO 淘汰旧条目）
+        assert det.detected_events[-1].data["other_actor_id"] == 9

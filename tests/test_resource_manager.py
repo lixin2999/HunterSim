@@ -129,6 +129,17 @@ class TestSimInstanceManager:
         assert inst.status == InstanceStatus.CREATED
         assert inst.gpu_id >= 0
 
+    def test_carla_ports_incremental_allocation(self) -> None:
+        """审查项 N：多实例按空闲端口对递增分配，销毁后可复用。"""
+        mgr = self._make_manager()
+        inst1 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
+        inst2 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
+        assert (inst1.carla_rpc_port, inst1.carla_stream_port) == (2000, 2001)
+        assert (inst2.carla_rpc_port, inst2.carla_stream_port) == (2002, 2003)
+        mgr.destroy_instance(inst2.sim_instance_id)
+        inst3 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
+        assert (inst3.carla_rpc_port, inst3.carla_stream_port) == (2002, 2003)  # 空闲对回收复用
+
     def test_lifecycle_transitions(self) -> None:
         """CREATED -> LOADING -> READY -> RUNNING -> COMPLETED。"""
         mgr = self._make_manager()
@@ -163,7 +174,7 @@ class TestSimInstanceManager:
         mgr = SimInstanceManager(settings=ResourceSettings(), gpu_pool=pool)
         # EPIC 只能分配 2 次
         i1 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
-        i2 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)  # 占满第二次分配
         # 第三次应该失败
         with pytest.raises(ResourceError):
             mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.EPIC)

@@ -10,8 +10,8 @@
 from __future__ import annotations
 
 import threading
-import time
-from typing import Any, Callable, Optional
+
+from typing import Any, Optional
 
 from hunter_sim.common.exceptions import ROS2ConnectionError, SensorSimulationError
 from hunter_sim.common.models import SensorType
@@ -62,7 +62,7 @@ class CarlaRosBridge:
         try:
             import rclpy  # noqa: PLC0415
             from rclpy.node import Node  # noqa: PLC0415
-            from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy  # noqa: PLC0415
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy  # noqa: PLC0415
             from sensor_msgs.msg import Image, Imu, PointCloud2  # noqa: PLC0415
             from nav_msgs.msg import Odometry  # noqa: PLC0415
         except ImportError as exc:

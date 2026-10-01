@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from hunter_sim.common.exceptions import ResourceError
-from hunter_sim.common.models import InstanceStatus, ResourceSettings
+from hunter_sim.common.models import ResourceSettings
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -64,7 +64,7 @@ class ResourceQuotaManager:
                     del self._user_counts[user_id]
             self._total_count = max(0, self._total_count - 1)
 
-    def get_usage(self, user_id: str = "") -> dict[str, int]:
+    def get_usage(self, user_id: str = "") -> dict[str, Any]:
         """查询配额使用情况。"""
         with self._lock:
             if user_id:
@@ -90,9 +90,9 @@ class InstanceHealthMonitor:
     def __init__(
         self,
         settings: Optional[ResourceSettings] = None,
-        check_callback: Optional[object] = None,
-        restart_callback: Optional[object] = None,
-        expired_cleanup_callback: Optional[object] = None,
+        check_callback: Optional[Callable[[str], bool]] = None,
+        restart_callback: Optional[Callable[[str], None]] = None,
+        expired_cleanup_callback: Optional[Callable[[], list[str]]] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._check_callback = check_callback
@@ -100,19 +100,24 @@ class InstanceHealthMonitor:
         self._expired_cleanup_callback = expired_cleanup_callback
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+        # 共享状态由请求线程（register/unregister）与后台监控线程并发访问，
+        # 统一用 _lock 保护，避免遍历中集合变更导致后台线程崩溃
+        self._lock: threading.Lock = threading.Lock()
         self._retry_counts: dict[str, int] = {}
         self._unrecoverable: set[str] = set()
         self._watched: set[str] = set()
 
     def register_instance(self, instance_id: str) -> None:
         """注册需要监控的实例。"""
-        self._watched.add(instance_id)
+        with self._lock:
+            self._watched.add(instance_id)
 
     def unregister_instance(self, instance_id: str) -> None:
         """取消监控（销毁实例时调用，清理重试计数）。"""
-        self._watched.discard(instance_id)
-        self._retry_counts.pop(instance_id, None)
-        self._unrecoverable.discard(instance_id)
+        with self._lock:
+            self._watched.discard(instance_id)
+            self._retry_counts.pop(instance_id, None)
+            self._unrecoverable.discard(instance_id)
 
     def start(self) -> None:
         """启动后台健康检查线程。"""
@@ -127,13 +132,20 @@ class InstanceHealthMonitor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
 
+    def watched_ids(self) -> list[str]:
+        """当前监控中的实例 ID 快照（锁内拷贝，供装配层同步监控集合）。"""
+        with self._lock:
+            return sorted(self._watched)
+
     def get_retry_count(self, instance_id: str) -> int:
         """获取实例重试次数。"""
-        return self._retry_counts.get(instance_id, 0)
+        with self._lock:
+            return self._retry_counts.get(instance_id, 0)
 
     def is_unrecoverable(self, instance_id: str) -> bool:
         """实例是否已超过最大重试次数被标记为不可恢复。"""
-        return instance_id in self._unrecoverable
+        with self._lock:
+            return instance_id in self._unrecoverable
 
     def run_check_cycle(self) -> dict[str, list[str]]:
         """执行一轮检查：健康探针 + 重启重试 + 超时清理。
@@ -144,10 +156,12 @@ class InstanceHealthMonitor:
         result: dict[str, list[str]] = {
             "failed": [], "restarted": [], "exhausted": [], "expired_destroyed": [],
         }
-        for instance_id in sorted(self._watched):
+        with self._lock:
+            watched = sorted(self._watched)  # 锁内快照，回调不在锁内执行集合变更
+        for instance_id in watched:
             if callable(self._check_callback):
                 try:
-                    healthy = bool(self._check_callback(instance_id))  # type: ignore[operator]
+                    healthy = bool(self._check_callback(instance_id))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"Health check error for '{instance_id}': {exc}")
                     healthy = False
@@ -155,16 +169,20 @@ class InstanceHealthMonitor:
                 healthy = True
             if healthy:
                 # 恢复正常后重置重试计数
-                self._retry_counts[instance_id] = 0
+                with self._lock:
+                    self._retry_counts[instance_id] = 0
                 continue
             result["failed"].append(instance_id)
-            if instance_id in self._unrecoverable:
-                continue
-            count = self._retry_counts.get(instance_id, 0) + 1
-            self._retry_counts[instance_id] = count
-            if count > self._settings.max_retry_count:
+            with self._lock:
+                if instance_id in self._unrecoverable:
+                    continue
+                count = self._retry_counts.get(instance_id, 0) + 1
+                self._retry_counts[instance_id] = count
                 # 异常恢复：最多重试 3 次，超出后不再重启（§14.1）
-                self._unrecoverable.add(instance_id)
+                exhausted = count > self._settings.max_retry_count
+                if exhausted:
+                    self._unrecoverable.add(instance_id)
+            if exhausted:
                 result["exhausted"].append(instance_id)
                 logger.error(
                     f"Instance '{instance_id}' exceeded max retries ({self._settings.max_retry_count}), "
@@ -172,7 +190,7 @@ class InstanceHealthMonitor:
                 )
             elif callable(self._restart_callback):
                 try:
-                    self._restart_callback(instance_id)  # type: ignore[operator]
+                    self._restart_callback(instance_id)
                     result["restarted"].append(instance_id)
                     logger.warning(f"Instance '{instance_id}' restarted (attempt {count})")
                 except Exception as exc:  # noqa: BLE001
@@ -180,8 +198,11 @@ class InstanceHealthMonitor:
 
         if callable(self._expired_cleanup_callback):
             try:
-                expired = self._expired_cleanup_callback() or []  # type: ignore[operator]
-                result["expired_destroyed"] = list(expired)
+                expired = list(self._expired_cleanup_callback() or [])
+                result["expired_destroyed"] = expired
+                # 过期实例已被销毁，自动注销监控，避免 _watched 集合单调增长
+                for iid in expired:
+                    self.unregister_instance(iid)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Expired instance cleanup failed: {exc}")
         return result
@@ -189,7 +210,12 @@ class InstanceHealthMonitor:
     def _loop(self) -> None:
         while self._running:
             time.sleep(self._settings.health_check_interval_seconds)
-            cycle = self.run_check_cycle()
+            try:
+                cycle = self.run_check_cycle()
+            except Exception as exc:  # noqa: BLE001
+                # 单轮异常不得静默终止 daemon 线程，记录后继续下一轮
+                logger.error(f"Health monitor cycle error: {exc}")
+                continue
             if cycle["failed"] or cycle["expired_destroyed"]:
                 logger.info(
                     f"Health cycle: failed={cycle['failed']} "

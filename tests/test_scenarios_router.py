@@ -114,3 +114,30 @@ class TestBatchReport:
     def test_report_unknown_task_404(self, client: TestClient, auth_headers: dict, _no_tasks: Any) -> None:
         resp = client.get("/api/v1/sim/scenarios/nope/report", headers=auth_headers)
         assert resp.status_code == 404
+
+    def test_report_other_user_task_404(
+        self, client: TestClient, auth_headers: dict, user_headers: dict, _no_tasks: Any
+    ) -> None:
+        # 审查项 P：任务归属隔离——非创建者查看返回 404（不泄露存在性）
+        client.post(
+            "/api/v1/sim/scenarios/batch",
+            json={"task_id": "task-owned", "scenes": [_SCENE_A]},
+            headers=auth_headers,
+        )
+        resp = client.get("/api/v1/sim/scenarios/task-owned/report", headers=user_headers)
+        assert resp.status_code == 404
+        # 创建者本人仍可正常查看
+        assert client.get("/api/v1/sim/scenarios/task-owned/report", headers=auth_headers).status_code == 200
+
+    def test_registry_evicts_finished_when_full(self, _no_tasks: Any) -> None:
+        # 审查项 P：任务表有界——满表时优先淘汰最早的非 running 任务
+        from hunter_sim.api.routers import scenarios
+
+        scenarios._tasks.clear()
+        for i in range(scenarios._MAX_TASKS):
+            scenarios._tasks[f"t{i}"] = {"task_id": f"t{i}", "status": "completed", "owner": "u"}
+        evicted = scenarios._evict_oldest_finished_locked()
+        assert evicted == "t0"  # 插入顺序最早的任务先被淘汰
+        assert "t0" not in scenarios._tasks
+        assert len(scenarios._tasks) == scenarios._MAX_TASKS - 1
+        scenarios._tasks.clear()

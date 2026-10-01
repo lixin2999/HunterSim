@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any, Optional
 
 from hunter_sim.common.exceptions import SensorSimulationError
@@ -58,8 +57,9 @@ class SensorMountSpec:
             carla.Rotation(pitch=self.pitch_deg, yaw=self.yaw_deg, roll=self.roll_deg),
         )
 
-
 # HUNTER SE 标准传感器安装位置
+
+
 _HUNTER_SE_MOUNTS: list[SensorMountSpec] = [
     SensorMountSpec(
         mount_id="lidar_top",

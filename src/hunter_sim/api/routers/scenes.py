@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import Any, Optional
 
@@ -18,7 +19,6 @@ from hunter_sim.api.models import (
     CalibrationRequest,
     CalibrationResponse,
     LoadSceneRequest,
-    SceneStatusResponse,
     SetWeatherRequest,
 )
 from hunter_sim.common.utils import get_logger
@@ -29,7 +29,7 @@ router = APIRouter()
 
 def _get_scene_runner(request: Request, instance_id: str) -> Any:
     """从 app.state 获取场景运行服务（按 instance_id 路由）。"""
-    runners: dict = getattr(request.app.state, "scene_runners", {})
+    runners: dict[str, Any] = getattr(request.app.state, "scene_runners", {})
     runner = runners.get(instance_id)
     if runner is None:
         raise HTTPException(
@@ -218,8 +218,10 @@ async def load_scene(
     """POST /api/v1/sim/scenes/load
 
     向指定实例下发场景配置。配置经过校验后转换为 CARLA 参数并加载。
+    审查项 O：load 涉及 CARLA Actor 生成等秒级阻塞操作，走 to_thread 避免阻塞事件循环。
     """
-    return ApiResponse(data=load_scene_impl(request, body.instance_id, body.scene_config))
+    data = await asyncio.to_thread(load_scene_impl, request, body.instance_id, body.scene_config)
+    return ApiResponse(data=data)
 
 
 @router.get("/{instance_id}/status", response_model=ApiResponse, summary="查询场景状态")
@@ -252,9 +254,12 @@ async def stop_scene(
     request: Request,
     _: str = Depends(get_current_user),
 ) -> ApiResponse:
-    """POST /api/v1/sim/scenes/{instance_id}/stop"""
+    """POST /api/v1/sim/scenes/{instance_id}/stop
+
+    审查项 O：stop 会 join 运行线程（最长 5s），走 to_thread 避免阻塞事件循环。
+    """
     runner = _get_scene_runner(request, instance_id)
-    runner.stop()
+    await asyncio.to_thread(runner.stop)
     return ApiResponse(data={"instance_id": instance_id, "status": "stopped"})
 
 
@@ -296,8 +301,10 @@ async def set_weather(
 
     设置仿真实例的天气参数，支持预设环境和自定义参数。
     渐变过渡时长可配置（transition_seconds），避免传感器数据跳变。
+    审查项 O：立即生效路径会调用 world.set_weather RPC，走 to_thread。
     """
-    return ApiResponse(data=set_weather_impl(request, instance_id, body))
+    data = await asyncio.to_thread(set_weather_impl, request, instance_id, body)
+    return ApiResponse(data=data)
 
 
 # ─── VIL 标定 ─────────────────────────────────────────────────────────────────
@@ -330,5 +337,7 @@ async def get_screenshot(
     """GET /api/v1/sim/scenes/{instance_id}/screenshot
 
     获取当前帧的 RGB 相机截图（Base64 编码 PNG）。
+    审查项 O：截图读取可能触发同步等待，走 to_thread。
     """
-    return ApiResponse(data=screenshot_impl(request, instance_id))
+    data = await asyncio.to_thread(screenshot_impl, request, instance_id)
+    return ApiResponse(data=data)

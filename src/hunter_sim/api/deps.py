@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -70,7 +70,10 @@ def create_access_token(
     }
     if extra_claims:
         payload.update(extra_claims)
-    return jwt.encode(payload, api_settings.jwt_secret.get_secret_value(), algorithm=api_settings.jwt_algorithm)
+    token = jwt.encode(
+        payload, api_settings.jwt_secret.get_secret_value(), algorithm=api_settings.jwt_algorithm
+    )
+    return cast(str, token)
 
 
 def decode_token(token: str, api_settings: APISettings) -> dict[str, Any]:
@@ -87,11 +90,11 @@ def decode_token(token: str, api_settings: APISettings) -> dict[str, Any]:
         HTTPException: Token 无效或过期时抛出 401。
     """
     try:
-        payload = jwt.decode(
+        payload = cast(dict[str, Any], jwt.decode(
             token,
             api_settings.jwt_secret.get_secret_value(),
             algorithms=[api_settings.jwt_algorithm],
-        )
+        ))
         return payload
     except JWTError as exc:
         logger.warning(f"JWT decode failed: {exc}")

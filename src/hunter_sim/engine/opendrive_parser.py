@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-import defusedxml.ElementTree as ET  # type: ignore[import]  # 安全解析，防止 XXE/DoS 攻击
+import defusedxml.ElementTree as ET  # 安全解析，防止 XXE/DoS 攻击
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from hunter_sim.common.exceptions import ConfigurationError
 from hunter_sim.common.utils import get_logger
@@ -95,6 +94,7 @@ class OpenDriveMapSummary:
         valid: 地图文件是否通过完整性验证。
         header_version: OpenDRIVE 版本字符串。
         map_name: 地图名称。
+        projection: geoReference 内的 PROJ 投影字符串（无则为空）。
         total_road_count: 道路总数。
         total_junction_count: 路口总数。
         total_signal_count: 信号灯/标志总数。
@@ -108,6 +108,7 @@ class OpenDriveMapSummary:
     valid: bool
     header_version: str = ""
     map_name: str = ""
+    projection: str = ""
     total_road_count: int = 0
     total_junction_count: int = 0
     total_signal_count: int = 0
@@ -165,6 +166,7 @@ class OpenDriveParser:
             errors.append(f"Unsupported OpenDRIVE version '{rev}', supported: {_SUPPORTED_HEADER_VERSIONS}")
 
         geo_ref = header.find("geoReference") if header is not None else None
+        projection = (geo_ref.text or "").strip() if geo_ref is not None else ""
         # OpenDRIVE 标准中地图名称为 <header> 的 name 属性
         map_name = (header.get("name", "") if header is not None else "") or self._path.stem
 
@@ -209,6 +211,7 @@ class OpenDriveParser:
             valid=valid,
             header_version=rev,
             map_name=map_name,
+            projection=projection,
             total_road_count=len(roads),
             total_junction_count=len(junctions),
             total_signal_count=len(signals),

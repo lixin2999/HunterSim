@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -201,7 +202,7 @@ async def start_instance(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     audit_log("instance.start", user_id, instance_id)
     inst = mgr.get_instance(instance_id)
-    return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
+    return ApiResponse(data=_instance_to_response(inst).model_dump())
 
 
 @router.post("/{instance_id}/stop", response_model=ApiResponse, summary="停止实例")
@@ -221,7 +222,7 @@ async def stop_instance(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     audit_log("instance.stop", user_id, instance_id)
     inst = mgr.get_instance(instance_id)
-    return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
+    return ApiResponse(data=_instance_to_response(inst).model_dump())
 
 
 @router.post("/{instance_id}/pause", response_model=ApiResponse, summary="暂停实例")
@@ -237,7 +238,7 @@ async def pause_instance(
     except InstanceStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     inst = mgr.get_instance(instance_id)
-    return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
+    return ApiResponse(data=_instance_to_response(inst).model_dump())
 
 
 @router.post("/{instance_id}/resume", response_model=ApiResponse, summary="恢复实例")
@@ -253,7 +254,7 @@ async def resume_instance(
     except InstanceStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     inst = mgr.get_instance(instance_id)
-    return ApiResponse(data=_instance_to_response(inst).model_dump())  # type: ignore[union-attr]
+    return ApiResponse(data=_instance_to_response(inst).model_dump())
 
 
 @router.delete("/{instance_id}", response_model=ApiResponse, summary="销毁实例")
@@ -304,8 +305,9 @@ async def assign_scene(
     """POST /api/v1/sim/instances/{instance_id}/scene（设计文档 §12.4）
 
     向指定实例下发场景配置，scene_config 为完整场景 JSON。
+    审查项 O：复用 load_scene_impl（秒级 CARLA 操作），走 to_thread 避免阻塞事件循环。
     """
-    data = load_scene_impl(request, instance_id, body.scene_config)
+    data = await asyncio.to_thread(load_scene_impl, request, instance_id, body.scene_config)
     if body.scene_id and data["scene_id"] != body.scene_id:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -322,7 +324,8 @@ async def set_instance_weather(
     _: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/weather（设计文档 §12.1）"""
-    return ApiResponse(data=set_weather_impl(request, instance_id, body))
+    data = await asyncio.to_thread(set_weather_impl, request, instance_id, body)
+    return ApiResponse(data=data)
 
 
 @router.post("/{instance_id}/vil/calibrate", response_model=ApiResponse, summary="VIL 初始位置标定")
@@ -347,7 +350,8 @@ async def get_instance_screenshot(
     _: str = Depends(get_current_user),
 ) -> ApiResponse:
     """GET /api/v1/sim/instances/{instance_id}/screenshot（设计文档 §12.1）"""
-    return ApiResponse(data=screenshot_impl(request, instance_id))
+    data = await asyncio.to_thread(screenshot_impl, request, instance_id)
+    return ApiResponse(data=data)
 
 
 @router.get("/{instance_id}/stream", response_model=ApiResponse, summary="获取视频流地址")

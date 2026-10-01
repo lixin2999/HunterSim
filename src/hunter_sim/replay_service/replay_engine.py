@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from hunter_sim.common.exceptions import CarlaSimulationError, ConfigurationError
-from hunter_sim.common.models import Transform, VehicleState
+from hunter_sim.common.exceptions import ConfigurationError
+from hunter_sim.common.models import VehicleState
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)

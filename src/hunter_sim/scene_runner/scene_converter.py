@@ -6,14 +6,13 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from hunter_sim.common.models import SimMode
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.weather_manager import WeatherProfile
-from hunter_sim.scene_runner.scene_config import SceneConfig, TrafficParticipantConfig
+from hunter_sim.scene_runner.scene_config import SceneConfig
 
 logger = get_logger(__name__)
 

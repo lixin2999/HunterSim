@@ -10,10 +10,10 @@ import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from hunter_sim.common.models import EvalGrade
-from hunter_sim.common.utils import get_logger, rmse
+from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -25,6 +25,9 @@ AVG_ACCEL_TARGET_MS2 = 1.0       # 平均加速度 < 1.0 m/s²
 MAX_ACCEL_TARGET_MS2 = 2.0       # 最大加速度 < 2.0 m/s²
 AVG_JERK_TARGET_MS3 = 2.0        # 平均加加速度 < 2.0 m/s³
 STEERING_SMOOTHNESS_TARGET = 0.3  # 转向平滑度 < 0.3 rad/s
+
+# 默认帧步长（秒，50Hz）：仅在无法从数据帧时间戳推导时作为回退（审查项 R）
+DEFAULT_FRAME_DT_S = 0.02
 
 # 评估等级标准
 _EVAL_THRESHOLDS: list[tuple[EvalGrade, float, float]] = [
@@ -277,6 +280,31 @@ class EvaluationEngine:
         )
 
     @staticmethod
+    def _frame_time_s(frame: dict[str, Any]) -> float:
+        """读取帧时间戳（秒）：兼容规范字段 time_stamp 与遥测/录制字段 timestamp（审查项 R）。"""
+        value = frame.get("time_stamp")
+        if value is None:
+            value = frame.get("timestamp")
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _derive_frame_dt(cls, states: list[dict[str, Any]]) -> float:
+        """从相邻帧时间戳推导帧步长（取中位数，对丢帧/异常值鲁棒）。
+
+        推导失败（帧数不足或时间戳无效/非单调）时回退 DEFAULT_FRAME_DT_S。
+        """
+        times = [cls._frame_time_s(s) for s in states]
+        diffs = sorted(b - a for a, b in zip(times, times[1:]) if 0.0 < b - a < 1.0)
+        if not diffs:
+            return DEFAULT_FRAME_DT_S
+        return diffs[len(diffs) // 2]
+
+    @staticmethod
     def _compute_safety(
         collisions: list[dict[str, Any]],
         events: list[dict[str, Any]],
@@ -306,10 +334,13 @@ class EvaluationEngine:
         max_speed = max(speeds) if speeds else 0.0
         total_dist = 0.0
         for i in range(1, len(states)):
-            dt = states[i].get("timestamp", 0.0) - states[i - 1].get("timestamp", 0.0)
+            # 审查项 R：时间字段兼容 time_stamp（规范）/timestamp（录制），不再只读单一字段
+            dt = EvaluationEngine._frame_time_s(states[i]) - EvaluationEngine._frame_time_s(states[i - 1])
             if 0.0 < dt < 0.1:
                 total_dist += states[i].get("vehicle_speed", 0.0) * dt
-        waiting = sum(1 for s in speeds if s < 0.2) * 0.02  # 50Hz 帧
+        # 审查项 R：帧步长由数据帧时间戳推导，不再硬编码 50Hz
+        frame_dt = EvaluationEngine._derive_frame_dt(states)
+        waiting = sum(1 for s in speeds if s < 0.2) * frame_dt
         return EfficiencyMetrics(
             avg_speed_ms=avg_speed,
             max_speed_ms=max_speed,
@@ -321,6 +352,8 @@ class EvaluationEngine:
 
     @staticmethod
     def _compute_comfort(states: list[dict[str, Any]]) -> ComfortMetrics:
+        # 审查项 R：帧步长从数据推导（回退 50Hz），不再在三处硬编码 0.02
+        dt = EvaluationEngine._derive_frame_dt(states) or DEFAULT_FRAME_DT_S
         accels = []
         yaws = []
         prev_speeds: list[float] = []
@@ -336,7 +369,6 @@ class EvaluationEngine:
         # Jerk 估算（加速度差分）
         jerks: list[float] = []
         for i in range(1, len(accels)):
-            dt = 0.02
             jerks.append(abs(accels[i] - accels[i - 1]) / dt)
         avg_jerk = sum(jerks) / len(jerks) if jerks else 0.0
         max_jerk = max(jerks) if jerks else 0.0
@@ -344,7 +376,7 @@ class EvaluationEngine:
         # 转向平滑度
         steer_rates: list[float] = []
         for i in range(1, len(yaws)):
-            steer_rates.append(abs(yaws[i] - yaws[i - 1]) / 0.02)
+            steer_rates.append(abs(yaws[i] - yaws[i - 1]) / dt)
         steer_smooth = sum(steer_rates) / len(steer_rates) if steer_rates else 0.0
 
         return ComfortMetrics(

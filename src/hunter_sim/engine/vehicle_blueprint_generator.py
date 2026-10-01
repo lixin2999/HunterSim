@@ -58,15 +58,15 @@ class SensorMountPosition:
 
     def to_carla_transform(self) -> Any:
         """转换为 carla.Transform 对象（相对坐标系）。"""
-        import math
         import carla  # noqa: PLC0415
         return carla.Transform(
             carla.Location(x=self.x, y=self.y, z=self.z),
             carla.Rotation(yaw=self.yaw_deg),
         )
 
-
 # HUNTER SE 标准传感器安装位置（基于实车设计）
+
+
 HUNTER_SE_SENSOR_MOUNTS: list[SensorMountPosition] = [
     SensorMountPosition(
         sensor_name="lidar_top",

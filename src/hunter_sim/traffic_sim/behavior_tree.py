@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from hunter_sim.common.utils import get_logger
 from hunter_sim.traffic_sim.actor_behaviors import ActorAction, ActorBehavior

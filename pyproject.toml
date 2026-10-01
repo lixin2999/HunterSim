@@ -64,6 +64,26 @@ python_version = "3.12"
 strict = true
 warn_return_any = true
 disallow_untyped_defs = true
+# pydantic v2 插件：识别 BaseSettings/Field 默认值，消除必填参数误报
+plugins = ["pydantic.mypy"]
+
+# CARLA / ROS2 / psycopg2 等可选引擎依赖无类型 stub：惰性导入环境下降级跳过
+[[tool.mypy.overrides]]
+module = [
+    "carla.*",
+    "rclpy.*",
+    "sensor_msgs.*",
+    "std_msgs.*",
+    "geometry_msgs.*",
+    "nav_msgs.*",
+    "rosbag2_py.*",
+    "custom_msgs.*",
+    "psycopg2.*",
+    "jose.*",
+    "kafka.*",
+    "defusedxml.*",
+]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["src/hunter_sim"]

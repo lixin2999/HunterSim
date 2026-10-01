@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 import pytest
 
@@ -25,21 +25,16 @@ from hunter_sim.common.models import (  # noqa: E402
     HunterSimSettings,
     KafkaSettings,
     ResourceSettings,
-    SimMode,
     Transform,
     VILSettings,
     VehicleState,
-    QualityLevel,
 )
 from hunter_sim.common.utils import RingBuffer  # noqa: E402
 from tests.mocks.carla_mocks import (  # noqa: E402
-    MockActor,
     MockCarlaClient,
-    MockTransform as MT,
     MockVehicle,
     MockWorld,
 )
-
 
 # ─── 配置 Fixtures ────────────────────────────────────────────────────────────
 
@@ -55,7 +50,6 @@ def test_settings() -> HunterSimSettings:
         vil=VILSettings(extrapolation_ms=150),
         resource=ResourceSettings(instance_max_lifetime_seconds=60),
     )
-
 
 # ─── CARLA Mock Fixtures ──────────────────────────────────────────────────────
 
@@ -76,7 +70,6 @@ def mock_world() -> MockWorld:
 def mock_vehicle() -> MockVehicle:
     """CARLA Vehicle Actor Mock。"""
     return MockVehicle("vehicle.hunter_se")
-
 
 # ─── 数据模型 Fixtures ────────────────────────────────────────────────────────
 
@@ -126,7 +119,6 @@ def sample_telemetry_frames() -> list[dict[str, Any]]:
         )
     return frames
 
-
 # ─── RingBuffer Fixture ───────────────────────────────────────────────────────
 
 
@@ -134,7 +126,6 @@ def sample_telemetry_frames() -> list[dict[str, Any]]:
 def ring_buffer() -> RingBuffer[int]:
     """测试用 RingBuffer，大小 5。"""
     return RingBuffer(max_size=5)
-
 
 # ─── FastAPI TestClient ───────────────────────────────────────────────────────
 

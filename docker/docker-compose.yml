@@ -88,6 +88,18 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
 
+  # ── Alertmanager 告警投递（审查项 S：prometheus.yml alerting 段的目标） ──────
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+
   # ── Grafana 可视化 ──────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.2.0
@@ -104,4 +116,5 @@ services:
 volumes:
   kafka_data:
   prometheus_data:
+  alertmanager_data:
   grafana_data:

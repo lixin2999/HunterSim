@@ -7,13 +7,13 @@
 from __future__ import annotations
 
 import json
-import math
+
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from pydantic import BaseModel, Field, field_validator
 
-from hunter_sim.common.exceptions import ConfigurationError, ValidationError
+from hunter_sim.common.exceptions import ConfigurationError
 from hunter_sim.common.utils import get_logger, lerp, smoothstep
 
 logger = get_logger(__name__)
@@ -100,10 +100,11 @@ class WeatherProfile(BaseModel):
             "fog_distance": self.fog_distance,
         }
 
-
 # ─── 预设环境配置字典 ─────────────────────────────────────────────────────────
 
 # 预设参数值严格对齐设计文档 §3.4.2 表格（cloudiness / rain / sun_altitude）
+
+
 _PRESET_PROFILES: dict[str, WeatherProfile] = {
     "sunny_noon": WeatherProfile(
         preset_name="sunny_noon",

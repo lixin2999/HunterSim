@@ -107,6 +107,3 @@ docker-compose.override.yml
 *.mp4
 captures/
 recordings/
-
-# uv.lock
-uv.lock

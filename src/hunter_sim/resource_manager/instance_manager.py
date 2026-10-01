@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
 from hunter_sim.common.models import (
+    CarlaSettings,
     InstanceStatus,
     QualityLevel,
     ResourceSettings,
@@ -130,6 +131,8 @@ class SimInstanceManager:
         gpu_pool: GPU 资源池实例。
         quota_manager: 用户配额管理器（可选）。注入后配额释放在
             destroy_instance() 内统一收敛，覆盖 API 销毁与超时自动回收两条路径（§14.2）。
+        carla: CARLA 连接配置（可选）。提供实例地址与基准端口，
+            多实例按步长递增分配独立端口对（审查项 N）。
     """
 
     def __init__(
@@ -137,10 +140,12 @@ class SimInstanceManager:
         settings: Optional[ResourceSettings] = None,
         gpu_pool: Optional[Any] = None,
         quota_manager: Optional[Any] = None,
+        carla: Optional[CarlaSettings] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._gpu_pool = gpu_pool
         self._quota_manager = quota_manager
+        self._carla = carla or CarlaSettings()
         self._instances: dict[str, SimInstance] = {}
         self._lock: threading.RLock = threading.RLock()
         logger.info("SimInstanceManager initialized")
@@ -210,10 +215,32 @@ class SimInstanceManager:
         )
 
         with self._lock:
+            # 端口递增分配（审查项 N）：多实例不得指向同一 CARLA server，
+            # 否则第二个实例 load_world 会重置第一个实例的世界
+            instance.carla_host = self._carla.host
+            instance.carla_rpc_port, instance.carla_stream_port = self._allocate_carla_ports()
             self._instances[instance_id] = instance
 
-        logger.info(f"Instance created: {instance_id} (gpu={gpu_id}, quality={quality.value})")
+        logger.info(
+            f"Instance created: {instance_id} (gpu={gpu_id}, quality={quality.value}, "
+            f"carla={instance.carla_host}:{instance.carla_rpc_port}/{instance.carla_stream_port})"
+        )
         return instance
+
+    def _allocate_carla_ports(self) -> tuple[int, int]:
+        """以配置基准端口为起点，按步长 2 递增分配空闲的 rpc/stream 端口对。
+
+        前提：已持有 self._lock（容器化部署 §10.2.3，每实例对应独立 CARLA server 进程）。
+        """
+        used_rpc = {i.carla_rpc_port for i in self._instances.values()}
+        used_stream = {i.carla_stream_port for i in self._instances.values()}
+        offset = 0
+        while True:
+            rpc = self._carla.rpc_port + offset
+            stream = self._carla.stream_port + offset
+            if rpc not in used_rpc and stream not in used_stream:
+                return rpc, stream
+            offset += 2
 
     def get_instance(self, instance_id: str) -> Optional[SimInstance]:
         """查询实例信息。"""

@@ -11,7 +11,6 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Optional
 
-from hunter_sim.common.models import Transform
 from hunter_sim.common.utils import euclidean_distance_2d, get_logger, rmse
 
 logger = get_logger(__name__)
@@ -22,7 +21,7 @@ class TwinMode(str, Enum):
 
     REALTIME = "realtime"     # VIL 实时孪生
     REPLAY = "replay"         # 历史回放孪生
-    COMPARISON = "comparison" # 对比孪生（实车 vs 仿真轨迹）
+    COMPARISON = "comparison"  # 对比孪生（实车 vs 仿真轨迹）
 
 
 class TrajectoryComparator:
@@ -54,8 +53,6 @@ class TrajectoryComparator:
         speed_errors: list[float] = []
 
         for real_frame in real_trajectory:
-            ts = round(real_frame["timestamp"], 3)
-            # 查找时间最近的仿真帧
             matched = self._find_nearest_frame(sim_by_ts, real_frame["timestamp"], time_tolerance_s)
             if matched is None:
                 continue

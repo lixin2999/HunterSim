@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import struct
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -38,7 +38,6 @@ class SensorDataConverter:
         Returns:
             ROS2 PointCloud2 消息对象。
         """
-        from rclpy.qos import QoSProfile  # noqa: PLC0415
         from sensor_msgs.msg import PointCloud2, PointField  # noqa: PLC0415
         from std_msgs.msg import Header  # noqa: PLC0415
 
@@ -154,7 +153,7 @@ class SensorDataConverter:
         Returns:
             ROS2 Odometry 消息对象。
         """
-        from geometry_msgs.msg import PoseWithCovariance, Quaternion, Twist, TwistWithCovariance  # noqa: PLC0415
+        from geometry_msgs.msg import Quaternion  # noqa: PLC0415
         from nav_msgs.msg import Odometry  # noqa: PLC0415
         from std_msgs.msg import Header  # noqa: PLC0415
 
@@ -177,7 +176,7 @@ class SensorDataConverter:
         return msg
 
     @staticmethod
-    def raw_image_to_numpy(image_data: Any) -> np.ndarray:
+    def raw_image_to_numpy(image_data: Any) -> np.ndarray[Any, Any]:
         """将 CARLA RawImage 转为 numpy 数组（H x W x 4, BGRA uint8）。
 
         Args:

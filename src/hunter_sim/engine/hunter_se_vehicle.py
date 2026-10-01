@@ -173,6 +173,9 @@ class HunterSEVehicleController:
     def apply_angular_velocity(self, wx: float, wy: float, wz: float) -> None:
         """设置车辆角速度（设计文档 §3.3.2 直接位姿控制）。
 
+        内部统一弧度制（rad/s），在 CARLA 边界处换算为 deg/s（CARLA
+        set_angular_velocity 期望 deg/s，直接透传会差 57.3 倍）。
+
         Args:
             wx: X 方向角速度（rad/s）。
             wy: Y 方向角速度（rad/s）。
@@ -183,7 +186,9 @@ class HunterSEVehicleController:
         """
         self._check_alive()
         try:
-            vec = _make_carla_vector3d(wx, wy, wz)
+            vec = _make_carla_vector3d(
+                math.degrees(wx), math.degrees(wy), math.degrees(wz)
+            )
             self._actor.set_angular_velocity(vec)
         except Exception as exc:
             raise CarlaSimulationError("apply_angular_velocity", str(exc)) from exc
@@ -416,7 +421,7 @@ def _apply_hunter_se_attributes(bp: Any, params: HunterSEParameters) -> None:
 def _get_carla_time() -> float:
     """获取当前 CARLA 世界仿真时间戳（延迟导入避免循环依赖）。"""
     try:
-        import carla  # noqa: PLC0415
+        import carla  # noqa: F401, PLC0415  # 探测 carla 可用性，无 world 上下文时不回退真实时间
         return 0.0  # 实际使用时从 world.get_snapshot().timestamp 获取
     except ImportError:
         import time
