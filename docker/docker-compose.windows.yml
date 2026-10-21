@@ -8,10 +8,10 @@
 # CARLA 官方镜像为 Linux 构建，Windows 下经 WSL2 GPU 直通运行；
 # 也可在宿主机原生启动 CarlaUE4.exe，桌面客户端两种都支持。
 #
-# 使用：docker compose -f docker/docker-compose.windows.yml up -d
+# 使用：docker compose -f docker/docker-compose.windows.yml up -d --build
+#   （本编排的 carla-server / sim-management 为本地构建镜像，首次需 --build；
+#    hunter-carla 由 docker/Dockerfile.carla 构建，ros2-bridge 需从远端拉取——请确保 registry mirror 可）
 # 停止：docker compose -f docker/docker-compose.windows.yml down
-
-version: "3.9"
 
 services:
   # ── CARLA 仿真引擎（GPU 离屏渲染）─────────────────────────────────────────
@@ -81,7 +81,8 @@ services:
 
   # ── Kafka（本地遥测总线；接入 HunterCore 时可改用远端 SASL_SSL broker）──────
   kafka:
-    image: bitnami/kafka:3.6
+    # bitnami/kafka 旧 tag 已从 Docker Hub 免费目录下架；改用内容一致的 bitnamilegacy/kafka。
+    image: bitnamilegacy/kafka:3.6
     ports:
       - "9092:9092"
     environment:

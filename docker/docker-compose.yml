@@ -1,13 +1,13 @@
 # HunterSim 开发环境编排
-# 使用：docker-compose -f docker/docker-compose.yml up -d
+# 使用：docker compose -f docker/docker-compose.yml up -d
 # CARLA 服务运行在宿主机 Windows（需单独启动 CarlaUE4.exe）
-
-version: "3.9"
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
   kafka:
-    image: bitnami/kafka:3.6
+    # bitnami/kafka 的旧 tag 已从 Docker Hub 免费目录下架（Nov 2024 迁移）；
+    # 改用内容一致的 bitnamilegacy/kafka（KAFKA_CFG_* 环境变量与 healthcheck 均不变）。
+    image: bitnamilegacy/kafka:3.6
     ports:
       - "9092:9092"
     environment:
