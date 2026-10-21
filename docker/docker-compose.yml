@@ -47,6 +47,20 @@ services:
       - ../resources:/home/carla/carla/PythonAPI/hunter_assets/resources
     restart: unless-stopped
 
+  # ── CARLA ↔ ROS2 桥接（可选，profile ros；对齐 ROS2_TOPIC_MAP，V2.2.0）────────
+  # 启用：docker-compose -f docker/docker-compose.yml --profile ros up -d
+  ros2-bridge:
+    profiles: ["ros"]
+    image: carla-simulator/ros-bridge:humble
+    network_mode: host   # ROS2 DDS 发现依赖组播/主机网络
+    environment:
+      CARLA_HOST: host.docker.internal
+      CARLA_PORT: "2000"
+      CARLA_CLIENT_ID: "0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
   # ── HunterSim 仿真服务 ──────────────────────────────────────────────────
   sim-service:
     build:

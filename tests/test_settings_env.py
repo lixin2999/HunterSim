@@ -65,3 +65,43 @@ def test_missing_dotenv_uses_defaults(tmp_path: Path) -> None:
     settings = HunterSimSettings()
     assert settings.carla.host == "127.0.0.1"
     assert settings.carla.rpc_port == 2000
+
+
+def test_cloud_and_gui_dotenv_apply(tmp_path: Path) -> None:
+    """V2.2.0：HUNTER_CORE_* / GUI_* 前缀 `.env` 键分别被 cloud / gui 分组读取。"""
+    _write_env(
+        tmp_path,
+        "HUNTER_CORE_ENABLED=true\n"
+        "HUNTER_CORE_VEHICLE_ID=SIM_X9\n"
+        "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.31.35:9092\n"
+        "HUNTER_CORE_JWT_TOKEN=abc.def.ghi\n"
+        "GUI_THEME=light\n"
+        "GUI_DEFAULT_MAP=Town05\n"
+        "GUI_STREAM_FPS=24\n",
+    )
+    settings = HunterSimSettings()
+    assert settings.cloud.enabled is True
+    assert settings.cloud.vehicle_id == "SIM_X9"
+    assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
+    assert settings.cloud.jwt_token is not None
+    assert settings.cloud.jwt_token.get_secret_value() == "abc.def.ghi"
+    assert settings.gui.theme == "light"
+    assert settings.gui.default_map == "Town05"
+    assert settings.gui.stream_fps == 24.0
+
+
+def test_cloud_defaults_are_noop(tmp_path: Path) -> None:
+    """未配置时 cloud 默认关闭、指向单机验证环境；gui 默认深色。"""
+    settings = HunterSimSettings()
+    assert settings.cloud.enabled is False
+    assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
+    assert settings.cloud.telemetry_topic == "hunter.{vehicle_id}.telemetry"
+    assert settings.gui.theme == "dark"
+    assert settings.gui.scenario_runner_path is None
+
+
+def test_cloud_unknown_keys_ignored(tmp_path: Path) -> None:
+    """HUNTER_CORE_ 前缀下的未知键不得触发校验错误。"""
+    _write_env(tmp_path, "HUNTER_CORE_TYPO_FIELD=1\nGUI_TYPO=2\n")
+    settings = HunterSimSettings()
+    assert settings.cloud.enabled is False

@@ -1,6 +1,6 @@
 [project]
 name = "hunter-sim"
-version = "2.1.2"
+version = "2.2.0"
 description = "HunterSim - VIL Virtual Simulation Platform for HUNTER SE Autonomous Driving"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,6 +40,18 @@ dev = [
     "flake8>=6.1,<7.0",
     "flake8-docstrings>=1.7,<2.0",
 ]
+# Windows 桌面仿真客户端（PySide6，惰性导入，不装不影响 hunter_sim 核心）
+gui = [
+    "PySide6>=6.6,<7.0",
+]
+# HunterCore 数据接入（Kafka 遥测 + MinIO bag 直传）；默认依赖已含 kafka-python/httpx
+cloud = [
+    "kafka-python>=2.0,<3.0",
+    "httpx>=0.24,<0.28",
+]
+
+[project.scripts]
+hunter-sim-gui = "hunter_sim.gui.app:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
@@ -82,13 +94,39 @@ module = [
     "jose.*",
     "kafka.*",
     "defusedxml.*",
+    "PySide6.*",
+    "scenario_runner.*",
 ]
 ignore_missing_imports = true
+
+# Qt-only 桌面界面模块：需 PySide6 类型 stub，验证环境（无 Qt）下基类解析为 Any，
+# 无法严格类型检查；按计划这些组件不纳入单测/静态门禁（见 V2.2.0 §5/§6）。
+# 非界面逻辑（scenario_launcher / camera_bridge / sim_presets / theme）仍保持 strict。
+[[tool.mypy.overrides]]
+module = [
+    "hunter_sim.gui.sim_worker",
+    "hunter_sim.gui.main_window",
+    "hunter_sim.gui.app",
+    "hunter_sim.gui.panels.*",
+    "hunter_sim.gui.views.*",
+    "hunter_sim.gui.widgets.*",
+]
+ignore_errors = true
 
 [tool.coverage.run]
 source = ["src/hunter_sim"]
 branch = true
-omit = ["*/tests/*", "*/__init__.py"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+    # Qt-only 桌面界面组件：需 PySide6 运行时，按计划不纳入单测（见 V2.2.0 §6）
+    "*/gui/main_window.py",
+    "*/gui/app.py",
+    "*/gui/sim_worker.py",
+    "*/gui/panels/*",
+    "*/gui/views/*",
+    "*/gui/widgets/*",
+]
 
 [tool.coverage.report]
 fail_under = 80

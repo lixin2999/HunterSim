@@ -1,9 +1,9 @@
 # HunterSim · HUNTER SE 车辆在环（VIL）虚拟仿真平台
 
-HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
+HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.1.2`（在 2.1.1 基础上补齐 CARLA 连通性诊断：`/health` 新增 `carla_sdk_installed` / `carla_probe_error`，探测失败只在状态翻转时告警；修复 `.env` 对 `CARLA_*/KAFKA_*/VIL_*/API_*/RESOURCE_*` 前缀不生效或直接报错的问题。详见 [`release.md`](release.md)）
+- **当前版本**：`2.2.0`（新增 **Windows 桌面仿真客户端**（PySide6，CarlaSceneX 风格，进程内直连 CARLA + ScenarioRunner）、**Windows 单机全容器编排**（Docker Desktop + WSL2 + NVIDIA Container Toolkit，含 ROS2 Bridge 容器）、**HunterCore 数据接入**（Kafka 遥测 Topic + MinIO bag 预签名直传）。纯增量、向后兼容，详见 [`release.md`](release.md)）
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -60,7 +60,9 @@ HunterSim/
 │   ├── traffic_sim/         # 交通流、Actor 行为、行为树、行人、触发条件
 │   ├── replay_service/      # 数据加载、回放引擎、数字孪生
 │   ├── eval_service/        # 评估引擎、评估报告
-│   └── resource_manager/    # 实例管理、GPU 资源池、健康监控
+│   ├── resource_manager/   # 实例管理、GPU 资源池、健康监控
+│   ├── gui/                 # 桌面仿真客户端（V2.2.0，PySide6 可选依赖，惰性导入）
+│   └── cloud/               # HunterCore 数据接入（V2.2.0，Kafka 遥测 + MinIO bag 直传）
 ├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
 ├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / alertmanager / grafana
 ├── k8s/                     # namespace / configmap / secret / deployment（含 CARLA GPU Pod + PVC）/ service
@@ -126,6 +128,41 @@ kubectl apply -f k8s/
 
 详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
 
+### 4.4 Windows 单机全容器（V2.2.0）
+
+在 Windows 11 上用 Docker Desktop（WSL2 后端）+ NVIDIA Container Toolkit 一键拉起 CARLA 服务、ROS2 Bridge 与仿真管理服务：
+
+```powershell
+# 前提：Docker Desktop 切换到 WSL2 后端；已安装 NVIDIA Container Toolkit（WSL2 GPU 直通）
+docker compose -f docker/docker-compose.windows.yml up -d
+# 服务：carla-server(:2000/:2001/:8000) · ros2-bridge · sim-management(:8080) · kafka(:9092)
+```
+
+> CARLA 官方镜像为 Linux 构建，Windows 经 WSL2 GPU 直通运行；也可在宿主机原生启动 `CarlaUE4.exe`，桌面客户端两种都支持。
+
+### 4.5 桌面仿真客户端（V2.2.0）
+
+PySide6 原生 Windows 客户端，进程内直连 CARLA，对标 CarlaSceneX：连接、地图/Actor/传感器面板、实时画面、Autopilot/Manual、ScenarioRunner 场景运行、VIL/SIL 模式。
+
+```powershell
+pip install -e ".[gui]"                 # 安装 PySide6；CARLA 同版本 0.9.16 wheel 需另装
+hunter-sim-gui                          # 或： python -m hunter_sim.gui.app
+```
+
+### 4.6 HunterCore 数据接入（V2.2.0）
+
+将数字孪生车作为“车端”，向 HunterCore（`192.168.31.35`）回传遥测与 bag：
+
+```powershell
+set HUNTER_CORE_ENABLED=true
+set HUNTER_CORE_VEHICLE_ID=SIM_HUNTER_SE_001
+set HUNTER_CORE_SASL_USERNAME=<账号>
+set HUNTER_CORE_SASL_PASSWORD=<口令>
+set HUNTER_CORE_JWT_TOKEN=<data-collector Bearer JWT>
+```
+
+未配置凭据（`enabled=false`）时连接器整体降级为 no-op，不影响本地仿真。详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
+
 ---
 
 ## 5. 配置
@@ -140,6 +177,8 @@ kubectl apply -f k8s/
 | `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
 | `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) |
 | `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
+| `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) |
+| `GUI_` | 桌面客户端 | `theme`(dark) · `default_map`(Town03) · `stream_fps`(30) · `scenario_runner_path`(None) |
 
 预设资源文件位于 `configs/`：8 种天气环境、7 类传感器、7 个场景模板、5 套交通流档位。
 
@@ -171,7 +210,7 @@ flake8 src tests                                               # Lint（配置�
 mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：593 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
+- **测试**：635 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

@@ -287,12 +287,69 @@ class ResourceSettings(BaseSettings):
     )
 
 
+class CloudSettings(BaseSettings):
+    """HunterCore 数据采集分析平台接入配置（V2.2.0）。
+
+    桌面客户端把 CARLA 数字孪生车当作“车端”，向 HunterCore 回传遥测与 bag：
+
+    - Kafka 遥测：`hunter.{vehicle_id}.telemetry/event/health`（SASL_SSL/SCRAM-SHA-512，
+      key=vehicle_id，Schema 对齐 `contracts/kafka/schemas/telemetry.schema.json`）；
+    - MinIO bag：经 data-collector `POST /api/v1/data/files/presign` 预签名直传，
+      完成后 `POST /api/v1/data/files/complete` 做 MD5/SHA-256 校验。
+
+    默认指向单机验证环境 `192.168.31.35`；`enabled=false` 时连接器整体降级为 no-op，
+    不影响本地仿真。凭据（SASL 口令 / JWT）仅经环境变量或 `.env` 注入，禁止硬编码。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="HUNTER_CORE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = Field(False, description="是否启用 HunterCore 数据回传")
+    vehicle_id: str = Field("SIM_HUNTER_SE_001", description="数字孪生车标识（= Kafka 消息 key）")
+    # ── Kafka 遥测总线 ──
+    kafka_bootstrap: str = Field("192.168.31.35:9092", description="Kafka broker（SASL_SSL）")
+    security_protocol: str = Field("SASL_SSL", description="Kafka 安全协议")
+    sasl_mechanism: str = Field("SCRAM-SHA-512", description="SASL 机制")
+    sasl_username: Optional[SecretStr] = None
+    sasl_password: Optional[SecretStr] = None
+    ca_cert_path: Optional[str] = Field(None, description="SASL_SSL CA 证书路径（None 用系统信任链）")
+    telemetry_interval_s: float = Field(0.1, gt=0.0, le=1.0, description="遥测发布周期（秒），默认 10Hz")
+    telemetry_topic: str = Field("hunter.{vehicle_id}.telemetry")
+    event_topic: str = Field("hunter.{vehicle_id}.event")
+    health_topic: str = Field("hunter.{vehicle_id}.health")
+    # ── data-collector 文件上传（经 api-gateway）──
+    gateway_url: str = Field("http://192.168.31.35:8080", description="api-gateway 基础地址")
+    jwt_token: Optional[SecretStr] = Field(None, description="data-collector REST Bearer JWT")
+    rosbag_bucket: str = Field("hunter-rosbag", description="bag 上传 Bucket（车端仅三个可写）")
+    upload_timeout_s: float = Field(60.0, gt=0.0, description="预签名/直传 HTTP 超时（秒）")
+
+
+class GuiSettings(BaseSettings):
+    """Windows 桌面仿真客户端配置（V2.2.0）。
+
+    仅影响 CarlaSceneX 风格桌面客户端的默认外观与启动参数；CARLA 连接参数复用
+    `CarlaSettings`，数据回传参数复用 `CloudSettings`。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="GUI_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    theme: str = Field("dark", pattern="^(dark|light)$", description="界面主题")
+    default_map: str = Field("Town03", description="启动默认地图")
+    stream_fps: float = Field(30.0, gt=0.0, le=60.0, description="实时画面目标帧率（Hz）")
+    scenario_runner_path: Optional[str] = Field(
+        None, description="scenario_runner.py 绝对路径（None 时走 PATH / 当前目录）"
+    )
+
+
 class HunterSimSettings(BaseSettings):
     """HunterSim 全局聚合配置。
 
     配置文件优先级：真实环境变量 > `.env` > 代码默认值；`.env` 需位于服务进程
-    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_）同样读取该 `.env`，
-    `extra="ignore"` 保证同一份文件中其他前缀的键不会触发校验错误。
+    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_/HUNTER_CORE_/GUI_）
+    同样读取该 `.env`，`extra="ignore"` 保证同一份文件中其他前缀的键不会触发校验错误。
     """
 
     model_config = SettingsConfigDict(
@@ -306,6 +363,8 @@ class HunterSimSettings(BaseSettings):
     vil: VILSettings = Field(default_factory=VILSettings)
     api: APISettings = Field(default_factory=APISettings)
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
+    cloud: CloudSettings = Field(default_factory=CloudSettings)
+    gui: GuiSettings = Field(default_factory=GuiSettings)
 
     @field_validator("log_level")
     @classmethod
