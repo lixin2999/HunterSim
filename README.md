@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.2.1`（V2.2.1 为 V2.2.0 的**代码审查修复专题**：桌面客户端实时画面真机可用性（`camera_bridge` 取 `raw_data`、相机回调传 `sensor.id`）、同步模式与线程生命周期（`fixed_delta_seconds`/单一事实源/`closeEvent` 竞态）、HunterCore 遥测非阻塞上传与 Kafka 异步失败回捞。向后兼容，详见 [`release.md`](release.md)）。上一个功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**（PySide6，CarlaSceneX 风格，进程内直连 CARLA + ScenarioRunner）、**Windows 单机全容器编排**（Docker Desktop + WSL2 + NVIDIA Container Toolkit，含 ROS2 Bridge 容器）与 **HunterCore 数据接入**（Kafka 遥测 Topic + MinIO bag 预签名直传）。
+- **当前版本**：`2.2.2`（V2.2.2 修复桌面客户端启动即崩溃的 `map_panel` QComboBox API 误用（`addSortedItems`→`addItems`），并将 FastAPI 应用版本改为随包元数据动态读取；向后兼容，详见 [`release.md`](release.md)）。上一个版本 `2.2.1` 为**代码审查修复专题**（桌面客户端实时画面 `raw_data`/`sensor.id`、同步模式与线程生命周期、HunterCore 遥测非阻塞上传与 Kafka 异步失败回捞）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**（PySide6，CarlaSceneX 风格，进程内直连 CARLA + ScenarioRunner）、**Windows 单机全容器编排**（Docker Desktop + WSL2 + NVIDIA Container Toolkit，含 ROS2 Bridge 容器）与 **HunterCore 数据接入**（Kafka 遥测 Topic + MinIO bag 预签名直传）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---

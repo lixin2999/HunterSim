@@ -29,7 +29,7 @@ class MapPanel(QGroupBox):
         layout = QVBoxLayout(self)
 
         self._combo = QComboBox()
-        self._combo.addSortedItems(sorted(BUILTIN_MAPS))
+        self._combo.addItems(sorted(BUILTIN_MAPS))
         idx = self._combo.findText(default_map)
         if idx >= 0:
             self._combo.setCurrentIndex(idx)

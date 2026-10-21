@@ -6,6 +6,8 @@ HunterSim REST API 服务，基础路径 /api/v1/sim。
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
@@ -25,6 +27,17 @@ from hunter_sim.resource_manager.health_monitor import InstanceHealthMonitor, Re
 from hunter_sim.resource_manager.instance_manager import SimInstanceManager
 
 logger = get_logger(__name__)
+
+
+def _resolve_app_version() -> str:
+    """从已安装包元数据读取版本，避免与 pyproject.toml 硬编码漂移；未安装时降级。"""
+    try:
+        return _pkg_version("hunter-sim")
+    except PackageNotFoundError:  # 源码直跑/未 pip install 时的兜底
+        return "0.0.0+unknown"
+
+
+_APP_VERSION = _resolve_app_version()
 
 # 探测失败摘要最大长度：异常文本可能很长，/health 只保留可读部分
 _MAX_PROBE_ERROR_CHARS = 200
@@ -234,7 +247,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="HunterSim API",
-        version="2.1.2",
+        version=_APP_VERSION,
         description="HUNTER SE VIL 仿真平台 REST API",
         default_response_class=ORJSONResponse,
         lifespan=lifespan,
