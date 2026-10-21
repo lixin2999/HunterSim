@@ -26,6 +26,72 @@ from hunter_sim.resource_manager.instance_manager import SimInstanceManager
 
 logger = get_logger(__name__)
 
+# 探测失败摘要最大长度：异常文本可能很长，/health 只保留可读部分
+_MAX_PROBE_ERROR_CHARS = 200
+
+
+def _carla_target(settings: HunterSimSettings) -> str:
+    """CARLA 探测目标（host:port），用于日志与 /health 诊断字段。"""
+    return f"{settings.carla.host}:{settings.carla.rpc_port}"
+
+
+def _clip_error(text: str) -> str:
+    """截断过长的异常摘要，避免 /health 响应体被异常栈淹没。"""
+    if len(text) <= _MAX_PROBE_ERROR_CHARS:
+        return text
+    return text[:_MAX_PROBE_ERROR_CHARS] + "..."
+
+
+def _describe_unavailable(state: Any, settings: HunterSimSettings) -> str:
+    """给 /health 输出 CARLA 不可用的原因（区分“未装 SDK”与“客户端初始化失败”）。"""
+    if not getattr(state, "carla_sdk_installed", False):
+        return (
+            f"CARLA Python SDK 未安装（import carla 失败），目标 {_carla_target(settings)}；"
+            "请安装到当前服务解释器后重启服务"
+        )
+    return f"CARLA 客户端初始化失败：{getattr(state, 'carla_client_error', None) or '未知原因'}"
+
+
+def _probe_carla(client: Any) -> tuple[bool, str | None]:
+    """CARLA 连通性探测（后台监控线程执行，阻塞受 set_timeout 限制）。
+
+    Returns:
+        (是否连通, 失败摘要)；探测成功时失败摘要为 None。
+    """
+    if client is None:
+        return False, None
+    try:
+        client.get_server_version()
+        return True, None
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _refresh_carla_state(state: Any, settings: HunterSimSettings) -> None:
+    """刷新 CARLA 连通状态（健康巡检周期调用）。
+
+    仅在首次评估或状态翻转时记录日志，避免每周期刷屏；失败原因写入
+    app.state.carla_probe_error，供 /health 与运维排查直接读取。
+    """
+    target = _carla_target(settings)
+    connected, error = _probe_carla(getattr(state, "carla_client", None))
+    previous: bool = getattr(state, "carla_connected", False)
+    first_evaluation = not getattr(state, "carla_probe_evaluated", False)
+
+    state.carla_connected = connected
+    state.carla_probe_evaluated = True
+    if connected:
+        state.carla_probe_error = None
+    else:
+        state.carla_probe_error = (
+            _clip_error(f"{target} 不可达：{error}") if error else _describe_unavailable(state, settings)
+        )
+
+    if connected and (first_evaluation or not previous):
+        logger.info(f"CARLA connection established ({target})")
+    elif not connected and (first_evaluation or previous):
+        logger.warning(f"CARLA connection unavailable ({target}): {state.carla_probe_error}")
+
 
 def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHealthMonitor | None:
     """生产运行组件装配（审查项 L：新增能力不能仅靠测试注入路径可达）。
@@ -38,6 +104,17 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
         由 lifespan 在关停时负责 stop()。
     """
     state = app.state
+
+    # 诊断字段默认值（only-if-absent，不覆盖测试/外部注入）
+    for attr, default in (
+        ("carla_connected", False),
+        ("carla_sdk_installed", False),
+        ("carla_client_error", None),
+        ("carla_probe_error", None),
+        ("carla_probe_evaluated", False),
+    ):
+        if not hasattr(state, attr):
+            setattr(state, attr, default)
 
     if getattr(state, "gpu_pool", None) is None:
         state.gpu_pool = GPUResourcePool()
@@ -57,14 +134,29 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
     if getattr(state, "map_manager", None) is None:
         try:
             import carla  # noqa: PLC0415  惰性导入：仅真实 CARLA 环境可用
-
-            client = carla.Client(settings.carla.host, settings.carla.rpc_port)
-            client.set_timeout(settings.carla.timeout_seconds)
-            state.carla_client = client
-            state.map_manager = MapManager(client)
         except ImportError:
             state.carla_client = None
-            logger.warning("carla SDK 不可用，map_manager 装配降级（相关端点返回不可用状态）")
+            logger.warning(
+                f"carla SDK 不可用，map_manager 装配降级（相关端点返回不可用状态）；"
+                f"目标 {_carla_target(settings)}，如需连接 CARLA 请安装到当前服务解释器后重启"
+            )
+        else:
+            state.carla_sdk_installed = True
+            try:
+                client = carla.Client(settings.carla.host, settings.carla.rpc_port)
+                client.set_timeout(settings.carla.timeout_seconds)
+                state.carla_client = client
+                state.map_manager = MapManager(client)
+            except Exception as exc:  # noqa: BLE001  SDK 存在但构建失败不应阻断服务启动
+                state.carla_client = None
+                state.carla_client_error = f"{type(exc).__name__}: {exc}"
+                logger.error(
+                    f"CARLA 客户端初始化失败（{_carla_target(settings)}）：{state.carla_client_error}"
+                )
+
+    # 启动期即给出可诊断原因（无需等首个巡检周期）
+    if getattr(state, "carla_client", None) is None:
+        state.carla_probe_error = _describe_unavailable(state, settings)
 
     monitor = getattr(state, "health_monitor", None)
     if monitor is None:
@@ -100,7 +192,7 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
                         if iid not in live_ids:
                             mon.unregister_instance(iid)
             state.active_instance_count = len(live_ids)
-            state.carla_connected = _probe_carla(getattr(state, "carla_client", None))
+            _refresh_carla_state(state, settings)
             return list(mgr.check_expired_instances()) if mgr is not None else []
 
         monitor = InstanceHealthMonitor(
@@ -112,17 +204,6 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
         monitor.start()
 
     return monitor
-
-
-def _probe_carla(client: Any) -> bool:
-    """CARLA 连通性探测（后台监控线程执行，阻塞受 set_timeout 限制）。"""
-    if client is None:
-        return False
-    try:
-        client.get_server_version()
-        return True
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
@@ -153,7 +234,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="HunterSim API",
-        version="2.1.1",
+        version="2.1.2",
         description="HUNTER SE VIL 仿真平台 REST API",
         default_response_class=ORJSONResponse,
         lifespan=lifespan,

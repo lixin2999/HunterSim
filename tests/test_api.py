@@ -13,7 +13,11 @@ class TestHealthEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert body["code"] == 0
-        assert "status" in body["data"]
+        data = body["data"]
+        assert "status" in data
+        # 2.1.2：降级原因可直接从响应读取，无需翻启动日志
+        assert isinstance(data["carla_sdk_installed"], bool)
+        assert "carla_probe_error" in data
 
     def test_liveness_returns_alive(self, client: TestClient) -> None:
         resp = client.get("/api/v1/sim/health/live")
@@ -54,6 +58,83 @@ class TestHealthEndpoints:
         assert data["performance_targets"]["vil_end_to_end_latency"]["unit"] == "ms"
         assert data["alert_thresholds"]["carla_rpc_response_time"] == "> 5s"
         assert data["alert_thresholds"]["disk_usage"] == "> 85%"
+
+
+class TestCarlaProbeDiagnostics:
+    """CARLA 连通性诊断（2.1.2）：/health 输出失败目标与异常摘要。"""
+
+    def test_health_exposes_probe_error_from_state(self) -> None:
+        """独立 app 实例：首个巡检周期（默认 10s）前注入错误，避免与后台线程竞争。"""
+        from hunter_sim.api.main import create_app
+        from hunter_sim.common.models import HunterSimSettings
+
+        app = create_app(HunterSimSettings(env="dev"))
+        with TestClient(app) as c:
+            app.state.carla_probe_error = "127.0.0.1:2000 不可达：ConnectionRefusedError: refused"
+            data = c.get("/api/v1/sim/health").json()["data"]
+            assert data["carla_probe_error"].startswith("127.0.0.1:2000")
+            assert isinstance(data["carla_sdk_installed"], bool)
+
+    def test_probe_success_clears_error(self) -> None:
+        from types import SimpleNamespace
+
+        from hunter_sim.api.main import _refresh_carla_state
+        from hunter_sim.common.models import HunterSimSettings
+
+        class _HealthyClient:
+            def get_server_version(self) -> str:
+                return "0.9.16"
+
+        state = SimpleNamespace(
+            carla_client=_HealthyClient(),
+            carla_sdk_installed=True,
+            carla_connected=False,
+            carla_probe_error="旧错误",
+            carla_probe_evaluated=False,
+        )
+        _refresh_carla_state(state, HunterSimSettings())
+        assert state.carla_connected is True
+        assert state.carla_probe_error is None
+
+    def test_probe_failure_records_target_and_exception(self) -> None:
+        from types import SimpleNamespace
+
+        from hunter_sim.api.main import _refresh_carla_state
+        from hunter_sim.common.models import CarlaSettings, HunterSimSettings
+
+        class _BrokenClient:
+            def get_server_version(self) -> str:
+                raise RuntimeError("connect timeout")
+
+        state = SimpleNamespace(
+            carla_client=_BrokenClient(),
+            carla_sdk_installed=True,
+            carla_connected=False,
+            carla_probe_error=None,
+            carla_probe_evaluated=False,
+        )
+        settings = HunterSimSettings(carla=CarlaSettings(host="10.0.0.5", rpc_port=2100))
+        _refresh_carla_state(state, settings)
+        assert state.carla_connected is False
+        assert "10.0.0.5:2100" in state.carla_probe_error
+        assert "RuntimeError" in state.carla_probe_error
+
+    def test_probe_without_sdk_hints_install(self) -> None:
+        from types import SimpleNamespace
+
+        from hunter_sim.api.main import _refresh_carla_state
+        from hunter_sim.common.models import HunterSimSettings
+
+        state = SimpleNamespace(
+            carla_client=None,
+            carla_sdk_installed=False,
+            carla_connected=False,
+            carla_probe_error=None,
+            carla_probe_evaluated=False,
+        )
+        _refresh_carla_state(state, HunterSimSettings())
+        assert state.carla_connected is False
+        assert "SDK" in state.carla_probe_error
 
 
 class TestAuthEndpoints:

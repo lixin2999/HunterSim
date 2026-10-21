@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.1.1`（对齐《Carla 仿真系统详细设计文档》V4.0，并完成 PR 审查阻塞问题修复（A–F）与建议级问题修复（G–T）：天气端到端闭环、上传安全与配额账本收敛、事件检测边沿闩锁、并发端口递增分配、lifespan 生产装配、评估步长推导、Alertmanager 接入、CARLA 启动参数修正等。详见 [`release.md`](release.md)）
+- **当前版本**：`2.1.2`（在 2.1.1 基础上补齐 CARLA 连通性诊断：`/health` 新增 `carla_sdk_installed` / `carla_probe_error`，探测失败只在状态翻转时告警；修复 `.env` 对 `CARLA_*/KAFKA_*/VIL_*/API_*/RESOURCE_*` 前缀不生效或直接报错的问题。详见 [`release.md`](release.md)）
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---

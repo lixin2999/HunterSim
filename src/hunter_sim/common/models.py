@@ -193,7 +193,9 @@ class PerceptionResult(BaseModel):
 class CarlaSettings(BaseSettings):
     """CARLA 连接配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="CARLA_")
+    model_config = SettingsConfigDict(
+        env_prefix="CARLA_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     host: str = Field("127.0.0.1", description="CARLA 服务器地址")
     rpc_port: int = Field(2000, ge=1024, le=65535, description="RPC 端口")
@@ -211,7 +213,9 @@ class CarlaSettings(BaseSettings):
 class KafkaSettings(BaseSettings):
     """Kafka 数据总线配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="KAFKA_")
+    model_config = SettingsConfigDict(
+        env_prefix="KAFKA_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     bootstrap_servers: str = Field("localhost:9092")
     group_id: str = Field("carla-vil", description="VIL 消费组 ID（设计文档 §4.2.2）")
@@ -226,7 +230,9 @@ class KafkaSettings(BaseSettings):
 class VILSettings(BaseSettings):
     """VIL 虚实映射参数配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="VIL_")
+    model_config = SettingsConfigDict(
+        env_prefix="VIL_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     extrapolation_ms: int = Field(150, ge=0, le=1000, description="位姿外推时间（毫秒）")
     max_data_latency_ms: int = Field(500, ge=100, le=5000, description="最大数据延迟（超过则暂停仿真）")
@@ -241,7 +247,9 @@ class VILSettings(BaseSettings):
 class APISettings(BaseSettings):
     """REST API 服务配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="API_")
+    model_config = SettingsConfigDict(
+        env_prefix="API_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     host: str = "0.0.0.0"
     port: int = Field(8080, ge=1024, le=65535)
@@ -262,7 +270,9 @@ class APISettings(BaseSettings):
 class ResourceSettings(BaseSettings):
     """资源管理配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="RESOURCE_")
+    model_config = SettingsConfigDict(
+        env_prefix="RESOURCE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     instance_max_lifetime_seconds: int = Field(7200, ge=60, description="实例最大运行时间（2小时，设计文档 §14.1）")
     max_retry_count: int = Field(3, ge=0, le=10, description="实例异常重启最大次数（设计文档 §14.1）")
@@ -278,9 +288,16 @@ class ResourceSettings(BaseSettings):
 
 
 class HunterSimSettings(BaseSettings):
-    """HunterSim 全局聚合配置。"""
+    """HunterSim 全局聚合配置。
 
-    model_config = SettingsConfigDict(env_prefix="HUNTER_SIM_", env_file=".env", env_file_encoding="utf-8")
+    配置文件优先级：真实环境变量 > `.env` > 代码默认值；`.env` 需位于服务进程
+    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_）同样读取该 `.env`，
+    `extra="ignore"` 保证同一份文件中其他前缀的键不会触发校验错误。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="HUNTER_SIM_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     env: str = Field("dev", pattern="^(dev|staging|prod)$")
     log_level: str = Field("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")

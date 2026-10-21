@@ -50,9 +50,15 @@ async def health_check(request: Request) -> ApiResponse:
     - healthy: 所有服务正常
     - degraded: 部分服务降级（CARLA 连接异常等）
     - unhealthy: 核心服务不可用
+
+    另输出 CARLA 诊断字段，便于运维直接定位降级原因：
+    - carla_sdk_installed: 服务解释器是否能导入 carla SDK（false 时客户端永远不会建立）
+    - carla_probe_error: 最近一次探测失败摘要（探测目标 host:port + 异常），连通时为 null
     """
     # 从 app.state 读取各服务健康状态（由各服务在启动时注册）
     carla_connected: bool = getattr(request.app.state, "carla_connected", False)
+    carla_sdk_installed: bool = getattr(request.app.state, "carla_sdk_installed", False)
+    carla_probe_error: str | None = getattr(request.app.state, "carla_probe_error", None)
     active_instances: int = getattr(request.app.state, "active_instance_count", 0)
 
     status = "healthy" if carla_connected else "degraded"
@@ -60,6 +66,8 @@ async def health_check(request: Request) -> ApiResponse:
         status=status,
         uptime_seconds=round(time.time() - _START_TIME, 1),
         carla_connected=carla_connected,
+        carla_sdk_installed=carla_sdk_installed,
+        carla_probe_error=carla_probe_error,
         active_instances=active_instances,
     )
     return ApiResponse(data=payload.model_dump())

@@ -254,9 +254,11 @@ class HealthResponse(BaseModel):
     """健康检查响应体。"""
 
     status: str = Field(..., description="healthy / degraded / unhealthy")
-    version: str = "2.1.1"
+    version: str = "2.1.2"
     uptime_seconds: float = 0.0
     carla_connected: bool = False
+    carla_sdk_installed: bool = Field(False, description="服务解释器是否可导入 carla SDK")
+    carla_probe_error: str | None = Field(None, description="最近一次探测失败原因（target + 异常摘要）")
     active_instances: int = 0
 
 
