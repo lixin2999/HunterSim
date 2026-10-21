@@ -80,3 +80,68 @@ def test_publish_state_throttles() -> None:
     assert first is True
     assert second is True  # 节流视为"已按节拍处理"但未发送
     assert len(fake.sent) == 1
+
+
+def test_publish_event_swallows_exception() -> None:
+    """publish_event 内部映射/发送异常时记 WARN 返回 False，绝不冒泡阻断仿真。"""
+    conn = CloudConnector(_settings(), producer_factory=lambda s: FakeProducer())
+    conn.start()
+
+    def boom(*args: object, **kwargs: object) -> bool:
+        raise ValueError("unknown event_type")
+
+    conn.producer.publish_event = boom  # type: ignore[method-assign]
+    assert conn.publish_event("not_a_contract_event") is False
+
+
+def test_upload_bag_swallows_exception() -> None:
+    """上传执行（_perform_upload）失败时记 WARN 不冒泡（C-1）。"""
+    conn = CloudConnector(_settings(), producer_factory=lambda s: FakeProducer())
+    conn.start()
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("presign 500")
+
+    conn.uploader.upload = boom  # type: ignore[method-assign]
+    # 直接调用上传线程入口：异常应被收口，不向上抛出
+    conn._perform_upload(Path("x.mcap"), "rosbag")
+    conn.stop()
+
+
+def test_upload_bag_runs_in_background() -> None:
+    """upload_bag 不阻塞调用线程：任务投递到后台线程，stop() join 后完成（C-2）。"""
+    recorded: list[str] = []
+    conn = CloudConnector(_settings(), producer_factory=lambda s: FakeProducer())
+    conn.start()
+
+    def fake_upload(path: object, data_type: str = "rosbag") -> object:
+        recorded.append(str(path))
+        return object()
+
+    conn.uploader.upload = fake_upload  # type: ignore[method-assign]
+    assert conn.upload_bag(Path("run1.mcap")) is None  # fire-and-forget，立即返回
+    conn.stop()  # join 等待后台线程处理完已入队任务
+    assert "run1.mcap" in (recorded[0] if recorded else "")
+
+
+def test_upload_worker_restarts_after_stop() -> None:
+    """stop → start 重启后新 worker 应分配全新 Event，不会因旧 Event 已置位而立即退出。"""
+    recorded: list[str] = []
+    conn = CloudConnector(_settings(), producer_factory=lambda s: FakeProducer())
+
+    def fake_upload(path: object, data_type: str = "rosbag") -> object:
+        recorded.append(Path(path).name)
+        return object()
+
+    conn.uploader.upload = fake_upload  # type: ignore[method-assign]
+
+    conn.start()
+    conn.upload_bag(Path("run1.mcap"))
+    conn.stop()
+
+    conn.start()  # 重启
+    conn.uploader.upload = fake_upload  # type: ignore[method-assign]
+    conn.upload_bag(Path("run2.mcap"))
+    conn.stop()
+
+    assert "run1.mcap" in recorded and "run2.mcap" in recorded  # 两轮均落数，无静默失效

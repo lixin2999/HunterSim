@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from pathlib import Path
@@ -41,6 +42,14 @@ class CloudConnector:
         self._started = False
         self._last_publish = 0.0
         self._lock = threading.Lock()
+        # bag 上传（文件哈希 + httpx PUT，可达数秒~分钟）放后台线程，绝不阻塞调用线程。
+        self._worker_lock = threading.Lock()
+        # 串行化上传执行：即便 stop() 因长 IO 使 join 超时、旧收尾线程与新线程短暂并存，
+        # 也保证任意时刻至多一次在途 uploader.upload，杠绝并发双上传。
+        self._upload_exec_lock = threading.Lock()
+        self._upload_q: "Optional[queue.Queue[Any]]" = None
+        self._upload_thread: Optional[threading.Thread] = None
+        self._upload_stop: Optional[threading.Event] = None
 
     @property
     def enabled(self) -> bool:
@@ -64,7 +73,19 @@ class CloudConnector:
         return self._started
 
     def stop(self) -> None:
-        """停止连接器（刷新缓冲、关闭生产者）。"""
+        """停止连接器（关闭上传后台线程、刷新缓冲、关闭生产者）。"""
+        with self._worker_lock:
+            thread = self._upload_thread
+            q = self._upload_q
+            old_stop = self._upload_stop
+            self._upload_thread = None
+            self._upload_q = None
+            self._upload_stop = None
+        if thread is not None and q is not None:
+            q.put(None)  # 唤醒并终止循环（已入队任务尽力处理）
+            thread.join(timeout=3.0)
+            if thread.is_alive() and old_stop is not None:
+                old_stop.set()
         self.producer.close()
         self._started = False
 
@@ -105,16 +126,57 @@ class CloudConnector:
         ts = timestamp if timestamp is not None else time.time()
         return self.producer.publish_health(ts, status=status)
 
-    def upload_bag(self, file_path: Path, data_type: str = "rosbag") -> Optional[Any]:
-        """上传 rosbag 文件；未启用时返回 None。
+    def upload_bag(self, file_path: Path, data_type: str = "rosbag") -> None:
+        """将 bag 上传任务投递到后台线程（fire-and-forget，不阻塞调用线程）。
 
-        presign/PUT/complete 任一环节失败（文件缺失、HTTP≥400、业务码非 0 等）
-        时记 WARN 并返回 None，绝不冒泡。
+        大文件的全量哈希 + presign/PUT/complete 在上传专用线程执行，避免 GUI/仿真
+        线程被长时 IO 卡住。成功/失败结果仅记日志（后台无法同步返回）；未启用/
+        未启动时直接返回。
         """
         if not self._started:
-            return None
-        try:
-            return self.uploader.upload(file_path, data_type=data_type)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"bag 上传失败（已忽略，不阻断仿真）：{type(exc).__name__}: {exc}")
-            return None
+            return
+        self._ensure_upload_worker()
+        if self._upload_q is not None:
+            self._upload_q.put((file_path, data_type))
+
+    # ── 上传后台线程 ────────────────────────────────────────
+    def _ensure_upload_worker(self) -> None:
+        """惰性启动上传工作线程（幂等）。"""
+        with self._worker_lock:
+            if self._upload_thread is not None and self._upload_thread.is_alive():
+                return
+            self._upload_stop = threading.Event()
+            self._upload_q = queue.Queue()
+            self._upload_thread = threading.Thread(
+                target=self._upload_loop, name="cloud-bag-uploader", daemon=True
+            )
+            self._upload_thread.start()
+
+    def _upload_loop(self) -> None:
+        """上传线程主体：消费队列项并执行，None 为终止哨兵。"""
+        q = self._upload_q
+        stop = self._upload_stop
+        assert q is not None and stop is not None
+        while not stop.is_set():
+            try:
+                job = q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            path, dtype = job
+            self._perform_upload(path, dtype)
+
+    def _perform_upload(self, file_path: Path, data_type: str) -> None:
+        """实际执行上传（在上传线程）；串行化保证任意时刻至多一次在途上传。
+
+        即便某次 stop() 时上传线程正卡在长网络 IO、join(3.0) 超时导致"旧收尾线程 +
+        新线程"短暂并存，执行锁也杠绝并发双上传（不同 bag 串行）；旧线程完成当前
+        上传后因 stop 信号退出，不阻塞后续。异常收口为 WARN，绝不冒泡。
+        """
+        with self._upload_exec_lock:
+            try:
+                result = self.uploader.upload(file_path, data_type=data_type)
+                logger.info(f"bag 上传完成：{file_path.name} → {result}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"bag 上传失败（已忽略，不阻断仿真）：{type(exc).__name__}: {exc}")

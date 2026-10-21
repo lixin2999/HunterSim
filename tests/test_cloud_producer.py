@@ -100,3 +100,45 @@ def test_disabled_is_noop() -> None:
     assert producer.connect() is False
     assert producer.available is False
     assert producer.publish_telemetry(_state(), seq=1) is False
+
+
+class _FakeFuture:
+    """模拟 kafka-python FutureRecordMetadata，收集 errback。"""
+
+    def __init__(self) -> None:
+        self.errbacks: list = []
+
+    def add_errback(self, callback) -> None:  # noqa: ANN001
+        self.errbacks.append(callback)
+
+
+class AsyncFailProducer:
+    """send 返回 Future（不同步抛异常），用于验证异步失败回捞。"""
+
+    def __init__(self) -> None:
+        self.futures: list = []
+
+    def send(self, topic: str, key: bytes = None, value: bytes = None):  # noqa: ANN001, ANN201, D102
+        fut = _FakeFuture()
+        self.futures.append(fut)
+        return fut
+
+    def flush(self, timeout: float = 3.0) -> None:  # noqa: ANN001, D102
+        return None
+
+    def close(self) -> None:  # noqa: D102
+        return None
+
+
+def test_async_send_error_rebuffers() -> None:
+    """send 同步不报错但异步投递失败时，errback 应将消息重入缓冲（C-3）。"""
+    fake = AsyncFailProducer()
+    producer = TelemetryProducer(_settings(), producer_factory=lambda s: fake)
+    producer.connect()
+    assert producer.publish_telemetry(_state(), seq=1) is True
+    assert producer.buffered_count == 0
+    # 模拟 broker 不可达：触发已注册的 errback
+    future = fake.futures[0]
+    assert future.errbacks, "应为发送 Future 注册 errback"
+    future.errbacks[0](RuntimeError("broker down"))
+    assert producer.buffered_count == 1

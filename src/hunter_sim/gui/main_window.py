@@ -264,5 +264,10 @@ class MainWindow(QMainWindow):
         if self._launcher is not None:
             self._launcher.stop()
         self._worker.shutdown()
-        self._worker.wait(3000)
+        # 工作线程可能正阻塞在无超时保护的 CARLA 调用里（load_world 等）；
+        # 强行关闭会在运行中的 QThread 上析构 → 崩溃。超时则忽略本次关闭、稍后重试。
+        if not self._worker.wait(3000):
+            event.ignore()  # type: ignore[attr-defined]
+            self._log.append_line("正在等待 CARLA 调用结束，请稍候再次关闭…")
+            return
         super().closeEvent(event)  # type: ignore[arg-type]

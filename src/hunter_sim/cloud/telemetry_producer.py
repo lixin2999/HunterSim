@@ -80,6 +80,9 @@ class TelemetryProducer:
             "acks": 1,
             "linger_ms": 5,
             "retries": 3,
+            # 限制 send 在内部缓冲满时对调用线程的最大阻塞（默认 60s 会卡死主循环）。
+            "max_block_ms": 1000,
+            "delivery_timeout_ms": 5000,
         }
         if s.sasl_username is not None:
             kwargs["sasl_plain_username"] = s.sasl_username.get_secret_value()
@@ -146,21 +149,40 @@ class TelemetryProducer:
         return topic_template.format(vehicle_id=self._settings.vehicle_id)
 
     def _send(self, topic: str, payload: dict[str, Any]) -> bool:
-        """发送一条 JSON 消息；失败进缓冲（不抛出）。"""
+        """发送一条 JSON 消息；同步失败立即入缓冲，异步失败经 errback 回捞（不抛出）。
+
+        kafka-python `send()` 返回 Future：broker 不可达 / SASL 认证失败 / 投递超时
+        都是**异步错误**，不会同步抛出；必须挂 errback 才能在真实链路上发现并
+        重投，否则遥测会静默丢失（仅体现为 `publish_*` 返回 True）。
+        """
         key = self._settings.vehicle_id.encode("utf-8")
         value = json.dumps(payload, default=str).encode("utf-8")
         if not self._available or self._producer is None:
-            with self._lock:
-                self._buffer.append((topic, key, value))
+            self._buffer_message(topic, key, value)
             return False
         try:
-            self._producer.send(topic, key=key, value=value)
-            return True
-        except Exception as exc:  # noqa: BLE001
+            future = self._producer.send(topic, key=key, value=value)
+        except Exception as exc:  # noqa: BLE001  序列化/缓冲满等同步异常
             logger.warning(f"Kafka send 失败（topic={topic}），入缓冲：{type(exc).__name__}: {exc}")
-            with self._lock:
-                self._buffer.append((topic, key, value))
+            self._buffer_message(topic, key, value)
             return False
+        add_errback = getattr(future, "add_errback", None)
+        if callable(add_errback):
+            try:
+                add_errback(lambda exc, t=topic, k=key, v=value: self._on_send_error(exc, t, k, v))
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _on_send_error(self, exc: BaseException, topic: str, key: bytes, value: bytes) -> None:
+        """Kafka 异步投递失败回调：记 WARN 并重入有界缓冲待 flush 重投。"""
+        logger.warning(f"Kafka 异步投递失败（topic={topic}），入缓冲重投：{type(exc).__name__}: {exc}")
+        self._buffer_message(topic, key, value)
+
+    def _buffer_message(self, topic: str, key: bytes, value: bytes) -> None:
+        """把一条消息放入有界重投缓冲（maxlen 满时自动丢弃最旧）。"""
+        with self._lock:
+            self._buffer.append((topic, key, value))
 
     def flush(self) -> int:
         """尽力重投缓冲消息，返回成功重投条数。"""

@@ -153,6 +153,7 @@ class SimWorker(QThread):
             self._blueprint_library = self._world.get_blueprint_library()
             self.connected.emit(version)
             self.logLine.emit(f"已连接 CARLA {version} @ {host}:{port}")
+            self._apply_sync_settings()
         except Exception as exc:  # noqa: BLE001
             self._client = None
             self.connectionFailed.emit(str(exc))
@@ -164,6 +165,7 @@ class SimWorker(QThread):
         self._world = self._client.load_world(map_name)
         self._blueprint_library = self._world.get_blueprint_library()
         self._reset_scene_state()
+        self._apply_sync_settings()  # load_world 返回新 world 会重置为异步，需重下发
         self.mapChanged.emit(map_name)
         self.logLine.emit(f"已加载地图 {map_name}")
 
@@ -175,6 +177,7 @@ class SimWorker(QThread):
         self._world = self._client.generate_opendrive_world(content)
         self._blueprint_library = self._world.get_blueprint_library()
         self._reset_scene_state()
+        self._apply_sync_settings()  # generate_opendrive_world 返回新 world，需重下发
         self.mapChanged.emit(Path(path).name)
         self.logLine.emit(f"已导入 OpenDRIVE 地图 {Path(path).name}")
 
@@ -259,12 +262,24 @@ class SimWorker(QThread):
 
     def _do_set_sync(self, enabled: bool) -> None:
         self._sync_mode = enabled
-        if self._world is not None:
-            settings = self._world.get_settings()
-            settings.synchronous_mode = enabled
-            settings.fixed_delta_seconds = 0.02 if enabled else 0.0
-            self._world.apply_settings(settings)
+        self._apply_sync_settings()
         self.logLine.emit(f"同步模式：{'开' if enabled else '关'}")
+
+    def _apply_sync_settings(self) -> None:
+        """把 `_sync_mode` 标志单一事实源下发到 world（connect/load_map/xodr/set_sync 共用）。
+
+        world 句柄切换后（load_world/generate_opendrive_world）会重置为异步，
+        必须重新下发，否则标志与实际 world 设置长期脱节。
+        """
+        if self._world is None:
+            return
+        try:
+            settings = self._world.get_settings()
+            settings.synchronous_mode = self._sync_mode
+            settings.fixed_delta_seconds = 0.02 if self._sync_mode else 0.0
+            self._world.apply_settings(settings)
+        except Exception as exc:  # noqa: BLE001
+            self.errorOccurred.emit(f"同步模式下发失败：{type(exc).__name__}: {exc}")
 
     def _do_start(self) -> None:
         self._running = True

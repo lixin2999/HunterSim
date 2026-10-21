@@ -16,14 +16,19 @@ def image_to_rgb_array(carla_image: Any) -> "np.ndarray[Any, np.dtype[np.uint8]]
     """把 `carla.Image` 转为 RGB 数组。
 
     Args:
-        carla_image: CARLA 图像传感器回调对象（含 width/height/data）。
+        carla_image: CARLA 图像传感器回调对象（含 width/height 与原始字节缓冲）。
 
     Returns:
         shape=(height, width, 3)、dtype=uint8 的 RGB 数组（自顶向下行序）。
     """
     width = int(carla_image.width)
     height = int(carla_image.height)
-    buffer = np.frombuffer(carla_image.data, dtype=np.uint8)
+    # 官方 CARLA PythonAPI 的 carla.Image 暴露 raw_data（部分旧版/桩以 .data 提供），
+    # 两者兼容取数，真机不会因属性名不存在而 AttributeError。
+    raw = getattr(carla_image, "raw_data", None)
+    if raw is None:
+        raw = carla_image.data
+    buffer = np.frombuffer(raw, dtype=np.uint8)
     bgra = buffer.reshape((height, width, 4))
     # BGRA → RGB：交换 R/B 通道（QImage Format_RGB888 期望 R,G,B 顺序）
     rgb = bgra[:, :, [2, 1, 0]]
