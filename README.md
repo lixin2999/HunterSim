@@ -210,7 +210,7 @@ flake8 src tests                                               # Lint（配置�
 mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：635 项单元 + 集成测试全绿；覆盖率门禁 `fail_under=80`。
+- **测试**：640 项单元 + 集成测试全绿；行覆盖率 **81%**（≥80 门禁）。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 
