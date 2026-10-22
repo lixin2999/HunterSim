@@ -12,7 +12,15 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from hunter_sim.api.deps import get_current_user, get_settings, require_admin
+from hunter_sim.api.deps import (
+    Principal,
+    current_principal,
+    get_current_user,
+    get_principal,
+    get_settings,
+    require_admin,
+    require_operator,
+)
 from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.models import (
     ApiResponse,
@@ -59,7 +67,12 @@ def _get_instance_manager(request: Request) -> Any:
 
 
 def _assert_owner(request: Request, instance_id: str, user_id: str) -> Any:
-    """获取实例并校验归属（非本人实例仅管理员可操作），不存在 → 404。"""
+    """获取实例并校验归属与租户（V2.5.0）。
+
+    - 实例不存在 → 404；
+    - 跨租户且非 admin → 404（不泄露其他租户实例存在性）；
+    - 同租户但非本人且非 admin → 403。
+    """
     mgr = _get_instance_manager(request)
     inst = mgr.get_instance(instance_id)
     if inst is None:
@@ -67,15 +80,17 @@ def _assert_owner(request: Request, instance_id: str, user_id: str) -> Any:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Instance '{instance_id}' not found",
         )
-    if inst.user_id and inst.user_id != user_id:
-        from hunter_sim.api.deps import get_user_role  # noqa: PLC0415
-
-        payload = getattr(request.state, "token_payload", None) or {}
-        if get_user_role(payload) != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Instance '{instance_id}' belongs to another user",
-            )
+    principal = current_principal(request)
+    if inst.tenant != principal.tenant and not principal.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instance '{instance_id}' not found",
+        )
+    if inst.user_id and inst.user_id != user_id and not principal.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Instance '{instance_id}' belongs to another user",
+        )
     return inst
 
 
@@ -114,10 +129,42 @@ def _instance_to_response(inst: Any) -> InstanceResponse:
         scene_id=inst.scene_id,
         vehicle_id=inst.vehicle_id,
         user_id=inst.user_id,
+        tenant=inst.tenant,
         create_time=inst.create_time,
         start_time=inst.start_time,
         error_message=inst.error_message,
     )
+
+
+def _resolve_scene_config(request: Request, body: InstanceSceneRequest) -> dict[str, Any]:
+    """解析场景下发请求体：直传配置或从场景库读取（V2.5.0）。
+
+    Raises:
+        HTTPException: 场景库未启用（503）或条目不存在（404）。
+    """
+    if body.scene_config:
+        return body.scene_config
+    store = getattr(request.app.state, "state_store", None)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Scene library requires state persistence; set STATE_ENABLED=true",
+        )
+    principal = current_principal(request)
+    # admin 可跨租户引用场景库条目；普通用户仅限本租户
+    item = store.get_library_scene(
+        body.library_scene_id, tenant="" if principal.is_admin else principal.tenant
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Library scene '{body.library_scene_id}' not found",
+        )
+    config = dict(item.get("config") or {})
+    scene_id = body.scene_id or str(item.get("scene_id", ""))
+    if scene_id:
+        config["scene_id"] = scene_id
+    return config
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
@@ -127,16 +174,23 @@ def _instance_to_response(inst: Any) -> InstanceResponse:
 async def create_instance(
     body: CreateInstanceRequest,
     request: Request,
-    user_id: str = Depends(require_admin),
+    principal: Principal = Depends(require_operator),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances（设计文档 §12.2）
 
     创建一个新的 CARLA 仿真实例，分配 GPU 资源并启动容器。
-    安全约束（§14.2）：需管理员角色，并受单用户并发配额限制；
-    自车模型需在平台审核白名单内（§14.3）。
+    安全约束：需 operator 及以上角色（V2.5.0 由 admin 下沉），
+    并受用户级与租户级并发配额限制；自车模型需在平台审核白名单内（§14.3）。
     响应含 carla_server 连接信息与 WebRTC 视频流地址。
     """
     mgr = _get_instance_manager(request)
+    user_id = principal.user_id
+    target_tenant = body.tenant or principal.tenant
+    if target_tenant != principal.tenant and not principal.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can create instances in another tenant",
+        )
 
     # 资源白名单：仅允许平台审核通过的车辆模型（§14.3）
     from hunter_sim.engine.vehicle_blueprint_generator import SUPPORTED_VEHICLES  # noqa: PLC0415
@@ -171,11 +225,14 @@ async def create_instance(
             scene_id=body.scene_id,
             vehicle_model=body.vehicle_model,
             replay_config=body.replay_config.model_dump() if body.replay_config else None,
+            tenant=target_tenant,
         )
 
         audit_log(
             "instance.create", user_id, inst.sim_instance_id,
-            f"map={body.map} mode={body.mode.value} quality={body.quality.value}",
+            f"map={body.map} mode={body.mode.value} quality={body.quality.value} tenant={target_tenant}",
+            tenant=target_tenant,
+            auth_type=principal.auth_type,
         )
 
         # 文档 §12.2 创建响应结构 + 下一步提示（避免对接方卡在 404 上）
@@ -211,15 +268,25 @@ async def create_instance(
 @router.get("", response_model=ApiResponse, summary="列出实例")
 async def list_instances(
     request: Request,
-    user_id: str = Depends(get_current_user),
+    principal: Principal = Depends(get_principal),
+    tenant: str = Query("", description="租户过滤（仅 admin 可跨租户查询）"),
     status_filter: Optional[InstanceStatus] = Query(None, alias="status", description="按状态过滤"),
 ) -> ApiResponse:
     """GET /api/v1/sim/instances
 
-    列出当前用户的所有仿真实例，可按状态过滤。
+    列出当前用户（admin 为本租户全部）的仿真实例，可按状态过滤。
     """
     mgr = _get_instance_manager(request)
-    instances = mgr.list_instances(user_id=user_id)
+    query_tenant = principal.tenant
+    if tenant and tenant != principal.tenant:
+        if not principal.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admin can query another tenant's instances",
+            )
+        query_tenant = tenant
+    user_scope = "" if principal.is_admin else principal.user_id
+    instances = mgr.list_instances(user_id=user_scope, tenant=query_tenant)
     if status_filter:
         instances = [i for i in instances if i.status == status_filter]
     items = [_instance_to_response(i).model_dump() for i in instances]
@@ -362,7 +429,15 @@ async def destroy_instance(
         await asyncio.to_thread(release_scene_runner, request.app, instance_id)
     # destroy_instance 内部统一释放 GPU 与用户配额（§14.2，含超时自动回收路径）
     mgr.destroy_instance(instance_id)
-    audit_log("instance.destroy", user_id, instance_id, f"owner={owner_id or user_id}")
+    caller = current_principal(request)
+    audit_log(
+        "instance.destroy",
+        user_id,
+        instance_id,
+        f"owner={owner_id or user_id} tenant={inst.tenant}",
+        tenant=inst.tenant,
+        auth_type=caller.auth_type,
+    )
     return ApiResponse(data={"sim_instance_id": instance_id, "destroyed": True})
 
 
@@ -397,10 +472,12 @@ async def assign_scene(
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/scene（设计文档 §12.4）
 
-    向指定实例下发场景配置，scene_config 为完整场景 JSON。
+    向指定实例下发场景配置：``scene_config`` 直传，或 ``library_scene_id``
+    引用场景库条目（V2.5.0）。
     审查项 O：复用 load_scene_impl（秒级 CARLA 操作），走 to_thread 避免阻塞事件循环。
     """
-    data = await asyncio.to_thread(load_scene_impl, request, instance_id, body.scene_config)
+    scene_config = _resolve_scene_config(request, body)
+    data = await asyncio.to_thread(load_scene_impl, request, instance_id, scene_config)
     if body.scene_id and data["scene_id"] != body.scene_id:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

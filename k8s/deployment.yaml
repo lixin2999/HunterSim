@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.4.0
+          image: hunter-sim:2.5.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -96,6 +96,27 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: state_db_path
+            # 平台化（V2.5.0）：多租户/租户配额/API Key/审计
+            - name: PLATFORM_DEFAULT_TENANT
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_default_tenant
+            - name: PLATFORM_MAX_INSTANCES_PER_TENANT
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_max_instances_per_tenant
+            - name: PLATFORM_API_KEYS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_api_keys_enabled
+            - name: PLATFORM_AUDIT_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_audit_enabled
           resources:
             requests:
               memory: "512Mi"

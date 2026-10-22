@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
-from hunter_sim.api.deps import decode_token, get_api_settings, get_user_role
+from hunter_sim.api.deps import decode_token, get_api_settings, get_default_tenant, get_user_role
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -122,17 +122,23 @@ async def _authorize(websocket: WebSocket, instance_id: str) -> bool:
         return False
 
     user_id = str(payload.get("sub", ""))
+    tenant = str(payload.get("tenant") or get_default_tenant())
+    role = get_user_role(payload)
     manager = getattr(websocket.app.state, "instance_manager", None)
     instance = manager.get_instance(instance_id) if manager is not None else None
-    if (
-        instance is not None
-        and instance.user_id
-        and instance.user_id != user_id
-        and get_user_role(payload) != _ADMIN_ROLE
-    ):
-        await websocket.close(code=_WS_FORBIDDEN, reason="Forbidden")
-        logger.warning(f"WebSocket access denied: user '{user_id}' -> instance {instance_id}")
-        return False
+    if instance is not None and role != _ADMIN_ROLE:
+        # V2.5.0：跨租户订阅一律拒绝；同租户非本人同样拒绝
+        if instance.tenant != tenant:
+            await websocket.close(code=_WS_FORBIDDEN, reason="Forbidden")
+            logger.warning(
+                f"WebSocket tenant denied: tenant '{tenant}' -> instance {instance_id} "
+                f"(tenant '{instance.tenant}')"
+            )
+            return False
+        if instance.user_id and instance.user_id != user_id:
+            await websocket.close(code=_WS_FORBIDDEN, reason="Forbidden")
+            logger.warning(f"WebSocket access denied: user '{user_id}' -> instance {instance_id}")
+            return False
     return True
 
 

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from hunter_sim.common.models import (
     EvalGrade,
@@ -70,6 +77,7 @@ class CreateInstanceRequest(BaseModel):
     scene_id: str = Field("", description="可选，预加载场景 ID")
     vehicle_id: str = Field("", description="VIL 模式必填，关联实车 ID")
     replay_config: Optional[ReplayWindow] = Field(None, description="replay 模式回放配置")
+    tenant: str = Field("", description="目标租户（V2.5.0，空取调用主体租户；跨租户仅 admin）")
 
     @field_validator("quality", mode="before")
     @classmethod
@@ -92,6 +100,7 @@ class InstanceResponse(BaseModel):
     scene_id: str
     vehicle_id: str
     user_id: str
+    tenant: str = "default"
     create_time: float
     start_time: float
     error_message: str = ""
@@ -110,13 +119,51 @@ class LoadSceneRequest(BaseModel):
 class InstanceSceneRequest(BaseModel):
     """POST /instances/{id}/scene 请求体（设计文档 §12.4）。
 
+    V2.5.0 支持两种下发方式（二选一）：
+    - ``scene_config``：直接提交完整场景配置；
+    - ``library_scene_id``：从当前租户的场景库读取已保存配置。
+
     Attributes:
-        scene_id: 场景 ID。
+        scene_id: 场景 ID（可覆盖场景库/配置中的 scene_id）。
         scene_config: 完整场景配置 JSON（见数据采集系统 4.2.2 节）。
+        library_scene_id: 场景库条目 ID（与 scene_config 二选一）。
     """
 
-    scene_id: str = Field(..., description="场景 ID")
-    scene_config: dict[str, Any] = Field(..., description="完整场景配置 JSON")
+    scene_id: str = Field("", description="场景 ID（可空，取配置中的 scene_id）")
+    scene_config: Optional[dict[str, Any]] = Field(None, description="完整场景配置 JSON")
+    library_scene_id: str = Field("", description="场景库条目 ID（V2.5.0）")
+
+    @model_validator(mode="after")
+    def _require_one_source(self) -> "InstanceSceneRequest":
+        """scene_config 与 library_scene_id 必须二选一。"""
+        if not self.scene_config and not self.library_scene_id:
+            raise ValueError("either scene_config or library_scene_id is required")
+        if self.scene_config and self.library_scene_id:
+            raise ValueError("scene_config and library_scene_id are mutually exclusive")
+        return self
+
+
+# ─── 平台化（V2.5.0） ──────────────────────────────────────────────────────
+
+
+class ApiKeyCreateRequest(BaseModel):
+    """POST /auth/api-keys 请求体（服务账号签发）。"""
+
+    name: str = Field(..., min_length=1, max_length=64, description="服务账号名称（可读标识）")
+    role: str = Field(
+        "operator", pattern="^(viewer|operator|admin)$", description="角色（viewer/operator/admin）"
+    )
+    tenant: str = Field("", description="所属租户（空取调用主体租户）")
+    expires_in_days: int = Field(0, ge=0, le=3650, description="有效期天数（0 表示永不过期）")
+
+
+class SceneLibraryCreateRequest(BaseModel):
+    """POST /scenes/library 请求体（场景库保存）。"""
+
+    name: str = Field(..., min_length=1, max_length=128, description="场景名称（同名自动递增版本）")
+    description: str = Field("", max_length=512, description="场景说明")
+    config: dict[str, Any] = Field(..., description="完整场景配置 JSON（SceneConfig 格式）")
+    scene_id: str = Field("", description="场景 ID（空取配置中的 scene_id）")
 
 
 class BatchScenarioRequest(BaseModel):

@@ -3,7 +3,7 @@
 # 注：文档示例基于 python:3.8-slim，但本项目代码使用 3.10+ 语法与 pydantic v2，
 #     为保持可构建性升级基础镜像；镜像结构（requirements + uvicorn 启动）与文档一致。
 # CARLA 引擎镜像另见 docker/Dockerfile.carla（§15.3）。
-# 使用：docker build -f docker/Dockerfile -t hunter-sim:2.3.0 .
+# 使用：docker build -f docker/Dockerfile -t hunter-sim:2.5.0 .
 #
 # CARLA Python SDK（V2.3.0）：服务端要「真跑起一个场景」必须能 import carla。
 # PyPI 自 0.9.14 起提供 manylinux wheel（cp310/cp311/cp312），默认随镜像安装，

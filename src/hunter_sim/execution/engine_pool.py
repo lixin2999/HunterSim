@@ -177,7 +177,8 @@ class EnginePool:
     def capacity(self) -> int:
         """已声明的引擎数量（未声明时按已租用端点数动态计算）。"""
         with self._lock:
-            return max(len(self._known), len({l.endpoint.key for l in self._leases.values()}))
+            leased = {lease.endpoint.key for lease in self._leases.values()}
+            return max(len(self._known), len(leased))
 
     @property
     def active_count(self) -> int:

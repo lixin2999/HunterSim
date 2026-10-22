@@ -1,4 +1,4 @@
-# HunterSim Windows 单机全容器编排（V2.4.0）
+# HunterSim Windows 单机全容器编排（V2.5.0）
 #
 # 前提（详见 deployment_and_operations.md「Windows 单机全容器拓扑」）：
 #   - Docker Desktop for Windows，后端切换为 WSL2
@@ -60,7 +60,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: hunter-sim:2.4.0
+    image: hunter-sim:2.5.0
     ports:
       - "8080:8080"
     environment:
@@ -85,6 +85,11 @@ services:
       STATE_DB_PATH: ${STATE_DB_PATH:-data/state/hunter_sim.db}
       STATE_RECOVER_INSTANCES: ${STATE_RECOVER_INSTANCES:-true}
       STATE_RESTORE_SCENES: ${STATE_RESTORE_SCENES:-true}
+      # 平台化（V2.5.0）：多租户默认租户/租户配额/服务账号 API Key/审计落库
+      PLATFORM_DEFAULT_TENANT: ${PLATFORM_DEFAULT_TENANT:-default}
+      PLATFORM_MAX_INSTANCES_PER_TENANT: ${PLATFORM_MAX_INSTANCES_PER_TENANT:-20}
+      PLATFORM_API_KEYS_ENABLED: ${PLATFORM_API_KEYS_ENABLED:-true}
+      PLATFORM_AUDIT_ENABLED: ${PLATFORM_AUDIT_ENABLED:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

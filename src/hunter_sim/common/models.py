@@ -336,6 +336,26 @@ class StateSettings(BaseSettings):
     busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时（秒）")
 
 
+class PlatformSettings(BaseSettings):
+    """平台化配置（V2.5.0：多租户 / 服务账号 / 审计）。
+
+    - ``default_tenant``：旧 Token（无 tenant claim）与未声明租户的请求归属租户，
+      保证升级后既有客户端继续可用；
+    - ``max_instances_per_tenant``：租户级并发实例上限，与用户级、全局配额叠加生效；
+    - ``api_keys_enabled``：关闭后服务账号 API Key 一律拒绝（仅保留 JWT）；
+    - ``audit_enabled``：开启后审计事件写入状态库，可通过 ``GET /audit`` 查询。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="PLATFORM_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    default_tenant: str = Field("default", description="默认租户 ID（旧 Token 兼容归属）")
+    max_instances_per_tenant: int = Field(20, ge=1, description="单租户最大并发实例数")
+    api_keys_enabled: bool = Field(True, description="是否启用服务账号 API Key 认证")
+    audit_enabled: bool = Field(True, description="是否将审计事件落库并可查询")
+
+
 class CloudSettings(BaseSettings):
     """HunterCore 数据采集分析平台接入配置（V2.2.0）。
 
@@ -397,8 +417,9 @@ class HunterSimSettings(BaseSettings):
     """HunterSim 全局聚合配置。
 
     配置文件优先级：真实环境变量 > `.env` > 代码默认值；`.env` 需位于服务进程
-    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_/HUNTER_CORE_/GUI_）
-    同样读取该 `.env`，`extra="ignore"` 保证同一份文件中其他前缀的键不会触发校验错误。
+    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_/EXECUTION_/STATE_/
+    PLATFORM_/HUNTER_CORE_/GUI_）同样读取该 `.env`，`extra="ignore"` 保证同一份
+    文件中其他前缀的键不会触发校验错误。
     """
 
     model_config = SettingsConfigDict(
@@ -414,6 +435,7 @@ class HunterSimSettings(BaseSettings):
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     state: StateSettings = Field(default_factory=StateSettings)
+    platform: PlatformSettings = Field(default_factory=PlatformSettings)
     cloud: CloudSettings = Field(default_factory=CloudSettings)
     gui: GuiSettings = Field(default_factory=GuiSettings)
 

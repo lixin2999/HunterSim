@@ -19,13 +19,16 @@ from fastapi.responses import ORJSONResponse
 from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
-from hunter_sim.api.middleware.logging import RequestLogMiddleware
+from hunter_sim.api.middleware.logging import RequestLogMiddleware, set_audit_sink
 from hunter_sim.api.routers import (
+    audit,
     auth,
     execution,
     health,
     instances,
+    platform,
     resources,
+    scene_library,
     scenarios,
     scenes,
     websocket,
@@ -213,9 +216,20 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
                 settings.state.db_path, settings.state.busy_timeout_seconds
             )
             state.state_store.normalize_scene_statuses()
+            # V2.5.0：重启不保留执行器，未完成的批量任务统一标记 failed
+            interrupted = state.state_store.normalize_batch_tasks()
+            if interrupted:
+                logger.warning(f"Marked {interrupted} interrupted batch task(s) as failed")
         except Exception as exc:  # noqa: BLE001  存储不可用时服务仍可启动
             state.state_store = None
             logger.error(f"State persistence disabled (init failed): {exc}")
+
+    # V2.5.0：审计落库（可选）；sink 只依赖 state_store，不阻断启动
+    store = getattr(state, "state_store", None)
+    if store is not None and settings.platform.audit_enabled:
+        set_audit_sink(store.append_audit)
+    else:
+        set_audit_sink(None)
 
     if getattr(state, "instance_manager", None) is None:
         endpoints = parse_engine_endpoints(
@@ -231,6 +245,7 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             carla=settings.carla,
             engine_endpoints=endpoints,
             state_store=getattr(state, "state_store", None),
+            platform=settings.platform,
         )
         if settings.state.recover_instances:
             restored = state.instance_manager.restore()
@@ -356,6 +371,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
                 logger.info(f"Released {released} scene runtime(s) on shutdown")
             if monitor is not None:
                 monitor.stop()
+            set_audit_sink(None)
             # 先释放执行面/停监控，再关闭持久化连接
             store = getattr(app.state, "state_store", None)
             if store is not None:
@@ -381,6 +397,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     app.add_middleware(
         JWTAuthMiddleware,
         api_settings=settings.api,
+        api_keys_enabled=settings.platform.api_keys_enabled,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -405,8 +422,13 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix=api_prefix, tags=["auth"])
     app.include_router(instances.router, prefix=f"{api_prefix}/instances", tags=["instances"])
     app.include_router(scenes.router, prefix=f"{api_prefix}/scenes", tags=["scenes"])
+    app.include_router(
+        scene_library.router, prefix=f"{api_prefix}/scenes", tags=["scene-library"]
+    )
     app.include_router(scenarios.router, prefix=f"{api_prefix}/scenarios", tags=["scenarios"])
     app.include_router(execution.router, prefix=api_prefix, tags=["execution"])
+    app.include_router(platform.router, prefix=api_prefix, tags=["platform"])
+    app.include_router(audit.router, prefix=api_prefix, tags=["audit"])
     app.include_router(resources.router, prefix=api_prefix, tags=["resources"])
     app.include_router(websocket.router, prefix=api_prefix, tags=["websocket"])
 

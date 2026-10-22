@@ -1,4 +1,4 @@
-# HunterSim 开发/单机部署编排（V2.4.0）
+# HunterSim 开发/单机部署编排（V2.5.0）
 # 使用：
 #   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
@@ -6,6 +6,8 @@
 # 镜像内已安装 carla==0.9.16 Python SDK，REST 可直接下发场景并生成自车。
 # V2.4.0：多引擎并行需在 .env 置 EXECUTION_ENGINE_ENDPOINTS（如 carla-engine:2000,carla-engine-2:2000），
 # 且启动两个 carla 容器（--profile carla）；实例与场景绑定落 data/state/hunter_sim.db。
+# V2.5.0：平台化——多租户隔离、服务账号 API Key（X-API-Key）、场景库/批量任务/审计落库，
+# 平台参数见下方 PLATFORM_*（默认单租户 default，API Key 与审计默认开启）。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -98,7 +100,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.4.0
+    image: hunter-sim:2.5.0
     ports:
       - "8080:8080"
     environment:
@@ -125,6 +127,11 @@ services:
       STATE_DB_PATH: ${STATE_DB_PATH:-data/state/hunter_sim.db}
       STATE_RECOVER_INSTANCES: ${STATE_RECOVER_INSTANCES:-true}
       STATE_RESTORE_SCENES: ${STATE_RESTORE_SCENES:-true}
+      # 平台化（V2.5.0）：多租户默认租户/租户配额/服务账号 API Key/审计落库
+      PLATFORM_DEFAULT_TENANT: ${PLATFORM_DEFAULT_TENANT:-default}
+      PLATFORM_MAX_INSTANCES_PER_TENANT: ${PLATFORM_MAX_INSTANCES_PER_TENANT:-20}
+      PLATFORM_API_KEYS_ENABLED: ${PLATFORM_API_KEYS_ENABLED:-true}
+      PLATFORM_AUDIT_ENABLED: ${PLATFORM_AUDIT_ENABLED:-true}
     depends_on:
       kafka:
         condition: service_healthy

@@ -17,11 +17,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 from fastapi import HTTPException, Request, status
 
-from hunter_sim.api.deps import get_user_role
+from hunter_sim.api.deps import get_default_tenant, get_user_role
 from hunter_sim.common.models import CarlaSettings, InstanceStatus
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.map_manager import MapManager
@@ -431,7 +431,7 @@ def assert_instance_access(
     user_id: str,
     require_exists: bool = True,
 ) -> Any | None:
-    """校验实例归属：非本人实例仅管理员可访问（修复实例级 IDOR）。"""
+    """校验实例归属与租户（V2.5.0）：非本人/跨租户仅管理员可访问（修复实例级 IDOR）。"""
     manager = getattr(request.app.state, "instance_manager", None)
     if manager is None or not user_id:
         return None
@@ -443,9 +443,18 @@ def assert_instance_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Instance '{instance_id}' not found",
         )
-    if instance.user_id and instance.user_id != user_id:
-        payload = getattr(request.state, "token_payload", None) or {}
-        if get_user_role(payload) != _ADMIN_ROLE:
+    payload = getattr(request.state, "token_payload", None) or {}
+    is_admin = get_user_role(payload) == _ADMIN_ROLE
+    if not is_admin:
+        tenant = str(payload.get("tenant") or get_default_tenant())
+        instance_tenant = getattr(instance, "tenant", None)
+        if instance_tenant is not None and instance_tenant != tenant:
+            # 跨租户不可见：返回 404 而非 403，避免探测其他租户实例
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Instance '{instance_id}' not found",
+            )
+        if instance.user_id and instance.user_id != user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Instance '{instance_id}' belongs to another user",

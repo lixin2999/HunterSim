@@ -21,6 +21,11 @@ data:
   # 状态持久化（V2.4.0）：SQLite 落独立 RWO 卷，Pod 重建后实例/场景绑定可恢复
   state_enabled: "true"
   state_db_path: "/home/hunter/app/data/state/hunter_sim.db"
+  # 平台化（V2.5.0）：多租户、租户配额、服务账号 API Key、审计落库
+  platform_default_tenant: "default"
+  platform_max_instances_per_tenant: "20"
+  platform_api_keys_enabled: "true"
+  platform_audit_enabled: "true"
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

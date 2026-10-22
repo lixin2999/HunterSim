@@ -17,6 +17,7 @@ from hunter_sim.common.exceptions import InstanceStateError, ResourceError
 from hunter_sim.common.models import (
     CarlaSettings,
     InstanceStatus,
+    PlatformSettings,
     QualityLevel,
     ResourceSettings,
     SimMode,
@@ -59,6 +60,7 @@ class SimInstance:
         scene_id: 关联场景 ID。
         vehicle_id: 关联实车 ID。
         user_id: 操作用户 ID。
+        tenant: 所属租户 ID（V2.5.0 平台化隔离）。
         create_time: 创建时间戳（epoch 秒）。
         start_time: 启动时间戳（未启动为 0）。
         docker_container_id: 容器 ID（§10.2.3 容器化部署）。
@@ -82,6 +84,7 @@ class SimInstance:
     vehicle_model: str = "hunter.se"
     replay_config: dict[str, Any] = field(default_factory=dict)
     user_id: str = ""
+    tenant: str = "default"
     create_time: float = field(default_factory=time.time)
     start_time: float = 0.0
     docker_container_id: str = ""
@@ -122,6 +125,7 @@ class SimInstance:
             "scene_id": self.scene_id,
             "mode": self.mode.value,
             "vehicle_id": self.vehicle_id,
+            "tenant": self.tenant,
             "create_time": _iso(self.create_time),
             "start_time": _iso(self.start_time),
             "gpu_id": self.gpu_id,
@@ -146,6 +150,7 @@ class SimInstance:
             "vehicle_model": self.vehicle_model,
             "replay_config": dict(self.replay_config),
             "user_id": self.user_id,
+            "tenant": self.tenant,
             "create_time": self.create_time,
             "start_time": self.start_time,
             "docker_container_id": self.docker_container_id,
@@ -197,6 +202,7 @@ class SimInstance:
             vehicle_model=str(record.get("vehicle_model", "hunter.se")),
             replay_config=dict(record.get("replay_config") or {}),
             user_id=str(record.get("user_id", "")),
+            tenant=str(record.get("tenant", "default")),
             create_time=float(record.get("create_time") or time.time()),
             start_time=0.0,
             docker_container_id=str(record.get("docker_container_id", "")),
@@ -222,6 +228,7 @@ class SimInstanceManager:
             一个未占用端点，支持多引擎并行；耗尽时抛 ResourceError。
         state_store: 状态持久化存储（可选）。提供后实例创建/流转/销毁同步落盘，
             可通过 restore() 在服务重启后重建实例表。
+        platform: 平台化配置（可选）。提供租户级并发上限与默认租户（V2.5.0）。
     """
 
     def __init__(
@@ -232,6 +239,7 @@ class SimInstanceManager:
         carla: Optional[CarlaSettings] = None,
         engine_endpoints: Optional[list[Any]] = None,
         state_store: Optional[Any] = None,
+        platform: Optional[PlatformSettings] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._gpu_pool = gpu_pool
@@ -239,6 +247,7 @@ class SimInstanceManager:
         self._carla = carla or CarlaSettings()
         self._engine_endpoints: list[Any] = list(engine_endpoints or [])
         self._state_store = state_store
+        self._platform = platform or PlatformSettings()
         self._instances: dict[str, SimInstance] = {}
         self._lock: threading.RLock = threading.RLock()
         logger.info("SimInstanceManager initialized")
@@ -253,6 +262,7 @@ class SimInstanceManager:
         scene_id: str = "",
         vehicle_model: str = "hunter.se",
         replay_config: Optional[dict[str, Any]] = None,
+        tenant: str = "",
     ) -> SimInstance:
         """创建新仿真实例。
 
@@ -265,13 +275,17 @@ class SimInstanceManager:
             scene_id: 关联场景 ID。
             vehicle_model: 自车模型 ID（文档 §12.2）。
             replay_config: replay 模式回放配置（文档 §12.2）。
+            tenant: 租户 ID（V2.5.0）；为空时取平台默认租户。
 
         Returns:
             创建的 SimInstance。
 
         Raises:
-            ResourceError: GPU 资源不足。
+            ResourceError: GPU 资源不足或超出租户并发配额。
         """
+        tenant = tenant or self._platform.default_tenant
+        # 租户配额先行校验：必须在 GPU 分配前拒绝，避免分配后失败泄漏 GPU 名额
+        self._check_tenant_quota(tenant)
         instance_id = str(uuid.uuid4())
         gpu_id: int = -1
 
@@ -300,6 +314,7 @@ class SimInstanceManager:
             quality=quality,
             gpu_id=gpu_id,
             user_id=user_id,
+            tenant=tenant,
             vehicle_id=vehicle_id,
             scene_id=scene_id,
             vehicle_model=vehicle_model,
@@ -317,10 +332,32 @@ class SimInstanceManager:
 
         self._persist(instance)
         logger.info(
-            f"Instance created: {instance_id} (gpu={gpu_id}, quality={quality.value}, "
+            f"Instance created: {instance_id} (tenant={tenant}, gpu={gpu_id}, "
+            f"quality={quality.value}, "
             f"carla={instance.carla_host}:{instance.carla_rpc_port}/{instance.carla_stream_port})"
         )
         return instance
+
+    def _check_tenant_quota(self, tenant: str) -> None:
+        """校验租户并发实例配额（不计已终态实例）。
+
+        Raises:
+            ResourceError: 超出 ``PLATFORM_MAX_INSTANCES_PER_TENANT``。
+        """
+        limit = self._platform.max_instances_per_tenant
+        with self._lock:
+            count = sum(
+                1
+                for i in self._instances.values()
+                if i.tenant == tenant
+                and i.status not in (InstanceStatus.COMPLETED, InstanceStatus.FAILED)
+            )
+        if count >= limit:
+            raise ResourceError(
+                "quota",
+                f"Tenant '{tenant}' already has {count} instances (max {limit}); "
+                "destroy an idle instance or raise PLATFORM_MAX_INSTANCES_PER_TENANT",
+            )
 
     def _assign_endpoint(self) -> tuple[str, int, int]:
         """分配引擎端点（已持有 self._lock）。
@@ -348,12 +385,14 @@ class SimInstanceManager:
         with self._lock:
             return self._instances.get(instance_id)
 
-    def list_instances(self, user_id: str = "") -> list[SimInstance]:
-        """列出所有实例（可按用户过滤）。"""
+    def list_instances(self, user_id: str = "", tenant: str = "") -> list[SimInstance]:
+        """列出实例（可按用户 / 租户过滤）。"""
         with self._lock:
             instances = list(self._instances.values())
         if user_id:
             instances = [i for i in instances if i.user_id == user_id]
+        if tenant:
+            instances = [i for i in instances if i.tenant == tenant]
         return instances
 
     def transition(self, instance_id: str, new_status: InstanceStatus, error_msg: str = "") -> None:
@@ -456,6 +495,9 @@ class SimInstanceManager:
                     continue
                 if instance.sim_instance_id in self._instances:
                     continue
+                # 旧库记录无 tenant 字段时回落到平台默认租户
+                if not str(record.get("tenant", "")).strip():
+                    instance.tenant = self._platform.default_tenant
                 self._instances[instance.sim_instance_id] = instance
                 restored += 1
                 if instance.user_id and instance.status not in (

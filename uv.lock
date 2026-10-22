@@ -449,7 +449,7 @@ wheels = [
 
 [[package]]
 name = "hunter-sim"
-version = "2.1.2"
+version = "2.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

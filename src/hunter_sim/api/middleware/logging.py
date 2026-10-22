@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from typing import Callable, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -20,26 +21,57 @@ logger = get_logger(__name__)
 # 审计日志专用 logger，便于独立输出/采集
 _audit_logger = get_logger("hunter_sim.audit")
 
+# 审计落库 sink（V2.5.0）：由 main 注入 StateStore.append_audit
+_AuditSink = Callable[[str, str, str, str, str, str], None]
+_audit_sink: Optional[_AuditSink] = None
 
-def audit_log(action: str, user_id: str, target: str, detail: str = "") -> None:
+
+def set_audit_sink(sink: Optional[_AuditSink]) -> None:
+    """注册/清除审计落库 sink（参数：action, user_id, target, detail, tenant, auth_type）。"""
+    global _audit_sink  # noqa: PLW0603
+    _audit_sink = sink
+
+
+def audit_log(
+    action: str,
+    user_id: str,
+    target: str,
+    detail: str = "",
+    tenant: str = "default",
+    auth_type: str = "",
+) -> None:
     """记录一条审计日志（设计文档 §14.2：所有实例操作记录审计日志）。
+
+    V2.5.0 起同时写入状态库（由 ``set_audit_sink`` 注入），支持 ``GET /audit``
+    查询；落库失败仅告警，不影响主流程。
 
     Args:
         action: 操作类型，如 instance.create / instance.destroy。
-        user_id: 操作用户 ID（JWT sub）。
+        user_id: 操作用户 ID（JWT sub 或 API Key 绑定账号）。
         target: 操作对象，如实例 ID。
         detail: 附加信息。
+        tenant: 租户 ID。
+        auth_type: 认证方式（jwt/api_key）。
     """
     _audit_logger.info(
         {
             "audit": True,
             "action": action,
             "user_id": user_id,
+            "tenant": tenant,
             "target": target,
             "detail": detail,
+            "auth_type": auth_type,
             "timestamp": time.time(),
         }
     )
+    sink = _audit_sink
+    if sink is None:
+        return
+    try:
+        sink(action, user_id, target, detail, tenant, auth_type)
+    except Exception as exc:  # noqa: BLE001  审计落库失败不阻断业务操作
+        logger.warning(f"Audit sink failed for action '{action}': {exc}")
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):
