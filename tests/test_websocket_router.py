@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from hunter_sim.api.routers.websocket import WebSocketConnectionManager
 
@@ -105,8 +107,9 @@ class TestConnectionManager:
 
 
 class TestWebsocketEndpoint:
-    def test_connected_and_ping_pong(self, client: TestClient) -> None:
-        with client.websocket_connect("/api/v1/sim/ws/sim/inst-ws-1/status") as ws:
+    def test_connected_and_ping_pong(self, client: TestClient, auth_headers: dict[str, str]) -> None:
+        token = auth_headers["Authorization"].removeprefix("Bearer ")
+        with client.websocket_connect(f"/api/v1/sim/ws/sim/inst-ws-1/status?token={token}") as ws:
             hello = ws.receive_json()
             assert hello["type"] == "connected"
             assert hello["instance_id"] == "inst-ws-1"
@@ -117,8 +120,23 @@ class TestWebsocketEndpoint:
 
             ws.send_text(json.dumps({"type": "unsubscribe"}))
 
-    def test_invalid_json_ignored_then_unsubscribe(self, client: TestClient) -> None:
-        with client.websocket_connect("/api/v1/sim/ws/sim/inst-ws-2/status") as ws:
+    def test_invalid_json_ignored_then_unsubscribe(
+        self, client: TestClient, auth_headers: dict[str, str]
+    ) -> None:
+        token = auth_headers["Authorization"].removeprefix("Bearer ")
+        with client.websocket_connect(f"/api/v1/sim/ws/sim/inst-ws-2/status?token={token}") as ws:
             assert ws.receive_json()["type"] == "connected"
             ws.send_text("not-json")  # 被忽略
             ws.send_text(json.dumps({"type": "unsubscribe"}))
+
+    def test_rejects_missing_token(self, client: TestClient) -> None:
+        """未携带令牌的握手必须被拒绝（修复 WS 零鉴权）。"""
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/v1/sim/ws/sim/inst-ws-3/status"):
+                pass
+
+    def test_rejects_invalid_token(self, client: TestClient) -> None:
+        """伪造令牌的握手必须被拒绝。"""
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/v1/sim/ws/sim/inst-ws-4/status?token=not-a-jwt"):
+                pass

@@ -5,6 +5,8 @@ HunterSim REST API 服务，基础路径 /api/v1/sim。
 
 from __future__ import annotations
 
+import shutil
+import time
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -18,9 +20,10 @@ from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
 from hunter_sim.api.middleware.logging import RequestLogMiddleware
-from hunter_sim.api.routers import health, instances, resources, scenarios, scenes, websocket
+from hunter_sim.api.routers import auth, health, instances, resources, scenarios, scenes, websocket
+from hunter_sim.api.runtime import release_all_scene_runners, release_scene_runner
 from hunter_sim.common.models import HunterSimSettings, InstanceStatus, SceneStatus
-from hunter_sim.common.utils import get_logger
+from hunter_sim.common.utils import get_logger, set_default_log_level
 from hunter_sim.engine.map_manager import MapManager
 from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
 from hunter_sim.resource_manager.health_monitor import InstanceHealthMonitor, ResourceQuotaManager
@@ -41,6 +44,61 @@ _APP_VERSION = _resolve_app_version()
 
 # 探测失败摘要最大长度：异常文本可能很长，/health 只保留可读部分
 _MAX_PROBE_ERROR_CHARS = 200
+
+# 生产环境必须覆盖的默认值（与 APISettings / docker-compose / .env.example 默认值一致）
+_INSECURE_JWT_SECRETS = frozenset(
+    {
+        "CHANGE_ME_IN_PRODUCTION",
+        "dev-only-change-me-at-least-32-characters",
+    }
+)
+_MIN_PROD_SECRET_LEN = 32
+
+
+def _enforce_production_guards(settings: HunterSimSettings) -> None:
+    """生产环境启动闸门：默认密钥 / 通配 CORS 直接拒绝启动。
+
+    dev/staging 保持宽松，便于本地与联调；prod 下与默认值共存等同公开鉴权密钥。
+
+    Raises:
+        RuntimeError: 配置不满足生产安全基线。
+    """
+    if settings.env != "prod":
+        return
+    secret = settings.api.jwt_secret.get_secret_value()
+    if secret in _INSECURE_JWT_SECRETS or len(secret) < _MIN_PROD_SECRET_LEN:
+        raise RuntimeError(
+            "HUNTER_SIM_ENV=prod 必须通过 API_JWT_SECRET 注入至少 "
+            f"{_MIN_PROD_SECRET_LEN} 位的随机密钥（当前使用默认值或长度不足）；"
+            "参考 docs/单机部署指南.md 的密钥生成方法"
+        )
+    if "*" in settings.api.cors_allow_origins:
+        raise RuntimeError(
+            "HUNTER_SIM_ENV=prod 不允许 API_CORS_ALLOW_ORIGINS 包含通配符 '*'，"
+            "请显式配置前端域名"
+        )
+    if settings.api.admin_password.get_secret_value() == "admin":
+        raise RuntimeError(
+            "HUNTER_SIM_ENV=prod 必须通过 API_ADMIN_PASSWORD 覆盖默认管理员口令 'admin'"
+        )
+
+
+def _configure_logging(settings: HunterSimSettings) -> int:
+    """使 HUNTER_SIM_LOG_LEVEL 真正生效（同步已创建模块 logger）。"""
+    level = set_default_log_level(settings.log_level)
+    logger.info(f"Log level set to {settings.log_level}")
+    return level
+
+
+def _refresh_disk_usage(state: Any) -> None:
+    """刷新磁盘使用率指标（/metrics 的 huntersim_disk_usage_ratio 数据源）。"""
+    try:
+        usage = shutil.disk_usage(".")
+    except OSError as exc:  # noqa: BLE001  磁盘不可读时指标置空而不是崩溃
+        logger.debug(f"disk_usage probe failed: {exc}")
+        state.disk_usage_ratio = None
+        return
+    state.disk_usage_ratio = (usage.used / usage.total) if usage.total else 0.0
 
 
 def _carla_target(settings: HunterSimSettings) -> str:
@@ -81,18 +139,21 @@ def _probe_carla(client: Any) -> tuple[bool, str | None]:
 
 
 def _refresh_carla_state(state: Any, settings: HunterSimSettings) -> None:
-    """刷新 CARLA 连通状态（健康巡检周期调用）。
+    """刷新 CARLA 连通状态与 RPC 延迟（健康巡检周期调用）。
 
     仅在首次评估或状态翻转时记录日志，避免每周期刷屏；失败原因写入
     app.state.carla_probe_error，供 /health 与运维排查直接读取。
     """
     target = _carla_target(settings)
+    started = time.perf_counter()
     connected, error = _probe_carla(getattr(state, "carla_client", None))
+    elapsed = time.perf_counter() - started
     previous: bool = getattr(state, "carla_connected", False)
     first_evaluation = not getattr(state, "carla_probe_evaluated", False)
 
     state.carla_connected = connected
     state.carla_probe_evaluated = True
+    state.carla_rpc_latency_seconds = elapsed if connected else None
     if connected:
         state.carla_probe_error = None
     else:
@@ -206,7 +267,12 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
                             mon.unregister_instance(iid)
             state.active_instance_count = len(live_ids)
             _refresh_carla_state(state, settings)
-            return list(mgr.check_expired_instances()) if mgr is not None else []
+            _refresh_disk_usage(state)
+            expired = list(mgr.check_expired_instances()) if mgr is not None else []
+            # 超时实例同样要回收场景运行器（否则 tick 线程与 Actor 残留）
+            for instance_id in expired:
+                release_scene_runner(app, instance_id)
+            return expired
 
         monitor = InstanceHealthMonitor(
             settings=settings.resource,
@@ -231,6 +297,10 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     if settings is None:
         settings = HunterSimSettings()
 
+    # 启动闸门与日志级别：必须在任何组件日志输出前生效
+    _enforce_production_guards(settings)
+    _configure_logging(settings)
+
     # 注入全局配置到 deps 模块
     set_app_settings(settings)
 
@@ -241,6 +311,10 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # 先停场景循环（停止 tick、销毁 Actor），再停巡检线程
+            released = release_all_scene_runners(app)
+            if released:
+                logger.info(f"Released {released} scene runtime(s) on shutdown")
             if monitor is not None:
                 monitor.stop()
             logger.info("HunterSim API shutting down")
@@ -282,6 +356,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     # ── 路由注册 ──────────────────────────────────────────────────────────────
     api_prefix = "/api/v1/sim"
     app.include_router(health.router, prefix=api_prefix, tags=["health"])
+    app.include_router(auth.router, prefix=api_prefix, tags=["auth"])
     app.include_router(instances.router, prefix=f"{api_prefix}/instances", tags=["instances"])
     app.include_router(scenes.router, prefix=f"{api_prefix}/scenes", tags=["scenes"])
     app.include_router(scenarios.router, prefix=f"{api_prefix}/scenarios", tags=["scenarios"])

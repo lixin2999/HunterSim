@@ -12,6 +12,8 @@ data:
   carla_rpc_port: "2000"
   carla_stream_port: "2001"
   kafka_bootstrap_servers: "kafka:9092"
+  # prod 启动闸门禁止 "*"；按实际前端域名配置（JSON 数组）
+  cors_allow_origins: '["https://sim.example.com"]'
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

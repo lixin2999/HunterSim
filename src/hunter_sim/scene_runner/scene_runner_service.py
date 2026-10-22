@@ -18,7 +18,12 @@ from hunter_sim.common.exceptions import (
 )
 from hunter_sim.common.models import SceneStatus
 from hunter_sim.common.utils import get_logger
-from hunter_sim.engine.weather_manager import WeatherManager
+from hunter_sim.engine.weather_manager import (
+    PRESET_ENVIRONMENTS,
+    WeatherManager,
+    WeatherProfile,
+)
+from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
 from hunter_sim.scene_runner.event_detector import DetectedEvent, EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig
@@ -53,6 +58,7 @@ class SceneRunnerService:
         self._state_mgr: Optional[SceneStateManager] = None
         self._event_detector: Optional[EventDetector] = None
         self._scenario: Optional[CustomScenarioBase] = None
+        self._scenario_cleaned: bool = True
         self._config: Optional[SceneConfig] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
@@ -67,6 +73,18 @@ class SceneRunnerService:
         """当前场景 ID（无场景时返回 None）。"""
         with self._lock:
             return self._config.scene_id if self._config else None
+
+    @property
+    def has_scene(self) -> bool:
+        """是否已下发场景（供 API 判定 409 前置条件）。"""
+        with self._lock:
+            return self._state_mgr is not None
+
+    @property
+    def is_running(self) -> bool:
+        """场景循环线程是否存活。"""
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def get_state_snapshot(self) -> Optional[SceneStateSnapshot]:
         """获取当前场景状态快照。"""
@@ -93,9 +111,11 @@ class SceneRunnerService:
         }
 
     def load_scene(self, config: SceneConfig, scenario: Optional[CustomScenarioBase] = None) -> None:
-        """加载场景配置，初始化状态机和事件检测器。
+        """加载场景配置，初始化状态机和事件检测器，并把场景落到 CARLA 世界。
 
         状态转换：CREATED → LOADING → READY。
+        默认使用 ``BuiltinScenario``（按配置生成自车/参与者）；传入 ``scenario``
+        时使用自定义 Python 场景。
 
         Args:
             config: 已验证的场景配置。
@@ -105,10 +125,24 @@ class SceneRunnerService:
             ConfigurationError: 配置无效。
             CarlaSimulationError: 地图或 Actor 初始化失败。
         """
+        preset = config.weather.preset_name
+        if preset and preset not in PRESET_ENVIRONMENTS:
+            raise ConfigurationError(
+                "load_scene",
+                f"Unknown weather preset '{preset}'. Available: {list(PRESET_ENVIRONMENTS)}",
+            )
+
+        # 运行中重新下发：先停机（join 在锁外执行，避免与 _run_loop 互等）
+        self._stop_if_running()
+
         with self._lock:
             logger.info(f"Loading scene: {config.scene_id} ({config.mode.value} mode)")
 
+            # 回收上一场景 Actor，避免重复下发后旧 Actor 残影
+            self._cleanup()
+
             self._config = config
+            self._apply_scene_weather(config)
             self._state_mgr = SceneStateManager(
                 scene_id=config.scene_id,
                 on_state_change=self._on_state_change,
@@ -122,14 +156,18 @@ class SceneRunnerService:
                 on_event=self._on_event,
             )
 
+            if scenario is None:
+                scenario = BuiltinScenario(config, self._state_mgr, self._event_detector)
             self._scenario = scenario
+            self._scenario_cleaned = False
 
-            if scenario is not None:
-                try:
-                    scenario.setup(self._world)
-                except Exception as exc:
-                    self._state_mgr.transition_to(SceneStatus.FAILED, str(exc))
-                    raise CarlaSimulationError("scene_setup", str(exc)) from exc
+            try:
+                scenario.setup(self._world)
+            except Exception as exc:
+                self._state_mgr.transition_to(SceneStatus.FAILED, str(exc))
+                if isinstance(exc, (ConfigurationError, CarlaSimulationError)):
+                    raise
+                raise CarlaSimulationError("scene_setup", str(exc)) from exc
 
             self._state_mgr.transition_to(SceneStatus.READY)
             logger.info(f"Scene '{config.scene_id}' ready to start")
@@ -140,20 +178,23 @@ class SceneRunnerService:
         状态转换：READY → RUNNING。
 
         Raises:
-            InstanceStateError: 当前状态不允许启动。
+            ConfigurationError: 未加载场景或场景已在运行。
         """
         with self._lock:
             if self._state_mgr is None:
                 raise ConfigurationError("start", "No scene loaded")
+            # 重入保护：双线程 tick 同一 world 会导致 CARLA 帧同步错乱
+            if self._thread is not None and self._thread.is_alive():
+                raise ConfigurationError("start", "Scene is already running")
             self._state_mgr.transition_to(SceneStatus.RUNNING)
 
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name=f"SceneRunner-{self._config.scene_id if self._config else 'unknown'}",
-            daemon=True,
-        )
-        self._thread.start()
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                name=f"SceneRunner-{self._config.scene_id if self._config else 'unknown'}",
+                daemon=True,
+            )
+            self._thread.start()
         logger.info(f"Scene '{self._config.scene_id if self._config else ''}' started")
 
     def pause(self) -> None:
@@ -233,21 +274,23 @@ class SceneRunnerService:
                 # 执行场景 tick
                 if self._scenario is not None:
                     self._scenario._update_elapsed()
+                    timestamp = tick_count * delta_seconds
+
+                    # 场景自判完成（内置场景：运行时长达到 duration_seconds）
+                    if self._scenario.check_finish(self._world, timestamp):
+                        with self._lock:
+                            if self._state_mgr and self._state_mgr.status == SceneStatus.RUNNING:
+                                self._state_mgr.transition_to(SceneStatus.COMPLETED)
+                        break
+
+                    # 兜底：自定义场景未自判完成时按 duration 超时失败
                     if self._scenario.is_timeout():
                         with self._lock:
                             if self._state_mgr and self._state_mgr.status == SceneStatus.RUNNING:
                                 self._state_mgr.transition_to(SceneStatus.FAILED, "Duration timeout")
                         break
 
-                    timestamp = tick_count * delta_seconds
                     self._scenario.tick(self._world, timestamp, delta_seconds)
-
-                    # 检查场景完成
-                    if self._scenario.check_finish(self._world, timestamp):
-                        with self._lock:
-                            if self._state_mgr and self._state_mgr.status == SceneStatus.RUNNING:
-                                self._state_mgr.transition_to(SceneStatus.COMPLETED)
-                        break
 
                 # 推进仿真
                 self._world.tick()
@@ -277,9 +320,43 @@ class SceneRunnerService:
         self._cleanup()
 
     def _cleanup(self) -> None:
-        """清理场景资源。"""
+        """清理场景资源（幂等：同一场景只清理一次）。"""
+        scenario = self._scenario
+        if scenario is None or self._scenario_cleaned:
+            return
+        self._scenario_cleaned = True
         try:
-            if self._scenario is not None:
-                self._scenario.cleanup(self._world)
+            scenario.cleanup(self._world)
         except Exception as exc:
             logger.warning(f"Scenario cleanup error: {exc}")
+
+    def _stop_if_running(self, timeout_s: float = 5.0) -> None:
+        """若有场景循环线程在跑，先停掉（不修改公开状态机，供重新下发场景使用）。"""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return
+        self._stop_event.set()
+        thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            logger.warning(f"Scene loop did not stop within {timeout_s:.0f}s during reload")
+
+    def _apply_scene_weather(self, config: SceneConfig) -> None:
+        """把场景配置中的天气下发到 world（预设名优先，否则自定义参数）。"""
+        weather = config.weather
+        try:
+            if weather.preset_name:
+                self._weather_manager.set_preset(weather.preset_name)
+            else:
+                profile = WeatherProfile(
+                    cloudiness=weather.cloudiness,
+                    precipitation=weather.precipitation,
+                    precipitation_deposits=weather.precipitation_deposits,
+                    wind_intensity=weather.wind_intensity,
+                    sun_azimuth_angle=weather.sun_azimuth_angle,
+                    sun_altitude_angle=weather.sun_altitude_angle,
+                    fog_density=weather.fog_density,
+                    fog_distance=weather.fog_distance,
+                )
+                self._weather_manager.set_weather(profile)
+        except Exception as exc:  # noqa: BLE001  天气下发失败不应阻断场景加载
+            logger.warning(f"Apply scene weather failed: {exc}")

@@ -11,6 +11,7 @@ from typing import Any, Optional
 import pytest
 from fastapi.testclient import TestClient
 
+from hunter_sim.common.models import QualityLevel, SimMode
 from hunter_sim.engine.weather_manager import WeatherProfile
 
 _VALID_CONFIG: dict[str, Any] = {
@@ -140,6 +141,27 @@ class TestSceneLoad:
             "/api/v1/sim/scenes/unknown-inst/status", headers=auth_headers
         )
         assert resp.status_code == 404
+
+    def test_load_rejects_other_user(
+        self, client: TestClient, user_headers: dict, app: Any
+    ) -> None:
+        """向他人实例下发场景 → 403（首次下发时运行器尚未装配也必须校验归属）。"""
+        mgr = app.state.instance_manager
+        inst = mgr.create_instance(
+            mode=SimMode.SIL,
+            map_id="Town05",
+            quality=QualityLevel.MEDIUM,
+            user_id="someone-else",
+        )
+        try:
+            resp = client.post(
+                f"/api/v1/sim/instances/{inst.sim_instance_id}/scene",
+                json={"scene_id": "scene-001", "scene_config": _VALID_CONFIG},
+                headers=user_headers,
+            )
+            assert resp.status_code == 403
+        finally:
+            mgr.destroy_instance(inst.sim_instance_id)
 
 
 class TestSceneControls:

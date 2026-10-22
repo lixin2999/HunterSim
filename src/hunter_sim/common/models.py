@@ -259,6 +259,11 @@ class APISettings(BaseSettings):
     )
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = Field(1440, ge=1, le=10080)
+    admin_username: str = Field("admin", description="内置管理员账号（POST /auth/token）")
+    admin_password: SecretStr = Field(
+        default=SecretStr("admin"),
+        description="内置管理员口令（dev 默认 admin，prod 必须通过 API_ADMIN_PASSWORD 覆盖）",
+    )
     cors_allow_origins: list[str] = Field(default=["*"])
     rate_limit_per_minute: int = Field(1000, ge=1)
     stream_base_url: str = Field(

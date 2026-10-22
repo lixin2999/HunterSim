@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.2.2
+          image: hunter-sim:2.3.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -56,6 +56,22 @@ spec:
                 secretKeyRef:
                   name: hunter-sim-secrets
                   key: jwt_secret
+            # prod 启动闸门要求：管理员口令非默认 admin、CORS 不含 "*"
+            - name: API_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: admin_username
+            - name: API_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: admin_password
+            - name: API_CORS_ALLOW_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: cors_allow_origins
           resources:
             requests:
               memory: "512Mi"

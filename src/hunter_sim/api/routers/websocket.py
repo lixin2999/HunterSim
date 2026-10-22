@@ -11,12 +11,18 @@ import json
 import time
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
+from hunter_sim.api.deps import decode_token, get_api_settings, get_user_role
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+# WebSocket 自定义关闭码（4000+ 为应用层保留段）
+_WS_UNAUTHORIZED = 4401
+_WS_FORBIDDEN = 4403
+_ADMIN_ROLE = "admin"
 
 
 class WebSocketConnectionManager:
@@ -87,6 +93,49 @@ def get_ws_manager() -> WebSocketConnectionManager:
     return _ws_manager
 
 
+def _extract_token(websocket: WebSocket) -> str:
+    """从查询参数或 Authorization 头提取 JWT（浏览器 WebSocket 无法自定义头）。"""
+    token = websocket.query_params.get("token", "")
+    if token:
+        return token
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return ""
+
+
+async def _authorize(websocket: WebSocket, instance_id: str) -> bool:
+    """握手鉴权：校验 JWT 与实例归属，失败时发送 4401/4403 关闭帧。
+
+    中间件已将 ``/ws/`` 加入白名单（WebSocket 握手无法携带 Bearer 头），
+    因此鉴权必须在此处完成，否则任何人都能订阅任意实例状态。
+    """
+    token = _extract_token(websocket)
+    if not token:
+        await websocket.close(code=_WS_UNAUTHORIZED, reason="Missing token")
+        return False
+    try:
+        payload = decode_token(token, get_api_settings())
+    except HTTPException as exc:
+        await websocket.close(code=_WS_UNAUTHORIZED, reason="Invalid or expired token")
+        logger.warning(f"WebSocket auth failed for instance {instance_id}: {exc.detail}")
+        return False
+
+    user_id = str(payload.get("sub", ""))
+    manager = getattr(websocket.app.state, "instance_manager", None)
+    instance = manager.get_instance(instance_id) if manager is not None else None
+    if (
+        instance is not None
+        and instance.user_id
+        and instance.user_id != user_id
+        and get_user_role(payload) != _ADMIN_ROLE
+    ):
+        await websocket.close(code=_WS_FORBIDDEN, reason="Forbidden")
+        logger.warning(f"WebSocket access denied: user '{user_id}' -> instance {instance_id}")
+        return False
+    return True
+
+
 @router.websocket("/ws/sim/{instance_id}/status")
 async def websocket_instance_status(websocket: WebSocket, instance_id: str) -> None:
     """WebSocket /api/v1/sim/ws/sim/{instance_id}/status
@@ -112,6 +161,9 @@ async def websocket_instance_status(websocket: WebSocket, instance_id: str) -> N
         }
     }
     """
+    # 握手鉴权：中间件无法覆盖 WS，必须在 accept 前完成，否则任何人都能订阅任意实例
+    if not await _authorize(websocket, instance_id):
+        return
     await _ws_manager.connect(instance_id, websocket)
     try:
         # 发送连接确认消息

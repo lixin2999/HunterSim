@@ -1,6 +1,9 @@
-# HunterSim 开发环境编排
-# 使用：docker compose -f docker/docker-compose.yml up -d
-# CARLA 服务运行在宿主机 Windows（需单独启动 CarlaUE4.exe）
+# HunterSim 开发/单机部署编排（V2.3.0）
+# 使用：
+#   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
+#   docker compose -f docker/docker-compose.yml up -d
+# CARLA server 运行在宿主机（Windows：先启动 CarlaUE4.exe；Linux：可选 --profile carla）
+# 镜像内已安装 carla==0.9.16 Python SDK，REST 可直接下发场景并生成自车。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -25,7 +28,8 @@ services:
       test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 20s
 
   # ── CARLA 仿真引擎（可选，Linux + NVIDIA GPU 环境启用）──────────────────────
   # 设计文档 §10.2.3/§15.3：每个 CARLA 实例运行在独立容器，NVIDIA Container Toolkit 分配 GPU
@@ -66,16 +70,28 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        # CARLA Python SDK 版本必须与宿主机 CARLA server 严格一致
+        CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
+        # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
+        INSTALL_CARLA: ${INSTALL_CARLA:-true}
+    image: hunter-sim:2.3.0
     ports:
       - "8080:8080"
     environment:
-      HUNTER_SIM_ENV: dev
-      HUNTER_SIM_LOG_LEVEL: INFO
-      CARLA_HOST: host.docker.internal
-      CARLA_RPC_PORT: "2000"
-      CARLA_STREAM_PORT: "2001"
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      API_JWT_SECRET: CHANGE_ME_IN_PRODUCTION
+      HUNTER_SIM_ENV: ${HUNTER_SIM_ENV:-dev}
+      HUNTER_SIM_LOG_LEVEL: ${HUNTER_SIM_LOG_LEVEL:-INFO}
+      CARLA_HOST: ${CARLA_HOST:-host.docker.internal}
+      CARLA_RPC_PORT: ${CARLA_RPC_PORT:-2000}
+      CARLA_STREAM_PORT: ${CARLA_STREAM_PORT:-2001}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # 开发默认值仅满足长度校验；HUNTER_SIM_ENV=prod 时必须通过 .env 覆盖（启动闸门会拒绝默认值）
+      API_JWT_SECRET: ${API_JWT_SECRET:-dev-only-change-me-at-least-32-characters}
+      API_ADMIN_USERNAME: ${API_ADMIN_USERNAME:-admin}
+      API_ADMIN_PASSWORD: ${API_ADMIN_PASSWORD:-admin}
+      # CORS 允许来源（JSON 数组）；prod 启动闸门禁止 "*"
+      API_CORS_ALLOW_ORIGINS: '${API_CORS_ALLOW_ORIGINS:-["*"]}'
+      API_STREAM_BASE_URL: ${API_STREAM_BASE_URL:-webrtc://localhost:8080}
       API_PORT: "8080"
     depends_on:
       kafka:

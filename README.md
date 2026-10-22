@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.2.2`（V2.2.2 修复桌面客户端启动即崩溃的 `map_panel` QComboBox API 误用（`addSortedItems`→`addItems`），并将 FastAPI 应用版本改为随包元数据动态读取；向后兼容，详见 [`release.md`](release.md)）。上一个版本 `2.2.1` 为**代码审查修复专题**（桌面客户端实时画面 `raw_data`/`sensor.id`、同步模式与线程生命周期、HunterCore 遥测非阻塞上传与 Kafka 异步失败回捞）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**（PySide6，CarlaSceneX 风格，进程内直连 CARLA + ScenarioRunner）、**Windows 单机全容器编排**（Docker Desktop + WSL2 + NVIDIA Container Toolkit，含 ROS2 Bridge 容器）与 **HunterCore 数据接入**（Kafka 遥测 Topic + MinIO bag 预签名直传）。
+- **当前版本**：`2.3.0`（V2.3.0 为**阶段一「可用性止血」**：打通 REST 场景闭环——获取 Token → 创建实例 → 下发场景（真实加载地图/生成自车）→ 启动 → 查询进度 → 停止/销毁，`docker compose up` 后可直接跑起一个场景；同时补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK，详见 [`release.md`](release.md)）。上一个修复版本 `2.2.2` 修复桌面客户端启动崩溃；功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -113,22 +113,33 @@ uvicorn hunter_sim.api.main:app --host 0.0.0.0 --port 8080
 
 启动后访问交互式文档：<http://localhost:8080/api/v1/sim/docs>
 
-### 4.3 容器化 / 编排
+> V2.3.0 起需先换取 Token（dev 默认 `admin/admin`，生产由 `API_ADMIN_USERNAME` / `API_ADMIN_PASSWORD` 覆盖）：
+>
+> ```bash
+> curl -X POST http://localhost:8080/api/v1/sim/auth/token \
+>   -H "Content-Type: application/json" \
+>   -d '{"username":"admin","password":"admin"}'
+> ```
+
+### 4.3 容器化 / 编排（CARLA 跑在宿主机）
 
 ```bash
-# 依赖编排（Kafka + 仿真服务 + Prometheus + Grafana，CARLA 跑在宿主机）
-docker-compose -f docker/docker-compose.yml up -d
+# 1) 准备环境变量（开发默认值可直接用；生产改 API_JWT_SECRET / API_ADMIN_PASSWORD）
+cp .env.example .env                              # Windows: copy .env.example .env
+
+# 2) 构建并启动（镜像内置 carla==0.9.16 Python SDK，可直接驱动宿主机 CARLA）
+docker compose -f docker/docker-compose.yml up -d --build
 
 # Linux + NVIDIA GPU 主机可额外启用容器化 CARLA 引擎（profile，需 NVIDIA Container Toolkit）
-docker-compose -f docker/docker-compose.yml --profile carla up -d
+docker compose -f docker/docker-compose.yml --profile carla up -d
 
 # Kubernetes（需 NVIDIA GPU Operator；含 sim-service + carla-engine GPU Pod + 共享 PVC）
 kubectl apply -f k8s/
 ```
 
-详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
+> 前置条件：宿主机已启动 CARLA 0.9.16（Windows 双击 `CarlaUE4.exe`）。服务启动后用 `GET /api/v1/sim/health` 确认 `carla_connected=true`，再按 §4.7 跑 REST 场景闭环。详见 [`deployment_and_operations.md`](deployment_and_operations.md) 与 [`docs/单机部署指南.md`](docs/单机部署指南.md)。
 
-### 4.4 Windows 单机全容器（V2.2.0）
+### 4.4 Windows 单机全容器（V2.2.0）（CARLA 不在宿主机在Docker里跑）
 
 在 Windows 11 上用 Docker Desktop（WSL2 后端）+ NVIDIA Container Toolkit 一键拉起 CARLA 服务、ROS2 Bridge 与仿真管理服务：
 
@@ -163,6 +174,34 @@ set HUNTER_CORE_JWT_TOKEN=<data-collector Bearer JWT>
 
 未配置凭据（`enabled=false`）时连接器整体降级为 no-op，不影响本地仿真。详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
 
+### 4.7 REST 场景闭环（V2.3.0）
+
+`docker compose up -d` + 宿主机 CARLA 就绪后，最小闭环只需 5 个请求（`BASE=http://localhost:8080/api/v1/sim`）：
+
+```bash
+# 1) 取 Token（dev 默认 admin/admin）
+TOKEN=$(curl -s -X POST $BASE/auth/token -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' | jq -r .data.access_token)
+
+# 2) 创建实例（需 admin）→ 返回 sim_instance_id
+curl -X POST $BASE/instances -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"sil","map":"Town03","quality":"medium"}'
+
+# 3) 下发场景（首次会 load_world + 切换同步模式 + 生成自车，约 10~30s）
+curl -X POST $BASE/instances/<INSTANCE_ID>/scene -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"scene_id":"smoke-001","scene_config":{"scene_id":"smoke-001","map_id":"Town03","duration_seconds":30,"ego_vehicle":{"vehicle_blueprint":"hunter_se","spawn_point":{"x":1.0,"y":2.0},"autopilot":true}}}'
+
+# 4) 启动 + 查询进度
+curl -X POST $BASE/instances/<INSTANCE_ID>/start -H "Authorization: Bearer $TOKEN"
+curl $BASE/instances/<INSTANCE_ID>/status -H "Authorization: Bearer $TOKEN"     # data.scene.progress
+
+# 5) 停止（释放场景 Actor）→ 销毁实例
+curl -X POST $BASE/instances/<INSTANCE_ID>/stop -H "Authorization: Bearer $TOKEN"
+curl -X DELETE $BASE/instances/<INSTANCE_ID> -H "Authorization: Bearer $TOKEN"
+```
+
+> 单引擎单场景：同一个 CARLA server 同时只能有一个实例持有场景运行器，第二个实例下发场景返回 503；CARLA 未就绪时下发场景返回 503（`/health` 的 `carla_probe_error` 给出原因），`start` 仍返回 200 但 `scene_runner=unavailable`。Windows 用户可把 `curl` 换成 PowerShell `Invoke-RestMethod`，完整示例见 [`user_manual.md`](user_manual.md)。
+
 ---
 
 ## 5. 配置
@@ -186,17 +225,18 @@ set HUNTER_CORE_JWT_TOKEN=<data-collector Bearer JWT>
 
 ## 6. API 一览
 
-统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。除健康检查与 WebSocket 外均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）；**创建/销毁实例与地图上传额外要求 Token 载荷 `role=admin`**（§14.2）。
+统一前缀 `/api/v1/sim`，响应体 `{code, message, data}`。先调 `POST /auth/token` 换取 Token，其余接口（除健康检查与 WebSocket 握手鉴权外）均需 `Authorization: Bearer <JWT>`（HS256，密钥 `API_JWT_SECRET`）；**创建/销毁实例与地图上传额外要求 Token 载荷 `role=admin`**（§14.2）。
 
 | 分组 | 方法与路径 |
 |------|-----------|
+| 认证 | `POST /auth/token`（`API_ADMIN_USERNAME` / `API_ADMIN_PASSWORD` 换取 JWT） |
 | 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /health/performance-targets` · `GET /metrics` |
 | 实例 | `POST /instances`⁺ · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}`⁺（⁺ 需 admin） |
 | 实例子资源 | `GET /instances/{id}/status` · `POST /instances/{id}/scene` · `POST /instances/{id}/weather` · `POST /instances/{id}/vil/calibrate` · `GET /instances/{id}/screenshot` · `GET /instances/{id}/stream` |
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch` · `GET /scenarios/{task_id}/report` |
 | 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
-| 实时推送 | `WS /ws/sim/{instance_id}/status` |
+| 实时推送 | `WS /ws/sim/{instance_id}/status?token=<JWT>`（握手需令牌，缺失/非法 4401，越权 4403） |
 
 完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
 
@@ -210,7 +250,7 @@ flake8 src tests                                               # Lint（配置�
 mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：640 项单元 + 集成测试全绿；行覆盖率 **81%**（≥80 门禁）。
+- **测试**：675 项单元 + 集成测试全绿（较 V2.2.2 新增 33 项：内置场景、自车蓝图回退、运行时装配、认证与生产闸门、WebSocket 鉴权、场景下发归属）；行覆盖率维持 ≥80 门禁（本机以 `pytest -q` 回归验证）。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

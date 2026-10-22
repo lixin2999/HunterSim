@@ -310,6 +310,10 @@ class SimInstanceManager:
                     expired.append(inst.sim_instance_id)
         for iid in expired:
             logger.warning(f"Instance '{iid}' expired, destroying")
-            self.transition(iid, InstanceStatus.COMPLETED)
+            try:
+                self.transition(iid, InstanceStatus.COMPLETED)
+            except InstanceStateError as exc:
+                # 巡检线程与用户并发操作竞争时状态可能已变更，继续回收资源即可
+                logger.debug(f"Instance '{iid}' already moved out of RUNNING: {exc}")
             self.destroy_instance(iid)
         return expired

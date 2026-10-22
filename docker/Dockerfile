@@ -3,7 +3,12 @@
 # 注：文档示例基于 python:3.8-slim，但本项目代码使用 3.10+ 语法与 pydantic v2，
 #     为保持可构建性升级基础镜像；镜像结构（requirements + uvicorn 启动）与文档一致。
 # CARLA 引擎镜像另见 docker/Dockerfile.carla（§15.3）。
-# 使用：docker build -f docker/Dockerfile -t hunter-sim:2.0.0 .
+# 使用：docker build -f docker/Dockerfile -t hunter-sim:2.3.0 .
+#
+# CARLA Python SDK（V2.3.0）：服务端要「真跑起一个场景」必须能 import carla。
+# PyPI 自 0.9.14 起提供 manylinux wheel（cp310/cp311/cp312），默认随镜像安装，
+# 版本必须与 CARLA server 严格一致；无 wheel 的平台可用 --build-arg INSTALL_CARLA=false 关闭
+# （此时服务仍可启动，下发场景返回 503 并给出诊断原因）。
 
 FROM python:3.12-slim AS base
 
@@ -35,6 +40,15 @@ WORKDIR /home/hunter/app
 # 安装 Python 依赖
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --user -r requirements.txt
+
+# 安装 CARLA Python SDK（与 CARLA server 版本一致，详见文件头说明）
+ARG CARLA_VERSION=0.9.16
+ARG INSTALL_CARLA=true
+RUN if [ "$INSTALL_CARLA" = "true" ]; then \
+        pip install --no-cache-dir --user "carla==${CARLA_VERSION}"; \
+    else \
+        echo "Skip CARLA SDK install (INSTALL_CARLA=${INSTALL_CARLA})"; \
+    fi
 
 # 安装 hunter-sim 包
 COPY --from=builder /wheels /wheels

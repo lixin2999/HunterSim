@@ -21,6 +21,7 @@ from hunter_sim.api.models import (
     LoadSceneRequest,
     SetWeatherRequest,
 )
+from hunter_sim.api.runtime import assert_instance_access, ensure_scene_runner_or_http
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -34,8 +35,18 @@ def _get_scene_runner(request: Request, instance_id: str) -> Any:
     if runner is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No scene runner for instance '{instance_id}'",
+            detail=(
+                f"No scene runner for instance '{instance_id}'; "
+                f"请先 POST /api/v1/sim/instances/{instance_id}/scene 下发场景"
+            ),
         )
+    # 实例级归属校验（实例表中存在时才校验，注入 FakeRunner 的单测不受影响）
+    assert_instance_access(
+        request,
+        instance_id,
+        getattr(request.state, "user_id", ""),
+        require_exists=False,
+    )
     return runner
 
 
@@ -55,8 +66,6 @@ def load_scene_impl(request: Request, instance_id: str, scene_config: dict[str, 
     """
     from hunter_sim.scene_runner.scene_config import SceneConfig  # noqa: PLC0415
 
-    runner = _get_scene_runner(request, instance_id)
-
     try:
         config = SceneConfig(**scene_config)
     except Exception as exc:
@@ -64,6 +73,26 @@ def load_scene_impl(request: Request, instance_id: str, scene_config: dict[str, 
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Scene config validation failed: {exc}",
         ) from exc
+
+    # 实例级归属校验：首次下发时运行器尚未装配，_get_scene_runner 的校验覆盖不到
+    assert_instance_access(
+        request, instance_id, getattr(request.state, "user_id", ""), require_exists=False
+    )
+
+    # 单引擎单地图：场景地图必须与实例已加载地图一致，否则 Actor 会落在错误地图上
+    mgr = getattr(request.app.state, "instance_manager", None)
+    inst = mgr.get_instance(instance_id) if mgr is not None else None
+    if inst is not None and inst.map_id and config.map_id != inst.map_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"scene map_id '{config.map_id}' does not match instance map '{inst.map_id}'; "
+                "请保证场景配置与实例地图一致"
+            ),
+        )
+
+    # 首次下发时按需装配运行器（加载地图 + 切换同步模式），不可用时返回 503
+    runner = ensure_scene_runner_or_http(request.app, instance_id)
 
     try:
         runner.load_scene(config)

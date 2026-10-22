@@ -22,6 +22,13 @@ from hunter_sim.api.models import (
     InstanceSceneRequest,
     SetWeatherRequest,
 )
+from hunter_sim.api.runtime import (
+    InstanceNotFound,
+    SceneRuntimeUnavailable,
+    ensure_scene_runner,
+    get_scene_runner,
+    release_scene_runner,
+)
 from hunter_sim.api.routers.scenes import (
     calibrate_impl,
     load_scene_impl,
@@ -48,6 +55,49 @@ def _get_instance_manager(request: Request) -> Any:
             detail="Instance manager not initialized",
         )
     return mgr
+
+
+def _assert_owner(request: Request, instance_id: str, user_id: str) -> Any:
+    """获取实例并校验归属（非本人实例仅管理员可操作），不存在 → 404。"""
+    mgr = _get_instance_manager(request)
+    inst = mgr.get_instance(instance_id)
+    if inst is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instance '{instance_id}' not found",
+        )
+    if inst.user_id and inst.user_id != user_id:
+        from hunter_sim.api.deps import get_user_role  # noqa: PLC0415
+
+        payload = getattr(request.state, "token_payload", None) or {}
+        if get_user_role(payload) != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Instance '{instance_id}' belongs to another user",
+            )
+    return inst
+
+
+async def _ensure_runner_if_carla_ready(request: Request, instance_id: str) -> Any | None:
+    """CARLA 就绪时装配场景运行器；SDK 缺失/未连接时返回 None（降级为纯状态流转）。"""
+    if getattr(request.app.state, "map_manager", None) is None:
+        logger.warning(
+            f"CARLA runtime not ready; instance {instance_id} falls back to state-only mode "
+            f"({getattr(request.app.state, 'carla_probe_error', None) or 'no carla client'})"
+        )
+        return None
+    try:
+        return await asyncio.to_thread(ensure_scene_runner, request.app, instance_id)
+    except InstanceNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instance '{instance_id}' not found",
+        ) from exc
+    except SceneRuntimeUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"CARLA runtime unavailable: {exc}",
+        ) from exc
 
 
 def _instance_to_response(inst: Any) -> InstanceResponse:
@@ -127,7 +177,7 @@ async def create_instance(
             f"map={body.map} mode={body.mode.value} quality={body.quality.value}",
         )
 
-        # 文档 §12.2 创建响应结构
+        # 文档 §12.2 创建响应结构 + 下一步提示（避免对接方卡在 404 上）
         settings = get_settings()
         data = {
             "sim_instance_id": inst.sim_instance_id,
@@ -138,6 +188,10 @@ async def create_instance(
                 "stream_port": inst.carla_stream_port,
             },
             "stream_url": f"{settings.api.stream_base_url}/sim/{inst.sim_instance_id}",
+            "next_step": [
+                f"POST /api/v1/sim/instances/{inst.sim_instance_id}/scene（下发场景：加载地图并生成自车）",
+                f"POST /api/v1/sim/instances/{inst.sim_instance_id}/start（启动场景运行）",
+            ],
         }
         return ApiResponse(data=data)
     except ResourceError as exc:
@@ -175,13 +229,10 @@ async def list_instances(
 async def get_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """GET /api/v1/sim/instances/{instance_id}"""
-    mgr = _get_instance_manager(request)
-    inst = mgr.get_instance(instance_id)
-    if inst is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
+    inst = _assert_owner(request, instance_id, user_id)
     return ApiResponse(data=_instance_to_response(inst).model_dump())
 
 
@@ -193,16 +244,36 @@ async def start_instance(
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/start
 
-    将实例从 READY 状态切换到 RUNNING 状态。
+    将实例从 READY 状态切换到 RUNNING，并启动场景运行循环（首次调用会按需装配运行器）。
+    CARLA 未就绪时降级为纯状态流转，响应中 ``scene_runner=unavailable``。
     """
     mgr = _get_instance_manager(request)
+    _assert_owner(request, instance_id, user_id)
+    runner = await _ensure_runner_if_carla_ready(request, instance_id)
+
+    if runner is not None:
+        if not getattr(runner, "has_scene", True):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "No scene loaded; POST /api/v1/sim/instances/"
+                    f"{instance_id}/scene first"
+                ),
+            )
+        runner.start()
+
     try:
         mgr.transition(instance_id, InstanceStatus.RUNNING)
     except InstanceStateError as exc:
+        if runner is not None:
+            runner.stop()  # 回滚：状态机拒绝时不留孤儿仿真循环
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
     audit_log("instance.start", user_id, instance_id)
     inst = mgr.get_instance(instance_id)
-    return ApiResponse(data=_instance_to_response(inst).model_dump())
+    data = _instance_to_response(inst).model_dump()
+    data["scene_runner"] = "started" if runner is not None else "unavailable"
+    return ApiResponse(data=data)
 
 
 @router.post("/{instance_id}/stop", response_model=ApiResponse, summary="停止实例")
@@ -213,9 +284,13 @@ async def stop_instance(
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/stop
 
-    停止运行中的实例（进入 COMPLETED 状态）。
+    停止场景运行循环并释放场景 Actor，实例进入 COMPLETED 状态。
     """
     mgr = _get_instance_manager(request)
+    _assert_owner(request, instance_id, user_id)
+    # 释放运行器（stop + 清理 Actor）在后台线程执行，避免 join 阻塞事件循环
+    if get_scene_runner(request.app, instance_id) is not None:
+        await asyncio.to_thread(release_scene_runner, request.app, instance_id)
     try:
         mgr.transition(instance_id, InstanceStatus.COMPLETED)
     except InstanceStateError as exc:
@@ -229,10 +304,14 @@ async def stop_instance(
 async def pause_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/pause"""
     mgr = _get_instance_manager(request)
+    _assert_owner(request, instance_id, user_id)
+    runner = get_scene_runner(request.app, instance_id)
+    if runner is not None:
+        runner.pause()
     try:
         mgr.transition(instance_id, InstanceStatus.PAUSED)
     except InstanceStateError as exc:
@@ -245,10 +324,14 @@ async def pause_instance(
 async def resume_instance(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """POST /api/v1/sim/instances/{instance_id}/resume"""
     mgr = _get_instance_manager(request)
+    _assert_owner(request, instance_id, user_id)
+    runner = get_scene_runner(request.app, instance_id)
+    if runner is not None and getattr(runner, "has_scene", True):
+        runner.resume()
     try:
         mgr.transition(instance_id, InstanceStatus.RUNNING)
     except InstanceStateError as exc:
@@ -265,13 +348,17 @@ async def destroy_instance(
 ) -> ApiResponse:
     """DELETE /api/v1/sim/instances/{instance_id}
 
-    销毁实例并释放 GPU 资源与用户配额（§14.2 需管理员权限）。
+    销毁实例并释放 GPU 资源与用户配额（§14.2 需管理员权限）；
+    同时停止场景循环并销毁场景 Actor，避免 CARLA 中残留静态 Actor。
     """
     mgr = _get_instance_manager(request)
     inst = mgr.get_instance(instance_id)
     if inst is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
     owner_id = inst.user_id
+    # 先释放场景运行器（join 运行线程最长 5s），再释放 GPU/配额，避免僵尸 tick 线程
+    if get_scene_runner(request.app, instance_id) is not None:
+        await asyncio.to_thread(release_scene_runner, request.app, instance_id)
     # destroy_instance 内部统一释放 GPU 与用户配额（§14.2，含超时自动回收路径）
     mgr.destroy_instance(instance_id)
     audit_log("instance.destroy", user_id, instance_id, f"owner={owner_id or user_id}")
@@ -282,17 +369,18 @@ async def destroy_instance(
 async def get_instance_status(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """GET /api/v1/sim/instances/{instance_id}/status
 
-    返回实例实时状态，数据结构遵循设计文档 §10.2.2 实例数据模型。
+    返回实例实时状态，数据结构遵循设计文档 §10.2.2 实例数据模型；
+    ``scene`` 字段附加当前场景进度（未下发场景时为 null）。
     """
-    mgr = _get_instance_manager(request)
-    inst = mgr.get_instance(instance_id)
-    if inst is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
-    return ApiResponse(data=inst.to_dict())
+    inst = _assert_owner(request, instance_id, user_id)
+    data = inst.to_dict()
+    runner = get_scene_runner(request.app, instance_id)
+    data["scene"] = runner.get_scene_state() if runner is not None else None
+    return ApiResponse(data=data)
 
 
 @router.post("/{instance_id}/scene", response_model=ApiResponse, summary="下发场景配置")
@@ -358,21 +446,23 @@ async def get_instance_screenshot(
 async def get_instance_stream(
     instance_id: str,
     request: Request,
-    _: str = Depends(get_current_user),
+    user_id: str = Depends(get_current_user),
 ) -> ApiResponse:
     """GET /api/v1/sim/instances/{instance_id}/stream（设计文档 §12.1）
 
     返回 WebRTC 仿真画面视频流地址。
     """
-    mgr = _get_instance_manager(request)
-    inst = mgr.get_instance(instance_id)
-    if inst is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
+    inst = _assert_owner(request, instance_id, user_id)
     settings = get_settings()
     return ApiResponse(
         data={
             "sim_instance_id": instance_id,
             "stream_url": f"{settings.api.stream_base_url}/sim/{instance_id}",
             "protocol": "webrtc",
+            "carla_server": {
+                "host": inst.carla_host,
+                "rpc_port": inst.carla_rpc_port,
+                "stream_port": inst.carla_stream_port,
+            },
         }
     )

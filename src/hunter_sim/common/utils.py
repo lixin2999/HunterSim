@@ -19,15 +19,40 @@ T = TypeVar("T")
 
 # ─── 日志工厂 ─────────────────────────────────────────────────────────────────
 
+# 全局默认日志级别（由应用入口按 HUNTER_SIM_LOG_LEVEL 注入）
+_DEFAULT_LEVEL: int = logging.INFO
 
-def get_logger(name: str, level: str = "INFO") -> logging.Logger:
+
+def set_default_log_level(level: str | int) -> int:
+    """设置全局默认日志级别，并同步已创建的 hunter_sim 模块 logger。
+
+    ``get_logger`` 默认取此级别，避免“配置了 HUNTER_SIM_LOG_LEVEL 但不生效”。
+
+    Args:
+        level: 级别名（DEBUG/INFO/WARNING/ERROR/CRITICAL）或 logging 整型级别。
+
+    Returns:
+        实际生效的 logging 整型级别。
+    """
+    global _DEFAULT_LEVEL  # noqa: PLW0603  进程级配置，全局唯一
+    resolved = getattr(logging, level.upper(), logging.INFO) if isinstance(level, str) else int(level)
+    _DEFAULT_LEVEL = resolved
+    logging.getLogger().setLevel(resolved)
+    # 已创建的模块 logger 都显式设过级别，需一并刷新
+    for name in list(logging.root.manager.loggerDict):
+        if name.startswith("hunter_sim"):
+            logging.getLogger(name).setLevel(resolved)
+    return resolved
+
+
+def get_logger(name: str, level: Optional[str] = None) -> logging.Logger:
     """获取统一格式的 logging.Logger 实例。
 
     日志格式：[时间][级别][模块名] 消息
 
     Args:
         name: 模块/类名称，作为日志记录器名称。
-        level: 最低日志级别字符串。
+        level: 最低日志级别字符串；None 表示使用全局默认级别。
 
     Returns:
         配置好的 Logger 实例。
@@ -41,7 +66,10 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    if level is not None:
+        logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    else:
+        logger.setLevel(_DEFAULT_LEVEL)
     return logger
 
 

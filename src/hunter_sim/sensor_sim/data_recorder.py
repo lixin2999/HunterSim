@@ -71,10 +71,12 @@ class DataRecorder:
             ]
 
             try:
+                # 输出丢弃：ros2 bag record 日志量大，无人读取 PIPE 会写满缓冲区
+                # 导致录制进程阻塞（reviewed：阶段一 可用性止血）
                 self._process = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
                 self._recording = True
                 self._start_time = time.perf_counter()

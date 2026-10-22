@@ -60,17 +60,21 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: hunter-sim:latest
+    image: hunter-sim:2.3.0
     ports:
       - "8080:8080"
     environment:
-      HUNTER_SIM_ENV: dev
-      HUNTER_SIM_LOG_LEVEL: INFO
+      HUNTER_SIM_ENV: ${HUNTER_SIM_ENV:-dev}
+      HUNTER_SIM_LOG_LEVEL: ${HUNTER_SIM_LOG_LEVEL:-INFO}
       CARLA_HOST: carla-server
       CARLA_RPC_PORT: "2000"
       CARLA_STREAM_PORT: "2001"
       CARLA_TM_PORT: "8000"
-      API_JWT_SECRET: CHANGE_ME_IN_PRODUCTION
+      # 开发默认值仅满足长度校验；HUNTER_SIM_ENV=prod 时必须通过 .env 覆盖（启动闸门会拒绝默认值）
+      API_JWT_SECRET: ${API_JWT_SECRET:-dev-only-change-me-at-least-32-characters}
+      API_ADMIN_USERNAME: ${API_ADMIN_USERNAME:-admin}
+      API_ADMIN_PASSWORD: ${API_ADMIN_PASSWORD:-admin}
+      API_CORS_ALLOW_ORIGINS: '${API_CORS_ALLOW_ORIGINS:-["*"]}'
       API_PORT: "8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -100,7 +104,8 @@ services:
       test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 20s
 
 volumes:
   kafka_data:
