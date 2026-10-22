@@ -19,7 +19,7 @@ from fastapi.responses import ORJSONResponse
 from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
-from hunter_sim.api.middleware.logging import RequestLogMiddleware, set_audit_sink
+from hunter_sim.api.middleware.logging import RequestLogMiddleware, audit_log, set_audit_sink
 from hunter_sim.api.middleware.rate_limit import (
     RateLimitMiddleware,
     LoginFailureGuard,
@@ -35,6 +35,7 @@ from hunter_sim.api.routers import (
     scene_library,
     scenarios,
     scenes,
+    users,
     websocket,
 )
 from hunter_sim.api.runtime import (
@@ -46,8 +47,9 @@ from hunter_sim.api.runtime import (
 from hunter_sim.common.metrics import CARLA_RPC_ERRORS_TOTAL
 from hunter_sim.common.models import HunterSimSettings, InstanceStatus, SceneStatus
 from hunter_sim.common.utils import configure_logging, get_logger
+from hunter_sim.engine.carla_supervisor import CarlaProcessSupervisor
 from hunter_sim.engine.map_manager import MapManager
-from hunter_sim.execution.engine_pool import parse_engine_endpoints
+from hunter_sim.execution.engine_pool import EnginePool, parse_engine_endpoints
 from hunter_sim.persistence.state_store import StateStore
 from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
 from hunter_sim.resource_manager.health_monitor import InstanceHealthMonitor, ResourceQuotaManager
@@ -261,6 +263,15 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             settings.execution.max_engines,
         )
         state.execution_endpoints = endpoints
+        # V2.8.0 P2-14：租约池提前装配，使实例创建期就能做地图亲和调度
+        # （不再等首次装配场景时惰性建池），控制面与执行面共用同一份占用/地图真相
+        lease_ttl = (
+            float(settings.execution.lease_ttl_seconds or 0)
+            if settings.execution.lease_heartbeat_enabled
+            else 0.0
+        )
+        if getattr(state, "engine_pool", None) is None:
+            state.engine_pool = EnginePool(endpoints, lease_ttl_seconds=lease_ttl)
         state.instance_manager = SimInstanceManager(
             settings=settings.resource,
             gpu_pool=getattr(state, "gpu_pool", None),
@@ -269,6 +280,7 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             engine_endpoints=endpoints,
             state_store=getattr(state, "state_store", None),
             platform=settings.platform,
+            engine_pool=getattr(state, "engine_pool", None),
         )
         if settings.state.recover_instances:
             restored = state.instance_manager.restore()
@@ -308,6 +320,34 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
     # 启动期即给出可诊断原因（无需等首个巡检周期）
     if getattr(state, "carla_client", None) is None:
         state.carla_probe_error = _describe_unavailable(state, settings)
+
+    # V2.8.0 P2-15：本地 CARLA 进程托管（仅开关打开时装配；远程端点自动忽略）
+    if getattr(state, "carla_supervisor", None) is None and settings.carla.supervisor_enabled:
+        managed_endpoints = getattr(state, "execution_endpoints", None)
+        if not isinstance(managed_endpoints, list) or not managed_endpoints:
+            managed_endpoints = parse_engine_endpoints(
+                settings.execution.engine_endpoints,
+                settings.carla,
+                settings.execution.max_engines,
+            )
+            state.execution_endpoints = managed_endpoints
+
+        def _supervisor_audit(event: str, endpoint_key: str, detail: str) -> None:
+            """CARLA 进程事件落审计（主体记为系统账号，便于区分人操与自愈）。"""
+            audit_log(
+                f"engine.carla.{event}",
+                "carla-supervisor",
+                endpoint_key,
+                detail=detail,
+                auth_type="system",
+            )
+
+        supervisor = CarlaProcessSupervisor(
+            settings.carla, managed_endpoints, event_sink=_supervisor_audit
+        )
+        state.carla_supervisor = supervisor
+        supervisor.start()
+        supervisor.ensure_started()
 
     monitor = getattr(state, "health_monitor", None)
     if monitor is None:
@@ -396,6 +436,13 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
                 logger.info(f"Released {released} scene runtime(s) on shutdown")
             if monitor is not None:
                 monitor.stop()
+            # V2.8.0 P2-15：只终止本服务亲自拉起的 CARLA 进程（人工启动的不接管）
+            supervisor = getattr(app.state, "carla_supervisor", None)
+            if supervisor is not None:
+                try:
+                    supervisor.stop()
+                except Exception as exc:  # noqa: BLE001  关停失败不影响退出流程
+                    logger.warning(f"CARLA supervisor stop failed: {exc}")
             set_audit_sink(None)
             # 先释放执行面/停监控，再关闭持久化连接
             store = getattr(app.state, "state_store", None)
@@ -464,6 +511,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     api_prefix = "/api/v1/sim"
     app.include_router(health.router, prefix=api_prefix, tags=["health"])
     app.include_router(auth.router, prefix=api_prefix, tags=["auth"])
+    app.include_router(users.router, prefix=api_prefix, tags=["users"])
     app.include_router(instances.router, prefix=f"{api_prefix}/instances", tags=["instances"])
     app.include_router(scenes.router, prefix=f"{api_prefix}/scenes", tags=["scenes"])
     app.include_router(

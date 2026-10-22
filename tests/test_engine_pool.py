@@ -1,6 +1,7 @@
-"""引擎库存与租约池测试（V2.4.0 执行面分离）。
+"""引擎库存与租约池测试（V2.4.0 执行面分离，V2.8.0 P2-14 地图亲和）。
 
-覆盖端点字符串解析、独占租约语义、释放复用与快照内容；
+覆盖端点字符串解析、独占租约语义、释放复用、快照内容，
+以及端点地图记忆与亲和调度（同地图空闲优先 → 未加载过地图 → 声明顺序）；
 不依赖真实 CARLA server。
 """
 
@@ -169,3 +170,113 @@ class TestEnginePool:
 
         assert pool.capacity == 1
         assert pool.snapshot()["engines"][0]["key"] == "127.0.0.1:2000"
+
+
+class TestMapAffinity:
+    """地图感知调度（V2.8.0 P2-14）。"""
+
+    def _pool(self) -> tuple[EnginePool, EngineEndpoint, EngineEndpoint, EngineEndpoint]:
+        first = EngineEndpoint("10.0.0.1", 2000, 2001)
+        second = EngineEndpoint("10.0.0.2", 2000, 2001)
+        third = EngineEndpoint("10.0.0.3", 2000, 2001)
+        return EnginePool([first, second, third]), first, second, third
+
+    def test_note_and_read_loaded_map(self) -> None:
+        pool, first, _, _ = self._pool()
+
+        assert pool.loaded_map_of(first.key) == ""
+        pool.note_loaded_map(first.key, "Town03")
+        assert pool.loaded_map_of(first.key) == "Town03"
+
+        # 空 map_id 不覆盖已有事实（load_world 回退时不得抹除记忆）
+        pool.note_loaded_map(first.key, "")
+        assert pool.loaded_map_of(first.key) == "Town03"
+
+        # 未知端点不报错，返回空串
+        assert pool.loaded_map_of("10.9.9.9:2000") == ""
+
+    def test_acquire_records_requested_map(self) -> None:
+        pool, first, _, _ = self._pool()
+        pool.acquire("inst-1", first, "Town03")
+
+        assert pool.loaded_map_of(first.key) == "Town03"
+
+    def test_loaded_map_fact_overrides_acquire_claim(self) -> None:
+        """实际加载成功的世界为准：避免 acquire 时的“申请地图”误导亲和。"""
+        pool, first, _, _ = self._pool()
+        pool.acquire("inst-1", first, "Town05")
+        pool.note_loaded_map(first.key, "Town03")
+
+        assert pool.loaded_map_of(first.key) == "Town03"
+
+    def test_same_map_prefers_endpoint_already_holding_it(self) -> None:
+        pool, first, second, _ = self._pool()
+        pool.acquire("inst-1", second, "Town03")
+        pool.note_loaded_map(second.key, "Town03")
+        pool.release("inst-1")
+
+        picked = pool.pick_free_endpoint([first, second], prefer_map_id="Town03")
+
+        # 声明顺序上 first 在前，但 second 已加载目标地图，应优先复用（免 load_world）
+        assert picked is second
+
+    def test_free_endpoint_without_map_beats_map_switch(self) -> None:
+        pool, first, second, _ = self._pool()
+        pool.acquire("inst-1", first, "Town03")
+        pool.note_loaded_map(first.key, "Town03")
+        pool.release("inst-1")
+
+        picked = pool.pick_free_endpoint([first, second], prefer_map_id="Town04")
+
+        # 目标地图未命中：宁可动“从未加载过地图”的空闲引擎，不去切换他人在用的世界
+        assert picked is second
+
+    def test_falls_back_to_first_free_when_all_hold_other_maps(self) -> None:
+        pool, first, second, _ = self._pool()
+        pool.note_loaded_map(first.key, "Town01")
+        pool.note_loaded_map(second.key, "Town02")
+
+        assert pool.pick_free_endpoint([first, second], prefer_map_id="Town09") is first
+        # 无亲和偏好时同样按声明顺序
+        assert pool.pick_free_endpoint([first, second]) is first
+
+    def test_returns_none_when_all_candidates_occupied(self) -> None:
+        pool, first, second, _ = self._pool()
+        pool.acquire("inst-1", first, "Town03")
+        pool.acquire("inst-2", second, "Town04")
+
+        assert pool.pick_free_endpoint([first, second], prefer_map_id="Town03") is None
+
+    def test_occupied_endpoint_with_matching_map_is_not_picked(self) -> None:
+        """亲和仅限“空闲”端点：同地图但已被占用的引擎不得抢用。"""
+        pool, first, second, _ = self._pool()
+        pool.acquire("inst-1", first, "Town03")
+        pool.note_loaded_map(first.key, "Town03")
+
+        assert pool.pick_free_endpoint([first, second], prefer_map_id="Town03") is second
+
+    def test_is_endpoint_free_and_lease_of(self) -> None:
+        pool, first, _, _ = self._pool()
+        assert pool.is_endpoint_free(first.key) is True
+
+        lease = pool.acquire("inst-1", first, "Town03")
+        assert pool.is_endpoint_free(first.key) is False
+        assert pool.lease_of(first.key) is lease
+        assert pool.lease_of("10.9.9.9:2000") is None
+
+        pool.release("inst-1")
+        assert pool.is_endpoint_free(first.key) is True
+        assert pool.lease_of(first.key) is None
+
+    def test_snapshot_exposes_affinity_and_free_endpoint_map(self) -> None:
+        pool, first, second, _ = self._pool()
+        pool.acquire("inst-1", first, "Town03")
+        pool.note_loaded_map(second.key, "Town04")
+        pool.release("inst-1")
+
+        engines = {item["key"]: item for item in pool.snapshot()["engines"]}
+        assert pool.snapshot()["map_affinity_enabled"] is True
+        # 空闲端点仍保留最后已知地图（供亲和决策与排障）
+        assert engines[second.key]["holder"] is None
+        assert engines[second.key]["map_id"] == "Town04"
+        assert engines[first.key]["map_id"] == "Town03"

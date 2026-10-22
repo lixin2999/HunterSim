@@ -14,7 +14,10 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
-from hunter_sim.common.metrics import INSTANCE_LIFECYCLE_TOTAL
+from hunter_sim.common.metrics import (
+    INSTANCE_LIFECYCLE_TOTAL,
+    SCHEDULING_DECISIONS_TOTAL,
+)
 from hunter_sim.common.models import (
     CarlaSettings,
     InstanceStatus,
@@ -42,6 +45,18 @@ _TRANSITIONS: dict[InstanceStatus, set[InstanceStatus]] = {
     InstanceStatus.FAILED:    {InstanceStatus.DESTROYED},
     InstanceStatus.DESTROYED: set(),
 }
+
+# 终态实例不再占用引擎端点（其端点可被新实例复用）
+_TERMINAL_STATUSES = (
+    InstanceStatus.COMPLETED,
+    InstanceStatus.FAILED,
+    InstanceStatus.DESTROYED,
+)
+
+
+def _endpoint_addr(endpoint: Any) -> tuple[str, int]:
+    """把引擎端点投影为 ``(host, rpc_port)``，与控制面已分配地址对齐比对。"""
+    return str(getattr(endpoint, "host", "")), int(getattr(endpoint, "rpc_port", 0))
 
 
 @dataclass
@@ -227,6 +242,8 @@ class SimInstanceManager:
             未声明引擎库存时，所有实例共享该单引擎端点（V2.4.0）。
         engine_endpoints: 引擎端点库存（可选）。提供后实例创建时独占分配
             一个未占用端点，支持多引擎并行；耗尽时抛 ResourceError。
+        engine_pool: 引擎租约池（可选，V2.8.0 P2-14）。注入后调度可感知
+            端点占用与已加载地图，同地图实例优先复用同一引擎（免重复 load_world）。
         state_store: 状态持久化存储（可选）。提供后实例创建/流转/销毁同步落盘，
             可通过 restore() 在服务重启后重建实例表。
         platform: 平台化配置（可选）。提供租户级并发上限与默认租户（V2.5.0）。
@@ -241,6 +258,7 @@ class SimInstanceManager:
         engine_endpoints: Optional[list[Any]] = None,
         state_store: Optional[Any] = None,
         platform: Optional[PlatformSettings] = None,
+        engine_pool: Optional[Any] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._gpu_pool = gpu_pool
@@ -249,6 +267,7 @@ class SimInstanceManager:
         self._engine_endpoints: list[Any] = list(engine_endpoints or [])
         self._state_store = state_store
         self._platform = platform or PlatformSettings()
+        self._engine_pool = engine_pool
         self._instances: dict[str, SimInstance] = {}
         self._lock: threading.RLock = threading.RLock()
         logger.info("SimInstanceManager initialized")
@@ -326,8 +345,9 @@ class SimInstanceManager:
         with self._lock:
             # 引擎端点分配（V2.4.0）：声明库存时独占分配，耗尽即拒绝创建；
             # 未声明库存时所有实例共享单引擎，由执行面保证单场景约束
+            # V2.8.0 P2-14：分配时带地图亲和，同地图空闲端点优先复用
             instance.carla_host, instance.carla_rpc_port, instance.carla_stream_port = (
-                self._assign_endpoint()
+                self._assign_endpoint(map_id)
             )
             self._instances[instance_id] = instance
 
@@ -361,20 +381,60 @@ class SimInstanceManager:
                 "destroy an idle instance or raise PLATFORM_MAX_INSTANCES_PER_TENANT",
             )
 
-    def _assign_endpoint(self) -> tuple[str, int, int]:
+    def _assign_endpoint(self, map_id: str = "") -> tuple[str, int, int]:
         """分配引擎端点（已持有 self._lock）。
 
         - 未声明 ``engine_endpoints``：返回配置的单引擎端点；
-        - 已声明：返回第一个未被活跃实例占用的端点，全部占用时抛 ResourceError。
+        - 已声明且注入 ``engine_pool``（P2-14）：按地图亲和选空闲端点，
+          同地图的已加载端点优先（省一次 ``load_world``）；
+        - 已声明但无池（旧调用路径/单测）：按活跃实例占用表选首个空闲端点。
+
+        Raises:
+            ResourceError: 库存端点已全部占用。
         """
         if not self._engine_endpoints:
             return self._carla.host, self._carla.rpc_port, self._carla.stream_port
-        used = {(i.carla_host, i.carla_rpc_port) for i in self._instances.values()}
+        if self._engine_pool is not None:
+            # 双重占用防护：控制面创建实例时引擎租约尚未被执行面领取（租约在
+            # 场景装配时才产生），故本管理器必须自行排除已分配给活跃实例的端点，
+            # 否则同批多个实例会被调度到同一引擎，装配期才以 EngineUnavailable 失败。
+            reserved = {
+                (instance.carla_host, instance.carla_rpc_port)
+                for instance in self._instances.values()
+                if instance.status not in _TERMINAL_STATUSES
+            }
+            candidates = [ep for ep in self._engine_endpoints if _endpoint_addr(ep) not in reserved]
+            endpoint = self._engine_pool.pick_free_endpoint(candidates, prefer_map_id=map_id)
+            if endpoint is None:
+                raise ResourceError(
+                    "engine",
+                    f"No CARLA engine endpoint available (all {len(self._engine_endpoints)} in use). "
+                    "Destroy an idle instance or add endpoints via EXECUTION_ENGINE_ENDPOINTS",
+                )
+            loaded = str(self._engine_pool.loaded_map_of(endpoint.key) or "")
+            if loaded and loaded == map_id:
+                kind = "affinity_reuse"
+            elif not loaded:
+                kind = "fresh_endpoint"
+            else:
+                kind = "fallback"
+            SCHEDULING_DECISIONS_TOTAL.labels(kind=kind).inc()
+            logger.info(
+                f"Engine scheduled for map '{map_id}': {endpoint.key} "
+                f"(loaded_map={loaded or 'none'}, decision={kind})"
+            )
+            return endpoint.host, endpoint.rpc_port, endpoint.stream_port
+        used = {
+            (i.carla_host, i.carla_rpc_port)
+            for i in self._instances.values()
+            if i.status not in _TERMINAL_STATUSES
+        }
         for endpoint in self._engine_endpoints:
             host = str(getattr(endpoint, "host", self._carla.host))
             rpc_port = int(getattr(endpoint, "rpc_port", self._carla.rpc_port))
             stream_port = int(getattr(endpoint, "stream_port", rpc_port + 1))
             if (host, rpc_port) not in used:
+                SCHEDULING_DECISIONS_TOTAL.labels(kind="fallback").inc()
                 return host, rpc_port, stream_port
         raise ResourceError(
             "engine",

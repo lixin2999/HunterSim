@@ -150,6 +150,21 @@ def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
         return None
 
 
+def _engine_pool(app: Any, endpoints: list[Any], lease_ttl_seconds: float) -> EnginePool:
+    """获取共享的引擎租约池（必要时创建）。
+
+    V2.8.0 P2-14：控制面（实例创建时的地图亲和调度）与执行面必须共用同一个池，
+    否则端点占用/地图记忆会出现两份真相。已注入的非 EnginePool 对象（测试桩）
+    不强行接管，按其自带类型直接使用。
+    """
+    existing = getattr(app.state, "engine_pool", None)
+    if existing is not None:
+        return cast(EnginePool, existing)
+    pool = EnginePool(endpoints, lease_ttl_seconds=lease_ttl_seconds)
+    app.state.engine_pool = pool
+    return pool
+
+
 def _execution_plane(app: Any) -> ExecutionPlane:
     """获取（必要时创建）执行平面，绑定到 app.state。"""
     existing = getattr(app.state, "execution_plane", None)
@@ -176,7 +191,7 @@ def _execution_plane(app: Any) -> ExecutionPlane:
         lease_ttl = float(getattr(exec_cfg, "lease_ttl_seconds", 0) or 0) if heartbeat_on else 0.0
 
         plane = ExecutionPlane(
-            EnginePool(endpoints, lease_ttl_seconds=lease_ttl),
+            _engine_pool(app, endpoints, lease_ttl),
             lambda endpoint: _resolve_map_manager(app, endpoint),
             lock=_runtime_lock(app),
             fixed_delta_seconds=delta,
@@ -240,17 +255,21 @@ def ensure_scene_runner(app: Any, instance_id: str) -> Any:
             reason = getattr(app.state, "carla_probe_error", None) or "CARLA 客户端不可用"
             raise SceneRuntimeUnavailable(str(reason))
 
-        # 兼容单引擎地图约束（V2.3.0 语义）：引擎已加载其他地图时拒绝装配
-        loaded_map = getattr(app.state, "scene_world_map_id", None)
-        runners = _runners(app)
-        if loaded_map is not None and loaded_map != instance.map_id and not runners:
+        # P2-14：地图冲突下沉到端点级——只有目标端点被其他实例活跃占用且地图不同才拒绝，
+        # 不再因“全局限一个地图”误伤多引擎与同地图复用场景
+        plane = _execution_plane(app)
+        endpoint_key = f"{instance.carla_host}:{instance.carla_rpc_port}"
+        conflict_holder, conflict_map = plane.map_conflict(
+            endpoint_key, instance_id, instance.map_id
+        )
+        if conflict_holder:
             raise SceneRuntimeUnavailable(
-                f"当前 CARLA 引擎已加载地图 '{loaded_map}'，无法再加载 '{instance.map_id}'"
-                "（单引擎单地图约束）；请先销毁占用实例，或为实例部署独立 CARLA 引擎"
+                f"引擎端点 '{endpoint_key}' 已加载地图 '{conflict_map}'"
+                f"且正被实例 '{conflict_holder}' 占用，无法同时加载 '{instance.map_id}'"
+                "（单引擎单地图约束）；请先销毁占用实例，或追加空闲引擎端点"
             )
 
         _enter_loading(manager, instance)
-        plane = _execution_plane(app)
 
     # 慢装配在控制面锁外：同端点串行由引擎锁保证，不同端点可并行
     try:
@@ -269,6 +288,7 @@ def ensure_scene_runner(app: Any, instance_id: str) -> Any:
 
     with _runtime_lock(app):
         if plane.active_engine_count <= 1:
+            # 单引擎形态下保留全局地图字段（/health 与旧客户端依赖），多引擎不再互斥
             app.state.scene_world_map_id = instance.map_id
         _enter_ready(manager, instance)
 

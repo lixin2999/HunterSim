@@ -327,3 +327,39 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int = Field(..., description="过期时间（秒）")
+
+
+# ─── 多用户体系（V2.8.0 P2-13） ────────────────────────────────────────────
+
+
+class UserCreateRequest(BaseModel):
+    """POST /auth/users 请求体（admin 创建用户）。"""
+
+    username: str = Field(
+        ...,
+        min_length=3,
+        max_length=64,
+        pattern=r"^[0-9A-Za-z._-]+$",
+        description="登录名（3-64 位，仅限字母/数字/`.`/`_`/`-`）",
+    )
+    password: str = Field(..., min_length=6, max_length=256, description="初始口令（最短长度受 PLATFORM_MIN_PASSWORD_LENGTH 约束）")
+    role: str = Field(
+        "operator", pattern="^(viewer|operator|admin)$", description="角色（viewer/operator/admin）"
+    )
+    tenant: str = Field("", description="所属租户（空取调用主体租户）")
+
+
+class UserUpdateRequest(BaseModel):
+    """PATCH /auth/users/{username} 请求体（字段留空表示不修改）。"""
+
+    role: Optional[str] = Field(None, pattern="^(viewer|operator|admin)$", description="新角色")
+    tenant: Optional[str] = Field(None, max_length=64, description="新租户")
+    password: Optional[str] = Field(None, min_length=6, max_length=256, description="重置口令（明文，入库仅存摘要）")
+    disabled: Optional[bool] = Field(None, description="是否禁用（禁用后不可登录，已发 Token 靠自然过期失效）")
+
+
+class PasswordChangeRequest(BaseModel):
+    """POST /auth/password 请求体（当前登录用户自助改口令）。"""
+
+    old_password: str = Field(..., min_length=1, max_length=256, description="当前口令")
+    new_password: str = Field(..., min_length=6, max_length=256, description="新口令（最短长度受 PLATFORM_MIN_PASSWORD_LENGTH 约束）")

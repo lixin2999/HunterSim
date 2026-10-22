@@ -1,6 +1,9 @@
 # HunterSim K8s Deployment
 # 命名空间：hunter-sim
 # 适用环境：Kubernetes 1.25+ with NVIDIA GPU Operator
+# V2.8.0：多用户体系（PLATFORM_USERS_*）；引擎自愈在 K8s 形态下由 carla-engine Pod 的
+# liveness 联动重启承担（不启用进程托管 CARLA_SUPERVISOR_ENABLED）；
+# 服务仍为单副本 + 重启恢复（SQLite 需 RWO 卷），多副本无状态化为长期项，见文档 §受支持形态。
 
 apiVersion: apps/v1
 kind: Deployment
@@ -28,7 +31,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.7.0
+          image: hunter-sim:2.8.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -206,6 +209,28 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: log_json
+            # 多用户体系（V2.8.0 P2-13）：/auth/users 由 admin 管理，口令 PBKDF2 摘要入库
+            - name: PLATFORM_USERS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_users_enabled
+            - name: PLATFORM_MIN_PASSWORD_LENGTH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_min_password_length
+            - name: PLATFORM_PASSWORD_HASH_ITERATIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: platform_password_hash_iterations
+            # 本地 CARLA 进程自愈（V2.8.0 P2-15）：集群形态置 false，
+            # 引擎 Pod 崩溃由 livenessProbe 联动重启；仅宿主机原生 CarlaUE4 需要置 true
+            - name: CARLA_SUPERVISOR_ENABLED
+              value: "false"
+            - name: CARLA_SUPERVISOR_BINARY_PATH
+              value: ""
           resources:
             requests:
               memory: "512Mi"

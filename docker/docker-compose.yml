@@ -1,4 +1,4 @@
-# HunterSim 开发/单机部署编排（V2.7.0）
+# HunterSim 开发/单机部署编排（V2.8.0）
 # 使用：
 #   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
@@ -15,6 +15,10 @@
 # KAFKA_REBUILD_AFTER_ERRORS/KAFKA_DLQ_TOPIC）、VIL 乱序闸门与自动环深（VIL_*）、JWT 吊销/续期
 # （API_JWT_REVOCATION_ENABLED/API_JWT_REFRESH_ENABLED，需 STATE_ENABLED=true）、structlog 统一
 # 日志与 request_id 贯穿（HUNTER_SIM_LOG_JSON/HUNTER_SIM_LOG_FILE）。
+# V2.8.0：架构演进 P2——多用户体系与慢哈希（PLATFORM_USERS_ENABLED 等）、地图亲和调度
+# （同地图优先复用空闲引擎）、本地 CARLA 进程自愈（CARLA_SUPERVISOR_*，仅回环端点）、
+# 部署预检 CLI（docker compose exec sim-service python -m hunter_sim.cli.main doctor）、
+# 监控栈 healthcheck 与 service_healthy 依赖条件（P2-16）。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -107,7 +111,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.7.0
+    image: hunter-sim:2.8.0
     ports:
       - "8080:8080"
     environment:
@@ -162,6 +166,16 @@ services:
       # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
       API_JWT_REVOCATION_ENABLED: ${API_JWT_REVOCATION_ENABLED:-true}
       API_JWT_REFRESH_ENABLED: ${API_JWT_REFRESH_ENABLED:-true}
+      # 多用户体系（V2.8.0 P2-13）：/auth/users 由 admin 管理，口令按 PBKDF2 摘要入库
+      PLATFORM_USERS_ENABLED: ${PLATFORM_USERS_ENABLED:-true}
+      PLATFORM_MIN_PASSWORD_LENGTH: ${PLATFORM_MIN_PASSWORD_LENGTH:-10}
+      PLATFORM_PASSWORD_HASH_ITERATIONS: ${PLATFORM_PASSWORD_HASH_ITERATIONS:-100000}
+      # 本地 CARLA 进程自愈（V2.8.0 P2-15）：仅托管回环端点；容器内默认关闭，
+      # 引擎容器由 docker restart / K8s liveness 负责，避免跨层抢管进程
+      CARLA_SUPERVISOR_ENABLED: ${CARLA_SUPERVISOR_ENABLED:-false}
+      CARLA_SUPERVISOR_BINARY_PATH: ${CARLA_SUPERVISOR_BINARY_PATH:-}
+      CARLA_SUPERVISOR_MAX_RESTARTS: ${CARLA_SUPERVISOR_MAX_RESTARTS:-3}
+      CARLA_SUPERVISOR_RESTART_BACKOFF_SECONDS: ${CARLA_SUPERVISOR_RESTART_BACKOFF_SECONDS:-5}
       # 统一日志（V2.7.0）：生产采集可置 JSON；容器环境文件轮转留空由 docker logs 托管
       HUNTER_SIM_LOG_JSON: ${HUNTER_SIM_LOG_JSON:-false}
       HUNTER_SIM_LOG_FILE: ${HUNTER_SIM_LOG_FILE:-}
@@ -191,6 +205,13 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
+    # V2.8.0 P2-16：就绪探针（busybox wget 镜像内置），供下游依赖条件判定
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
 
   # ── Alertmanager 告警投递（审查项 S：prometheus.yml alerting 段的目标） ──────
   alertmanager:
@@ -203,6 +224,12 @@ services:
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
 
   # ── Grafana 可视化 ──────────────────────────────────────────────────────────
   grafana:
@@ -214,8 +241,16 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    # V2.8.0 P2-16：等 Prometheus 健康后再启动，避免数据源首连失败反复重试
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   kafka_data:

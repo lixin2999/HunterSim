@@ -25,6 +25,11 @@
 - huntersim_vil_latency_seconds            VIL 端到端延迟直方图（P50/P95/P99，P1-9）
 - huntersim_execution_lease_reclaims_total 僵尸租约强制回收计数（P1-7）
 - huntersim_auth_token_events_total        Token 续期/吊销计数（P1-6）
+
+指标清单（V2.8.0 P2 新增）：
+- huntersim_user_events_total              平台用户管理/登录计数（P2-13）
+- huntersim_scheduling_decisions_total     地图感知调度决策计数（P2-14）
+- huntersim_carla_supervisor_events_total  托管 CARLA 进程事件计数（P2-15）
 """
 
 from __future__ import annotations
@@ -165,6 +170,27 @@ AUTH_TOKEN_EVENTS_TOTAL = Counter(
     labelnames=("event",),
 )
 
+# ─── V2.8.0 P2：多用户 / 地图感知调度 / 引擎自愈 ────────────────────────────
+
+USER_EVENTS_TOTAL = Counter(
+    "huntersim_user_events_total",
+    "Platform user management events (event=create|update|delete|password_change|"
+    "password_change_denied|login|login_denied).",
+    labelnames=("event",),
+)
+
+SCHEDULING_DECISIONS_TOTAL = Counter(
+    "huntersim_scheduling_decisions_total",
+    "Engine endpoint scheduling outcomes (kind=affinity_reuse|fresh_endpoint|fallback).",
+    labelnames=("kind",),
+)
+
+CARLA_SUPERVISOR_EVENTS_TOTAL = Counter(
+    "huntersim_carla_supervisor_events_total",
+    "Managed CARLA process events (event=start|exit|restart|giveup|stop).",
+    labelnames=("event",),
+)
+
 # ─── app.state 派生 Gauge（抓取时刻刷新）────────────────────────────────────
 
 _GAUGE_SPECS: tuple[tuple[str, str, str], ...] = (
@@ -273,6 +299,7 @@ def metric_exists(name: str) -> bool:
 __all__ = [
     "AUTH_TOKEN_EVENTS_TOTAL",
     "CARLA_RPC_ERRORS_TOTAL",
+    "CARLA_SUPERVISOR_EVENTS_TOTAL",
     "CLOUD_DLQ_PUBLISHED_TOTAL",
     "CLOUD_UPLOAD_DROPPED_TOTAL",
     "CLOUD_UPLOAD_TOTAL",
@@ -285,7 +312,9 @@ __all__ = [
     "KAFKA_CONSUMED_TOTAL",
     "LOGIN_REJECTIONS_TOTAL",
     "RATE_LIMITED_REJECTIONS_TOTAL",
+    "SCHEDULING_DECISIONS_TOTAL",
     "SERVICE_START_TIME",
+    "USER_EVENTS_TOTAL",
     "VIL_LATENCY_SECONDS",
     "VIL_MESSAGE_DROPPED_TOTAL",
     "counter_value",

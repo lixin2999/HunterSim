@@ -6,7 +6,8 @@
 - ``GET  /api/v1/sim/auth/api-keys``：列出服务账号（admin）；
 - ``DELETE /api/v1/sim/auth/api-keys/{key_id}``：吊销服务账号（admin）。
 
-账号来源：``API_ADMIN_USERNAME`` / ``API_ADMIN_PASSWORD``（默认 admin/admin，仅限 dev）；
+账号来源：优先用户表（V2.8.0 P2-13，需 ``STATE_ENABLED=true``），未命中回退
+``API_ADMIN_USERNAME`` / ``API_ADMIN_PASSWORD``（默认 admin/admin，引导账号，仅限 dev）；
 ``HUNTER_SIM_ENV=prod`` 时启动闸门会拒绝默认口令。
 API Key 依赖状态库（``STATE_ENABLED=true``）：密钥仅存 sha256(salt:secret) 摘要，
 明文只在签发响应中返回一次。
@@ -17,9 +18,10 @@ from __future__ import annotations
 import math
 import secrets
 import time
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 
 from hunter_sim.api.deps import (
     Principal,
@@ -33,7 +35,11 @@ from hunter_sim.api.deps import (
 from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.middleware.rate_limit import LoginFailureGuard
 from hunter_sim.api.models import ApiKeyCreateRequest, ApiResponse, TokenRequest, TokenResponse
-from hunter_sim.common.metrics import AUTH_TOKEN_EVENTS_TOTAL, LOGIN_REJECTIONS_TOTAL
+from hunter_sim.common.metrics import (
+    AUTH_TOKEN_EVENTS_TOTAL,
+    LOGIN_REJECTIONS_TOTAL,
+    USER_EVENTS_TOTAL,
+)
 from hunter_sim.common.models import APISettings
 from hunter_sim.common.utils import get_logger
 
@@ -55,13 +61,60 @@ def _require_store(request: Request) -> Any:
     return store
 
 
+async def _authenticate(
+    request: Request, body: TokenRequest, api_settings: APISettings
+) -> dict[str, str]:
+    """校验登录凭据，返回 ``{username, role, tenant}``；失败抛 401。
+
+    顺序（V2.8.0 P2-13）：先查用户表（PBKDF2 摘要校验，线程池执行以免阻塞事件循环），
+    未命中再回退内置管理员比对（V2.3.0 语义），保证无状态库/未建用户时既有客户端不变。
+    """
+    platform = get_settings().platform
+    store = getattr(request.app.state, "state_store", None)
+    if store is not None and platform.users_enabled:
+        try:
+            record: Optional[dict[str, Any]] = await run_in_threadpool(
+                store.verify_user, body.username, body.password
+            )
+        except Exception as exc:  # noqa: BLE001  用户表不可用不阻断内置管理员登录
+            logger.warning(f"User table verification unavailable, falling back: {exc}")
+            record = None
+        if record is not None:
+            return {
+                "username": str(record["username"]),
+                "role": str(record["role"]),
+                "tenant": str(record["tenant"] or platform.default_tenant),
+            }
+
+    expected_user = api_settings.admin_username
+    expected_password = api_settings.admin_password.get_secret_value()
+    # 常量时间比较，避免口令被计时侧信道推断；按 UTF-8 字节比较以兼容非 ASCII 用户名
+    user_ok = secrets.compare_digest(body.username.encode("utf-8"), expected_user.encode("utf-8"))
+    password_ok = secrets.compare_digest(
+        body.password.encode("utf-8"),
+        expected_password.encode("utf-8"),
+    )
+    if not (user_ok and password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "username": expected_user,
+        "role": _ADMIN_ROLE,
+        "tenant": platform.default_tenant,
+    }
+
+
 @router.post(
     "/auth/token",
     response_model=ApiResponse,
     summary="获取 JWT 访问令牌",
     description=(
-        "使用 API_ADMIN_USERNAME / API_ADMIN_PASSWORD 换取 Bearer Token。"
-        "返回的 access_token 用于其余接口的 Authorization: Bearer <token>。"
+        "用平台账号换取 Bearer Token：优先校对用户表（V2.8.0 P2-13，口令以 PBKDF2 摘要入库），"
+        "未命中时回退内置管理员 ``API_ADMIN_USERNAME`` / ``API_ADMIN_PASSWORD``。"
+        "返回的 access_token 用于其余接口的 Authorization: Bearer <token>，角色与租户写入 JWT 声明。"
         "V2.6.0：同 IP 连续失败达 API_LOGIN_MAX_FAILED_ATTEMPTS 后进入"
         "指数退避（429 + Retry-After），成功登录即复位。"
     ),
@@ -75,7 +128,7 @@ async def issue_token(
 
     Args:
         body: 用户名/口令。
-        request: 当前请求（用于定位登录退避主体 IP）。
+        request: 当前请求（用于定位登录退避主体 IP 与读取状态库）。
         api_settings: API 配置（内置管理员凭据与 JWT 参数）。
 
     Returns:
@@ -104,37 +157,36 @@ async def issue_token(
                 headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
             )
 
-    expected_user = api_settings.admin_username
-    expected_password = api_settings.admin_password.get_secret_value()
-
-    # 常量时间比较，避免口令被计时侧信道推断；按 UTF-8 字节比较以兼容非 ASCII 用户名
-    user_ok = secrets.compare_digest(body.username.encode("utf-8"), expected_user.encode("utf-8"))
-    password_ok = secrets.compare_digest(
-        body.password.encode("utf-8"),
-        expected_password.encode("utf-8"),
-    )
-    if not (user_ok and password_ok):
+    try:
+        identity = await _authenticate(request, body, api_settings)
+    except HTTPException:
         if guard is not None:
             guard.record_failure(client_ip)
         LOGIN_REJECTIONS_TOTAL.labels(reason="credential").inc()
+        USER_EVENTS_TOTAL.labels(event="login_denied").inc()
         logger.warning(f"Token request rejected for user '{body.username}'")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise
 
     if guard is not None:
         guard.reset(client_ip)
     token = create_access_token(
-        body.username,
+        identity["username"],
         api_settings,
-        extra_claims={"role": _ADMIN_ROLE},
-        tenant=get_settings().platform.default_tenant,
+        extra_claims={"role": identity["role"]},
+        tenant=identity["tenant"],
+    )
+    USER_EVENTS_TOTAL.labels(event="login").inc()
+    audit_log(
+        "auth.login",
+        identity["username"],
+        identity["username"],
+        detail=f"role={identity['role']}",
+        tenant=identity["tenant"],
+        auth_type="jwt",
     )
     logger.info(
-        f"Issued access token for '{body.username}' "
-        f"(role={_ADMIN_ROLE}, tenant={get_settings().platform.default_tenant})"
+        f"Issued access token for '{identity['username']}' "
+        f"(role={identity['role']}, tenant={identity['tenant']})"
     )
     payload = TokenResponse(
         access_token=token,

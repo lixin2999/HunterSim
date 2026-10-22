@@ -28,6 +28,19 @@ class ExecutionUnavailable(RuntimeError):
     """执行面不可用（引擎被占用、端点无客户端或地图加载失败）。"""
 
 
+def _world_map_id(world: Any, fallback: str) -> str:
+    """读取世界实际地图 ID（CARLA 返回 ``/Game/Maps/Town03`` 取末段）。
+
+    Mock/受限 world 无 ``get_map`` 时回退到请求地图，不阻断装配。
+    """
+    try:
+        name = str(world.get_map().name)
+    except Exception:  # noqa: BLE001  地图名不可读不影响主流程
+        return fallback
+    tail = name.rstrip("/").split("/")[-1] if name else ""
+    return tail or fallback
+
+
 class ExecutionPlane:
     """场景执行平面。
 
@@ -132,6 +145,10 @@ class ExecutionPlane:
                     )
                 world = map_manager.load_map(instance.map_id)
                 self._configure_world(world)
+                # P2-14：以事实加载的地图登记端点地图，下次调度才能命中亲和
+                self._pool.note_loaded_map(
+                    lease.endpoint.key, _world_map_id(world, instance.map_id)
+                )
                 runner = self._runner_factory(
                     world,
                     on_state_change=on_state_change,
@@ -225,6 +242,37 @@ class ExecutionPlane:
     def stale_instance_ids(self) -> list[str]:
         """返回僵尸租约对应的实例 ID（心跳超时且无存活运行器）。"""
         return [lease.instance_id for lease in self._pool.stale_leases()]
+
+    def endpoint_key_of(self, instance_id: str) -> str:
+        """实例当前占用的端点 key（无租约时返回空串，P2-14）。"""
+        with self._registry_lock:
+            cached = self._runner_engines.get(instance_id)
+        if cached:
+            return str(cached)
+        lease = self._pool.get(instance_id)
+        if lease is not None:
+            return lease.endpoint.key
+        return ""
+
+    def map_conflict(
+        self, endpoint_key: str, holder_instance_id: str, target_map_id: str
+    ) -> tuple[str, str]:
+        """端点地图冲突检查（P2-14：从全局单地图下沉到端点级）。
+
+        仅当端点被**其他**实例活跃占用且已加载地图与目标地图不同时返回冲突。
+
+        Returns:
+            ``(冲突占用者实例 ID, 端点已加载地图)``；无冲突时为 ``("", "")``。
+        """
+        if not endpoint_key:
+            return "", ""
+        lease = self._pool.lease_of(endpoint_key)
+        if lease is None or lease.instance_id == holder_instance_id:
+            return "", ""
+        loaded = self._pool.loaded_map_of(endpoint_key)
+        if loaded and loaded != target_map_id:
+            return lease.instance_id, loaded
+        return "", ""
 
     def force_release(self, instance_id: str) -> bool:
         """管理强制回收：释放运行器与引擎租约（用于僵尸持有者，P1-7）。

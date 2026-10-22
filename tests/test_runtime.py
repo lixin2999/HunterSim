@@ -133,12 +133,37 @@ class TestEnsureSceneRunner:
         assert instance.status == InstanceStatus.CREATED
         assert manager.transitions == []
 
-    def test_map_conflict_raises_unavailable(self) -> None:
-        app, _, _, _ = _make_app(map_id="Town03")
+    def test_global_map_field_alone_no_longer_blocks_assemble(self) -> None:
+        """P2-14：遗留的全局地图字段不再误伤（端点空闲即可装配）。"""
+        app, _, _, map_manager = _make_app(map_id="Town03")
         app.state.scene_world_map_id = "Town04"
 
+        runner = ensure_scene_runner(app, "inst-1")
+
+        assert isinstance(runner, SceneRunnerService)
+        assert map_manager.loaded_maps == ["Town03"]
+
+    def test_endpoint_map_conflict_raises_unavailable(self) -> None:
+        """P2-14：同一端点被他人活跃占用且地图不同时仍须拒绝。"""
+        app, _, _, _ = _make_app()
+        ensure_scene_runner(app, "inst-1")  # 端点 localhost:2000 已加载 Town03
+
+        other = SimpleNamespace(
+            sim_instance_id="inst-2",
+            map_id="Town04",
+            status=InstanceStatus.CREATED,
+            user_id="user-2",
+            carla_host="localhost",
+            carla_rpc_port=2000,
+            carla_stream_port=2001,
+        )
+        original_get = app.state.instance_manager.get_instance
+        app.state.instance_manager.get_instance = (
+            lambda iid: other if iid == "inst-2" else original_get(iid)
+        )
+
         with pytest.raises(SceneRuntimeUnavailable, match="Town04"):
-            ensure_scene_runner(app, "inst-1")
+            ensure_scene_runner(app, "inst-2")
 
     def test_engine_occupied_by_another_instance(self) -> None:
         app, _, _, _ = _make_app()

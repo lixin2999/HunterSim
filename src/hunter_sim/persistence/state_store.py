@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS revoked_tokens (
     expires_at REAL NOT NULL DEFAULT 0,
     revoked_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    username     TEXT PRIMARY KEY,
+    tenant       TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    pass_hash    TEXT NOT NULL,
+    salt         TEXT NOT NULL,
+    iterations   INTEGER NOT NULL DEFAULT 100000,
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    last_login_at REAL NOT NULL DEFAULT 0,
+    disabled_at  REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant);
 """
 
 # 服务重启后执行面已丢失：运行中的场景统一回到「已就绪（可重新启动）」
@@ -117,6 +132,35 @@ _API_KEY_PREFIX = "hsk"
 _API_KEY_SECRET_BYTES = 24
 # last_used_at 写库节流：每次请求都写会放大 SQLite 写竞争
 _API_KEY_TOUCH_INTERVAL_S = 60.0
+
+# 用户口令慢哈希参数（V2.8.0 P2-13）：PBKDF2-HMAC-SHA256（stdlib，无新增 C 扩展依赖）
+_PASSWORD_ALG = "pbkdf2-sha256"
+_PASSWORD_HASH_BYTES = 32
+_DEFAULT_PASSWORD_ITERATIONS = 100_000
+# 用户不存在时用于拉齐校验耗时的固定 salt（避免通过响应时间枚举用户名）
+_DUMMY_SALT = "00" * 16
+
+
+def _password_fingerprint(
+    password: str, salt: str, iterations: int
+) -> str:
+    """计算口令摘要（``alg$iterations$salt$hex``，库中不保存明文）。"""
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        int(iterations),
+        dklen=_PASSWORD_HASH_BYTES,
+    )
+    return f"{_PASSWORD_ALG}${int(iterations)}${salt}${digest.hex()}"
+
+
+def _parse_fingerprint(fingerprint: str) -> tuple[int, str, bytes]:
+    """拆解摘要为 ``(迭代次数, salt, 哈希字节)``；格式非法时抛 ValueError。"""
+    parts = fingerprint.split("$")
+    if len(parts) != 4 or parts[0] != _PASSWORD_ALG:
+        raise ValueError("malformed password fingerprint")
+    return int(parts[1]), parts[2], bytes.fromhex(parts[3])
 
 
 def _to_epoch(value: Any) -> float:
@@ -749,6 +793,180 @@ class StateStore:
                     (cutoff,),
                 )
         return int(cursor.rowcount)
+
+    # ─── 用户体系（V2.8.0 P2-13） ─────────────────────────────────────────
+
+    @staticmethod
+    def hash_password(
+        password: str, salt: Optional[str] = None, iterations: Optional[int] = None
+    ) -> str:
+        """计算口令摘要（PBKDF2-HMAC-SHA256）；salt/迭代次数缺省时自动生成。
+
+        Returns:
+            ``pbkdf2-sha256$<iterations>$<salt-hex>$<digest-hex>`` 形式的摘要，
+            可直接入库（不含明文）。
+        """
+        salt = salt or secrets.token_hex(16)
+        rounds = int(iterations or _DEFAULT_PASSWORD_ITERATIONS)
+        return _password_fingerprint(password, salt, rounds)
+
+    @staticmethod
+    def verify_password(password: str, fingerprint: str) -> bool:
+        """恒时比对口令与摘要（格式非法或算法不符返回 False）。"""
+        try:
+            rounds, salt, expected = _parse_fingerprint(fingerprint)
+        except (ValueError, TypeError):
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), rounds
+        )
+        return hmac.compare_digest(expected, actual)
+
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        role: str = "operator",
+        tenant: str = "default",
+        created_by: str = "",
+        iterations: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """创建用户；用户名已存在时返回 None（调用方转 409）。
+
+        口令仅以 PBKDF2 摘要 + salt 入库，长度/强度校验由调用方（路由）完成。
+        """
+        name = (username or "").strip()
+        if not name:
+            return None
+        now = time.time()
+        salt = secrets.token_hex(16)
+        rounds = int(iterations or _DEFAULT_PASSWORD_ITERATIONS)
+        fingerprint = _password_fingerprint(password, salt, rounds)
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "INSERT INTO users (username, tenant, role, pass_hash, salt, iterations, "
+                    "created_by, created_at, updated_at, last_login_at, disabled_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0) "
+                    "ON CONFLICT(username) DO NOTHING",
+                    (name, tenant, role, fingerprint, salt, rounds, created_by, now, now),
+                )
+                if cursor.rowcount == 0:
+                    return None
+        record = self.get_user(name)
+        return record
+
+    def get_user(self, username: str) -> Optional[dict[str, Any]]:
+        """读取用户记录（含摘要，仅供内部校验；对外展示请用 :meth:`list_users`）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_users(self, tenant: str = "") -> list[dict[str, Any]]:
+        """列出用户（不含 pass_hash/salt，按创建时间升序）。"""
+        query = (
+            "SELECT username, tenant, role, created_by, created_at, updated_at, "
+            "last_login_at, disabled_at FROM users"
+        )
+        params: tuple[Any, ...] = ()
+        if tenant:
+            query += " WHERE tenant = ?"
+            params = (tenant,)
+        query += " ORDER BY created_at ASC"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["disabled"] = float(item.get("disabled_at", 0.0)) > 0
+        return items
+
+    def count_users(self) -> int:
+        """用户总数（供 /health 与预检展示）。"""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def verify_user(self, username: str, password: str) -> Optional[dict[str, Any]]:
+        """校验用户口令：成功返回 ``{username, role, tenant}`` 并回写登录时间，否则 None。
+
+        用户不存在/已禁用/口令错误均返回 None，且响应时间近似相等
+        （不存在时用虚假摘要跑一次同迭代次数的 PBKDF2）。
+        """
+        record = self.get_user(username.strip())
+        if record is None:
+            # 用户不存在也算一次同参数 PBKDF2，避免通过响应时间枚举用户名
+            _password_fingerprint(password, _DUMMY_SALT, _DEFAULT_PASSWORD_ITERATIONS)
+            return None
+        if float(record.get("disabled_at", 0.0)) > 0:
+            return None
+        if not self.verify_password(password, str(record["pass_hash"])):
+            return None
+        now = time.time()
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE users SET last_login_at = ? WHERE username = ?",
+                    (now, record["username"]),
+                )
+        return {
+            "username": str(record["username"]),
+            "role": str(record["role"]),
+            "tenant": str(record["tenant"]),
+        }
+
+    def update_user(
+        self,
+        username: str,
+        role: Optional[str] = None,
+        tenant: Optional[str] = None,
+        password: Optional[str] = None,
+        disabled: Optional[bool] = None,
+        iterations: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """部分更新用户（角色/租户/口令/禁用）；用户不存在返回 None。"""
+        if role is None and tenant is None and password is None and disabled is None:
+            return self.get_user(username)
+        sets: list[str] = []
+        params: list[Any] = []
+        if role is not None:
+            sets.append("role = ?")
+            params.append(role)
+        if tenant is not None:
+            sets.append("tenant = ?")
+            params.append(tenant)
+        if password is not None:
+            salt = secrets.token_hex(16)
+            rounds = int(iterations or _DEFAULT_PASSWORD_ITERATIONS)
+            sets.append("pass_hash = ?")
+            params.append(_password_fingerprint(password, salt, rounds))
+            sets.append("salt = ?")
+            params.append(salt)
+            sets.append("iterations = ?")
+            params.append(rounds)
+        if disabled is not None:
+            sets.append("disabled_at = ?")
+            params.append(time.time() if disabled else 0.0)
+        sets.append("updated_at = ?")
+        params.append(time.time())
+        params.append(username)
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    f"UPDATE users SET {', '.join(sets)} WHERE username = ?",  # noqa: S608  列名固定
+                    tuple(params),
+                )
+                if cursor.rowcount == 0:
+                    return None
+        return self.get_user(username)
+
+    def delete_user(self, username: str) -> bool:
+        """硬删除用户（已签发 Token 靠自然过期失效，必要时可同时吊销）；返回是否命中。"""
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        return bool(cursor.rowcount > 0)
 
     def close(self) -> None:
         """关闭数据库连接。"""

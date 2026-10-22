@@ -1,4 +1,4 @@
-"""CARLA 引擎库存与独占租约（V2.4.0 执行面分离）。
+"""CARLA 引擎库存与地图亲和调度（V2.4.0 执行面分离，V2.8.0 P2-14 地图感知）。
 
 一个 CARLA server 同一时刻只能承载一个场景（``load_world`` 会重置整个世界）。
 ``EnginePool`` 以端点（host:rpc_port）为粒度维护占用关系，保证：
@@ -6,6 +6,10 @@
 - 同一端点不会被两个实例同时租用；
 - 多引擎部署时，每个实例在自己的端点上并行运行；
 - 释放后端点立即可被新实例复用（不再依赖端口递增猜测）。
+
+V2.8.0 P2-14：端点额外记住自己最后一次实际加载的地图（CARLA 释放租约后世界仍驻内存）。
+装配前按目标地图做亲和选择：同地图的空闲端点优先复用（省一次 ``load_world``，
+避免不必要的地图重置），因此“不同地图也能共存”不再受单地图误伤。
 """
 
 from __future__ import annotations
@@ -193,6 +197,8 @@ class EnginePool:
         self._lock = threading.RLock()
         # 心跳 TTL（秒）：0 表示禁用僵判定（单引擎/未启用心跳）
         self._ttl_seconds = float(lease_ttl_seconds)
+        # 端点 → 最后一次成功加载的地图（P2-14）：释放租约后仍保留，用于亲和调度
+        self._endpoint_maps: dict[str, str] = {}
 
     @property
     def capacity(self) -> int:
@@ -245,6 +251,7 @@ class EnginePool:
             lease = EngineLease(instance_id=instance_id, endpoint=endpoint, map_id=map_id)
             self._leases[instance_id] = lease
             self._known.setdefault(endpoint.key, endpoint)
+            self._endpoint_maps[endpoint.key] = map_id
             return lease
 
     def release(self, instance_id: str) -> bool:
@@ -275,6 +282,65 @@ class EnginePool:
         with self._lock:
             return [lease for lease in self._leases.values() if lease.is_stale(self._ttl_seconds)]
 
+    # ─── 地图亲和调度（V2.8.0 P2-14） ──────────────────────────────────
+
+    def note_loaded_map(self, endpoint_key: str, map_id: str) -> None:
+        """登记端点实际加载的地图（世界加载成功后由运行器调用）。
+
+        ``acquire`` 只能记录“申请时的地图”，而 ``load_world`` 可能失败或回退到
+        默认地图；本方法以事实为准覆盖，下次调度才能正确命中亲和。
+        """
+        if not map_id:
+            return
+        with self._lock:
+            self._endpoint_maps[endpoint_key] = map_id
+
+    def loaded_map_of(self, endpoint_key: str) -> str:
+        """端点最后已知加载的地图（未知返回空串）。"""
+        with self._lock:
+            return self._endpoint_maps.get(endpoint_key, "")
+
+    def is_endpoint_free(self, endpoint_key: str) -> bool:
+        """端点当前是否无活跃租约（僵租约视同空闲，已被心跳回收口径覆盖）。"""
+        with self._lock:
+            return self._holder_of(endpoint_key) is None
+
+    def lease_of(self, endpoint_key: str) -> Optional[EngineLease]:
+        """返回占用指定端点的租约（无占用返回 None）。"""
+        with self._lock:
+            return self._holder_of(endpoint_key)
+
+    def pick_free_endpoint(
+        self,
+        candidates: Iterable[EngineEndpoint],
+        prefer_map_id: str = "",
+    ) -> Optional[EngineEndpoint]:
+        """在候选端点中挑一个空闲的，同地图优先（P2-14）。
+
+        优先级：已加载目标地图的空闲端点（免 ``load_world``）
+        → 从未加载过地图的空闲端点（避免动他人在用的世界）
+        → 按声明顺序的首个空闲端点（需切换地图，但仍是空闲引擎）。
+
+        Args:
+            candidates: 候选端点库存（声明顺序即优先级顺序）。
+            prefer_map_id: 目标地图 ID（空串表示无亲和偏好）。
+
+        Returns:
+            选中的端点；候选全部被占用时返回 None。
+        """
+        with self._lock:
+            free = [ep for ep in candidates if self._holder_of(ep.key) is None]
+            if not free:
+                return None
+            if prefer_map_id:
+                for endpoint in free:
+                    if self._endpoint_maps.get(endpoint.key) == prefer_map_id:
+                        return endpoint
+            for endpoint in free:
+                if not self._endpoint_maps.get(endpoint.key):
+                    return endpoint
+            return free[0]
+
     def snapshot(self) -> dict[str, Any]:
         """执行面快照（供 ``GET /execution`` 与排障使用）。"""
         with self._lock:
@@ -286,7 +352,9 @@ class EnginePool:
                 holder = self._holder_of(key)
                 item = endpoint.to_dict()
                 item["holder"] = holder.instance_id if holder else None
-                item["map_id"] = holder.map_id if holder else None
+                item["map_id"] = (
+                    holder.map_id if holder else self._endpoint_maps.get(key, "")
+                )
                 item["acquired_at"] = holder.acquired_at if holder else None
                 item["last_renew_at"] = holder.last_renew_at if holder else None
                 item["stale"] = bool(holder and holder.is_stale(self._ttl_seconds))
@@ -300,6 +368,7 @@ class EnginePool:
             "active_leases": len(leases),
             "stale_leases": stale_count,
             "lease_ttl_seconds": self._ttl_seconds,
+            "map_affinity_enabled": True,
             "leases": list(leases.values()),
         }
 

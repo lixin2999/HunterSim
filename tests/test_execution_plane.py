@@ -1,7 +1,8 @@
-"""执行平面测试（V2.4.0 执行面分离）。
+"""执行平面测试（V2.4.0 执行面分离，V2.8.0 P2-14 端点级地图亲和）。
 
 覆盖 ``ExecutionPlane`` 的引擎租约、地图加载、同步模式配置、
-运行器装配/释放与失败回滚；CARLA world 全部使用桩对象。
+运行器装配/释放与失败回滚，以及端点地图事实登记与冲突判定；
+CARLA world 全部使用桩对象。
 """
 
 from __future__ import annotations
@@ -14,7 +15,11 @@ from typing import Any
 import pytest
 
 from hunter_sim.execution.engine_pool import EngineEndpoint, EnginePool
-from hunter_sim.execution.plane import ExecutionPlane, ExecutionUnavailable
+from hunter_sim.execution.plane import (
+    ExecutionPlane,
+    ExecutionUnavailable,
+    _world_map_id,
+)
 
 
 class _StubWorld:
@@ -421,3 +426,76 @@ class TestEngineLocks:
         assert destroyed == [True]
         assert plane.get_runner("inst-1") is None
         assert plane.active_engine_count == 0
+
+
+class _NamedWorld(_StubWorld):
+    """带 ``get_map()`` 的世界桩（CARLA 返回全路径地图名）。"""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+
+    def get_map(self) -> Any:
+        return SimpleNamespace(name=self._name)
+
+
+class _NamedMapManager(_StubMapManager):
+    """返回带地图名的 world，用于验证“以实际加载为准”的地图登记。"""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+
+    def load_map(self, map_id: str) -> _NamedWorld:
+        self.loaded_maps.append(map_id)
+        return _NamedWorld(self._name)
+
+
+class TestWorldMapId:
+    def test_strips_carla_map_path(self) -> None:
+        world = _NamedWorld("/Game/Maps/Town05")
+        assert _world_map_id(world, "Town03") == "Town05"
+
+    def test_falls_back_when_map_unreadable(self) -> None:
+        """无 get_map 的 Mock/受限世界不阻断装配，回退到请求地图。"""
+        assert _world_map_id(_StubWorld(), "Town03") == "Town03"
+        assert _world_map_id(_NamedWorld(""), "Town03") == "Town03"
+
+
+class TestEndpointMapAwareness:
+    def test_assemble_records_actual_loaded_map(self) -> None:
+        """登记的是世界实际地图，而非申请地图（CARLA 回退默认图时不失真）。"""
+        manager = _NamedMapManager("/Game/Maps/Town05")
+        plane, _ = _plane(map_manager=manager)
+
+        plane.ensure_runner(_instance("inst-1", map_id="Town03"))
+
+        assert plane.pool.loaded_map_of("10.0.0.1:2000") == "Town05"
+
+    def test_endpoint_key_of_tracks_instance_lease(self) -> None:
+        plane, _ = _plane()
+        assert plane.endpoint_key_of("inst-1") == ""
+
+        plane.ensure_runner(_instance())
+        assert plane.endpoint_key_of("inst-1") == "10.0.0.1:2000"
+
+        plane.release("inst-1")
+        assert plane.endpoint_key_of("inst-1") == ""
+
+    def test_conflict_only_when_other_instance_holds_different_map(self) -> None:
+        plane, _ = _plane()
+        plane.ensure_runner(_instance("inst-1", map_id="Town03"))
+
+        assert plane.map_conflict("10.0.0.1:2000", "inst-2", "Town04") == ("inst-1", "Town03")
+        # 同地图不冲突（这正是 P2-14 要的不切图复用）
+        assert plane.map_conflict("10.0.0.1:2000", "inst-2", "Town03") == ("", "")
+        # 自己占用自己的端点不构成冲突
+        assert plane.map_conflict("10.0.0.1:2000", "inst-1", "Town04") == ("", "")
+
+    def test_free_endpoint_never_conflicts(self) -> None:
+        plane, _ = _plane()
+        plane.ensure_runner(_instance("inst-1", map_id="Town03"))
+        plane.release("inst-1")
+
+        assert plane.map_conflict("10.0.0.1:2000", "inst-2", "Town04") == ("", "")
+        assert plane.map_conflict("", "inst-2", "Town04") == ("", "")

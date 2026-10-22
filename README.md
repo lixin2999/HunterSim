@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.6.0`（V2.6.0 为**阶段四「并发安全与稳定性加固」（P0）**：运行器注册表与装配锁启动期预建（消除首次并发竞态）、引擎级装配锁（多引擎并行装配不再被全局锁串行）、按 IP 限流与 `/auth/token` 失败指数退避（429 + `Retry-After`）、cloud bag 上传队列有界化（队满丢最旧并计数）、`/metrics` 改标准 prometheus_client 导出并预置 Grafana 总览盘，详见 [`release.md`](release.md)）。上一版本 `2.5.0` 为**阶段三「平台化」**：多租户隔离（`tenant` + 租户配额）、服务账号 API Key（`X-API-Key`）、RBAC 角色层级（guest < viewer < operator < admin）、场景库版本化 CRUD、批量任务与审计事件落 SQLite、`GET /platform/overview` 平台概览。更早：`2.4.0` 为**阶段二「执行面分离与状态持久化」**——引擎端点库存 `EXECUTION_ENGINE_ENDPOINTS` 与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution` 观测；`2.3.0` 为**阶段一「可用性止血」**——打通 REST 场景闭环（Token → 创建实例 → 下发场景 → 启动 → 进度 → 停止/销毁），补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
+- **当前版本**：`2.8.0`（V2.8.0 为**阶段六「多用户 / 调度智能化 / 引擎自愈 / 部署体验」（P2）**：平台用户表 + PBKDF2 慢哈希与角色/租户绑定（`/auth/users`、`/auth/password`，审计落到具体人）、地图感知调度（同地图优先复用空闲引擎，多引擎不再被「全局限一地图」误伤）、本地 CARLA 进程自愈看门狗（`CARLA_SUPERVISOR_*`，事件写审计）、部署预检 CLI `huntersim doctor` + `Makefile` + compose 健康依赖条件，并文档明确「单副本 + 重启恢复」为受支持形态，详见 [`release.md`](release.md)）。上一版本 `2.7.0` 为**阶段五「稳定性与数据链路加固」（P1）**：JWT 吊销/滑动续期、引擎租约心跳与僵尸回收、Kafka 消费自愈与 DLQ、VIL 乱序闸门与自动环深、快照写节流、structlog 统一日志 + request_id 贯穿、端到端集成测试。更早：`2.6.0` 为**阶段四「并发安全与稳定性加固」（P0）**——运行器注册表与装配锁启动期预建、引擎级装配锁、按 IP 限流与登录退避、cloud bag 上传队列有界化、标准化 Prometheus 指标 + Grafana 预置盘；`2.5.0` 为**阶段三「平台化」**（多租户隔离与配额、服务账号 API Key、RBAC 角色层级、场景库版本化、批量任务与审计落库、平台概览）；`2.4.0` 为**阶段二「执行面分离与状态持久化」**（引擎端点库存与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution`）；`2.3.0` 为**阶段一「可用性止血」**（打通 REST 场景闭环、`/auth/token`、生产启动闸门、WebSocket 鉴权、实例归属校验）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -24,6 +24,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 安全治理 | JWT/API Key 统一主体与角色分级（创建实例需 operator+，销毁实例与地图上传、管理面需 admin）、车辆模型白名单、场景安全审核、地图上传审核（含路径穿越双重校验）、租户级隔离、审计落库 |
 | 并发安全与限流（V2.6.0） | 装配锁与运行器注册表启动期预建；引擎级装配锁支撑多引擎并行 `load_world`；按 IP 令牌桶限流（429 + `Retry-After`）与 `/auth/token` 失败指数退避；cloud bag 上传队列有界化；标准化 Prometheus 指标 + Grafana 预置盘 |
 | 稳定性与链路加固（V2.7.0） | JWT 吊销/滑动续期（`jti` + 吊销名单）；引擎租约心跳 + 僵尸判定 + admin 强制回收（`DELETE /execution/leases/{id}`）；Kafka 消费自愈与坏消息 DLQ；VIL 乱序/去重闸门、环深自动推导、延迟 P50/P95/P99；快照写节流（状态跃迁必写）；structlog 统一日志 + request_id 贯穿 |
+| 多用户与运维演进（V2.8.0） | 平台用户表 + PBKDF2-HMAC-SHA256 慢哈希（逐条存迭代次数、恒时比对、用户名枚举时序对齐），登录写 `role/tenant` 入 JWT，审计归属到具体人；**地图感知调度**（同图优先复用空闲引擎，冲突判定下沉到端点级）；**本地 CARLA 进程自愈**（看门狗退避重启 + 重启预算封顶 + 事件写审计）；`huntersim doctor` 部署预检与 `Makefile` 统一日常回路；受支持形态 = **单副本 + 重启恢复**（见 §4.10） |
 
 ---
 
@@ -36,7 +37,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 │    scenarios · audit · platform · resources · websocket       │
 ├─────────────────────────────────────────────────────────────┤
 │  执行面  execution/ —— 引擎端点库存与独占租约（V2.4.0）          │
-│    engine_pool（端点解析/租约） · plane（装配/释放/快照）        │
+│    engine_pool（端点库存/租约/地图亲和选端） · plane（装配/释放） │
 ├─────────────────────────────────────────────────────────────┤
 │  服务层  —— 业务编排（无 CARLA/ROS2 直接依赖，可单测）           │
 │    scene_runner  ·  vil_mapper  ·  sensor_sim  ·  traffic_sim  │
@@ -46,10 +47,12 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 │    map_manager · weather_manager · hunter_se_vehicle ·          │
 │    vehicle_blueprint_generator · coordinate_converter ·        │
 │    opendrive_parser · vehicle_controller · carla_server_config  │
+│    carla_supervisor（本地引擎进程自愈，V2.8.0 P2-15）           │
 ├─────────────────────────────────────────────────────────────┤
 │  公共层  common/ —— 配置模型、领域数据类、异常、日志工具          │
 │  持久化  persistence/ —— SQLite：实例/场景绑定 + API Key/场景库/  │
-│    批量任务/审计（V2.4.0 / V2.5.0）                              │
+│    批量任务/审计/平台用户（V2.4.0 / V2.5.0 / V2.8.0）            │
+│  运维    cli/ —— huntersim doctor 部署预检 / version（V2.8.0）    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -64,9 +67,9 @@ HunterSim/
 ├── src/hunter_sim/          # 主包（见下方模块职责）
 │   ├── api/                 # 接口层：main, runtime, deps, error_handlers, middleware, models, routers
 │   ├── common/              # 公共层：models, exceptions, utils
-│   ├── execution/           # 执行面：engine_pool（端点库存/租约）, plane（装配/释放/快照）
-│   ├── persistence/         # 状态持久化：state_store（实例/场景绑定 + API Key/场景库/批量任务/审计）
-│   ├── engine/              # 引擎层：CARLA 原子能力 + 环境检查 + 服务端配置
+│   ├── execution/           # 执行面：engine_pool（端点库存/租约/地图亲和选端）, plane（装配/释放/快照）
+│   ├── persistence/         # 状态持久化：state_store（实例/场景绑定 + API Key/场景库/批量任务/审计/平台用户）
+│   ├── engine/              # 引擎层：CARLA 原子能力 + 环境检查 + 服务端配置 + 进程自愈 supervisor
 │   ├── scene_runner/        # 场景加载、校验、状态机、事件检测、自定义场景
 │   ├── vil_mapper/          # 遥测缓冲、位姿外推、坐标标定、虚实同步
 │   ├── sensor_sim/          # 传感器工厂、安装位、数据转换、ROS2 桥接、录制
@@ -75,13 +78,15 @@ HunterSim/
 │   ├── eval_service/        # 评估引擎、评估报告
 │   ├── resource_manager/   # 实例管理、GPU 资源池、健康监控
 │   ├── gui/                 # 桌面仿真客户端（V2.2.0，PySide6 可选依赖，惰性导入）
+│   ├── cli/                 # 运维 CLI（V2.8.0 P2-16）：huntersim doctor 部署预检 / version
 │   └── cloud/               # HunterCore 数据接入（V2.2.0，Kafka 遥测 + MinIO bag 直传）
 ├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
 ├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / alertmanager / grafana
 ├── k8s/                     # namespace / configmap / secret / deployment（含 CARLA GPU Pod + PVC）/ service
 ├── hunter_assets/           # CARLA 引擎镜像构建资源（Dockerfile.carla COPY 上下文）
 ├── tests/                   # 单元 + 集成测试（覆盖率门禁 ≥80%）
-├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / flake8 / mypy / coverage）
+├── Makefile                 # 一键入口（V2.8.0）：doctor / serve / test / typecheck / image / up …
+├── pyproject.toml           # 依赖与工具配置（setuptools / pytest / flake8 / mypy / coverage / console script）
 ├── setup.cfg                # flake8 质量门禁配置
 └── requirements.txt         # 运行依赖清单
 ```
@@ -95,7 +100,14 @@ HunterSim/
 - **GPU 主机（推荐 Windows，CARLA 原生平台）**：安装 NVIDIA 驱动（≥510）、CUDA（≥11.0）、CARLA 0.9.16。
 - **服务主机（Linux 或 Windows）**：Python 3.12、Kafka 3.6、（可选）ROS2 Humble。
 
-验证运行环境（在 CARLA 主机上执行，检查 OS / Python≥3.12 / 驱动 / CUDA / 显存）：
+验证运行环境（**V2.8.0 推荐**：一次跑完配置/密钥强度/端口/磁盘/GPU/CARLA/状态库，失败即非零退出）：
+
+```bash
+huntersim doctor                    # 或： python -m hunter_sim.cli.main doctor
+huntersim doctor --json --strict     # 脚本消费 / 上线门禁（warn 提为 fail）
+```
+
+仅验证 GPU/CUDA/驱动/Python 环境（旧方式，仍可用）：
 
 ```bash
 python -c "from hunter_sim.engine.check_environment import check_environment as c; r=c(); print(r); raise SystemExit(0 if r.passed else 1)"
@@ -130,9 +142,15 @@ set STATE_DB_PATH=data/state/hunter_sim.db
 # （可选）平台化（V2.5.0）：默认租户与租户级并发配额
 set PLATFORM_DEFAULT_TENANT=default
 set PLATFORM_MAX_INSTANCES_PER_TENANT=20
+
+# （可选）本地 CARLA 进程自愈（V2.8.0 P2-15，仅回环端点；远程/K8s 不要开）
+set CARLA_SUPERVISOR_ENABLED=true
+set CARLA_SUPERVISOR_BINARY_PATH=D:/CARLA_0.9.16/CarlaUE4.exe
 ```
 
 启动后访问交互式文档：<http://localhost:8080/api/v1/sim/docs>
+
+> **Makefile 一键入口（V2.8.0 P2-16）**：`make doctor`（预检）· `make serve`（前台起 API）· `make test` / `make coverage` / `make typecheck`（质量回路）· `make image` / `make up` / `make up-carla` / `make logs`（容器）。配方不依赖 sh 专有语法（只调 `python` / `docker`），可覆盖变量 `PYTHON`（Windows 默认 `.venv/Scripts/python.exe`）/ `COMPOSE_FILE` / `IMAGE_TAG`；**注意 `make` 本体为 Unix 工具，Windows 不自带**（需另装 GNU make 或在 Git Bash / WSL 内执行），未安装时直接执行配方里的等价命令即可。
 
 > V2.3.0 起需先换取 Token（dev 默认 `admin/admin`，生产由 `API_ADMIN_USERNAME` / `API_ADMIN_PASSWORD` 覆盖）：
 >
@@ -161,6 +179,8 @@ kubectl apply -f k8s/
 ```
 
 > 前置条件：宿主机已启动 CARLA 0.9.16（Windows 双击 `CarlaUE4.exe`）。服务启动后用 `GET /api/v1/sim/health` 确认 `carla_connected=true`，再按 §4.7 跑 REST 场景闭环。详见 [`deployment_and_operations.md`](deployment_and_operations.md) 与 [`docs/单机部署指南.md`](docs/单机部署指南.md)。
+
+> **健康依赖条件（V2.8.0 P2-16）**：Kafka / Prometheus / Alertmanager / Grafana 均带 healthcheck，`sim-service` 以 `depends_on.kafka.condition: service_healthy` 等 Kafka 就绪后再起，Grafana 等 Prometheus 健康后再起（避免数据源首连失败反复重试）；镜像内已装 `huntersim` console script（V2.8.0 起 `Dockerfile` 已将 `--user` 脚本目录 `/home/hunter/.local/bin` 加入 `PATH`），预检可直接 `docker compose exec sim-service huntersim doctor --strict`；沿用旧镜像时改用 `python -m hunter_sim.cli.main doctor`。
 
 ### 4.4 Windows 单机全容器（V2.2.0）（CARLA 不在宿主机在Docker里跑）
 
@@ -252,6 +272,51 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 > API Key 需 `STATE_ENABLED=true`（否则签发/列表/吊销返回 `503`）；`PLATFORM_API_KEYS_ENABLED=false` 时关闭 API Key 认证。租户隔离对非 admin 生效：按 ID 读取他租户资源返回 `404`，显式指定他租户的列表/创建请求返回 `403`，admin 可跨租户运维。
 
+### 4.9 多用户与引擎运维（V2.8.0）
+
+```bash
+BASE=http://localhost:8080/api/v1/sim
+# 内置管理员（引导账号）先换 Token
+TOKEN=$(curl -s -X POST $BASE/auth/token -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' | jq -r .data.access_token)
+
+# 1) 建平台用户（admin；口令 PBKDF2 摘要入库，不再依赖明文配置）
+curl -X POST $BASE/auth/users -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"username":"zhangsan","password":"Ops-Team-2026","role":"operator","tenant":"team-a"}'
+
+# 2) 用户登录（role/tenant 写入 JWT，审计落到具体人）· 自助改密 · 管理面
+curl -X POST $BASE/auth/token -H "Content-Type: application/json" \
+  -d '{"username":"zhangsan","password":"Ops-Team-2026"}'
+curl "$BASE/auth/users?tenant=team-a" -H "Authorization: Bearer $TOKEN"
+curl -X PATCH $BASE/auth/users/zhangsan -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"disabled":true}'
+curl -X POST $BASE/auth/password -H "Authorization: Bearer $ZHANGSAN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"old_password":"Ops-Team-2026","new_password":"Ops-Team-2027"}'
+
+# 3) 执行面：地图亲和调度与 CARLA 进程托管状态（admin）
+curl "$BASE/execution" -H "Authorization: Bearer $TOKEN" | jq '.data | {engines, carla_supervisor}'
+curl -X POST "$BASE/execution/engines/restart?endpoint=127.0.0.1:2000" -H "Authorization: Bearer $TOKEN"
+```
+
+> **用户体系边界**：需 `STATE_ENABLED=true`（无状态库时返回 `503`）；`PLATFORM_USERS_ENABLED=false` 时管理接口整体 `403`。口令策略：长度 ≥ `PLATFORM_MIN_PASSWORD_LENGTH`（默认 10）、同时含字母与数字、不得等于或包含登录名（不分大小写）。内置管理员**不入库**，作为引导账号保留（用户表未命中时回退明文比对，既有脚本不变）；接口不可修改它（`409`），且最后一名可用 admin 不得降级/禁用/删除（`409` 锁死保护）。
+
+> **调度与自愈语义（V2.8.0）**：配置 `EXECUTION_ENGINE_ENDPOINTS` 后，创建实例优先复用**已加载目标地图的空闲引擎**（省一次 `load_world`），其次选未加载过地图的空闲引擎；地图冲突判定从「全局限一地图」下沉为「**同端点互斥**」，因此不同引擎可同时跑不同地图。`GET /execution` 的空闲端点也展示最后已知地图与 `map_affinity_enabled`。进程自愈仅托管**回环端点**（`127.*`/`localhost`/`::1`），远程引擎由其自身编排器负责；`POST /execution/engines/restart` 会重置世界，该端点上的场景需重新装配。
+
+### 4.10 运行形态与容量边界（V2.8.0 P2-17）
+
+**受支持形态：单副本 + 重启恢复**（本文档、compose 与 k8s 清单均按此形态交付与验证）：
+
+| 项 | 口径 |
+|------|------|
+| API 服务副本数 | **1**（`uvicorn --workers 1`；k8s `replicas: 1`） |
+| 状态库 | SQLite（WAL + 单写者）；k8s 形态需 **RWO 卷**（`STATE_ENABLED=true`） |
+| 进程内状态 | IP 令牌桶限流、登录退避计数、JWT 吊销名单、引擎租约与地图记忆、CARLA 进程托管、场景运行器注册表 |
+| 重启恢复 | 实例与场景绑定从 SQLite 恢复（`STATE_RECOVER_INSTANCES` / `STATE_RESTORE_SCENES`），恢复后场景回到 `ready` 可重新启动 |
+| 水平扩展 | **不受支持**：多副本需先把上述状态外置（PostgreSQL/Redis + 引擎注册中心与分布式租约），属长期项 |
+| 多引擎并行 | **受支持**：单服务副本可挂多个 CARLA 引擎端点（`EXECUTION_ENGINE_ENDPOINTS`），引擎级装配锁支撑并行 `load_world` |
+
+> 如需多副本活性，请前置满足：共享状态库、共享限流/吊销名单、租约改为分布式抢占；否则会出现两个副本各自认为拥有同一引擎端点的脑裂情况。`huntersim doctor` 的 `state_store` 与 `users` 检查项会提示当前形态是否具备持久化能力。
+
 ---
 
 ## 5. 配置
@@ -261,14 +326,14 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 | 前缀 | 组 | 关键项（默认值） |
 |------|------|------------------|
 | `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) · **V2.7.0**：`log_json`(false，JSON 行渲染) · `log_file`(空=仅 stdout，非空启用轮转文件) · `log_max_bytes`(10485760) · `log_backup_count`(5) |
-| `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) |
+| `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) · **V2.8.0**：`supervisor_enabled`(false，仅托管回环端点) · `supervisor_binary_path`(空=只观测不自愈) · `supervisor_extra_args` · `supervisor_max_restarts`(3/300s 窗口) · `supervisor_restart_backoff_seconds`(5) · `supervisor_ready_timeout_seconds`(60) · `supervisor_graceful_shutdown_seconds`(10) |
 | `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) · **V2.7.0**：`enable_self_heal`(true) · `rebuild_after_errors`(10) · `dlq_topic`(空=不转发) |
 | `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` · **V2.7.0**：`ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true，环深按窗口×频率推导) |
 | `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) · **V2.6.0**：`rate_limit_enabled`(true) · `rate_limit_per_minute`(1000) · `login_max_failed_attempts`(5) · `login_backoff_base_seconds`(2.0) · `login_backoff_max_seconds`(60) · **V2.7.0**：`jwt_revocation_enabled`(true) · `jwt_refresh_enabled`(true)，均需状态库 |
 | `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
-| `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · **V2.7.0**：`lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120，超时未续租判定僵尸) |
+| `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · **V2.7.0**：`lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120，超时未续租判定僵尸) · **V2.8.0**：同图优先复用空闲引擎（无新开关，自动生效） |
 | `STATE_` | 状态持久化（V2.4.0） | `enabled`(false，compose/K8s 为 true) · `db_path`(data/state/hunter_sim.db) · `recover_instances`(true) · `restore_scenes`(true) · `busy_timeout_seconds`(5.0) · **V2.7.0**：`snapshot_write_interval_seconds`(1.0，同状态落库最小间隔；跃迁必写；0 不节流) |
-| `PLATFORM_` | 平台化（V2.5.0） | `default_tenant`(default) · `max_instances_per_tenant`(20) · `api_keys_enabled`(true) · `audit_enabled`(true) |
+| `PLATFORM_` | 平台化（V2.5.0） | `default_tenant`(default) · `max_instances_per_tenant`(20) · `api_keys_enabled`(true) · `audit_enabled`(true) · **V2.8.0**：`users_enabled`(true，需状态库) · `min_password_length`(10) · `password_hash_iterations`(100000，逐条入库，调高不影响存量用户) |
 | `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) · **V2.6.0**：`upload_queue_max_size`(32，bag 上传后台队列容量，队满丢最旧) |
 | `GUI_` | 桌面客户端 | `theme`(dark) · `default_map`(Town03) · `stream_fps`(30) · `scenario_runner_path`(None) |
 
@@ -282,7 +347,8 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 | 分组 | 方法与路径 |
 |------|-----------|
-| 认证 | `POST /auth/token`（换取 JWT） · `POST /auth/refresh`（V2.7.0，滑动续期+旧 Token 轮换吊销） · `POST /auth/revoke`（V2.7.0，退出登录） · `POST /auth/api-keys`⁺（签发服务账号） · `GET /auth/api-keys`⁺ · `DELETE /auth/api-keys/{key_id}`⁺ |
+| 认证 | `POST /auth/token`（换取 JWT；V2.8.0 先校用户表再回退内置管理员） · `POST /auth/refresh`（V2.7.0，滑动续期+旧 Token 轮换吊销） · `POST /auth/revoke`（V2.7.0，退出登录） · `POST /auth/password`（V2.8.0，自助改密） · `POST /auth/api-keys`⁺（签发服务账号） · `GET /auth/api-keys`⁺ · `DELETE /auth/api-keys/{key_id}`⁺ |
+| 用户管理（V2.8.0） | `POST /auth/users`⁺（创建） · `GET /auth/users`⁺（可按 `tenant`/`include_disabled` 过滤） · `GET /auth/users/{username}`⁺ · `PATCH /auth/users/{username}`⁺（角色/租户/重置口令/禁用） · `DELETE /auth/users/{username}`⁺ |
 | 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /health/performance-targets` · `GET /metrics` |
 | 实例 | `POST /instances`（operator+） · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}`⁺ |
 | 实例子资源 | `GET /instances/{id}/status` · `POST /instances/{id}/scene`（`scene_config` 或 `library_scene_id`） · `POST /instances/{id}/weather` · `POST /instances/{id}/vil/calibrate` · `GET /instances/{id}/screenshot` · `GET /instances/{id}/stream` |
@@ -290,7 +356,7 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch`（operator+） · `GET /scenarios`（任务中心） · `GET /scenarios/{task_id}/report` |
 | 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
-| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器，V2.7.0 含 `stale` 僵尸标志） · `DELETE /execution/leases/{instance_id}`⁺（V2.7.0，强制回收僵尸租约） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
+| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器，V2.7.0 含 `stale` 僵尸标志，V2.8.0 含端点 `map_id` 与 `carla_supervisor` 快照） · `DELETE /execution/leases/{instance_id}`⁺（V2.7.0，强制回收僵尸租约） · `POST /execution/engines/restart?endpoint=`⁺（V2.8.0，手动重启托管进程） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
 | 实时推送 | `WS /ws/sim/{instance_id}/status?token=<JWT>`（握手需令牌，缺失/非法 4401，越权 4403） |
 
 > ⁺ 需 `role=admin`；`POST /instances` 需 `operator` 及以上（admin 天然满足）。完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
@@ -299,17 +365,22 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 > **令牌生命周期与僵尸回收（V2.7.0）**：`POST /auth/refresh` 用有效 Token 换新 Token 并就地吊销旧 Token（轮换），`POST /auth/revoke` 立即吊销当前 Token，均依赖状态库（`STATE_ENABLED=true`）；引擎租约心跳超 `EXECUTION_LEASE_TTL_SECONDS` 未续在 `GET /execution` 标记 `stale=true`，admin 可 `DELETE /execution/leases/{instance_id}` 强制回收；日志携带 `request_id` 贯穿全链路，客户端可传 `X-Request-ID` 复用自定义追踪号。
 
+> **多用户与引擎自愈（V2.8.0）**：`/auth/users*` 仅限 `admin`（无状态库 `503`，`PLATFORM_USERS_ENABLED=false` 则 `403`），对外视图不回显摘要/salt/迭代次数；`POST /auth/password` 需当前有效 Token 并校对旧口令（错误 `401`，内置账号 `409`）。用户表未命中时回退内置管理员，既有凭据与脚本不变；角色/租户写入 JWT，审计可按人回溯。`POST /execution/engines/restart?endpoint=127.0.0.1:2000`（admin）仅对**托管回环端点**生效：未启用托管 `409`、仅观测（未配 `CARLA_SUPERVISOR_BINARY_PATH`）`409`、端点不受管 `404`。
+
 ---
 
 ## 7. 开发与测试
 
 ```bash
-pytest tests -q --cov=hunter_sim --cov-report=term-missing   # 覆盖率门禁 fail_under=80
-flake8 src tests                                               # Lint（配置见 setup.cfg）
-mypy src                                                       # 类型检查 strict 模式
+make test          # 等价于： pytest tests -q（含覆盖率门禁 fail_under=80）
+make coverage      # pytest -q --cov=src/hunter_sim --cov-report=term-missing
+make typecheck     # mypy strict
+make doctor        # 部署预检（V2.8.0）
+flake8 src tests   # Lint（配置见 setup.cfg）
 ```
 
-- **测试**：822 项单元 + 集成测试全绿（较 V2.5.0 的 776 项新增 46 项：`tests/test_rate_limit.py` 令牌桶/429+Retry-After/登录退避集成、`tests/test_metrics.py` 指标导出与路径归一化、`test_execution_plane.py` 引擎级锁并行装配、`test_runtime.py` 启动期预建单锁、`test_cloud_connector.py` 有界队列背压）；行覆盖率 **81.11%**（≥80% 门禁，`pytest --cov` 验证）。
+- **测试**：1008 项单元 + 集成测试全绿（较 V2.7.0 的 867 项新增 141 项：`tests/test_users_router.py` 用户 CRUD/口令策略/锁死保护/自助改密/JWT 声明、`tests/test_carla_supervisor.py` 状态机与重启预算、`tests/test_doctor_cli.py` 11 个预检项与退出码、`tests/test_map_scheduling.py` 地图亲和与双重占用防护）；行覆盖率 **84.3%**（≥80% 门禁，`pytest --cov` 验证）。
+- **类型**：`mypy src`（strict）**113 个源文件无问题**。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 
@@ -321,7 +392,7 @@ mypy src                                                       # 类型检查 st
 |------|------|
 | `README.md` | 项目总览与快速开始（本文件） |
 | [`user_manual.md`](user_manual.md) | API 使用方法、场景/天气/标定示例、错误码 |
-| [`deployment_and_operations.md`](deployment_and_operations.md) | 环境准备、部署、监控、故障排查 |
+| [`deployment_and_operations.md`](deployment_and_operations.md) | 环境准备、部署（含 `huntersim doctor` 预检）、监控、故障排查、受支持部署形态与边界 |
 | [`release.md`](release.md) | 版本发布说明 |
 | `HunterSim.ai-rules.md` | 工程约束与开发规范 |
 

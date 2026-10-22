@@ -208,6 +208,32 @@ class CarlaSettings(BaseSettings):
     substepping: bool = Field(True, description="是否启用 substepping")
     max_substep_delta_time: float = Field(0.01, gt=0.0, le=0.1, description="子步最大时间（秒，设计文档 §3.1.2）")
     max_substeps: int = Field(4, ge=1, le=10, description="最大子步数")
+    # ── V2.8.0 P2-15：本地 CARLA 进程自愈（supervisor）──
+    supervisor_enabled: bool = Field(
+        False,
+        description=(
+            "是否由服务托管本机 CarlaUE4 进程（崩溃自动重启 + 事件写审计）；"
+            "仅对回环地址端点生效，远程引擎不受影响（P2-15）"
+        ),
+    )
+    supervisor_binary_path: str = Field(
+        "", description="CarlaUE4 可执行文件绝对路径（空表示不可自愈，仅观测）"
+    )
+    supervisor_extra_args: str = Field(
+        "", description="CARLA 启动附加参数（空格分隔，如 -quality-level=Low -RenderOffScreen）"
+    )
+    supervisor_max_restarts: int = Field(
+        3, ge=0, le=20, description="单个巡检窗口内允许的最大自动重启次数（P2-15）"
+    )
+    supervisor_restart_backoff_seconds: float = Field(
+        5.0, ge=0.0, le=600.0, description="两次自动重启之间的退避时长（秒）"
+    )
+    supervisor_ready_timeout_seconds: float = Field(
+        60.0, gt=0.0, le=600.0, description="拉起后等待 RPC 端口就绪的超时（秒）"
+    )
+    supervisor_graceful_shutdown_seconds: float = Field(
+        10.0, gt=0.0, le=120.0, description="关停时等待进程优雅退出的时长（秒）"
+    )
 
 
 class KafkaSettings(BaseSettings):
@@ -407,6 +433,23 @@ class PlatformSettings(BaseSettings):
     max_instances_per_tenant: int = Field(20, ge=1, description="单租户最大并发实例数")
     api_keys_enabled: bool = Field(True, description="是否启用服务账号 API Key 认证")
     audit_enabled: bool = Field(True, description="是否将审计事件落库并可查询")
+    # ── V2.8.0 P2-13：多用户体系（需 STATE_ENABLED=true，否则仅内置管理员）──
+    users_enabled: bool = Field(
+        True,
+        description=(
+            "是否启用用户表登录（POST /auth/token 先查用户表，未命中回退内置管理员）；"
+            "需状态库，关闭后仅保留内置账号与 API Key（P2-13）"
+        ),
+    )
+    min_password_length: int = Field(
+        10, ge=6, le=128, description="用户口令最小长度（创建/改密校验，P2-13）"
+    )
+    password_hash_iterations: int = Field(
+        100_000,
+        ge=1_000,
+        le=2_000_000,
+        description="PBKDF2-HMAC-SHA256 迭代次数（慢哈希抗暴破；调低仅用于测试，P2-13）",
+    )
 
 
 class CloudSettings(BaseSettings):
