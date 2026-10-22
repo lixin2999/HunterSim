@@ -64,11 +64,14 @@ async def health_check(request: Request) -> ApiResponse:
     status = "healthy" if carla_connected else "degraded"
     payload = HealthResponse(
         status=status,
+        version=request.app.version,
         uptime_seconds=round(time.time() - _START_TIME, 1),
         carla_connected=carla_connected,
         carla_sdk_installed=carla_sdk_installed,
         carla_probe_error=carla_probe_error,
         active_instances=active_instances,
+        state_persistence=getattr(request.app.state, "state_store", None) is not None,
+        restored_instances=int(getattr(request.app.state, "restored_instance_count", 0)),
     )
     return ApiResponse(data=payload.model_dump())
 

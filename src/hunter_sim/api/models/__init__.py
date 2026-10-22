@@ -254,12 +254,14 @@ class HealthResponse(BaseModel):
     """健康检查响应体。"""
 
     status: str = Field(..., description="healthy / degraded / unhealthy")
-    version: str = "2.1.2"
+    version: str = ""
     uptime_seconds: float = 0.0
     carla_connected: bool = False
     carla_sdk_installed: bool = Field(False, description="服务解释器是否可导入 carla SDK")
     carla_probe_error: str | None = Field(None, description="最近一次探测失败原因（target + 异常摘要）")
     active_instances: int = 0
+    state_persistence: bool = Field(False, description="状态持久化是否启用（V2.4.0）")
+    restored_instances: int = Field(0, description="启动时从持久化恢复的实例数")
 
 
 # ─── 认证 ─────────────────────────────────────────────────────────────────────

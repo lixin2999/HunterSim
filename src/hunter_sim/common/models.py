@@ -292,6 +292,50 @@ class ResourceSettings(BaseSettings):
     )
 
 
+class ExecutionSettings(BaseSettings):
+    """执行面配置（V2.4.0：执行面分离）。
+
+    一个仿真实例绑定一个 CARLA 引擎端点；通过 ``engine_endpoints`` 显式声明
+    可用引擎库存后，实例创建时独占分配端点，未占用端点可并行运行场景。
+    留空时退化为单引擎（``CarlaSettings.host:rpc_port``），同一时刻仍只允许
+    一个场景运行器（V2.3.0 兼容行为）。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="EXECUTION_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    engine_endpoints: str = Field(
+        "",
+        description=(
+            "CARLA 引擎端点清单，逗号分隔 host:rpc[:stream[:tm]]；"
+            "留空表示单引擎（取 CARLA_HOST/CARLA_RPC_PORT）"
+        ),
+    )
+    max_engines: int = Field(8, ge=1, le=64, description="端点清单最大解析数量（防止误配置超量）")
+    restore_scene_on_assemble: bool = Field(
+        True, description="重新装配运行器时自动恢复已持久化的场景定义（重启恢复）"
+    )
+
+
+class StateSettings(BaseSettings):
+    """状态持久化配置（V2.4.0：实例与场景绑定落 SQLite）。
+
+    默认关闭，避免源码直跑/单测产生本地文件；部署编排（compose/.env.example）
+    默认开启。开启后实例创建/状态流转/销毁与场景下发均同步落盘，服务重启可恢复。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="STATE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = Field(False, description="是否启用状态持久化")
+    db_path: str = Field("data/state/hunter_sim.db", description="SQLite 数据库路径")
+    recover_instances: bool = Field(True, description="启动时恢复未终态实例")
+    restore_scenes: bool = Field(True, description="启动后按需恢复已持久化的场景定义")
+    busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时（秒）")
+
+
 class CloudSettings(BaseSettings):
     """HunterCore 数据采集分析平台接入配置（V2.2.0）。
 
@@ -368,6 +412,8 @@ class HunterSimSettings(BaseSettings):
     vil: VILSettings = Field(default_factory=VILSettings)
     api: APISettings = Field(default_factory=APISettings)
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    state: StateSettings = Field(default_factory=StateSettings)
     cloud: CloudSettings = Field(default_factory=CloudSettings)
     gui: GuiSettings = Field(default_factory=GuiSettings)
 

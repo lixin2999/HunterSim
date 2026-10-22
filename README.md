@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.3.0`（V2.3.0 为**阶段一「可用性止血」**：打通 REST 场景闭环——获取 Token → 创建实例 → 下发场景（真实加载地图/生成自车）→ 启动 → 查询进度 → 停止/销毁，`docker compose up` 后可直接跑起一个场景；同时补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK，详见 [`release.md`](release.md)）。上一个修复版本 `2.2.2` 修复桌面客户端启动崩溃；功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
+- **当前版本**：`2.4.0`（V2.4.0 为**阶段二「执行面分离与状态持久化」**：控制面与执行面解耦——新增引擎端点库存 `EXECUTION_ENGINE_ENDPOINTS` 与独占租约，多 CARLA 引擎可并行承载多实例场景；实例与场景绑定落 SQLite（WAL），服务重启后实例仍可查询、非终态实例回 `created`/`ready` 且场景定义在下次装配时自动恢复；新增 `GET /api/v1/sim/execution` 观测端点，详见 [`release.md`](release.md)）。上一版本 `2.3.0` 为**阶段一「可用性止血」**：打通 REST 场景闭环——获取 Token → 创建实例 → 下发场景（真实加载地图/生成自车）→ 启动 → 查询进度 → 停止/销毁，`docker compose up` 后可直接跑起一个场景；同时补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -18,6 +18,8 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 数据录制与回放 | mcap/自定义容器录制，数字孪生回放，支持变速与跳帧 |
 | 场景评估 | 轨迹、舒适性、安全性、覆盖率四维评分（S/A/B/C/D），支持批量场景测试与汇总报告 |
 | 资源编排 | GPU 资源池 + 实例生命周期管理，按画质限制单 GPU 并发；单用户/全局并发配额与实例守护（崩溃重试、超时回收） |
+| 执行面分离（V2.4.0） | 引擎端点库存（`EXECUTION_ENGINE_ENDPOINTS`）按实例独占租约，多 CARLA 引擎可并行跑多场景；`GET /execution` 观测引擎占用、租约与运行器 |
+| 状态持久化（V2.4.0） | 实例与场景绑定落 SQLite（WAL），服务重启后实例可查询、场景定义在装配时自动恢复；`/health` 与 `/execution` 暴露持久化开关与恢复计数 |
 | 安全治理 | JWT 角色分级（创建/销毁实例与地图上传需 admin）、车辆模型白名单、场景安全审核、地图上传审核（含路径穿越双重校验）、审计日志 |
 
 ---
@@ -29,16 +31,20 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 │  接口层  api/  —— FastAPI 应用、路由、中间件、统一响应/异常      │
 │    health · instances · scenes · resources · websocket        │
 ├─────────────────────────────────────────────────────────────┤
+│  执行面  execution/ —— 引擎端点库存与独占租约（V2.4.0）          │
+│    engine_pool（端点解析/租约） · plane（装配/释放/快照）        │
+├─────────────────────────────────────────────────────────────┤
 │  服务层  —— 业务编排（无 CARLA/ROS2 直接依赖，可单测）           │
 │    scene_runner  ·  vil_mapper  ·  sensor_sim  ·  traffic_sim  │
 │    replay_service ·  eval_service ·  resource_manager          │
 ├─────────────────────────────────────────────────────────────┤
 │  引擎层  engine/ —— CARLA 原子能力封装（依赖 carla 模块）        │
 │    map_manager · weather_manager · hunter_se_vehicle ·          │
-│    vehicle_blueprint_generator · coordinate_converter ·         │
+│    vehicle_blueprint_generator · coordinate_converter ·        │
 │    opendrive_parser · vehicle_controller · carla_server_config  │
 ├─────────────────────────────────────────────────────────────┤
 │  公共层  common/ —— 配置模型、领域数据类、异常、日志工具          │
+│  持久化  persistence/ —— SQLite 实例表 + 场景绑定快照（V2.4.0）  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,8 +57,10 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 ```
 HunterSim/
 ├── src/hunter_sim/          # 主包（见下方模块职责）
-│   ├── api/                 # 接口层：main, deps, error_handlers, middleware, models, routers
+│   ├── api/                 # 接口层：main, runtime, deps, error_handlers, middleware, models, routers
 │   ├── common/              # 公共层：models, exceptions, utils
+│   ├── execution/           # 执行面：engine_pool（端点库存/租约）, plane（装配/释放/快照）
+│   ├── persistence/         # 状态持久化：state_store（SQLite 实例表 + 场景绑定）
 │   ├── engine/              # 引擎层：CARLA 原子能力 + 环境检查 + 服务端配置
 │   ├── scene_runner/        # 场景加载、校验、状态机、事件检测、自定义场景
 │   ├── vil_mapper/          # 遥测缓冲、位姿外推、坐标标定、虚实同步
@@ -109,6 +117,10 @@ set API_JWT_SECRET=your-strong-secret         # Windows CMD
 
 # 启动 API 服务
 uvicorn hunter_sim.api.main:app --host 0.0.0.0 --port 8080
+
+# （可选）启用状态持久化：实例与场景绑定落 SQLite，重启后自动恢复
+set STATE_ENABLED=true
+set STATE_DB_PATH=data/state/hunter_sim.db
 ```
 
 启动后访问交互式文档：<http://localhost:8080/api/v1/sim/docs>
@@ -131,7 +143,9 @@ cp .env.example .env                              # Windows: copy .env.example .
 docker compose -f docker/docker-compose.yml up -d --build
 
 # Linux + NVIDIA GPU 主机可额外启用容器化 CARLA 引擎（profile，需 NVIDIA Container Toolkit）
-docker compose -f docker/docker-compose.yml --profile carla up -d
+# 同时拉起 carla-engine(:2000) 与 carla-engine-2(:2100) 双引擎并行
+EXECUTION_ENGINE_ENDPOINTS=carla-engine:2000,carla-engine-2:2000 \
+  docker compose -f docker/docker-compose.yml --profile carla up -d
 
 # Kubernetes（需 NVIDIA GPU Operator；含 sim-service + carla-engine GPU Pod + 共享 PVC）
 kubectl apply -f k8s/
@@ -174,7 +188,7 @@ set HUNTER_CORE_JWT_TOKEN=<data-collector Bearer JWT>
 
 未配置凭据（`enabled=false`）时连接器整体降级为 no-op，不影响本地仿真。详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
 
-### 4.7 REST 场景闭环（V2.3.0）
+### 4.7 REST 场景闭环（V2.3.0 引入，V2.4.0 端点独占）
 
 `docker compose up -d` + 宿主机 CARLA 就绪后，最小闭环只需 5 个请求（`BASE=http://localhost:8080/api/v1/sim`）：
 
@@ -200,7 +214,7 @@ curl -X POST $BASE/instances/<INSTANCE_ID>/stop -H "Authorization: Bearer $TOKEN
 curl -X DELETE $BASE/instances/<INSTANCE_ID> -H "Authorization: Bearer $TOKEN"
 ```
 
-> 单引擎单场景：同一个 CARLA server 同时只能有一个实例持有场景运行器，第二个实例下发场景返回 503；CARLA 未就绪时下发场景返回 503（`/health` 的 `carla_probe_error` 给出原因），`start` 仍返回 200 但 `scene_runner=unavailable`。Windows 用户可把 `curl` 换成 PowerShell `Invoke-RestMethod`，完整示例见 [`user_manual.md`](user_manual.md)。
+> **端点独占（V2.4.0）**：配置 `EXECUTION_ENGINE_ENDPOINTS` 后每个实例独占一个引擎端点，可并行运行；未配置时所有实例共享 `CARLA_HOST:CARLA_RPC_PORT` 单引擎，同一时刻仅一个实例能持有场景运行器，第二个实例下发场景返回 `503`（`GET /execution` 可查看占用）。CARLA 未就绪时下发场景返回 `503`（`/health` 的 `carla_probe_error` 给出原因），`start` 仍返回 200 但 `scene_runner=unavailable`。Windows 用户可把 `curl` 换成 PowerShell `Invoke-RestMethod`，完整示例见 [`user_manual.md`](user_manual.md)。
 
 ---
 
@@ -216,6 +230,8 @@ curl -X DELETE $BASE/instances/<INSTANCE_ID> -H "Authorization: Bearer $TOKEN"
 | `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
 | `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) |
 | `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
+| `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) |
+| `STATE_` | 状态持久化（V2.4.0） | `enabled`(false，compose/K8s 为 true) · `db_path`(data/state/hunter_sim.db) · `recover_instances`(true) · `restore_scenes`(true) · `busy_timeout_seconds`(5.0) |
 | `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) |
 | `GUI_` | 桌面客户端 | `theme`(dark) · `default_map`(Town03) · `stream_fps`(30) · `scenario_runner_path`(None) |
 
@@ -236,6 +252,7 @@ curl -X DELETE $BASE/instances/<INSTANCE_ID> -H "Authorization: Bearer $TOKEN"
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch` · `GET /scenarios/{task_id}/report` |
 | 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
+| 执行面（V2.4.0） | `GET /execution`⁺（引擎库存/独占租约/运行器/持久化与恢复计数） |
 | 实时推送 | `WS /ws/sim/{instance_id}/status?token=<JWT>`（握手需令牌，缺失/非法 4401，越权 4403） |
 
 完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
@@ -250,7 +267,7 @@ flake8 src tests                                               # Lint（配置�
 mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：675 项单元 + 集成测试全绿（较 V2.2.2 新增 33 项：内置场景、自车蓝图回退、运行时装配、认证与生产闸门、WebSocket 鉴权、场景下发归属）；行覆盖率维持 ≥80 门禁（本机以 `pytest -q` 回归验证）。
+- **测试**：749 项单元 + 集成测试全绿（较 V2.3.0 的 675 项新增 74 项：引擎端点解析与租约、执行面装配/释放/快照、SQLite 状态存储、重启恢复、`/execution` 鉴权与恢复场景）；行覆盖率维持 ≥80 门禁（本机以 `pytest -q` 回归验证）。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

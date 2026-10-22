@@ -1,7 +1,7 @@
-"""场景运行时装配测试（V2.3.0）。
+"""场景运行时装配测试（V2.4.0）。
 
-覆盖 api/runtime.py 的按需装配、单引擎占用约束、释放与实例归属校验，
-不依赖真实 CARLA server（MapManager/CARLA Client 均为桩）。
+覆盖 api/runtime.py 的按需装配、引擎占用约束、释放、实例归属校验，
+以及场景持久化快照与重启后的运行器恢复；不依赖真实 CARLA server。
 """
 
 from __future__ import annotations
@@ -16,9 +16,13 @@ from starlette.requests import Request
 from hunter_sim.api.runtime import (
     InstanceNotFound,
     SceneRuntimeUnavailable,
+    _restore_persisted_scene,
     assert_instance_access,
+    describe_execution,
     ensure_scene_runner,
     get_scene_runner,
+    persist_scene,
+    persisted_scene_state,
     release_all_scene_runners,
     release_scene_runner,
 )
@@ -77,6 +81,15 @@ def _make_app(
             carla_client=object() if with_carla else None,
             map_manager=map_manager if with_carla else None,
             carla_probe_error=None if with_carla else "Connection refused",
+            # 执行面配置：端点与实例一致（localhost:2000），与单引擎部署语义一致
+            settings=SimpleNamespace(
+                carla=SimpleNamespace(host="localhost", rpc_port=2000, stream_port=2001),
+                execution=SimpleNamespace(
+                    engine_endpoints="",
+                    max_engines=8,
+                    restore_scene_on_assemble=True,
+                ),
+            ),
         )
     )
     return app, instance, manager, map_manager
@@ -129,12 +142,15 @@ class TestEnsureSceneRunner:
         app, _, _, _ = _make_app()
         first = ensure_scene_runner(app, "inst-1")
 
-        # 新实例（同地图）也不允许共享同一引擎
+        # 新实例（同引擎同地图）也不允许共享同一引擎
         other = SimpleNamespace(
             sim_instance_id="inst-2",
             map_id="Town03",
             status=InstanceStatus.CREATED,
             user_id="user-2",
+            carla_host="localhost",
+            carla_rpc_port=2000,
+            carla_stream_port=2001,
         )
         original_get = app.state.instance_manager.get_instance
         app.state.instance_manager.get_instance = lambda iid: other if iid == "inst-2" else original_get(iid)
@@ -212,3 +228,155 @@ class TestInstanceAccess:
         app, _, _, _ = _make_app()
         request = _make_request(app, user_id="user-1")
         assert assert_instance_access(request, "ghost", "user-1", require_exists=False) is None
+
+
+class _StubSceneRunner:
+    """运行器桩：仅覆盖持久化恢复所需接口。"""
+
+    def __init__(self, has_scene: bool = False, fail: bool = False) -> None:
+        self.has_scene = has_scene
+        self.fail = fail
+        self.loaded: list[Any] = []
+
+    def load_scene(self, config: Any) -> None:
+        if self.fail:
+            raise RuntimeError("restore failed")
+        self.loaded.append(config)
+
+
+def _scene_config() -> Any:
+    from hunter_sim.scene_runner.scene_config import SceneConfig
+
+    return SceneConfig(
+        scene_id="scene-1",
+        map_id="Town03",
+        ego_vehicle={"spawn_point": {"x": 1.0, "y": 2.0}},
+    )
+
+
+def _app_with_store(tmp_path: Any) -> Any:
+    from hunter_sim.persistence.state_store import StateStore
+
+    app, _, _, _ = _make_app()
+    app.state.state_store = StateStore(str(tmp_path / "state.db"))
+    return app
+
+
+class TestScenePersistence:
+    """场景定义与快照持久化（V2.4.0 重启恢复）。"""
+
+    def test_persist_then_read_snapshot(self, tmp_path: Any) -> None:
+        app = _app_with_store(tmp_path)
+
+        persist_scene(app, "inst-1", _scene_config())
+        snapshot = persisted_scene_state(app, "inst-1")
+
+        assert snapshot is not None
+        assert snapshot["scene_id"] == "scene-1"
+        assert snapshot["status"] == "ready"
+        assert snapshot["detached"] is True
+        app.state.state_store.close()
+
+    def test_persist_without_store_is_noop(self) -> None:
+        app, _, _, _ = _make_app()
+        persist_scene(app, "inst-1", _scene_config())
+        assert persisted_scene_state(app, "inst-1") is None
+
+    def test_restore_loads_scene_when_runner_has_none(self, tmp_path: Any) -> None:
+        app = _app_with_store(tmp_path)
+        persist_scene(app, "inst-1", _scene_config())
+        runner = _StubSceneRunner(has_scene=False)
+
+        _restore_persisted_scene(app, "inst-1", runner)
+
+        assert len(runner.loaded) == 1
+        assert runner.loaded[0].scene_id == "scene-1"
+        app.state.state_store.close()
+
+    def test_restore_skipped_when_runner_already_has_scene(self, tmp_path: Any) -> None:
+        app = _app_with_store(tmp_path)
+        persist_scene(app, "inst-1", _scene_config())
+        runner = _StubSceneRunner(has_scene=True)
+
+        _restore_persisted_scene(app, "inst-1", runner)
+
+        assert runner.loaded == []
+        app.state.state_store.close()
+
+    def test_restore_skipped_when_disabled(self, tmp_path: Any) -> None:
+        app = _app_with_store(tmp_path)
+        app.state.settings = SimpleNamespace(
+            execution=SimpleNamespace(restore_scene_on_assemble=False)
+        )
+        persist_scene(app, "inst-1", _scene_config())
+        runner = _StubSceneRunner(has_scene=False)
+
+        _restore_persisted_scene(app, "inst-1", runner)
+
+        assert runner.loaded == []
+        app.state.state_store.close()
+
+    def test_restore_failure_is_non_fatal(self, tmp_path: Any) -> None:
+        app = _app_with_store(tmp_path)
+        persist_scene(app, "inst-1", _scene_config())
+        runner = _StubSceneRunner(has_scene=False, fail=True)
+
+        _restore_persisted_scene(app, "inst-1", runner)  # 不应抛异常
+
+        app.state.state_store.close()
+
+    def test_state_callback_updates_snapshot(self, tmp_path: Any) -> None:
+        from hunter_sim.api.runtime import _scene_state_callback
+        from hunter_sim.common.models import SceneStatus
+
+        app = _app_with_store(tmp_path)
+        persist_scene(app, "inst-1", _scene_config())
+        callback = _scene_state_callback(app, "inst-1")
+
+        callback(
+            SimpleNamespace(
+                status=SceneStatus.RUNNING,
+                progress=0.75,
+                elapsed_seconds=12.5,
+                error_message="",
+            )
+        )
+
+        snapshot = persisted_scene_state(app, "inst-1")
+        assert snapshot is not None
+        assert snapshot["status"] == "running"
+        assert snapshot["progress"] == 0.75
+        assert snapshot["elapsed_seconds"] == 12.5
+        app.state.state_store.close()
+
+
+class TestDescribeExecution:
+    def test_without_plane_uses_declared_endpoints(self) -> None:
+        from hunter_sim.common.models import ExecutionSettings, HunterSimSettings
+
+        app, _, _, _ = _make_app()
+        app.state.settings = HunterSimSettings(
+            execution=ExecutionSettings(engine_endpoints="10.0.0.1:2000,10.0.0.2:2100")
+        )
+
+        payload = describe_execution(app)
+
+        assert payload["capacity"] == 2
+        assert {e["key"] for e in payload["engines"]} == {
+            "10.0.0.1:2000",
+            "10.0.0.2:2100",
+        }
+        assert payload["active_leases"] == 0
+        assert payload["persistence"]["enabled"] is False
+
+    def test_with_plane_reports_leases(self) -> None:
+        app, _, _, _ = _make_app()
+        ensure_scene_runner(app, "inst-1")
+
+        payload = describe_execution(app)
+
+        assert payload["active_leases"] == 1
+        assert payload["engines"][0]["holder"] == "inst-1"
+        assert payload["runners"] == [
+            {"instance_id": "inst-1", "engine": "localhost:2000"}
+        ]

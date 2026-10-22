@@ -20,11 +20,22 @@ from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
 from hunter_sim.api.middleware.logging import RequestLogMiddleware
-from hunter_sim.api.routers import auth, health, instances, resources, scenarios, scenes, websocket
+from hunter_sim.api.routers import (
+    auth,
+    execution,
+    health,
+    instances,
+    resources,
+    scenarios,
+    scenes,
+    websocket,
+)
 from hunter_sim.api.runtime import release_all_scene_runners, release_scene_runner
 from hunter_sim.common.models import HunterSimSettings, InstanceStatus, SceneStatus
 from hunter_sim.common.utils import get_logger, set_default_log_level
 from hunter_sim.engine.map_manager import MapManager
+from hunter_sim.execution.engine_pool import parse_engine_endpoints
+from hunter_sim.persistence.state_store import StateStore
 from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
 from hunter_sim.resource_manager.health_monitor import InstanceHealthMonitor, ResourceQuotaManager
 from hunter_sim.resource_manager.instance_manager import SimInstanceManager
@@ -178,6 +189,8 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
         由 lifespan 在关停时负责 stop()。
     """
     state = app.state
+    # 执行面/持久化配置供 runtime 惰性装配读取
+    state.settings = settings
 
     # 诊断字段默认值（only-if-absent，不覆盖测试/外部注入）
     for attr, default in (
@@ -193,13 +206,39 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
     if getattr(state, "gpu_pool", None) is None:
         state.gpu_pool = GPUResourcePool()
 
+    # 状态持久化（V2.4.0）：实例表与场景绑定落 SQLite；失败降级为内存态
+    if getattr(state, "state_store", None) is None and settings.state.enabled:
+        try:
+            state.state_store = StateStore(
+                settings.state.db_path, settings.state.busy_timeout_seconds
+            )
+            state.state_store.normalize_scene_statuses()
+        except Exception as exc:  # noqa: BLE001  存储不可用时服务仍可启动
+            state.state_store = None
+            logger.error(f"State persistence disabled (init failed): {exc}")
+
     if getattr(state, "instance_manager", None) is None:
+        endpoints = parse_engine_endpoints(
+            settings.execution.engine_endpoints,
+            settings.carla,
+            settings.execution.max_engines,
+        )
+        state.execution_endpoints = endpoints
         state.instance_manager = SimInstanceManager(
             settings=settings.resource,
             gpu_pool=getattr(state, "gpu_pool", None),
             quota_manager=getattr(state, "quota_manager", None),
             carla=settings.carla,
+            engine_endpoints=endpoints,
+            state_store=getattr(state, "state_store", None),
         )
+        if settings.state.recover_instances:
+            restored = state.instance_manager.restore()
+            state.restored_instance_count = restored
+            if restored:
+                logger.info(
+                    f"Recovered {restored} instance(s) from {settings.state.db_path}"
+                )
 
     if getattr(state, "scene_runners", None) is None:
         state.scene_runners = {}
@@ -317,6 +356,13 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
                 logger.info(f"Released {released} scene runtime(s) on shutdown")
             if monitor is not None:
                 monitor.stop()
+            # 先释放执行面/停监控，再关闭持久化连接
+            store = getattr(app.state, "state_store", None)
+            if store is not None:
+                try:
+                    store.close()
+                except Exception as exc:  # noqa: BLE001  关闭失败不影响退出
+                    logger.warning(f"State store close failed: {exc}")
             logger.info("HunterSim API shutting down")
 
     app = FastAPI(
@@ -360,6 +406,7 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     app.include_router(instances.router, prefix=f"{api_prefix}/instances", tags=["instances"])
     app.include_router(scenes.router, prefix=f"{api_prefix}/scenes", tags=["scenes"])
     app.include_router(scenarios.router, prefix=f"{api_prefix}/scenarios", tags=["scenarios"])
+    app.include_router(execution.router, prefix=api_prefix, tags=["execution"])
     app.include_router(resources.router, prefix=api_prefix, tags=["resources"])
     app.include_router(websocket.router, prefix=api_prefix, tags=["websocket"])
 

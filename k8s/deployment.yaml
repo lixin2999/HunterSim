@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.3.0
+          image: hunter-sim:2.4.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -72,6 +72,30 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: cors_allow_origins
+            # 执行面（V2.4.0）：端点库存决定可并行实例数，端点耗尽时创建返回 503
+            - name: EXECUTION_ENGINE_ENDPOINTS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: execution_engine_endpoints
+            - name: EXECUTION_MAX_ENGINES
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: execution_max_engines
+            - name: EXECUTION_RESTORE_SCENE_ON_ASSEMBLE
+              value: "true"
+            # 状态持久化（V2.4.0）：实例/场景绑定落 SQLite，Pod 重建后恢复
+            - name: STATE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: state_enabled
+            - name: STATE_DB_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: state_db_path
           resources:
             requests:
               memory: "512Mi"
@@ -102,6 +126,9 @@ spec:
             # 共享存储 PVC（设计文档 §15.1：地图资源/车辆模型/场景配置/仿真记录）
             - name: shared-resources
               mountPath: /home/hunter/app/resources
+            # 状态持久化（V2.4.0）：SQLite 需独占块存储，不使用 NFS/RWX（WAL 锁不可靠）
+            - name: state-data
+              mountPath: /home/hunter/app/data/state
       volumes:
         - name: configs
           configMap:
@@ -109,6 +136,9 @@ spec:
         - name: shared-resources
           persistentVolumeClaim:
             claimName: hunter-sim-resources-pvc
+        - name: state-data
+          persistentVolumeClaim:
+            claimName: hunter-sim-state-pvc
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 ---
@@ -129,12 +159,29 @@ spec:
     requests:
       storage: 500Gi  # §15.2 推荐存储配置
 ---
+# 状态持久化卷（V2.4.0）：实例与场景绑定 SQLite。
+# 必须 ReadWriteOnce（块存储/本地盘）；NFS 等 RWX 上的 SQLite WAL 锁不可靠，
+# 多副本同时挂载也会损坏数据库，因此保持 sim-service replicas=1。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hunter-sim-state-pvc
+  namespace: hunter-sim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # 留空回落集群默认 StorageClass；生产建议指定本地 SSD/云盘类
+  resources:
+    requests:
+      storage: 10Gi
+---
 # CARLA 仿真引擎 GPU Pod（设计文档 §15.1/§10.2.3）
 # 需要 NVIDIA GPU Operator / Container Toolkit；每 Pod 分配 1 块 GPU，
 # 单 GPU 可承载 1-2 个实例（§10.3.2 并发限制由应用层 GPU 资源池调度）
-# 审查项 S：固定 RPC/流端口 2000/2001 + 应用层单端点假设（CARLA_HOST 单一），
-# Deployment 多副本会导致负载均衡到错误引擎且 load_world 互相重置。
-# 扩容需改 StatefulSet + per-Pod Service（配合应用层实例端口递增分配，见 instance_manager）。
+# V2.4.0：应用层已支持多引擎端点库存（EXECUTION_ENGINE_ENDPOINTS）。
+# 扩容时建议改为 StatefulSet（稳定 DNS：carla-engine-0.carla-engine-headless）+ Headless Service，
+# 并将每个 Pod 的 host:rpc 写入 EXECUTION_ENGINE_ENDPOINTS；仍禁止用普通 Deployment
+# 多副本 + 单一 ClusterIP，否则 load_world 会互相重置且请求会落到错误引擎。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -144,7 +191,7 @@ metadata:
     app: hunter-sim
     component: carla-engine
 spec:
-  replicas: 1   # 审查项 S：单副本——多引擎扩容见上方注释（StatefulSet 方案）
+  replicas: 1   # 扩容需改 StatefulSet + Headless Service，并同步 EXECUTION_ENGINE_ENDPOINTS
   selector:
     matchLabels:
       app: hunter-sim

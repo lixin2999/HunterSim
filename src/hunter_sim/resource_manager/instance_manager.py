@@ -25,6 +25,10 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
+# 重启恢复时执行面已丢失：运行中/加载中的实例退回到可重新装配的状态
+_RECOVERABLE_LOADING = (InstanceStatus.LOADING,)
+_RECOVERABLE_RUNNING = (InstanceStatus.RUNNING, InstanceStatus.PAUSED)
+
 # 合法状态转换
 _TRANSITIONS: dict[InstanceStatus, set[InstanceStatus]] = {
     InstanceStatus.CREATED:   {InstanceStatus.LOADING, InstanceStatus.DESTROYED},
@@ -87,6 +91,8 @@ class SimInstance:
     max_lifetime_s: float = 7200.0
     retry_count: int = 0
     error_message: str = ""
+    restored: bool = False
+    """是否由启动恢复流程从持久化存储重建（执行面需重新装配）。"""
 
     def is_expired(self) -> bool:
         """检查实例是否超过最大运行时间。"""
@@ -120,7 +126,86 @@ class SimInstance:
             "start_time": _iso(self.start_time),
             "gpu_id": self.gpu_id,
             "resources": dict(self.resource_limits),
+            "restored": self.restored,
         }
+
+    def to_record(self) -> dict[str, Any]:
+        """序列化为持久化记录（与 ``from_record`` 配对，枚举存字符串）。"""
+        return {
+            "sim_instance_id": self.sim_instance_id,
+            "status": self.status.value,
+            "mode": self.mode.value,
+            "map_id": self.map_id,
+            "quality": self.quality.value,
+            "gpu_id": self.gpu_id,
+            "carla_host": self.carla_host,
+            "carla_rpc_port": self.carla_rpc_port,
+            "carla_stream_port": self.carla_stream_port,
+            "scene_id": self.scene_id,
+            "vehicle_id": self.vehicle_id,
+            "vehicle_model": self.vehicle_model,
+            "replay_config": dict(self.replay_config),
+            "user_id": self.user_id,
+            "create_time": self.create_time,
+            "start_time": self.start_time,
+            "docker_container_id": self.docker_container_id,
+            "resource_limits": dict(self.resource_limits),
+            "max_lifetime_s": self.max_lifetime_s,
+            "retry_count": self.retry_count,
+            "error_message": self.error_message,
+            "restored": self.restored,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "SimInstance":
+        """从持久化记录重建实例（字段缺失/枚举非法时回退默认值）。"""
+
+        def _status() -> InstanceStatus:
+            try:
+                status = InstanceStatus(record.get("status", "created"))
+            except ValueError:
+                return InstanceStatus.CREATED
+            # 执行面不跨进程存活：LOADING → CREATED；RUNNING/PAUSED → READY
+            if status in _RECOVERABLE_LOADING:
+                return InstanceStatus.CREATED
+            if status in _RECOVERABLE_RUNNING:
+                return InstanceStatus.READY
+            return status
+
+        try:
+            mode = SimMode(record.get("mode", "sil"))
+        except ValueError:
+            mode = SimMode.SIL
+        try:
+            quality = QualityLevel(record.get("quality", "medium"))
+        except ValueError:
+            quality = QualityLevel.MEDIUM
+
+        return cls(
+            sim_instance_id=str(record["sim_instance_id"]),
+            status=_status(),
+            mode=mode,
+            map_id=str(record.get("map_id", "Town03")),
+            quality=quality,
+            # GPU 资源池不持久化，重建实例不持有旧 GPU 名额
+            gpu_id=-1,
+            carla_host=str(record.get("carla_host", "127.0.0.1")),
+            carla_rpc_port=int(record.get("carla_rpc_port", 2000)),
+            carla_stream_port=int(record.get("carla_stream_port", 2001)),
+            scene_id=str(record.get("scene_id", "")),
+            vehicle_id=str(record.get("vehicle_id", "")),
+            vehicle_model=str(record.get("vehicle_model", "hunter.se")),
+            replay_config=dict(record.get("replay_config") or {}),
+            user_id=str(record.get("user_id", "")),
+            create_time=float(record.get("create_time") or time.time()),
+            start_time=0.0,
+            docker_container_id=str(record.get("docker_container_id", "")),
+            resource_limits=dict(record.get("resource_limits") or {}),
+            max_lifetime_s=float(record.get("max_lifetime_s") or 7200.0),
+            retry_count=int(record.get("retry_count", 0)),
+            error_message=str(record.get("error_message", "")),
+            restored=True,
+        )
 
 
 class SimInstanceManager:
@@ -131,8 +216,12 @@ class SimInstanceManager:
         gpu_pool: GPU 资源池实例。
         quota_manager: 用户配额管理器（可选）。注入后配额释放在
             destroy_instance() 内统一收敛，覆盖 API 销毁与超时自动回收两条路径（§14.2）。
-        carla: CARLA 连接配置（可选）。提供实例地址与基准端口，
-            多实例按步长递增分配独立端口对（审查项 N）。
+        carla: CARLA 连接配置（可选）。提供实例地址与基准端口；
+            未声明引擎库存时，所有实例共享该单引擎端点（V2.4.0）。
+        engine_endpoints: 引擎端点库存（可选）。提供后实例创建时独占分配
+            一个未占用端点，支持多引擎并行；耗尽时抛 ResourceError。
+        state_store: 状态持久化存储（可选）。提供后实例创建/流转/销毁同步落盘，
+            可通过 restore() 在服务重启后重建实例表。
     """
 
     def __init__(
@@ -141,11 +230,15 @@ class SimInstanceManager:
         gpu_pool: Optional[Any] = None,
         quota_manager: Optional[Any] = None,
         carla: Optional[CarlaSettings] = None,
+        engine_endpoints: Optional[list[Any]] = None,
+        state_store: Optional[Any] = None,
     ) -> None:
         self._settings = settings or ResourceSettings()
         self._gpu_pool = gpu_pool
         self._quota_manager = quota_manager
         self._carla = carla or CarlaSettings()
+        self._engine_endpoints: list[Any] = list(engine_endpoints or [])
+        self._state_store = state_store
         self._instances: dict[str, SimInstance] = {}
         self._lock: threading.RLock = threading.RLock()
         logger.info("SimInstanceManager initialized")
@@ -215,32 +308,40 @@ class SimInstanceManager:
         )
 
         with self._lock:
-            # 端口递增分配（审查项 N）：多实例不得指向同一 CARLA server，
-            # 否则第二个实例 load_world 会重置第一个实例的世界
-            instance.carla_host = self._carla.host
-            instance.carla_rpc_port, instance.carla_stream_port = self._allocate_carla_ports()
+            # 引擎端点分配（V2.4.0）：声明库存时独占分配，耗尽即拒绝创建；
+            # 未声明库存时所有实例共享单引擎，由执行面保证单场景约束
+            instance.carla_host, instance.carla_rpc_port, instance.carla_stream_port = (
+                self._assign_endpoint()
+            )
             self._instances[instance_id] = instance
 
+        self._persist(instance)
         logger.info(
             f"Instance created: {instance_id} (gpu={gpu_id}, quality={quality.value}, "
             f"carla={instance.carla_host}:{instance.carla_rpc_port}/{instance.carla_stream_port})"
         )
         return instance
 
-    def _allocate_carla_ports(self) -> tuple[int, int]:
-        """以配置基准端口为起点，按步长 2 递增分配空闲的 rpc/stream 端口对。
+    def _assign_endpoint(self) -> tuple[str, int, int]:
+        """分配引擎端点（已持有 self._lock）。
 
-        前提：已持有 self._lock（容器化部署 §10.2.3，每实例对应独立 CARLA server 进程）。
+        - 未声明 ``engine_endpoints``：返回配置的单引擎端点；
+        - 已声明：返回第一个未被活跃实例占用的端点，全部占用时抛 ResourceError。
         """
-        used_rpc = {i.carla_rpc_port for i in self._instances.values()}
-        used_stream = {i.carla_stream_port for i in self._instances.values()}
-        offset = 0
-        while True:
-            rpc = self._carla.rpc_port + offset
-            stream = self._carla.stream_port + offset
-            if rpc not in used_rpc and stream not in used_stream:
-                return rpc, stream
-            offset += 2
+        if not self._engine_endpoints:
+            return self._carla.host, self._carla.rpc_port, self._carla.stream_port
+        used = {(i.carla_host, i.carla_rpc_port) for i in self._instances.values()}
+        for endpoint in self._engine_endpoints:
+            host = str(getattr(endpoint, "host", self._carla.host))
+            rpc_port = int(getattr(endpoint, "rpc_port", self._carla.rpc_port))
+            stream_port = int(getattr(endpoint, "stream_port", rpc_port + 1))
+            if (host, rpc_port) not in used:
+                return host, rpc_port, stream_port
+        raise ResourceError(
+            "engine",
+            f"No CARLA engine endpoint available (all {len(self._engine_endpoints)} in use). "
+            "Destroy an idle instance or add endpoints via EXECUTION_ENGINE_ENDPOINTS",
+        )
 
     def get_instance(self, instance_id: str) -> Optional[SimInstance]:
         """查询实例信息。"""
@@ -279,6 +380,7 @@ class SimInstanceManager:
             elif new_status == InstanceStatus.FAILED:
                 instance.error_message = error_msg
 
+        self._persist(instance)
         logger.info(f"Instance '{instance_id}' status: {new_status.value}")
 
     def destroy_instance(self, instance_id: str) -> None:
@@ -299,6 +401,12 @@ class SimInstanceManager:
         # 配额释放在锁外执行（锁顺序：instance_manager → quota_manager，无反向路径，无死锁环）
         if self._quota_manager is not None and instance.user_id:
             self._quota_manager.release(instance.user_id)
+        # 销毁同时删除持久化记录与场景绑定（唯一释放出口，防残留）
+        if self._state_store is not None:
+            try:
+                self._state_store.delete_instance(instance_id)
+            except Exception as exc:  # noqa: BLE001  持久化失败不阻塞销毁
+                logger.warning(f"Persist delete failed for instance {instance_id}: {exc}")
         logger.info(f"Instance destroyed: {instance_id}")
 
     def check_expired_instances(self) -> list[str]:
@@ -317,3 +425,61 @@ class SimInstanceManager:
                 logger.debug(f"Instance '{iid}' already moved out of RUNNING: {exc}")
             self.destroy_instance(iid)
         return expired
+
+    # ─── 持久化 / 重启恢复 ───────────────────────────────────────────────────
+
+    def restore(self) -> int:
+        """从持久化存储重建实例表，返回恢复数量。
+
+        重启后执行面（world/tick 线程）已丢失，恢复语义：
+        - LOADING → CREATED（可重新下发场景）；
+        - RUNNING/PAUSED → READY（场景定义若已持久化，下一次 start/下发时自动装配）；
+        - gpu_id 置 -1（GPU 池不持久化，不持有旧名额）；
+        - 非终态实例重新计入用户配额，避免重启后并发额度被绕过。
+        """
+        if self._state_store is None:
+            return 0
+        try:
+            records = self._state_store.load_instances()
+        except Exception as exc:  # noqa: BLE001  读库失败不阻断服务启动
+            logger.error(f"Load persisted instances failed: {exc}")
+            return 0
+
+        restored = 0
+        quota_reservations: dict[str, int] = {}
+        with self._lock:
+            for record in records:
+                try:
+                    instance = SimInstance.from_record(record)
+                except Exception as exc:  # noqa: BLE001  单条损坏不影响其他实例
+                    logger.warning(f"Skip corrupted instance record: {exc}")
+                    continue
+                if instance.sim_instance_id in self._instances:
+                    continue
+                self._instances[instance.sim_instance_id] = instance
+                restored += 1
+                if instance.user_id and instance.status not in (
+                    InstanceStatus.COMPLETED,
+                    InstanceStatus.FAILED,
+                ):
+                    quota_reservations[instance.user_id] = (
+                        quota_reservations.get(instance.user_id, 0) + 1
+                    )
+                # 回写归一化后的状态，保证下次重启语义一致
+                self._persist(instance)
+
+        if self._quota_manager is not None and hasattr(self._quota_manager, "restore_existing"):
+            for user_id, count in quota_reservations.items():
+                self._quota_manager.restore_existing(user_id, count)
+        if restored:
+            logger.info(f"Restored {restored} instance(s) from state store")
+        return restored
+
+    def _persist(self, instance: SimInstance) -> None:
+        """尽力持久化实例记录（失败只告警，不影响主流程）。"""
+        if self._state_store is None:
+            return
+        try:
+            self._state_store.save_instance(instance.to_record())
+        except Exception as exc:  # noqa: BLE001  存储故障降级为内存态
+            logger.warning(f"Persist instance {instance.sim_instance_id} failed: {exc}")

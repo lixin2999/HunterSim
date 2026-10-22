@@ -21,7 +21,12 @@ from hunter_sim.api.models import (
     LoadSceneRequest,
     SetWeatherRequest,
 )
-from hunter_sim.api.runtime import assert_instance_access, ensure_scene_runner_or_http
+from hunter_sim.api.runtime import (
+    assert_instance_access,
+    ensure_scene_runner_or_http,
+    persist_scene,
+    persisted_scene_state,
+)
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -102,6 +107,9 @@ def load_scene_impl(request: Request, instance_id: str, scene_config: dict[str, 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Scene load failed: {exc}",
         ) from exc
+
+    # 场景定义持久化（V2.4.0）：服务重启后装配运行器时自动恢复
+    persist_scene(request.app, instance_id, config)
 
     return {"instance_id": instance_id, "scene_id": config.scene_id, "status": "ready"}
 
@@ -259,8 +267,27 @@ async def get_scene_status(
     request: Request,
     _: str = Depends(get_current_user),
 ) -> ApiResponse:
-    """GET /api/v1/sim/scenes/{instance_id}/status"""
-    runner = _get_scene_runner(request, instance_id)
+    """GET /api/v1/sim/scenes/{instance_id}/status
+
+    运行器未装配（如服务刚重启）时回落到持久化快照（``detached=true``），
+    只有既无运行器也无持久化记录时才返回 404。
+    """
+    runners: dict[str, Any] = getattr(request.app.state, "scene_runners", {})
+    runner = runners.get(instance_id)
+    if runner is None:
+        persisted = persisted_scene_state(request.app, instance_id)
+        if persisted is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No scene runner for instance '{instance_id}'; "
+                    f"请先 POST /api/v1/sim/instances/{instance_id}/scene 下发场景"
+                ),
+            )
+        assert_instance_access(
+            request, instance_id, getattr(request.state, "user_id", ""), require_exists=False
+        )
+        return ApiResponse(data=persisted)
     state = runner.get_scene_state()
     return ApiResponse(data=state)
 

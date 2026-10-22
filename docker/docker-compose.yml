@@ -1,9 +1,11 @@
-# HunterSim 开发/单机部署编排（V2.3.0）
+# HunterSim 开发/单机部署编排（V2.4.0）
 # 使用：
 #   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
 # CARLA server 运行在宿主机（Windows：先启动 CarlaUE4.exe；Linux：可选 --profile carla）
 # 镜像内已安装 carla==0.9.16 Python SDK，REST 可直接下发场景并生成自车。
+# V2.4.0：多引擎并行需在 .env 置 EXECUTION_ENGINE_ENDPOINTS（如 carla-engine:2000,carla-engine-2:2000），
+# 且启动两个 carla 容器（--profile carla）；实例与场景绑定落 data/state/hunter_sim.db。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -51,6 +53,27 @@ services:
       - ../resources:/home/carla/carla/PythonAPI/hunter_assets/resources
     restart: unless-stopped
 
+  # ── 第二个 CARLA 引擎（可选，多引擎并行）────────────────────────────────
+  # 启用：先置 EXECUTION_ENGINE_ENDPOINTS=carla-engine:2000,carla-engine-2:2000，
+  # 再 docker compose -f docker/docker-compose.yml --profile carla up -d
+  # 容器内 RPC/数据流/TM 端口均为 2000/2001/8000，宿主机映射到 2100/2101/8100 避免冲突。
+  carla-engine-2:
+    profiles: ["carla"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.carla
+    image: hunter-carla:0.9.16
+    ports:
+      - "2100:2000"   # RPC
+      - "2101:2001"   # 数据流
+      - "8100:8000"   # Traffic Manager
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    runtime: nvidia
+    volumes:
+      - ../resources:/home/carla/carla/PythonAPI/hunter_assets/resources
+    restart: unless-stopped
+
   # ── CARLA ↔ ROS2 桥接（可选，profile ros；对齐 ROS2_TOPIC_MAP，V2.2.0）────────
   # 启用：docker-compose -f docker/docker-compose.yml --profile ros up -d
   ros2-bridge:
@@ -75,7 +98,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.3.0
+    image: hunter-sim:2.4.0
     ports:
       - "8080:8080"
     environment:
@@ -93,6 +116,15 @@ services:
       API_CORS_ALLOW_ORIGINS: '${API_CORS_ALLOW_ORIGINS:-["*"]}'
       API_STREAM_BASE_URL: ${API_STREAM_BASE_URL:-webrtc://localhost:8080}
       API_PORT: "8080"
+      # 执行面（V2.4.0）：端点库存留空 = 单引擎（CARLA_HOST:CARLA_RPC_PORT）
+      EXECUTION_ENGINE_ENDPOINTS: ${EXECUTION_ENGINE_ENDPOINTS:-}
+      EXECUTION_MAX_ENGINES: ${EXECUTION_MAX_ENGINES:-8}
+      EXECUTION_RESTORE_SCENE_ON_ASSEMBLE: ${EXECUTION_RESTORE_SCENE_ON_ASSEMBLE:-true}
+      # 状态持久化：实例/场景绑定落 SQLite，重启可恢复（data 卷持久化）
+      STATE_ENABLED: ${STATE_ENABLED:-true}
+      STATE_DB_PATH: ${STATE_DB_PATH:-data/state/hunter_sim.db}
+      STATE_RECOVER_INSTANCES: ${STATE_RECOVER_INSTANCES:-true}
+      STATE_RESTORE_SCENES: ${STATE_RESTORE_SCENES:-true}
     depends_on:
       kafka:
         condition: service_healthy
@@ -102,6 +134,8 @@ services:
       - ../configs:/home/hunter/app/configs:ro
       # 资源仓库（自定义地图上传与回放数据落盘，§10.4.1/§15.5）
       - ../resources:/home/hunter/app/resources
+      # 状态持久化（V2.4.0）：重启后实例与场景绑定可恢复
+      - ../data:/home/hunter/app/data
     restart: unless-stopped
 
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────

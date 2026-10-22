@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
@@ -129,16 +131,17 @@ class TestSimInstanceManager:
         assert inst.status == InstanceStatus.CREATED
         assert inst.gpu_id >= 0
 
-    def test_carla_ports_incremental_allocation(self) -> None:
-        """审查项 N：多实例按空闲端口对递增分配，销毁后可复用。"""
+    def test_single_engine_endpoint_shared_without_inventory(self) -> None:
+        """未声明引擎库存（V2.4.0）：所有实例共享配置的单引擎端点。
+
+        端口递增猜测会指向不存在的引擎（实例 2 → 2002），实际无法联网；
+        共享端点后由执行面租约保证「单引擎单场景」约束。
+        """
         mgr = self._make_manager()
         inst1 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
         inst2 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
         assert (inst1.carla_rpc_port, inst1.carla_stream_port) == (2000, 2001)
-        assert (inst2.carla_rpc_port, inst2.carla_stream_port) == (2002, 2003)
-        mgr.destroy_instance(inst2.sim_instance_id)
-        inst3 = mgr.create_instance(mode=SimMode.SIL, map_id="Town01", quality=QualityLevel.LOW)
-        assert (inst3.carla_rpc_port, inst3.carla_stream_port) == (2002, 2003)  # 空闲对回收复用
+        assert (inst2.carla_rpc_port, inst2.carla_stream_port) == (2000, 2001)
 
     def test_lifecycle_transitions(self) -> None:
         """CREATED -> LOADING -> READY -> RUNNING -> COMPLETED。"""
@@ -248,3 +251,121 @@ class TestSimInstanceDataModel:
             map_id="Town01", quality=QualityLevel.LOW, gpu_id=0,
         )
         assert inst.to_dict()["start_time"] is None
+
+
+class TestEngineEndpointInventory:
+    """引擎端点库存（V2.4.0）：独占分配 / 耗尽拒绝 / 销毁复用。"""
+
+    def _make_manager(self, endpoints: list[Any]) -> SimInstanceManager:
+        from hunter_sim.common.models import ResourceSettings
+        return SimInstanceManager(
+            settings=ResourceSettings(),
+            gpu_pool=GPUResourcePool(gpu_count=4, total_memory_gb=64.0),
+            engine_endpoints=endpoints,
+        )
+
+    def test_exclusive_assignment_per_instance(self) -> None:
+        from hunter_sim.execution.engine_pool import EngineEndpoint
+        mgr = self._make_manager(
+            [
+                EngineEndpoint("10.0.0.11", 2000, 2001),
+                EngineEndpoint("10.0.0.12", 2000, 2001),
+            ]
+        )
+        inst1 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+        inst2 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+
+        assert (inst1.carla_host, inst1.carla_rpc_port, inst1.carla_stream_port) == (
+            "10.0.0.11", 2000, 2001,
+        )
+        assert (inst2.carla_host, inst2.carla_rpc_port) == ("10.0.0.12", 2000)
+
+    def test_exhaustion_raises_resource_error(self) -> None:
+        from hunter_sim.execution.engine_pool import EngineEndpoint
+        mgr = self._make_manager([EngineEndpoint("127.0.0.1", 2000, 2001)])
+        mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+
+        with pytest.raises(ResourceError, match="No CARLA engine endpoint available"):
+            mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+
+    def test_endpoint_reused_after_destroy(self) -> None:
+        from hunter_sim.execution.engine_pool import EngineEndpoint
+        mgr = self._make_manager(
+            [
+                EngineEndpoint("127.0.0.1", 2000, 2001),
+                EngineEndpoint("127.0.0.1", 2100, 2101),
+            ]
+        )
+        inst1 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+        inst2 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+        mgr.destroy_instance(inst1.sim_instance_id)
+
+        inst3 = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW)
+        assert inst3.carla_rpc_port == 2000
+        assert inst2.carla_rpc_port == 2100
+
+
+class TestInstancePersistence:
+    """实例持久化与重启恢复（V2.4.0）。"""
+
+    def _record(self, iid: str, status: InstanceStatus, user_id: str = "user_a") -> dict:
+        from hunter_sim.resource_manager.instance_manager import SimInstance
+        return SimInstance(
+            sim_instance_id=iid,
+            status=status,
+            mode=SimMode.SIL,
+            map_id="Town03",
+            quality=QualityLevel.LOW,
+            gpu_id=0,
+            user_id=user_id,
+        ).to_record()
+
+    def test_restore_normalizes_status_and_refills_quota(self, tmp_path: Any) -> None:
+        from hunter_sim.persistence.state_store import StateStore
+
+        store = StateStore(str(tmp_path / "state.db"))
+        store.save_instance(self._record("inst-run", InstanceStatus.RUNNING))
+        store.save_instance(self._record("inst-load", InstanceStatus.LOADING))
+        store.save_instance(self._record("inst-done", InstanceStatus.COMPLETED))
+        quota = ResourceQuotaManager(max_per_user=10, max_total=20)
+        mgr = SimInstanceManager(
+            quota_manager=quota, state_store=store, gpu_pool=GPUResourcePool(gpu_count=4)
+        )
+
+        assert mgr.restore() == 3
+
+        running = mgr.get_instance("inst-run")
+        loading = mgr.get_instance("inst-load")
+        assert running is not None and running.status == InstanceStatus.READY
+        assert running.restored is True
+        assert running.gpu_id == -1
+        assert loading is not None and loading.status == InstanceStatus.CREATED
+        done = mgr.get_instance("inst-done")
+        assert done is not None and done.status == InstanceStatus.COMPLETED
+        # 非终态实例重新占用配额，终态实例不占
+        assert quota.get_usage("user_a")["user_count"] == 2
+        # 回写归一化状态：再次读取不应还是 running/loading
+        statuses = {r["sim_instance_id"]: r["status"] for r in store.load_instances()}
+        assert statuses == {"inst-run": "ready", "inst-load": "created", "inst-done": "completed"}
+        store.close()
+
+    def test_create_transition_destroy_persist(self, tmp_path: Any) -> None:
+        from hunter_sim.persistence.state_store import StateStore
+
+        store = StateStore(str(tmp_path / "state.db"))
+        mgr = SimInstanceManager(
+            state_store=store, gpu_pool=GPUResourcePool(gpu_count=1)
+        )
+        inst = mgr.create_instance(SimMode.SIL, "Town01", QualityLevel.LOW, user_id="u1")
+        assert store.load_instances()[0]["sim_instance_id"] == inst.sim_instance_id
+
+        mgr.transition(inst.sim_instance_id, InstanceStatus.LOADING)
+        assert store.load_instances()[0]["status"] == "loading"
+
+        mgr.destroy_instance(inst.sim_instance_id)
+        assert store.load_instances() == []
+        store.close()
+
+    def test_restore_without_store_is_noop(self) -> None:
+        mgr = SimInstanceManager()
+        assert mgr.restore() == 0

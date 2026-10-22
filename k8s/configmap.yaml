@@ -14,6 +14,13 @@ data:
   kafka_bootstrap_servers: "kafka:9092"
   # prod 启动闸门禁止 "*"；按实际前端域名配置（JSON 数组）
   cors_allow_origins: '["https://sim.example.com"]'
+  # 执行面（V2.4.0）：CARLA 引擎端点库存，逗号分隔 host:rpc[:stream[:tm]]。
+  # 单引擎填 carla-engine-svc:2000；多引擎扩 Pod 后按 StatefulSet 稳定 DNS 逐条列出。
+  execution_engine_endpoints: "carla-engine-svc:2000"
+  execution_max_engines: "8"
+  # 状态持久化（V2.4.0）：SQLite 落独立 RWO 卷，Pod 重建后实例/场景绑定可恢复
+  state_enabled: "true"
+  state_db_path: "/home/hunter/app/data/state/hunter_sim.db"
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

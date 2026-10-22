@@ -1,29 +1,32 @@
-"""场景运行时装配（V2.3.0）。
+"""场景运行时装配（V2.4.0：执行面分离 + 状态持久化）。
 
-把「实例」与「场景运行器」真正接起来：实例首次下发场景/启动时，
-按实例地图加载 CARLA 世界、切换同步模式、创建 ``SceneRunnerService``，
-并登记到 ``app.state.scene_runners``（供 scenes/instances 路由查询）。
+控制面与执行面的边界：
+
+- 控制面（本模块 + 路由）：鉴权、归属校验、实例状态机、HTTP 错误映射；
+- 执行面（``execution.ExecutionPlane``）：引擎租约、地图加载、同步模式、
+  ``SceneRunnerService`` 的创建/销毁。
 
 装配策略：
-- 惰性：不在 ``POST /instances`` 里加载地图（避免创建接口被 10~30s 地图加载拖住），
-  首次下发场景或启动时才装配；
-- 单引擎单地图：一个 CARLA server 只能加载一个地图，已加载其他地图时拒绝装配，
-  避免 ``load_world`` 把其他实例的世界重置掉；
-- 只降级不中断：CARLA SDK 缺失/不可达时抛 ``SceneRuntimeUnavailable``，
-  路由层转换为 503 并给出可诊断原因（对应 ``/health.carla_probe_error``）。
+- 惰性：不在 ``POST /instances`` 里加载地图，首次下发场景或启动时才装配；
+- 引擎独占：一个 CARLA 引擎同一时刻只承载一个运行器；多引擎端点可并行；
+- 只降级不中断：CARLA 不可用时抛 ``SceneRuntimeUnavailable``，路由转 503；
+- 可恢复：场景下发成功后写入 ``StateStore``；服务重启后实例恢复为 READY，
+  再次装配时自动载入持久化场景定义（``EXECUTION_RESTORE_SCENE_ON_ASSEMBLE``）。
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Optional, cast
 
 from fastapi import HTTPException, Request, status
 
 from hunter_sim.api.deps import get_user_role
-from hunter_sim.common.models import InstanceStatus
+from hunter_sim.common.models import CarlaSettings, InstanceStatus
 from hunter_sim.common.utils import get_logger
-from hunter_sim.scene_runner.scene_runner_service import SceneRunnerService
+from hunter_sim.engine.map_manager import MapManager
+from hunter_sim.execution.engine_pool import EngineEndpoint, EnginePool, parse_engine_endpoints
+from hunter_sim.execution.plane import ExecutionPlane, ExecutionUnavailable
 
 logger = get_logger(__name__)
 
@@ -35,14 +38,14 @@ _FIXED_DELTA_SECONDS = 0.02
 
 
 class SceneRuntimeUnavailable(RuntimeError):
-    """CARLA 运行时不可用（SDK 缺失、连接失败或引擎地图冲突）。"""
+    """CARLA 运行时不可用（SDK 缺失、连接失败或引擎被占用）。"""
 
 
 class InstanceNotFound(LookupError):
     """实例不存在。"""
 
 
-# ─── 注册表访问 ───────────────────────────────────────────────────────────────
+# ─── 注册表 / 执行平面访问 ───────────────────────────────────────────────────
 
 
 def _runners(app: Any) -> dict[str, Any]:
@@ -54,17 +57,111 @@ def _runners(app: Any) -> dict[str, Any]:
     return runners
 
 
-def _runtime_lock(app: Any) -> threading.Lock:
-    """装配互斥锁：防止并发请求重复 load_world / 重复创建运行器。"""
+def _runtime_lock(app: Any) -> threading.RLock:
+    """装配互斥锁（可重入：运行时与执行平面共用）。"""
     lock = getattr(app.state, "scene_runtime_lock", None)
     if lock is None:
-        lock = threading.Lock()
+        lock = threading.RLock()
         app.state.scene_runtime_lock = lock
     return lock
 
 
+def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
+    """按端点解析 MapManager。
+
+    优先级：
+    1. ``app.state.map_managers``（测试/多引擎注入，键为 endpoint.key 或 host）；
+    2. ``app.state.map_manager``（单引擎启动期装配的共享管理器）；
+    3. 惰性创建：复用启动期 ``carla_client`` 或按端点新建 ``carla.Client``。
+    """
+    managers = getattr(app.state, "map_managers", None)
+    if isinstance(managers, dict):
+        for key in (endpoint.key, endpoint.host, f"{endpoint.host}:{endpoint.rpc_port}"):
+            manager = managers.get(key)
+            if manager is not None:
+                return manager
+        return None
+
+    shared = getattr(app.state, "map_manager", None)
+    if shared is not None:
+        return shared
+
+    cache = getattr(app.state, "execution_map_managers", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        app.state.execution_map_managers = cache
+    cached = cache.get(endpoint.key)
+    if cached is not None:
+        return cached
+
+    settings = getattr(app.state, "settings", None)
+    try:
+        import carla  # noqa: PLC0415  惰性导入：仅真实 CARLA 环境可用
+    except ImportError:
+        return None
+
+    try:
+        base_client = getattr(app.state, "carla_client", None)
+        is_base_endpoint = (
+            settings is not None
+            and endpoint.host == settings.carla.host
+            and endpoint.rpc_port == settings.carla.rpc_port
+        )
+        if is_base_endpoint and base_client is not None:
+            client = base_client
+        else:
+            client = carla.Client(endpoint.host, endpoint.rpc_port)
+            timeout = settings.carla.timeout_seconds if settings is not None else 10.0
+            client.set_timeout(timeout)
+        manager = MapManager(client)
+        cache[endpoint.key] = manager
+        return manager
+    except Exception as exc:  # noqa: BLE001  端点不可达 → 交由上层转 503
+        logger.warning(f"Map manager unavailable for engine {endpoint.key}: {exc}")
+        return None
+
+
+def _execution_plane(app: Any) -> ExecutionPlane:
+    """获取（必要时创建）执行平面，绑定到 app.state。"""
+    existing = getattr(app.state, "execution_plane", None)
+    if existing is not None:
+        return cast(ExecutionPlane, existing)
+
+    with _runtime_lock(app):
+        existing = getattr(app.state, "execution_plane", None)
+        if existing is not None:
+            return cast(ExecutionPlane, existing)
+
+        settings = getattr(app.state, "settings", None)
+        base = settings.carla if settings is not None else CarlaSettings()
+        endpoints = getattr(app.state, "execution_endpoints", None)
+        if not isinstance(endpoints, list) or not endpoints:
+            spec = settings.execution.engine_endpoints if settings is not None else ""
+            max_engines = settings.execution.max_engines if settings is not None else 8
+            endpoints = parse_engine_endpoints(spec, base, max_engines)
+            app.state.execution_endpoints = endpoints
+        delta = getattr(base, "fixed_delta_seconds", _FIXED_DELTA_SECONDS)
+
+        plane = ExecutionPlane(
+            EnginePool(endpoints),
+            lambda endpoint: _resolve_map_manager(app, endpoint),
+            lock=_runtime_lock(app),
+            fixed_delta_seconds=delta,
+            runners=_runners(app),
+        )
+        app.state.execution_plane = plane
+        logger.info(
+            f"Execution plane initialized with {len(endpoints)} engine endpoint(s): "
+            f"{', '.join(ep.key for ep in endpoints)}"
+        )
+        return plane
+
+
 def get_scene_runner(app: Any, instance_id: str) -> Any | None:
     """查询已装配的场景运行器（未装配返回 None）。"""
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is not None:
+        return plane.get_runner(instance_id)
     return _runners(app).get(instance_id)
 
 
@@ -74,24 +171,17 @@ def get_scene_runner(app: Any, instance_id: str) -> Any | None:
 def ensure_scene_runner(app: Any, instance_id: str) -> Any:
     """确保实例已装配场景运行器，返回运行器实例（阻塞：可能触发地图加载）。
 
-    Args:
-        app: FastAPI 应用（读取 app.state）。
-        instance_id: 仿真实例 ID。
-
-    Returns:
-        已装配的 SceneRunnerService。
-
     Raises:
         InstanceNotFound: 实例不存在。
-        SceneRuntimeUnavailable: CARLA 运行时不可用或引擎地图冲突。
+        SceneRuntimeUnavailable: CARLA 运行时不可用或引擎已被占用。
     """
     runners = _runners(app)
-    runner = runners.get(instance_id)
+    runner = get_scene_runner(app, instance_id)
     if runner is not None:
         return runner
 
     with _runtime_lock(app):
-        runner = runners.get(instance_id)
+        runner = get_scene_runner(app, instance_id)
         if runner is not None:
             return runner
 
@@ -102,54 +192,64 @@ def ensure_scene_runner(app: Any, instance_id: str) -> Any:
         if instance is None:
             raise InstanceNotFound(instance_id)
 
-        client = getattr(app.state, "carla_client", None)
-        map_manager = getattr(app.state, "map_manager", None)
-        if client is None or map_manager is None:
+        has_manager = (
+            getattr(app.state, "map_manager", None) is not None
+            or isinstance(getattr(app.state, "map_managers", None), dict)
+        )
+        if (
+            not has_manager
+            and getattr(app.state, "carla_client", None) is None
+            and not getattr(app.state, "carla_sdk_installed", False)
+        ):
             reason = getattr(app.state, "carla_probe_error", None) or "CARLA 客户端不可用"
             raise SceneRuntimeUnavailable(str(reason))
 
-        # 单引擎单场景：同一 CARLA 引擎同一时刻只能有一个运行器，
-        # 否则两个 tick 线程会互相推进同一 world（帧同步错乱）+ load_world 重置他人 Actor
-        occupied = next(iter(runners), None)
-        if occupied is not None and occupied != instance_id:
-            raise SceneRuntimeUnavailable(
-                f"当前 CARLA 引擎已被实例 '{occupied}' 占用（单引擎同一时刻只能运行一个场景）；"
-                "请先停止并销毁该实例，或为实例部署独立 CARLA 引擎"
-            )
-
+        # 兼容单引擎地图约束（V2.3.0 语义）：引擎已加载其他地图时拒绝装配
         loaded_map = getattr(app.state, "scene_world_map_id", None)
-        if loaded_map is not None and loaded_map != instance.map_id:
+        if loaded_map is not None and loaded_map != instance.map_id and not runners:
             raise SceneRuntimeUnavailable(
                 f"当前 CARLA 引擎已加载地图 '{loaded_map}'，无法再加载 '{instance.map_id}'"
                 "（单引擎单地图约束）；请先销毁占用实例，或为实例部署独立 CARLA 引擎"
             )
 
         _enter_loading(manager, instance)
+        plane = _execution_plane(app)
         try:
-            world = map_manager.load_map(instance.map_id)
-            _configure_world(world)
-            runner = SceneRunnerService(world)
-            runners[instance_id] = runner
-            app.state.scene_world_map_id = instance.map_id
+            runner = plane.ensure_runner(
+                instance,
+                on_state_change=_scene_state_callback(app, instance_id),
+            )
+            if plane.active_engine_count <= 1:
+                app.state.scene_world_map_id = instance.map_id
             _enter_ready(manager, instance)
+        except ExecutionUnavailable as exc:
+            _mark_failed(manager, instance_id, exc)
+            logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
+            raise SceneRuntimeUnavailable(str(exc)) from exc
         except Exception as exc:
             _mark_failed(manager, instance_id, exc)
             logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
             raise
 
+        _restore_persisted_scene(app, instance_id, runner)
+
         logger.info(
             f"Scene runtime assembled: instance={instance_id}, map={instance.map_id}, "
-            f"carla={instance.carla_host}:{instance.carla_rpc_port}"
+            f"carla={getattr(instance, 'carla_host', '?')}:"
+            f"{getattr(instance, 'carla_rpc_port', '?')}"
         )
         return runner
 
 
 def release_scene_runner(app: Any, instance_id: str) -> bool:
-    """释放实例的场景运行器（停止循环、销毁场景 Actor）。
+    """释放实例的场景运行器（停止循环、销毁场景 Actor、归还引擎租约）。"""
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is not None:
+        released = bool(plane.release(instance_id))
+        if plane.active_engine_count == 0:
+            app.state.scene_world_map_id = None
+        return released
 
-    Returns:
-        True 表示确实释放了一个运行器。
-    """
     runners = _runners(app)
     runner = runners.pop(instance_id, None)
     if runner is None:
@@ -166,11 +266,140 @@ def release_scene_runner(app: Any, instance_id: str) -> bool:
 
 def release_all_scene_runners(app: Any) -> int:
     """释放全部场景运行器（服务关停时调用），返回释放数量。"""
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is not None:
+        released = int(plane.release_all())
+        app.state.scene_world_map_id = None
+        return released
     released = 0
     for instance_id in list(_runners(app)):
         if release_scene_runner(app, instance_id):
             released += 1
     return released
+
+
+# ─── 场景持久化 / 状态查询 ───────────────────────────────────────────────────
+
+
+def persist_scene(app: Any, instance_id: str, config: Any) -> None:
+    """持久化场景绑定（下发成功后调用，失败只告警）。"""
+    store = getattr(app.state, "state_store", None)
+    if store is None:
+        return
+    try:
+        payload = config.model_dump(mode="json") if hasattr(config, "model_dump") else dict(config)
+        store.save_scene(
+            instance_id=instance_id,
+            scene_id=str(payload.get("scene_id", "")),
+            map_id=str(payload.get("map_id", "")),
+            config=payload,
+        )
+    except Exception as exc:  # noqa: BLE001  持久化失败不阻塞场景下发
+        logger.warning(f"Persist scene for instance {instance_id} failed: {exc}")
+
+
+def persisted_scene_state(app: Any, instance_id: str) -> dict[str, Any] | None:
+    """读取持久化的场景快照（无运行器时用于 status 查询）。"""
+    store = getattr(app.state, "state_store", None)
+    if store is None:
+        return None
+    try:
+        binding = store.load_scene(instance_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Load persisted scene for instance {instance_id} failed: {exc}")
+        return None
+    if binding is None:
+        return None
+    return {
+        "scene_id": binding["scene_id"],
+        "status": binding["status"],
+        "elapsed_seconds": round(float(binding["elapsed_seconds"]), 3),
+        "progress": round(float(binding["progress"]), 4),
+        "error_message": binding["error_message"] or None,
+        "detached": True,
+    }
+
+
+def describe_execution(app: Any) -> dict[str, Any]:
+    """执行面快照：引擎库存、租约、运行器与持久化状态。"""
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is not None:
+        payload = cast(dict[str, Any], plane.snapshot())
+    else:
+        settings = getattr(app.state, "settings", None)
+        base = settings.carla if settings is not None else CarlaSettings()
+        endpoints = getattr(app.state, "execution_endpoints", None)
+        if not isinstance(endpoints, list) or not endpoints:
+            spec = settings.execution.engine_endpoints if settings is not None else ""
+            max_engines = settings.execution.max_engines if settings is not None else 8
+            endpoints = parse_engine_endpoints(spec, base, max_engines)
+        payload = {
+            "engines": [
+                {**ep.to_dict(), "holder": None, "map_id": None, "acquired_at": None}
+                for ep in endpoints
+            ],
+            "capacity": len(endpoints),
+            "active_leases": 0,
+            "leases": [],
+            "runners": [],
+        }
+    store = getattr(app.state, "state_store", None)
+    payload["persistence"] = {
+        "enabled": store is not None,
+        "db_path": getattr(store, "path", None),
+        "restored_instances": int(getattr(app.state, "restored_instance_count", 0)),
+    }
+    return payload
+
+
+def _restore_persisted_scene(app: Any, instance_id: str, runner: Any) -> None:
+    """装配完成后按需恢复已持久化的场景定义（重启恢复）。"""
+    store = getattr(app.state, "state_store", None)
+    if store is None:
+        return
+    settings = getattr(app.state, "settings", None)
+    if settings is not None and not settings.execution.restore_scene_on_assemble:
+        return
+    if getattr(runner, "has_scene", True):
+        return
+    try:
+        binding = store.load_scene(instance_id)
+    except Exception as exc:  # noqa: BLE001  读库失败不影响新场景下发
+        logger.warning(f"Load persisted scene for instance {instance_id} failed: {exc}")
+        return
+    if not binding:
+        return
+    try:
+        from hunter_sim.scene_runner.scene_config import SceneConfig  # noqa: PLC0415
+
+        runner.load_scene(SceneConfig(**binding["config"]))
+        logger.info(
+            f"Restored persisted scene '{binding['scene_id']}' for instance {instance_id} "
+            "during runtime assembly"
+        )
+    except Exception as exc:  # noqa: BLE001  场景恢复失败不阻断装配，等待重新下发
+        logger.warning(f"Restore persisted scene for instance {instance_id} failed: {exc}")
+
+
+def _scene_state_callback(app: Any, instance_id: str) -> Any:
+    """场景状态变化 → 更新持久化快照。"""
+
+    def _callback(snapshot: Any) -> None:
+        store = getattr(app.state, "state_store", None)
+        if store is None:
+            return
+        try:
+            store.update_scene_snapshot(
+                instance_id=instance_id,
+                status=snapshot.status.value,
+                progress=float(getattr(snapshot, "progress", 0.0)),
+                elapsed_seconds=float(getattr(snapshot, "elapsed_seconds", 0.0)),
+                error_message=str(getattr(snapshot, "error_message", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001  持久化失败只影响快照新鲜度
+            logger.debug(f"Persist scene snapshot for instance {instance_id} failed: {exc}")
+
+    return _callback
 
 
 # ─── 路由辅助 ─────────────────────────────────────────────────────────────────
@@ -202,18 +431,7 @@ def assert_instance_access(
     user_id: str,
     require_exists: bool = True,
 ) -> Any | None:
-    """校验实例归属：非本人实例仅管理员可访问（修复实例级 IDOR）。
-
-    Args:
-        request: FastAPI 请求（读取 app.state）。
-        instance_id: 仿真实例 ID。
-        user_id: 当前登录用户。
-        require_exists: True 时实例不存在返回 404；False 时跳过（调用方已确认资源存在，
-            例如已注入运行器的单测/内部路径）。
-
-    Returns:
-        实例对象；实例管理器未就绪、未登录或实例不存在且不强制存在时返回 None。
-    """
+    """校验实例归属：非本人实例仅管理员可访问（修复实例级 IDOR）。"""
     manager = getattr(request.app.state, "instance_manager", None)
     if manager is None or not user_id:
         return None
@@ -258,31 +476,16 @@ def _mark_failed(manager: Any, instance_id: str, exc: Exception) -> None:
         logger.debug(f"Instance {instance_id} could not transition to FAILED")
 
 
-def _configure_world(world: Any) -> None:
-    """把世界切换到同步模式（固定 50Hz），与场景循环帧率保持一致。"""
-    try:
-        settings = world.get_settings()
-    except Exception as exc:  # noqa: BLE001  Mock/受限 world 无设置接口
-        logger.warning(f"Cannot read world settings: {exc}")
-        return
-    if settings is None:
-        return
-    try:
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = _FIXED_DELTA_SECONDS
-        world.apply_settings(settings)
-        logger.info(f"World switched to synchronous mode ({1.0 / _FIXED_DELTA_SECONDS:.0f}Hz)")
-    except Exception as exc:  # noqa: BLE001  同步模式失败时退回异步推进
-        logger.warning(f"Cannot enable synchronous mode: {exc}")
-
-
 __all__ = [
     "InstanceNotFound",
     "SceneRuntimeUnavailable",
     "assert_instance_access",
+    "describe_execution",
     "ensure_scene_runner",
     "ensure_scene_runner_or_http",
     "get_scene_runner",
+    "persist_scene",
+    "persisted_scene_state",
     "release_all_scene_runners",
     "release_scene_runner",
 ]

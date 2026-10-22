@@ -64,6 +64,18 @@ class ResourceQuotaManager:
                     del self._user_counts[user_id]
             self._total_count = max(0, self._total_count - 1)
 
+    def restore_existing(self, user_id: str, count: int = 1) -> None:
+        """重启恢复时重新计入已存在实例的配额占用（V2.4.0）。
+
+        持久化恢复的实例不会经过 create_instance 的预占流程，若不回填，
+        服务重启后并发额度会被重置，形成配额绕过。
+        """
+        if count <= 0:
+            return
+        with self._lock:
+            self._user_counts[user_id] = self._user_counts.get(user_id, 0) + count
+            self._total_count += count
+
     def get_usage(self, user_id: str = "") -> dict[str, Any]:
         """查询配额使用情况。"""
         with self._lock:

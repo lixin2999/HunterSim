@@ -27,6 +27,7 @@ from hunter_sim.api.runtime import (
     SceneRuntimeUnavailable,
     ensure_scene_runner,
     get_scene_runner,
+    persisted_scene_state,
     release_scene_runner,
 )
 from hunter_sim.api.routers.scenes import (
@@ -379,7 +380,11 @@ async def get_instance_status(
     inst = _assert_owner(request, instance_id, user_id)
     data = inst.to_dict()
     runner = get_scene_runner(request.app, instance_id)
-    data["scene"] = runner.get_scene_state() if runner is not None else None
+    if runner is not None:
+        data["scene"] = runner.get_scene_state()
+    else:
+        # 运行器未装配（服务重启/未下发）时回落持久化快照，避免查询断崖
+        data["scene"] = persisted_scene_state(request.app, instance_id)
     return ApiResponse(data=data)
 
 

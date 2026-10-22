@@ -1,0 +1,271 @@
+"""CARLA 引擎库存与独占租约（V2.4.0 执行面分离）。
+
+一个 CARLA server 同一时刻只能承载一个场景（``load_world`` 会重置整个世界）。
+``EnginePool`` 以端点（host:rpc_port）为粒度维护占用关系，保证：
+
+- 同一端点不会被两个实例同时租用；
+- 多引擎部署时，每个实例在自己的端点上并行运行；
+- 释放后端点立即可被新实例复用（不再依赖端口递增猜测）。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Optional
+
+from hunter_sim.common.exceptions import ConfigurationError
+from hunter_sim.common.models import CarlaSettings
+
+# 端点字符串中允许的最多段数：host:rpc[:stream[:tm]]
+_MAX_ENDPOINT_PARTS = 4
+_MIN_PORT = 1024
+_MAX_PORT = 65535
+
+
+class EngineUnavailable(RuntimeError):
+    """没有可用 CARLA 引擎（全部被占用或端点不可用）。"""
+
+
+@dataclass(frozen=True)
+class EngineEndpoint:
+    """一个 CARLA 引擎端点。
+
+    Attributes:
+        host: CARLA 服务器地址。
+        rpc_port: RPC 端口。
+        stream_port: 数据流端口（默认 rpc+1）。
+        tm_port: Traffic Manager 端口（默认 8000）。
+    """
+
+    host: str
+    rpc_port: int
+    stream_port: int
+    tm_port: int = 8000
+
+    @property
+    def key(self) -> str:
+        """端点唯一键：host:rpc_port。"""
+        return f"{self.host}:{self.rpc_port}"
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为 API 响应字段。"""
+        return {
+            "key": self.key,
+            "host": self.host,
+            "rpc_port": self.rpc_port,
+            "stream_port": self.stream_port,
+            "tm_port": self.tm_port,
+        }
+
+
+@dataclass
+class EngineLease:
+    """引擎租约：记录哪个实例在哪个端点上运行哪个地图。"""
+
+    instance_id: str
+    endpoint: EngineEndpoint
+    map_id: str
+    acquired_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为 API 响应字段。"""
+        return {
+            "instance_id": self.instance_id,
+            "engine": self.endpoint.to_dict(),
+            "map_id": self.map_id,
+            "acquired_at": self.acquired_at,
+        }
+
+
+def parse_engine_endpoints(
+    spec: str,
+    base: CarlaSettings,
+    max_engines: int = 8,
+) -> list[EngineEndpoint]:
+    """解析 ``EXECUTION_ENGINE_ENDPOINTS``，为空时退化为单引擎。
+
+    格式：``host:rpc[:stream[:tm]],host2:rpc2``。端口均为整数，
+    stream 缺省取 ``rpc+1``，tm 缺省取 ``CARLA_TM_PORT`` 或 8000。
+
+    Args:
+        spec: 逗号分隔的端点清单。
+        base: CARLA 基础配置（单引擎回退与默认 TM 端口）。
+        max_engines: 允许的最大端点数。
+
+    Returns:
+        端点列表（至少一个）。
+
+    Raises:
+        ConfigurationError: 端点格式非法、端口越界或数量超限。
+    """
+    default_tm = getattr(base, "tm_port", 8000)
+    if not spec.strip():
+        return [
+            EngineEndpoint(
+                host=base.host,
+                rpc_port=base.rpc_port,
+                stream_port=base.stream_port,
+                tm_port=default_tm,
+            )
+        ]
+
+    entries = [entry.strip() for entry in spec.split(",") if entry.strip()]
+    if not entries:
+        raise ConfigurationError("execution.engine_endpoints", "端点清单为空")
+    if len(entries) > max_engines:
+        raise ConfigurationError(
+            "execution.engine_endpoints",
+            f"端点数量 {len(entries)} 超过 EXECUTION_MAX_ENGINES={max_engines}",
+        )
+
+    endpoints: list[EngineEndpoint] = []
+    seen: set[str] = set()
+    for entry in entries:
+        parts = entry.split(":")
+        if len(parts) < 2 or len(parts) > _MAX_ENDPOINT_PARTS:
+            raise ConfigurationError(
+                "execution.engine_endpoints",
+                f"端点 '{entry}' 格式非法，应为 host:rpc[:stream[:tm]]",
+            )
+        host = parts[0].strip()
+        if not host:
+            raise ConfigurationError(
+                "execution.engine_endpoints", f"端点 '{entry}' 缺少 host"
+            )
+        try:
+            ports = [int(p) for p in parts[1:]]
+        except ValueError as exc:
+            raise ConfigurationError(
+                "execution.engine_endpoints", f"端点 '{entry}' 端口不是整数"
+            ) from exc
+        for port in ports:
+            if not _MIN_PORT <= port <= _MAX_PORT:
+                raise ConfigurationError(
+                    "execution.engine_endpoints",
+                    f"端点 '{entry}' 端口 {port} 超出范围 [{_MIN_PORT}, {_MAX_PORT}]",
+                )
+        rpc = ports[0]
+        stream = ports[1] if len(ports) > 1 else rpc + 1
+        tm = ports[2] if len(ports) > 2 else default_tm
+        endpoint = EngineEndpoint(host=host, rpc_port=rpc, stream_port=stream, tm_port=tm)
+        if endpoint.key in seen:
+            raise ConfigurationError(
+                "execution.engine_endpoints", f"端点 '{endpoint.key}' 重复声明"
+            )
+        seen.add(endpoint.key)
+        endpoints.append(endpoint)
+    return endpoints
+
+
+class EnginePool:
+    """引擎端点租约池（线程安全）。
+
+    Args:
+        endpoints: 已声明的引擎库存（用于容量与快照展示）。
+    """
+
+    def __init__(self, endpoints: Optional[Iterable[EngineEndpoint]] = None) -> None:
+        self._known: dict[str, EngineEndpoint] = {
+            ep.key: ep for ep in (endpoints or [])
+        }
+        self._leases: dict[str, EngineLease] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def capacity(self) -> int:
+        """已声明的引擎数量（未声明时按已租用端点数动态计算）。"""
+        with self._lock:
+            return max(len(self._known), len({l.endpoint.key for l in self._leases.values()}))
+
+    @property
+    def active_count(self) -> int:
+        """当前活跃租约数（= 正在运行的场景数）。"""
+        with self._lock:
+            return len(self._leases)
+
+    def acquire(
+        self,
+        instance_id: str,
+        endpoint: EngineEndpoint,
+        map_id: str,
+    ) -> EngineLease:
+        """为实例租用指定引擎端点。
+
+        Args:
+            instance_id: 实例 ID。
+            endpoint: 实例绑定的 CARLA 端点。
+            map_id: 实例地图。
+
+        Returns:
+            租约对象（同一实例重复调用返回既有租约）。
+
+        Raises:
+            EngineUnavailable: 端点已被其他实例占用。
+        """
+        with self._lock:
+            existing = self._leases.get(instance_id)
+            if existing is not None:
+                if existing.endpoint.key != endpoint.key:
+                    raise EngineUnavailable(
+                        f"Instance '{instance_id}' already holds engine "
+                        f"'{existing.endpoint.key}', cannot switch to '{endpoint.key}' at runtime"
+                    )
+                return existing
+            holder = self._holder_of(endpoint.key)
+            if holder is not None:
+                raise EngineUnavailable(
+                    f"CARLA engine '{endpoint.key}' is occupied by instance "
+                    f"'{holder.instance_id}' (one engine can host one scene at a time); "
+                    "stop/destroy that instance or add engines via EXECUTION_ENGINE_ENDPOINTS"
+                )
+            lease = EngineLease(instance_id=instance_id, endpoint=endpoint, map_id=map_id)
+            self._leases[instance_id] = lease
+            self._known.setdefault(endpoint.key, endpoint)
+            return lease
+
+    def release(self, instance_id: str) -> bool:
+        """释放实例的引擎租约，返回是否确实释放。"""
+        with self._lock:
+            return self._leases.pop(instance_id, None) is not None
+
+    def get(self, instance_id: str) -> Optional[EngineLease]:
+        """查询实例当前租约。"""
+        with self._lock:
+            return self._leases.get(instance_id)
+
+    def snapshot(self) -> dict[str, Any]:
+        """执行面快照（供 ``GET /execution`` 与排障使用）。"""
+        with self._lock:
+            leases = {iid: lease.to_dict() for iid, lease in self._leases.items()}
+            engines: list[dict[str, Any]] = []
+            for key, endpoint in sorted(self._known.items()):
+                lease = self._holder_of(key)
+                item = endpoint.to_dict()
+                item["holder"] = lease.instance_id if lease else None
+                item["map_id"] = lease.map_id if lease else None
+                item["acquired_at"] = lease.acquired_at if lease else None
+                engines.append(item)
+        return {
+            "engines": engines,
+            "capacity": len(engines),
+            "active_leases": len(leases),
+            "leases": list(leases.values()),
+        }
+
+    def _holder_of(self, endpoint_key: str) -> Optional[EngineLease]:
+        """返回占用指定端点的租约（已持有锁）。"""
+        for lease in self._leases.values():
+            if lease.endpoint.key == endpoint_key:
+                return lease
+        return None
+
+
+__all__ = [
+    "EngineEndpoint",
+    "EngineLease",
+    "EnginePool",
+    "EngineUnavailable",
+    "parse_engine_endpoints",
+]
