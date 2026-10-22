@@ -266,6 +266,18 @@ class APISettings(BaseSettings):
     )
     cors_allow_origins: list[str] = Field(default=["*"])
     rate_limit_per_minute: int = Field(1000, ge=1)
+    rate_limit_enabled: bool = Field(
+        True, description="是否启用按客户端 IP 的 API 限流（V2.6.0，消费 rate_limit_per_minute）"
+    )
+    login_max_failed_attempts: int = Field(
+        5, ge=1, description="同 IP 连续登录失败达到该次数后进入指数退避（V2.6.0）"
+    )
+    login_backoff_base_seconds: float = Field(
+        2.0, gt=0.0, le=60.0, description="登录退避首次时长（秒），按 2 的幂增长"
+    )
+    login_backoff_max_seconds: float = Field(
+        60.0, gt=0.0, le=3600.0, description="登录退避时长上限（秒）"
+    )
     stream_base_url: str = Field(
         "webrtc://localhost:8080", description="仿真画面 WebRTC 视频流基础地址（设计文档 §12.2）"
     )
@@ -392,6 +404,9 @@ class CloudSettings(BaseSettings):
     jwt_token: Optional[SecretStr] = Field(None, description="data-collector REST Bearer JWT")
     rosbag_bucket: str = Field("hunter-rosbag", description="bag 上传 Bucket（车端仅三个可写）")
     upload_timeout_s: float = Field(60.0, gt=0.0, description="预签名/直传 HTTP 超时（秒）")
+    upload_queue_max_size: int = Field(
+        32, ge=1, le=1024, description="bag 上传后台队列容量（V2.6.0：有界防积压，满时丢最旧）"
+    )
 
 
 class GuiSettings(BaseSettings):

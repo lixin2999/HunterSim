@@ -31,11 +31,17 @@ class ExecutionUnavailable(RuntimeError):
 class ExecutionPlane:
     """场景执行平面。
 
+    V2.6.0 锁粒度拆分：注册表互斥（``lock``，与 API 层共享）只保护字典
+    读写与租约领取；耗时的 ``load_world``/同步模式切换/运行器销毁在
+    **引擎级锁**（按端点 host:rpc_port 懒创建）下执行，不同引擎的实例
+    装配可并行，同一端点的 CARLA 操作仍串行为单线程（CARLA Client 非
+    线程安全）。
+
     Args:
         pool: 引擎租约池。
         map_manager_resolver: 端点 → MapManager 解析器（测试/多引擎实现注入点）。
         runner_factory: 运行器工厂（默认 SceneRunnerService）。
-        lock: 装配互斥锁（与 API 层共享同一把锁，防止并发重复 load_world）。
+        lock: 注册表互斥锁（与 API 层共享同一把锁，保护运行器注册表）。
         fixed_delta_seconds: 同步模式固定步长。
         runners: 复用的运行器注册表（与 ``app.state.scene_runners`` 同对象）。
     """
@@ -52,10 +58,12 @@ class ExecutionPlane:
         self._pool = pool
         self._resolve_map_manager = map_manager_resolver
         self._runner_factory = runner_factory
-        self._lock = lock or threading.RLock()
+        self._registry_lock = lock or threading.RLock()
         self._fixed_delta_seconds = fixed_delta_seconds
         self._runners: dict[str, Any] = runners if runners is not None else {}
         self._runner_engines: dict[str, str] = {}
+        # 端点 key → 引擎级装配/销毁锁（在注册表锁内懒创建，避免建锁竞态）
+        self._engine_locks: dict[str, threading.RLock] = {}
 
     @property
     def pool(self) -> EnginePool:
@@ -80,6 +88,10 @@ class ExecutionPlane:
     ) -> Any:
         """确保实例已装配运行器并返回（可能触发地图加载，阻塞）。
 
+        锁分层（V2.6.0）：注册表锁内完成重复检查与租约领取（短临界区），
+        随后仅持有该端点的引擎锁执行慢速 CARLA 操作；多引擎部署时
+        不同端点的装配互不阻塞。
+
         Args:
             instance: 仿真实例（需含 sim_instance_id/map_id/carla_* 字段）。
             on_state_change: 场景状态变化回调（持久化/推送）。
@@ -92,7 +104,7 @@ class ExecutionPlane:
             ExecutionUnavailable: 引擎被占用、端点无客户端或地图加载失败。
         """
         instance_id = instance.sim_instance_id
-        with self._lock:
+        with self._registry_lock:
             existing = self._runners.get(instance_id)
             if existing is not None:
                 return existing
@@ -102,16 +114,22 @@ class ExecutionPlane:
                 lease = self._pool.acquire(instance_id, endpoint, instance.map_id)
             except Exception as exc:  # EngineUnavailable 等 → 统一为执行面不可用
                 raise ExecutionUnavailable(str(exc)) from exc
+            engine_lock = self._engine_lock(lease.endpoint.key)
 
-            map_manager = self._resolve_map_manager(lease.endpoint)
-            if map_manager is None:
-                self._pool.release(instance_id)
-                raise ExecutionUnavailable(
-                    f"No CARLA client available for engine '{lease.endpoint.key}' "
-                    f"(target {lease.endpoint.host}:{lease.endpoint.rpc_port})"
-                )
-
-            try:
+        # 慢操作（load_world 可达 10~30s）在注册表锁外、引擎锁内执行
+        try:
+            with engine_lock:
+                # 同实例并发调用在等锁期间可能已被先者装配：事后再查一次避免重复 load
+                with self._registry_lock:
+                    raced = self._runners.get(instance_id)
+                if raced is not None:
+                    return raced
+                map_manager = self._resolve_map_manager(lease.endpoint)
+                if map_manager is None:
+                    raise ExecutionUnavailable(
+                        f"No CARLA client available for engine '{lease.endpoint.key}' "
+                        f"(target {lease.endpoint.host}:{lease.endpoint.rpc_port})"
+                    )
                 world = map_manager.load_map(instance.map_id)
                 self._configure_world(world)
                 runner = self._runner_factory(
@@ -119,13 +137,17 @@ class ExecutionPlane:
                     on_state_change=on_state_change,
                     on_event=on_event,
                 )
-            except Exception as exc:
-                self._pool.release(instance_id)
-                raise ExecutionUnavailable(
-                    f"Failed to assemble scene runtime on engine "
-                    f"'{lease.endpoint.key}' for map '{instance.map_id}': {exc}"
-                ) from exc
+        except ExecutionUnavailable:
+            self._pool.release(instance_id)
+            raise
+        except Exception as exc:
+            self._pool.release(instance_id)
+            raise ExecutionUnavailable(
+                f"Failed to assemble scene runtime on engine "
+                f"'{lease.endpoint.key}' for map '{instance.map_id}': {exc}"
+            ) from exc
 
+        with self._registry_lock:
             self._runners[instance_id] = runner
             self._runner_engines[instance_id] = lease.endpoint.key
 
@@ -137,22 +159,33 @@ class ExecutionPlane:
 
     def release(self, instance_id: str) -> bool:
         """释放实例运行器并归还引擎租约，返回是否确实释放。"""
-        with self._lock:
+        with self._registry_lock:
             runner = self._runners.pop(instance_id, None)
-            self._runner_engines.pop(instance_id, None)
+            engine_key = self._runner_engines.pop(instance_id, None)
             released = self._pool.release(instance_id)
+            engine_lock = self._engine_locks.get(engine_key) if engine_key else None
         if runner is None:
             return released
-        try:
-            runner.destroy()
-        except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
-            logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
+
+        # 销毁场景 Actor 同样是 CARLA 操作：在同一引擎锁下与后续装配串行，
+        # 避免“旧运行器还在销毁、新实例已在同端点 load_world”的并发
+        def _destroy() -> None:
+            try:
+                runner.destroy()
+            except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
+                logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
+
+        if engine_lock is not None:
+            with engine_lock:
+                _destroy()
+        else:
+            _destroy()
         logger.info(f"Execution plane released: instance={instance_id}")
         return True
 
     def release_all(self) -> int:
         """释放全部运行器（服务关停），返回释放数量。"""
-        with self._lock:
+        with self._registry_lock:
             instance_ids = list(self._runners)
         released = 0
         for instance_id in instance_ids:
@@ -162,12 +195,13 @@ class ExecutionPlane:
 
     def get_runner(self, instance_id: str) -> Any | None:
         """查询已装配运行器（未装配返回 None）。"""
-        return self._runners.get(instance_id)
+        with self._registry_lock:
+            return self._runners.get(instance_id)
 
     def snapshot(self) -> dict[str, Any]:
         """执行面快照（引擎、租约、运行器）。"""
         payload = self._pool.snapshot()
-        with self._lock:
+        with self._registry_lock:
             payload["runners"] = [
                 {
                     "instance_id": instance_id,
@@ -176,6 +210,10 @@ class ExecutionPlane:
                 for instance_id in self._runners
             ]
         return payload
+
+    def _engine_lock(self, endpoint_key: str) -> threading.RLock:
+        """获取（必要时创建）端点对应的引擎级锁（调用方已持注册表锁）。"""
+        return self._engine_locks.setdefault(endpoint_key, threading.RLock())
 
     @staticmethod
     def _endpoint_of(instance: Any) -> EngineEndpoint:

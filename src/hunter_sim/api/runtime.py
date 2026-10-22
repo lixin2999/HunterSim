@@ -45,24 +45,52 @@ class InstanceNotFound(LookupError):
     """实例不存在。"""
 
 
+# 注册表/锁惰性创建的兼底互斥（V2.6.0：消除 check-then-act 竞态；
+# 正常路径由 lifespan 调用 ``init_runtime_state`` 提前初始化）
+_BOOT_LOCK = threading.Lock()
+
+
 # ─── 注册表 / 执行平面访问 ───────────────────────────────────────────────────
 
 
+def init_runtime_state(app: Any) -> None:
+    """提前初始化运行时注册表与装配锁（V2.6.0，lifespan 启动时调用）。
+
+    only-if-absent：不覆盖测试/外部已注入的对象；提前建好唯一一把
+    ``scene_runtime_lock``，避免首个并发请求各自惰性创建导致互斥失效。
+    """
+    with _BOOT_LOCK:
+        if getattr(app.state, "scene_runtime_lock", None) is None:
+            app.state.scene_runtime_lock = threading.RLock()
+        if getattr(app.state, "scene_runners", None) is None:
+            app.state.scene_runners = {}
+
+
 def _runners(app: Any) -> dict[str, Any]:
-    """获取实例 → 场景运行器注册表（不存在时惰性创建）。"""
+    """获取实例 → 场景运行器注册表（不存在时兜底惰性创建，双重检查）。"""
     runners = getattr(app.state, "scene_runners", None)
     if runners is None:
-        runners = {}
-        app.state.scene_runners = runners
+        with _BOOT_LOCK:
+            runners = getattr(app.state, "scene_runners", None)
+            if runners is None:
+                runners = {}
+                app.state.scene_runners = runners
     return runners
 
 
 def _runtime_lock(app: Any) -> threading.RLock:
-    """装配互斥锁（可重入：运行时与执行平面共用）。"""
+    """控制面短临界区互斥锁（双重检查惰性创建；正常已由 lifespan 预建）。
+
+    V2.6.0 起慢速 CARLA 装配不再全程持有本锁，只保护注册表检查/实例
+    状态流转等短临界区；引擎级串行由 ``ExecutionPlane`` 的端点锁保证。
+    """
     lock = getattr(app.state, "scene_runtime_lock", None)
     if lock is None:
-        lock = threading.RLock()
-        app.state.scene_runtime_lock = lock
+        with _BOOT_LOCK:
+            lock = getattr(app.state, "scene_runtime_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                app.state.scene_runtime_lock = lock
     return lock
 
 
@@ -171,11 +199,14 @@ def get_scene_runner(app: Any, instance_id: str) -> Any | None:
 def ensure_scene_runner(app: Any, instance_id: str) -> Any:
     """确保实例已装配场景运行器，返回运行器实例（阻塞：可能触发地图加载）。
 
+    V2.6.0 锁分层：控制面锁只包住前置检查与状态流转（短临界区），
+    ``plane.ensure_runner``（内含 load_world 等慢操作）在锁外执行；
+    多引擎部署时不同实例的装配可并行。
+
     Raises:
         InstanceNotFound: 实例不存在。
         SceneRuntimeUnavailable: CARLA 运行时不可用或引擎已被占用。
     """
-    runners = _runners(app)
     runner = get_scene_runner(app, instance_id)
     if runner is not None:
         return runner
@@ -206,6 +237,7 @@ def ensure_scene_runner(app: Any, instance_id: str) -> Any:
 
         # 兼容单引擎地图约束（V2.3.0 语义）：引擎已加载其他地图时拒绝装配
         loaded_map = getattr(app.state, "scene_world_map_id", None)
+        runners = _runners(app)
         if loaded_map is not None and loaded_map != instance.map_id and not runners:
             raise SceneRuntimeUnavailable(
                 f"当前 CARLA 引擎已加载地图 '{loaded_map}'，无法再加载 '{instance.map_id}'"
@@ -214,31 +246,35 @@ def ensure_scene_runner(app: Any, instance_id: str) -> Any:
 
         _enter_loading(manager, instance)
         plane = _execution_plane(app)
-        try:
-            runner = plane.ensure_runner(
-                instance,
-                on_state_change=_scene_state_callback(app, instance_id),
-            )
-            if plane.active_engine_count <= 1:
-                app.state.scene_world_map_id = instance.map_id
-            _enter_ready(manager, instance)
-        except ExecutionUnavailable as exc:
-            _mark_failed(manager, instance_id, exc)
-            logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
-            raise SceneRuntimeUnavailable(str(exc)) from exc
-        except Exception as exc:
-            _mark_failed(manager, instance_id, exc)
-            logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
-            raise
 
-        _restore_persisted_scene(app, instance_id, runner)
-
-        logger.info(
-            f"Scene runtime assembled: instance={instance_id}, map={instance.map_id}, "
-            f"carla={getattr(instance, 'carla_host', '?')}:"
-            f"{getattr(instance, 'carla_rpc_port', '?')}"
+    # 慢装配在控制面锁外：同端点串行由引擎锁保证，不同端点可并行
+    try:
+        runner = plane.ensure_runner(
+            instance,
+            on_state_change=_scene_state_callback(app, instance_id),
         )
-        return runner
+    except ExecutionUnavailable as exc:
+        _mark_failed(manager, instance_id, exc)
+        logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
+        raise SceneRuntimeUnavailable(str(exc)) from exc
+    except Exception as exc:
+        _mark_failed(manager, instance_id, exc)
+        logger.error(f"Scene runtime assembly failed for instance {instance_id}: {exc}")
+        raise
+
+    with _runtime_lock(app):
+        if plane.active_engine_count <= 1:
+            app.state.scene_world_map_id = instance.map_id
+        _enter_ready(manager, instance)
+
+    _restore_persisted_scene(app, instance_id, runner)
+
+    logger.info(
+        f"Scene runtime assembled: instance={instance_id}, map={instance.map_id}, "
+        f"carla={getattr(instance, 'carla_host', '?')}:"
+        f"{getattr(instance, 'carla_rpc_port', '?')}"
+    )
+    return runner
 
 
 def release_scene_runner(app: Any, instance_id: str) -> bool:
@@ -493,6 +529,7 @@ __all__ = [
     "ensure_scene_runner",
     "ensure_scene_runner_or_http",
     "get_scene_runner",
+    "init_runtime_state",
     "persist_scene",
     "persisted_scene_state",
     "release_all_scene_runners",

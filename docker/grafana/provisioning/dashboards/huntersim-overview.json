@@ -1,0 +1,155 @@
+{
+  "uid": "huntersim-overview",
+  "title": "HunterSim 平台总览",
+  "tags": ["huntersim", "v2.6.0"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "运行中实例",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "targets": [
+        { "expr": "huntersim_active_instances", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "CARLA 连接",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "断开", "color": "red" }, "1": { "text": "正常", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "huntersim_carla_connected", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "服务运行时长",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "huntersim_uptime_seconds", "refId": "A" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "磁盘使用率",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 0.75 }, { "color": "red", "value": 0.85 } ] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "max(huntersim_disk_usage_ratio)", "refId": "A" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "HTTP QPS（按路由）",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum by (path) (rate(huntersim_http_request_duration_seconds_count[5m]))", "legendFormat": "{{path}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "HTTP P95 延迟",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, path) (rate(huntersim_http_request_duration_seconds_bucket[5m])))", "legendFormat": "{{path}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "HTTP 错误率（4XX/5XX）",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(huntersim_http_request_duration_seconds_count{status_class=~\"4XX|5XX\"}[5m])) / clamp_min(sum(rate(huntersim_http_request_duration_seconds_count[5m])), 0.001)",
+          "legendFormat": "错误占比",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "仿真 FPS / VIL 延迟 / CARLA RPC 延迟",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "targets": [
+        { "expr": "huntersim_simulation_fps", "legendFormat": "FPS", "refId": "A" },
+        { "expr": "huntersim_vil_latency_ms", "legendFormat": "VIL 延迟(ms)", "refId": "B" },
+        { "expr": "huntersim_carla_rpc_latency_seconds * 1000", "legendFormat": "CARLA RPC(ms)", "refId": "C" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "安全治理（限流 / 登录拒绝）",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "targets": [
+        { "expr": "rate(huntersim_rate_limited_rejections_total[5m])", "legendFormat": "限流拒绝/s", "refId": "A" },
+        { "expr": "rate(huntersim_login_rejections_total[5m])", "legendFormat": "登录拒绝({{reason}})/s", "refId": "B" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "链路错误（CARLA RPC / Kafka）",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "expr": "increase(huntersim_carla_rpc_errors_total[10m])", "legendFormat": "CARLA RPC 错误(10m)", "refId": "A" },
+        { "expr": "increase(huntersim_kafka_consume_errors_total[10m])", "legendFormat": "Kafka 消费错误(10m)", "refId": "B" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "bag 上传（成功/失败/丢弃）与实例生命周期",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "huntersim-prometheus" },
+      "targets": [
+        { "expr": "increase(huntersim_cloud_upload_total{result=\"success\"}[30m])", "legendFormat": "上传成功(30m)", "refId": "A" },
+        { "expr": "increase(huntersim_cloud_upload_total{result=\"failed\"}[30m])", "legendFormat": "上传失败(30m)", "refId": "B" },
+        { "expr": "increase(huntersim_cloud_upload_dropped_total[30m])", "legendFormat": "队列溢出丢弃(30m)", "refId": "C" },
+        { "expr": "increase(huntersim_instance_lifecycle_total[30m])", "legendFormat": "实例 {{event}}(30m)", "refId": "D" }
+      ]
+    }
+  ]
+}

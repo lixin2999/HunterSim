@@ -20,6 +20,10 @@ from hunter_sim.api.deps import set_app_settings
 from hunter_sim.api.error_handlers import register_exception_handlers
 from hunter_sim.api.middleware.auth import JWTAuthMiddleware
 from hunter_sim.api.middleware.logging import RequestLogMiddleware, set_audit_sink
+from hunter_sim.api.middleware.rate_limit import (
+    RateLimitMiddleware,
+    LoginFailureGuard,
+)
 from hunter_sim.api.routers import (
     audit,
     auth,
@@ -33,7 +37,12 @@ from hunter_sim.api.routers import (
     scenes,
     websocket,
 )
-from hunter_sim.api.runtime import release_all_scene_runners, release_scene_runner
+from hunter_sim.api.runtime import (
+    init_runtime_state,
+    release_all_scene_runners,
+    release_scene_runner,
+)
+from hunter_sim.common.metrics import CARLA_RPC_ERRORS_TOTAL
 from hunter_sim.common.models import HunterSimSettings, InstanceStatus, SceneStatus
 from hunter_sim.common.utils import get_logger, set_default_log_level
 from hunter_sim.engine.map_manager import MapManager
@@ -171,6 +180,7 @@ def _refresh_carla_state(state: Any, settings: HunterSimSettings) -> None:
     if connected:
         state.carla_probe_error = None
     else:
+        CARLA_RPC_ERRORS_TOTAL.inc()
         state.carla_probe_error = (
             _clip_error(f"{target} 不可达：{error}") if error else _describe_unavailable(state, settings)
         )
@@ -194,6 +204,8 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
     state = app.state
     # 执行面/持久化配置供 runtime 惰性装配读取
     state.settings = settings
+    # V2.6.0：提前创建运行器注册表与唯一一把装配锁（消除首次并发惰性建锁竞态）
+    init_runtime_state(app)
 
     # 诊断字段默认值（only-if-absent，不覆盖测试/外部注入）
     for attr, default in (
@@ -256,7 +268,7 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
                 )
 
     if getattr(state, "scene_runners", None) is None:
-        state.scene_runners = {}
+        state.scene_runners = {}  # init_runtime_state 已预建；保留兼容外部注入路径
 
     # CARLA 客户端与地图管理器：无 carla SDK 时降级（惰性导入规范，不阻断服务启动）
     if getattr(state, "map_manager", None) is None:
@@ -399,6 +411,19 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
         api_settings=settings.api,
         api_keys_enabled=settings.platform.api_keys_enabled,
     )
+    # V2.6.0：按客户端 IP 的 API 限流（消费 API_RATE_LIMIT_PER_MINUTE）；
+    # 健康探针/Prometheus 抓取/WebSocket 握手豁免。先于 CORS 添加 → 位于
+    # CORS 内层，429 响应仍会附加 CORS 头
+    app.add_middleware(
+        RateLimitMiddleware,
+        rate_per_minute=settings.api.rate_limit_per_minute,
+        enabled=settings.api.rate_limit_enabled,
+        exempt_prefixes=(
+            "/api/v1/sim/health",
+            "/api/v1/sim/metrics",
+            "/api/v1/sim/ws/",
+        ),
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.api.cors_allow_origins,
@@ -414,6 +439,12 @@ def create_app(settings: HunterSimSettings | None = None) -> FastAPI:
     app.state.quota_manager = ResourceQuotaManager(
         max_per_user=settings.resource.max_instances_per_user,
         max_total=settings.resource.max_instances_total,
+    )
+    # V2.6.0：/auth/token 失败退避守卫（按客户端 IP，进程内计数）
+    app.state.login_failure_guard = LoginFailureGuard(
+        max_failures=settings.api.login_max_failed_attempts,
+        base_seconds=settings.api.login_backoff_base_seconds,
+        max_seconds=settings.api.login_backoff_max_seconds,
     )
 
     # ── 路由注册 ──────────────────────────────────────────────────────────────

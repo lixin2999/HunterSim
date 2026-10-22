@@ -19,6 +19,7 @@ from typing import Any, Optional
 from pydantic import ValidationError as PydanticValidationError
 
 from hunter_sim.common.exceptions import KafkaConnectionError
+from hunter_sim.common.metrics import KAFKA_CONSUME_ERRORS_TOTAL
 from hunter_sim.common.models import (
     DetectedObject,
     KafkaSettings,
@@ -146,6 +147,7 @@ class VILDataConsumer:
                             self._handle_message(msg.topic, msg.value)
                 except Exception as exc:
                     self._error_count += 1
+                    KAFKA_CONSUME_ERRORS_TOTAL.inc()
                     logger.warning(f"Kafka poll error: {exc}")
                     time.sleep(1.0)
 

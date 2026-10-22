@@ -14,12 +14,14 @@ from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from hunter_sim.api.models import ApiResponse, HealthResponse
+from hunter_sim.common.metrics import SERVICE_START_TIME, update_app_state_gauges
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
 
-_START_TIME: float = time.time()
+# 服务启动时间基准（V2.6.0 统一收口到 common.metrics，供 uptime 指标使用）
+_START_TIME: float = SERVICE_START_TIME
 
 # 仿真性能指标目标值（设计文档 §13.1）
 PERFORMANCE_TARGETS: dict[str, dict[str, Any]] = {
@@ -117,36 +119,12 @@ async def metrics(request: Request) -> Response:
     """GET /api/v1/sim/metrics
 
     暴露 Prometheus 文本格式指标，供 docker-compose / K8s 监控栈抓取。
-    附带进程运行时长、活跃实例数，以及健康监控指标
-    （RPC 延迟/FPS/VIL 延迟，对应设计文档 §15.4 告警项，由服务注册到 app.state）。
+
+    V2.6.0：改为正规 ``prometheus_client`` 指标族（``common/metrics.py``）：
+    - 业务 Gauge（uptime/实例数/CARLA 连通/RPC 延迟/FPS/VIL 延迟/磁盘）
+      在抓取时刻从 app.state 刷新（缺值写 NaN，不误告警）；
+    - 新增 HTTP 延迟直方图、限流/登录拒绝、实例生命周期、CARLA RPC 错误、
+      Kafka 消费错误、bag 上传结果/丢弃等 Counter。
     """
-    active_instances: int = getattr(request.app.state, "active_instance_count", 0)
-    carla_connected: bool = getattr(request.app.state, "carla_connected", False)
-    extra = (
-        "# HELP huntersim_uptime_seconds Service uptime in seconds.\n"
-        "# TYPE huntersim_uptime_seconds gauge\n"
-        f"huntersim_uptime_seconds {time.time() - _START_TIME:.1f}\n"
-        "# HELP huntersim_active_instances Number of active simulation instances.\n"
-        "# TYPE huntersim_active_instances gauge\n"
-        f"huntersim_active_instances {active_instances}\n"
-        "# HELP huntersim_carla_connected Whether CARLA connection is up.\n"
-        "# TYPE huntersim_carla_connected gauge\n"
-        f"huntersim_carla_connected {1 if carla_connected else 0}\n"
-    )
-    # §15.4 告警监控项：仅在服务注册了实时值时输出
-    monitored_gauges: tuple[tuple[str, str, str], ...] = (
-        ("carla_rpc_latency_seconds", "huntersim_carla_rpc_latency_seconds", "CARLA RPC 响应时间"),
-        ("simulation_fps", "huntersim_simulation_fps", "仿真平均帧率"),
-        ("vil_latency_ms", "huntersim_vil_latency_ms", "VIL 端到端延迟"),
-        ("disk_usage_ratio", "huntersim_disk_usage_ratio", "磁盘使用率（0-1）"),
-    )
-    for state_key, metric_name, help_text in monitored_gauges:
-        value: Any = getattr(request.app.state, state_key, None)
-        if value is not None:
-            extra += (
-                f"# HELP {metric_name} {help_text}.\n"
-                f"# TYPE {metric_name} gauge\n"
-                f"{metric_name} {float(value):.4f}\n"
-            )
-    payload = generate_latest() + extra.encode("utf-8")
-    return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
+    update_app_state_gauges(request.app.state)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

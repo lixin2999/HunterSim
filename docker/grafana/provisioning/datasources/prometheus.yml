@@ -7,5 +7,6 @@ datasources:
     type: prometheus
     access: proxy
     url: http://prometheus:9090
+    uid: huntersim-prometheus  # V2.6.0：固定 uid，预置仪表盘直接引用
     isDefault: true
     editable: false

@@ -1,0 +1,13 @@
+# Grafana 仪表盘提供者（V2.6.0）：自动加载本目录下的仪表盘 JSON
+apiVersion: 1
+
+providers:
+  - name: huntersim
+    orgId: 1
+    folder: "HunterSim"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

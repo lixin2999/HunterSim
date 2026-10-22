@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.5.0`（V2.5.0 为**阶段三「平台化」**：多租户隔离（`tenant` + 租户配额）、服务账号 API Key（`X-API-Key`）、RBAC 角色层级（guest < viewer < operator < admin）、场景库版本化 CRUD、批量任务与审计事件落 SQLite、`GET /platform/overview` 平台概览，详见 [`release.md`](release.md)）。上一版本 `2.4.0` 为**阶段二「执行面分离与状态持久化」**：引擎端点库存 `EXECUTION_ENGINE_ENDPOINTS` 与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution` 观测；更早的 `2.3.0` 为**阶段一「可用性止血」**：打通 REST 场景闭环——获取 Token → 创建实例 → 下发场景（真实加载地图/生成自车）→ 启动 → 查询进度 → 停止/销毁，`docker compose up` 后可直接跑起一个场景；同时补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
+- **当前版本**：`2.6.0`（V2.6.0 为**阶段四「并发安全与稳定性加固」（P0）**：运行器注册表与装配锁启动期预建（消除首次并发竞态）、引擎级装配锁（多引擎并行装配不再被全局锁串行）、按 IP 限流与 `/auth/token` 失败指数退避（429 + `Retry-After`）、cloud bag 上传队列有界化（队满丢最旧并计数）、`/metrics` 改标准 prometheus_client 导出并预置 Grafana 总览盘，详见 [`release.md`](release.md)）。上一版本 `2.5.0` 为**阶段三「平台化」**：多租户隔离（`tenant` + 租户配额）、服务账号 API Key（`X-API-Key`）、RBAC 角色层级（guest < viewer < operator < admin）、场景库版本化 CRUD、批量任务与审计事件落 SQLite、`GET /platform/overview` 平台概览。更早：`2.4.0` 为**阶段二「执行面分离与状态持久化」**——引擎端点库存 `EXECUTION_ENGINE_ENDPOINTS` 与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution` 观测；`2.3.0` 为**阶段一「可用性止血」**——打通 REST 场景闭环（Token → 创建实例 → 下发场景 → 启动 → 进度 → 停止/销毁），补齐 `/auth/token`、生产启动闸门、WebSocket 鉴权、实例级归属校验、日志级别与指标，镜像内置 `carla==0.9.16` SDK。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -22,6 +22,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 状态持久化（V2.4.0） | 实例与场景绑定落 SQLite（WAL），服务重启后实例可查询、场景定义在装配时自动恢复；`/health` 与 `/execution` 暴露持久化开关与恢复计数 |
 | 平台化（V2.5.0） | 多租户隔离与租户配额；服务账号 API Key（`hsk_...`，仅存哈希）；RBAC 角色层级；场景库版本化（同名自增版本/软删除/按 ID 下发）；批量任务与审计事件落库；平台概览 `GET /platform/overview` 与审计查询 `GET /audit` |
 | 安全治理 | JWT/API Key 统一主体与角色分级（创建实例需 operator+，销毁实例与地图上传、管理面需 admin）、车辆模型白名单、场景安全审核、地图上传审核（含路径穿越双重校验）、租户级隔离、审计落库 |
+| 并发安全与限流（V2.6.0） | 装配锁与运行器注册表启动期预建；引擎级装配锁支撑多引擎并行 `load_world`；按 IP 令牌桶限流（429 + `Retry-After`）与 `/auth/token` 失败指数退避；cloud bag 上传队列有界化；标准化 Prometheus 指标 + Grafana 预置盘 |
 
 ---
 
@@ -262,12 +263,12 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 | `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) |
 | `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) |
 | `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
-| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) |
+| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) · **V2.6.0**：`rate_limit_enabled`(true) · `rate_limit_per_minute`(1000) · `login_max_failed_attempts`(5) · `login_backoff_base_seconds`(2.0) · `login_backoff_max_seconds`(60) |
 | `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
 | `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) |
 | `STATE_` | 状态持久化（V2.4.0） | `enabled`(false，compose/K8s 为 true) · `db_path`(data/state/hunter_sim.db) · `recover_instances`(true) · `restore_scenes`(true) · `busy_timeout_seconds`(5.0) |
 | `PLATFORM_` | 平台化（V2.5.0） | `default_tenant`(default) · `max_instances_per_tenant`(20) · `api_keys_enabled`(true) · `audit_enabled`(true) |
-| `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) |
+| `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) · **V2.6.0**：`upload_queue_max_size`(32，bag 上传后台队列容量，队满丢最旧) |
 | `GUI_` | 桌面客户端 | `theme`(dark) · `default_map`(Town03) · `stream_fps`(30) · `scenario_runner_path`(None) |
 
 预设资源文件位于 `configs/`：8 种天气环境、7 类传感器、7 个场景模板、5 套交通流档位。
@@ -293,6 +294,8 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 > ⁺ 需 `role=admin`；`POST /instances` 需 `operator` 及以上（admin 天然满足）。完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
 
+> **限流与登录退避（V2.6.0）**：`/api/v1/sim/**` 按客户端 IP 令牌桶限流（`API_RATE_LIMIT_PER_MINUTE`，默认 1000/min；`/health*`、`/metrics`、`/ws/` 豁免，`API_RATE_LIMIT_ENABLED=false` 可关闭），超限返回 `429` + `Retry-After`；`/auth/token` 同 IP 连续失败达 `API_LOGIN_MAX_FAILED_ATTEMPTS`（默认 5）后指数退避（`API_LOGIN_BACKOFF_BASE_SECONDS` 2s 起、封顶 `API_LOGIN_BACKOFF_MAX_SECONDS` 60s），成功登录即复位。
+
 ---
 
 ## 7. 开发与测试
@@ -303,7 +306,7 @@ flake8 src tests                                               # Lint（配置�
 mypy src                                                       # 类型检查 strict 模式
 ```
 
-- **测试**：776 项单元 + 集成测试全绿（较 V2.4.0 的 749 项新增 27 项：`tests/test_platform.py` 覆盖平台配置与 `Principal` 角色层级、API Key 签发/校验/吊销、场景库版本自增与租户隔离、批量任务持久化与重启归一、审计落库/查询、租户配额、跨租户 404/admin 运维访问与 `/platform/overview`）；行覆盖率维持 ≥80 门禁（本机以 `pytest -q` 回归验证）。
+- **测试**：822 项单元 + 集成测试全绿（较 V2.5.0 的 776 项新增 46 项：`tests/test_rate_limit.py` 令牌桶/429+Retry-After/登录退避集成、`tests/test_metrics.py` 指标导出与路径归一化、`test_execution_plane.py` 引擎级锁并行装配、`test_runtime.py` 启动期预建单锁、`test_cloud_connector.py` 有界队列背压）；行覆盖率 **81.11%**（≥80% 门禁，`pytest --cov` 验证）。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

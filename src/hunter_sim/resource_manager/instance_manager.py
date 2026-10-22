@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
+from hunter_sim.common.metrics import INSTANCE_LIFECYCLE_TOTAL
 from hunter_sim.common.models import (
     CarlaSettings,
     InstanceStatus,
@@ -331,6 +332,7 @@ class SimInstanceManager:
             self._instances[instance_id] = instance
 
         self._persist(instance)
+        INSTANCE_LIFECYCLE_TOTAL.labels(event="create").inc()
         logger.info(
             f"Instance created: {instance_id} (tenant={tenant}, gpu={gpu_id}, "
             f"quality={quality.value}, "
@@ -447,6 +449,7 @@ class SimInstanceManager:
             except Exception as exc:  # noqa: BLE001  持久化失败不阻塞销毁
                 logger.warning(f"Persist delete failed for instance {instance_id}: {exc}")
         logger.info(f"Instance destroyed: {instance_id}")
+        INSTANCE_LIFECYCLE_TOTAL.labels(event="destroy").inc()
 
     def check_expired_instances(self) -> list[str]:
         """检查并销毁超时的运行实例，返回被销毁的实例 ID 列表。"""

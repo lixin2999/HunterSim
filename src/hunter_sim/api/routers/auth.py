@@ -14,6 +14,7 @@ API Key 依赖状态库（``STATE_ENABLED=true``）：密钥仅存 sha256(salt:s
 
 from __future__ import annotations
 
+import math
 import secrets
 import time
 from typing import Any
@@ -28,7 +29,9 @@ from hunter_sim.api.deps import (
     require_admin,
 )
 from hunter_sim.api.middleware.logging import audit_log
+from hunter_sim.api.middleware.rate_limit import LoginFailureGuard
 from hunter_sim.api.models import ApiKeyCreateRequest, ApiResponse, TokenRequest, TokenResponse
+from hunter_sim.common.metrics import LOGIN_REJECTIONS_TOTAL
 from hunter_sim.common.models import APISettings
 from hunter_sim.common.utils import get_logger
 
@@ -57,24 +60,48 @@ def _require_store(request: Request) -> Any:
     description=(
         "使用 API_ADMIN_USERNAME / API_ADMIN_PASSWORD 换取 Bearer Token。"
         "返回的 access_token 用于其余接口的 Authorization: Bearer <token>。"
+        "V2.6.0：同 IP 连续失败达 API_LOGIN_MAX_FAILED_ATTEMPTS 后进入"
+        "指数退避（429 + Retry-After），成功登录即复位。"
     ),
 )
 async def issue_token(
     body: TokenRequest,
+    request: Request,
     api_settings: APISettings = Depends(get_api_settings),
 ) -> ApiResponse:
     """POST /api/v1/sim/auth/token
 
     Args:
         body: 用户名/口令。
+        request: 当前请求（用于定位登录退避主体 IP）。
         api_settings: API 配置（内置管理员凭据与 JWT 参数）。
 
     Returns:
         统一响应体，data 为 TokenResponse 结构。
 
     Raises:
-        HTTPException: 凭据错误返回 401。
+        HTTPException: 凭据错误返回 401；退避期内拒绝返回 429。
     """
+    client_ip = request.client.host if request.client else "unknown"
+    guard: Any = getattr(request.app.state, "login_failure_guard", None)
+    if not isinstance(guard, LoginFailureGuard):
+        guard = None
+
+    # 退避期内直接拒绝（不泄露口令校验结果，不进入凭据比较）
+    if guard is not None:
+        retry_after = guard.retry_after(client_ip)
+        if retry_after is not None:
+            LOGIN_REJECTIONS_TOTAL.labels(reason="backoff").inc()
+            logger.warning(
+                f"Token request from '{client_ip}' rejected by login backoff "
+                f"(retry after {retry_after:.1f}s)"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts; retry later",
+                headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
+            )
+
     expected_user = api_settings.admin_username
     expected_password = api_settings.admin_password.get_secret_value()
 
@@ -85,6 +112,9 @@ async def issue_token(
         expected_password.encode("utf-8"),
     )
     if not (user_ok and password_ok):
+        if guard is not None:
+            guard.record_failure(client_ip)
+        LOGIN_REJECTIONS_TOTAL.labels(reason="credential").inc()
         logger.warning(f"Token request rejected for user '{body.username}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -92,6 +122,8 @@ async def issue_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if guard is not None:
+        guard.reset(client_ip)
     token = create_access_token(
         body.username,
         api_settings,

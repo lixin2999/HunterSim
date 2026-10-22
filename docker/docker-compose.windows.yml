@@ -60,7 +60,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: hunter-sim:2.5.0
+    image: hunter-sim:2.6.0
     ports:
       - "8080:8080"
     environment:
@@ -90,6 +90,14 @@ services:
       PLATFORM_MAX_INSTANCES_PER_TENANT: ${PLATFORM_MAX_INSTANCES_PER_TENANT:-20}
       PLATFORM_API_KEYS_ENABLED: ${PLATFORM_API_KEYS_ENABLED:-true}
       PLATFORM_AUDIT_ENABLED: ${PLATFORM_AUDIT_ENABLED:-true}
+      # 安全治理（V2.6.0）：按客户端 IP 限流 + /auth/token 失败指数退避
+      API_RATE_LIMIT_ENABLED: ${API_RATE_LIMIT_ENABLED:-true}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-1000}
+      API_LOGIN_MAX_FAILED_ATTEMPTS: ${API_LOGIN_MAX_FAILED_ATTEMPTS:-5}
+      API_LOGIN_BACKOFF_BASE_SECONDS: ${API_LOGIN_BACKOFF_BASE_SECONDS:-2}
+      API_LOGIN_BACKOFF_MAX_SECONDS: ${API_LOGIN_BACKOFF_MAX_SECONDS:-60}
+      # HunterCore bag 上传有界队列（V2.6.0，队满丢最旧并计数）
+      HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

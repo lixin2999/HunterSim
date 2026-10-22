@@ -38,13 +38,24 @@ class TestHealthEndpoints:
         assert "huntersim_active_instances" in body
 
     def test_metrics_exports_monitored_gauges(self, client: TestClient) -> None:
-        """§15.4 告警监控项：服务注册实时值后 /metrics 输出对应 gauge。"""
+        """§15.4 告警监控项：服务注册实时值后 /metrics 输出对应 gauge。
+
+        V2.6.0：/metrics 改由标准 prometheus_client 导出（浮点按最小精度
+        序列化），因此按行解析样本值比对，不再依赖手工拼接的固定小数格式。
+        """
         client.app.state.vil_latency_ms = 420.0
         client.app.state.simulation_fps = 18.5
+
+        def _gauge_value(body: str, name: str) -> float:
+            for line in body.splitlines():
+                if line.startswith(name + " "):
+                    return float(line.split(" ", 1)[1])
+            raise AssertionError(f"metric {name} not exported")
+
         try:
             body = client.get("/api/v1/sim/metrics").text
-            assert "huntersim_vil_latency_ms 420.0000" in body
-            assert "huntersim_simulation_fps 18.5000" in body
+            assert _gauge_value(body, "huntersim_vil_latency_ms") == 420.0
+            assert _gauge_value(body, "huntersim_simulation_fps") == 18.5
         finally:
             client.app.state.vil_latency_ms = None
             client.app.state.simulation_fps = None

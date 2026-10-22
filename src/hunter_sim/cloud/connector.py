@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from hunter_sim.cloud.bag_uploader import BagUploader
 from hunter_sim.cloud.telemetry_producer import TelemetryProducer
+from hunter_sim.common.metrics import CLOUD_UPLOAD_DROPPED_TOTAL, CLOUD_UPLOAD_TOTAL
 from hunter_sim.common.models import CloudSettings, VehicleState
 from hunter_sim.common.utils import get_logger
 
@@ -50,6 +51,11 @@ class CloudConnector:
         self._upload_q: "Optional[queue.Queue[Any]]" = None
         self._upload_thread: Optional[threading.Thread] = None
         self._upload_stop: Optional[threading.Event] = None
+        # V2.6.0：上传结果/溢出丢弃计数（可经 upload_stats 读取，指标同步写 Prometheus）
+        self._upload_counters_lock = threading.Lock()
+        self._upload_success = 0
+        self._upload_failed = 0
+        self._upload_dropped = 0
 
     @property
     def enabled(self) -> bool:
@@ -127,26 +133,63 @@ class CloudConnector:
         return self.producer.publish_health(ts, status=status)
 
     def upload_bag(self, file_path: Path, data_type: str = "rosbag") -> None:
-        """将 bag 上传任务投递到后台线程（fire-and-forget，不阻塞调用线程）。
+        """将 bag 上传任务投递到后台有界队列（fire-and-forget，不阻塞调用线程）。
 
-        大文件的全量哈希 + presign/PUT/complete 在上传专用线程执行，避免 GUI/仿真
-        线程被长时 IO 卡住。成功/失败结果仅记日志（后台无法同步返回）；未启用/
-        未启动时直接返回。
+        V2.6.0：队列容量由 ``upload_queue_max_size`` 限定，避免 MinIO/网络长时故障
+        时任务无界堆积在内存。队满时丢弃**最旧**待传任务为新任务腾位（丢弃计入
+        指标与告警日志）；未启用/未启动时直接返回。
         """
         if not self._started:
             return
         self._ensure_upload_worker()
-        if self._upload_q is not None:
-            self._upload_q.put((file_path, data_type))
+        q = self._upload_q
+        if q is None:
+            return
+        job: tuple[Path, str] = (file_path, data_type)
+        try:
+            q.put_nowait(job)
+            return
+        except queue.Full:
+            pass
+        # 队满：丢弃最旧任务腾位，保证最新采集的 bag 优先上传
+        dropped_job: Any = None
+        try:
+            dropped_job = q.get_nowait()
+        except queue.Empty:
+            dropped_job = None
+        if dropped_job is not None and isinstance(dropped_job, tuple):
+            self._count_drop(f"queue full, dropped oldest bag '{dropped_job[0]}'")
+        try:
+            q.put_nowait(job)
+        except queue.Full:
+            # 腾位失败（并发消费者已补位等极端情况）：丢弃新任务本身
+            self._count_drop(f"queue full, dropped new bag '{file_path}'")
+
+    def _count_drop(self, reason: str) -> None:
+        """记一次上传丢弃（计数器 + Prometheus + 告警日志）。"""
+        with self._upload_counters_lock:
+            self._upload_dropped += 1
+        CLOUD_UPLOAD_DROPPED_TOTAL.inc()
+        logger.warning(f"bag 上传丢弃（{reason}）")
+
+    @property
+    def upload_stats(self) -> dict[str, int]:
+        """上传后台计数（success/failed/dropped，供 /health 与测试读取）。"""
+        with self._upload_counters_lock:
+            return {
+                "success": self._upload_success,
+                "failed": self._upload_failed,
+                "dropped": self._upload_dropped,
+            }
 
     # ── 上传后台线程 ────────────────────────────────────────
     def _ensure_upload_worker(self) -> None:
-        """惰性启动上传工作线程（幂等）。"""
+        """惰性启动上传工作线程（幂等；V2.6.0 起队列为有界队列）。"""
         with self._worker_lock:
             if self._upload_thread is not None and self._upload_thread.is_alive():
                 return
             self._upload_stop = threading.Event()
-            self._upload_q = queue.Queue()
+            self._upload_q = queue.Queue(maxsize=self._settings.upload_queue_max_size)
             self._upload_thread = threading.Thread(
                 target=self._upload_loop, name="cloud-bag-uploader", daemon=True
             )
@@ -177,6 +220,12 @@ class CloudConnector:
         with self._upload_exec_lock:
             try:
                 result = self.uploader.upload(file_path, data_type=data_type)
+                with self._upload_counters_lock:
+                    self._upload_success += 1
+                CLOUD_UPLOAD_TOTAL.labels(result="success").inc()
                 logger.info(f"bag 上传完成：{file_path.name} → {result}")
             except Exception as exc:  # noqa: BLE001
+                with self._upload_counters_lock:
+                    self._upload_failed += 1
+                CLOUD_UPLOAD_TOTAL.labels(result="failed").inc()
                 logger.warning(f"bag 上传失败（已忽略，不阻断仿真）：{type(exc).__name__}: {exc}")

@@ -26,6 +26,12 @@ data:
   platform_max_instances_per_tenant: "20"
   platform_api_keys_enabled: "true"
   platform_audit_enabled: "true"
+  # 安全治理（V2.6.0）：按客户端 IP 限流 + /auth/token 失败指数退避（进程内计数，单副本权威）
+  api_rate_limit_enabled: "true"
+  api_rate_limit_per_minute: "1000"
+  api_login_max_failed_attempts: "5"
+  api_login_backoff_base_seconds: "2"
+  api_login_backoff_max_seconds: "60"
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

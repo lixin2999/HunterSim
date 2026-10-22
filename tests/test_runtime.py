@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,7 @@ from hunter_sim.api.runtime import (
     describe_execution,
     ensure_scene_runner,
     get_scene_runner,
+    init_runtime_state,
     persist_scene,
     persisted_scene_state,
     release_all_scene_runners,
@@ -380,3 +382,59 @@ class TestDescribeExecution:
         assert payload["runners"] == [
             {"instance_id": "inst-1", "engine": "localhost:2000"}
         ]
+
+
+# ─── V2.6.0：运行时状态预初始化（P0-1） ──────────────────────────────────
+
+
+class TestInitRuntimeState:
+    def test_creates_lock_and_registry(self) -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+
+        init_runtime_state(app)
+
+        assert app.state.scene_runtime_lock is not None
+        assert app.state.scene_runners == {}
+
+    def test_idempotent_and_preserves_injected_objects(self) -> None:
+        injected_lock = threading.RLock()
+        injected: dict[str, Any] = {"inst-keep": object()}
+        app = SimpleNamespace(
+            state=SimpleNamespace(scene_runtime_lock=injected_lock, scene_runners=injected)
+        )
+
+        init_runtime_state(app)
+        init_runtime_state(app)  # 重复调用无副作用
+
+        assert app.state.scene_runtime_lock is injected_lock
+        assert app.state.scene_runners is injected
+
+    def test_concurrent_init_yields_single_lock(self) -> None:
+        """并发预初始化只能创建一把锁（消除 check-then-act 竞态）。"""
+        app = SimpleNamespace(state=SimpleNamespace())
+        start = threading.Barrier(8, timeout=5.0)
+        locks: list[Any] = []
+
+        def _worker() -> None:
+            start.wait()
+            init_runtime_state(app)
+            locks.append(app.state.scene_runtime_lock)
+
+        threads = [threading.Thread(target=_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        assert len({id(lock) for lock in locks}) == 1
+
+    def test_lazy_fallback_still_works_without_init(self) -> None:
+        """未走 lifespan 预初始化时，惰性双检仍能完成装配（兼容注入式 app）。"""
+        app, _, _, map_manager = _make_app()
+        assert not hasattr(app.state, "scene_runtime_lock")
+
+        runner = ensure_scene_runner(app, "inst-1")
+
+        assert runner is not None
+        assert map_manager.loaded_maps == ["Town03"]
+        assert app.state.scene_runtime_lock is not None

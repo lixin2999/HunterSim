@@ -1,4 +1,4 @@
-# HunterSim 开发/单机部署编排（V2.5.0）
+# HunterSim 开发/单机部署编排（V2.6.0）
 # 使用：
 #   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
@@ -8,6 +8,8 @@
 # 且启动两个 carla 容器（--profile carla）；实例与场景绑定落 data/state/hunter_sim.db。
 # V2.5.0：平台化——多租户隔离、服务账号 API Key（X-API-Key）、场景库/批量任务/审计落库，
 # 平台参数见下方 PLATFORM_*（默认单租户 default，API Key 与审计默认开启）。
+# V2.6.0：安全治理 P0——按 IP 限流（API_RATE_LIMIT_*）、/auth/token 失败指数退避（API_LOGIN_*）、
+# cloud bag 上传有界队列（HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE）、/metrics 标准化 Prometheus 指标。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -100,7 +102,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.5.0
+    image: hunter-sim:2.6.0
     ports:
       - "8080:8080"
     environment:
@@ -132,6 +134,14 @@ services:
       PLATFORM_MAX_INSTANCES_PER_TENANT: ${PLATFORM_MAX_INSTANCES_PER_TENANT:-20}
       PLATFORM_API_KEYS_ENABLED: ${PLATFORM_API_KEYS_ENABLED:-true}
       PLATFORM_AUDIT_ENABLED: ${PLATFORM_AUDIT_ENABLED:-true}
+      # 安全治理（V2.6.0）：按客户端 IP 限流 + /auth/token 失败指数退避
+      API_RATE_LIMIT_ENABLED: ${API_RATE_LIMIT_ENABLED:-true}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-1000}
+      API_LOGIN_MAX_FAILED_ATTEMPTS: ${API_LOGIN_MAX_FAILED_ATTEMPTS:-5}
+      API_LOGIN_BACKOFF_BASE_SECONDS: ${API_LOGIN_BACKOFF_BASE_SECONDS:-2}
+      API_LOGIN_BACKOFF_MAX_SECONDS: ${API_LOGIN_BACKOFF_MAX_SECONDS:-60}
+      # HunterCore bag 上传有界队列（V2.6.0，队满丢最旧并计数）
+      HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
     depends_on:
       kafka:
         condition: service_healthy
@@ -177,7 +187,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

@@ -51,10 +51,13 @@ _ERR_CODES: dict[str, int] = {
 }
 
 
-def _err_response(code: int, message: str, http_status: int) -> ORJSONResponse:
+def _err_response(
+    code: int, message: str, http_status: int, headers: dict[str, str] | None = None
+) -> ORJSONResponse:
     return ORJSONResponse(
         status_code=http_status,
         content={"code": code, "message": message, "data": None},
+        headers=headers,
     )
 
 
@@ -110,14 +113,24 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> ORJSONResponse:
-        """处理 HTTPException（401/403/404 等）。"""
+        """处理 HTTPException（401/403/404 等）。
+
+        V2.6.0：透传 ``exc.headers``（如 401 的 WWW-Authenticate、429 的
+        Retry-After），此前自定义响应体丢失了异常携带的响应头。
+        """
+        headers = dict(exc.headers) if exc.headers else None
         if exc.status_code == status.HTTP_404_NOT_FOUND:
-            return _err_response(_ERR_CODES["not_found"], str(exc.detail), exc.status_code)
+            return _err_response(
+                _ERR_CODES["not_found"], str(exc.detail), exc.status_code, headers
+            )
         if exc.status_code == status.HTTP_403_FORBIDDEN:
-            return _err_response(_ERR_CODES["forbidden"], str(exc.detail), exc.status_code)
+            return _err_response(
+                _ERR_CODES["forbidden"], str(exc.detail), exc.status_code, headers
+            )
         return ORJSONResponse(
             status_code=exc.status_code,
             content={"code": exc.status_code, "message": str(exc.detail), "data": None},
+            headers=headers,
         )
 
     @app.exception_handler(Exception)

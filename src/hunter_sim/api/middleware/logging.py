@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from hunter_sim.common.metrics import observe_http_request
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -102,6 +103,14 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         response.headers["X-Request-ID"] = request_id
+
+        # V2.6.0：同步产出 Prometheus 延迟直方图（低基数路径归一化）
+        observe_http_request(
+            request.method,
+            str(request.url.path),
+            response.status_code,
+            elapsed_ms / 1000.0,
+        )
 
         log_level = "warning" if response.status_code >= 400 else "info"
         getattr(logger, log_level)(

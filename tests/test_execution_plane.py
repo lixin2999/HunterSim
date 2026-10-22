@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -272,3 +274,150 @@ class TestSnapshot:
         assert snapshot["engines"][0]["holder"] == "inst-1"
         assert snapshot["engines"][0]["map_id"] == "Town03"
         assert snapshot["runners"] == [{"instance_id": "inst-1", "engine": "10.0.0.1:2000"}]
+
+
+# ─── V2.6.0：引擎级锁拆分（P0-2） ───────────────────────────────────────────
+
+
+class _ConcurrentProbeMapManager(_StubMapManager):
+    """记录 load_map 并发进入数的 MapManager 桩。"""
+
+    def __init__(self, gate: Any = None) -> None:
+        super().__init__()
+        self.gate = gate
+        self.active = 0
+        self.max_active = 0
+        self.probe_lock = threading.Lock()
+
+    def load_map(self, map_id: str) -> _StubWorld:
+        with self.probe_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.gate is not None:
+                self.gate.wait(timeout=5.0)
+            return super().load_map(map_id)
+        finally:
+            with self.probe_lock:
+                self.active -= 1
+
+
+class TestEngineLocks:
+    def test_engine_lock_is_reused_per_endpoint(self) -> None:
+        plane, _ = _plane()
+        first = plane._engine_lock("10.0.0.1:2000")
+        assert plane._engine_lock("10.0.0.1:2000") is first
+        assert plane._engine_lock("10.0.0.2:2000") is not first
+
+    def test_different_endpoints_assemble_in_parallel(self) -> None:
+        """多引擎装配不再被全局锁串行化（V2.6.0 P0-2）。"""
+        manager_a = _ConcurrentProbeMapManager()
+        manager_b = _ConcurrentProbeMapManager()
+        endpoint_a = EngineEndpoint("10.0.0.1", 2000, 2001)
+        endpoint_b = EngineEndpoint("10.0.0.2", 2000, 2001)
+        managers = {endpoint_a.key: manager_a, endpoint_b.key: manager_b}
+        plane = ExecutionPlane(
+            EnginePool([endpoint_a, endpoint_b]),
+            lambda endpoint: managers[endpoint.key],
+            runner_factory=_StubRunner,
+        )
+        barrier = threading.Barrier(2, timeout=5.0)
+        manager_a.gate = barrier
+        manager_b.gate = barrier
+
+        results: list[Any] = []
+
+        def _assemble(instance: Any) -> None:
+            results.append(plane.ensure_runner(instance))
+
+        threads = [
+            threading.Thread(target=_assemble, args=(_instance("inst-1", host="10.0.0.1"),)),
+            threading.Thread(target=_assemble, args=(_instance("inst-2", host="10.0.0.2"),)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        # barrier 双线程会合成功 → 两次 load 时间上重叠（全局锁下会超时 BrokenBarrier）
+        assert not any(t.is_alive() for t in threads)
+        assert len(results) == 2
+        assert manager_a.max_active == 1 and manager_b.max_active == 1
+        assert plane.active_engine_count == 2
+
+    def test_external_holder_serializes_engine_operations(self) -> None:
+        """同端点的 CARLA 操作与引擎锁持有者严格串行（单引擎退化语义）。"""
+        plane, manager = _plane()
+        key = "10.0.0.1:2000"
+        engine_lock = plane._engine_lock(key)  # 线程启动前先建锁，避免建锁竞态
+        done: list[str] = []
+
+        def _assemble() -> None:
+            plane.ensure_runner(_instance())
+            done.append("assembled")
+
+        t = threading.Thread(target=_assemble)
+        with engine_lock:  # 外部持锁 → 装配必须等待
+            t.start()
+            time.sleep(0.15)
+            assert not done
+        t.join(timeout=10.0)
+        assert done == ["assembled"]
+        assert manager.loaded_maps == ["Town03"]
+
+    def test_concurrent_same_instance_loads_once(self) -> None:
+        """同实例并发 ensure：后到者在引擎锁内事后再查注册表，不重复 load。"""
+        slow: list[str] = []
+
+        def _slow_factory(world: Any, **kwargs: Any) -> _StubRunner:
+            time.sleep(0.1)
+            slow.append("built")
+            return _StubRunner(world)
+
+        plane = ExecutionPlane(
+            EnginePool([EngineEndpoint("10.0.0.1", 2000, 2001)]),
+            lambda endpoint: _StubMapManager(),
+            runner_factory=_slow_factory,
+        )
+        instance = _instance()
+        results: list[Any] = []
+
+        def _assemble() -> None:
+            results.append(plane.ensure_runner(instance))
+
+        threads = [threading.Thread(target=_assemble) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        assert len(results) == 2
+        assert results[0] is results[1]
+        assert len(slow) == 1
+        assert plane.runners["inst-1"] is results[0]
+
+    def test_release_of_registered_runner_waits_engine_lock(self) -> None:
+        """已注册运行器的销毁在引擎锁下执行，与在途 CARLA 操作串行。"""
+        plane, _ = _plane()
+        runner = plane.ensure_runner(_instance())
+        key = "10.0.0.1:2000"
+        engine_lock = plane._engine_lock(key)
+        destroyed: list[bool] = []
+        original_destroy = runner.destroy
+
+        def _spy_destroy() -> None:
+            destroyed.append(True)
+            original_destroy()
+
+        runner.destroy = _spy_destroy  # type: ignore[method-assign]
+
+        with engine_lock:  # 外部持锁 → 销毁必须等待
+            releaser = threading.Thread(target=plane.release, args=("inst-1",))
+            releaser.start()
+            time.sleep(0.15)
+            assert releaser.is_alive()
+            assert destroyed == []
+        releaser.join(timeout=10.0)
+        assert destroyed == [True]
+        assert plane.get_runner("inst-1") is None
+        assert plane.active_engine_count == 0
