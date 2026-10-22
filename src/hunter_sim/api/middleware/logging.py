@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from hunter_sim.common.metrics import observe_http_request
-from hunter_sim.common.utils import get_logger
+from hunter_sim.common.utils import bind_request_id, clear_request_id, get_logger
 
 logger = get_logger(__name__)
 
@@ -78,7 +78,8 @@ def audit_log(
 class RequestLogMiddleware(BaseHTTPMiddleware):
     """HTTP 请求日志中间件。
 
-    为每个请求生成唯一 request_id，并记录：
+    为每个请求生成唯一 request_id（优先复用客户端传入的 ``X-Request-ID``，
+    P1-11 链路追踪），绑定到 structlog contextvars 贯穿后续所有日志，并记录：
     - 请求方法 / 路径 / 查询参数
     - 响应状态码
     - 处理耗时（毫秒）
@@ -94,12 +95,17 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         Returns:
             响应对象。
         """
-        request_id = str(uuid.uuid4())[:8]
+        incoming_id = request.headers.get("X-Request-ID", "").strip()
+        request_id = incoming_id[:64] if incoming_id else str(uuid.uuid4())[:8]
         request.state.request_id = request_id
         start = time.perf_counter()
 
-        # 注入 request_id 到响应 header
-        response: Response = await call_next(request)
+        # P1-11：绑定 contextvars，下游处理链内全部日志自动携带 request_id
+        bind_request_id(request_id)
+        try:
+            response: Response = await call_next(request)
+        finally:
+            clear_request_id()
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         response.headers["X-Request-ID"] = request_id

@@ -225,6 +225,16 @@ class KafkaSettings(BaseSettings):
     command_topic: str = Field("hunter.{vehicle_id}.command_result")
     username: Optional[SecretStr] = None
     password: Optional[SecretStr] = None
+    # ── V2.7.0 P1-8：消费自愈与坏消息 DLQ ──
+    enable_self_heal: bool = Field(
+        True, description="连续轮询错误达阈值后自动重建 KafkaConsumer（P1-8）"
+    )
+    rebuild_after_errors: int = Field(
+        10, ge=1, description="触发消费者重建的连续错误次数阈值（P1-8）"
+    )
+    dlq_topic: str = Field(
+        "", description="坏消息死信队列 Topic（空则不转发，仅计数丢弃，P1-8）"
+    )
 
 
 class VILSettings(BaseSettings):
@@ -242,6 +252,17 @@ class VILSettings(BaseSettings):
     calibration_x0: float = Field(0.0, description="初始标定 X 偏移（CARLA 地图坐标）")
     calibration_y0: float = Field(0.0, description="初始标定 Y 偏移")
     calibration_yaw0: float = Field(0.0, description="初始标定航向偏移（弧度）")
+    # ── V2.7.0 P1-9：链路强化（乱序/去重、自动环深、延迟分位数） ──
+    ordering_guard_enabled: bool = Field(
+        True, description="按 timestamp+seq 丢弃乱序/重复遥测消息（P1-9）"
+    )
+    telemetry_frequency_hz: float = Field(
+        10.0, gt=0.0, le=200.0, description="遥测标称频率（Hz），用于自动推导环深（P1-9）"
+    )
+    auto_buffer_depth: bool = Field(
+        True,
+        description="为真时环深按 ceil(extrapolation_ms/1000 × 频率)+余量自动推导（P1-9）",
+    )
 
 
 class APISettings(BaseSettings):
@@ -277,6 +298,13 @@ class APISettings(BaseSettings):
     )
     login_backoff_max_seconds: float = Field(
         60.0, gt=0.0, le=3600.0, description="登录退避时长上限（秒）"
+    )
+    # ── V2.7.0 P1-6：JWT 吊销与滑动续期（仅 STATE_ENABLED=true 时生效）──
+    jwt_revocation_enabled: bool = Field(
+        True, description="写入 jti 并在中间件校验吊销名单（需状态库，P1-6）"
+    )
+    jwt_refresh_enabled: bool = Field(
+        True, description="开放 POST /auth/refresh 滑动续期（需状态库，P1-6）"
     )
     stream_base_url: str = Field(
         "webrtc://localhost:8080", description="仿真画面 WebRTC 视频流基础地址（设计文档 §12.2）"
@@ -328,6 +356,13 @@ class ExecutionSettings(BaseSettings):
     restore_scene_on_assemble: bool = Field(
         True, description="重新装配运行器时自动恢复已持久化的场景定义（重启恢复）"
     )
+    # ── V2.7.0 P1-7：租约心跳与僵尸持有者回收 ──
+    lease_heartbeat_enabled: bool = Field(
+        True, description="实例运行/状态查询时续租引擎心跳（P1-7）"
+    )
+    lease_ttl_seconds: int = Field(
+        120, ge=10, description="心跳超过该时长未续则视为僵尸租约（P1-7）"
+    )
 
 
 class StateSettings(BaseSettings):
@@ -346,6 +381,12 @@ class StateSettings(BaseSettings):
     recover_instances: bool = Field(True, description="启动时恢复未终态实例")
     restore_scenes: bool = Field(True, description="启动后按需恢复已持久化的场景定义")
     busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时（秒）")
+    # ── V2.7.0 P1-10：场景快照写节流 ──
+    snapshot_write_interval_seconds: float = Field(
+        1.0,
+        ge=0.0,
+        description="同状态快照落库最小间隔（秒）；状态跃迁不受限必写（0 表示不节流，P1-10）",
+    )
 
 
 class PlatformSettings(BaseSettings):
@@ -443,6 +484,19 @@ class HunterSimSettings(BaseSettings):
 
     env: str = Field("dev", pattern="^(dev|staging|prod)$")
     log_level: str = Field("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    # ── V2.7.0 P1-11：日志统一（structlog JSON + 可选文件轮转）──
+    log_json: bool = Field(
+        False, description="为真时模块日志以 JSON 渲染（生产采集）；否则保留可读文本（P1-11）"
+    )
+    log_file: str = Field(
+        "", description="日志文件路径（空表示仅 stdout）；启用时自动接入轮转文件处理器（P1-11）"
+    )
+    log_max_bytes: int = Field(
+        10_485_760, ge=1024, description="单日志文件最大字节数，超过则轮转（P1-11）"
+    )
+    log_backup_count: int = Field(
+        5, ge=0, le=50, description="轮转保留的历史日志文件数（P1-11）"
+    )
     carla: CarlaSettings = Field(default_factory=CarlaSettings)
     kafka: KafkaSettings = Field(default_factory=KafkaSettings)
     vil: VILSettings = Field(default_factory=VILSettings)

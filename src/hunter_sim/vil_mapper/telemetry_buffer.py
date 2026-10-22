@@ -2,18 +2,55 @@
 
 基于 RingBuffer 实现只保留最新 N 帧的线程安全缓冲区。
 支持数据超时检测和外推回退逻辑。
+
+V2.7.0 P1-9：
+- 环深自动推导 ``compute_auto_buffer_depth``：按 ``extrapolation_ms × 遥测频率``
+  计算外推窗口所需帧数并加余量，避免手工配置与外推参数不一致；
+- 收帧即产出 VIL 端到端延迟直方图样本（``observe_vil_latency``，P50/P95/P99）。
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-from hunter_sim.common.models import PerceptionResult, VehicleState
+from hunter_sim.common.metrics import observe_vil_latency
+from hunter_sim.common.models import PerceptionResult, VehicleState, VILSettings
 from hunter_sim.common.utils import RingBuffer, get_logger
 
 logger = get_logger(__name__)
+
+# 自动环深的下限/上限与余量帧数（覆盖抖动 + 至少 1 个外推周期）
+_AUTO_DEPTH_MARGIN_FRAMES = 5
+_AUTO_DEPTH_MIN = 10
+_AUTO_DEPTH_MAX = 200
+
+
+def compute_auto_buffer_depth(
+    extrapolation_ms: int,
+    telemetry_frequency_hz: float,
+    margin_frames: int = _AUTO_DEPTH_MARGIN_FRAMES,
+) -> int:
+    """按外推窗口与遥测频率自动推导 RingBuffer 环深（P1-9）。
+
+    公式：``ceil(extrapolation_ms / 1000 × frequency_hz) + margin_frames``，
+    结果钳制在 [``_AUTO_DEPTH_MIN``, ``_AUTO_DEPTH_MAX``]。
+
+    Args:
+        extrapolation_ms: 位姿外推时间窗口（毫秒）。
+        telemetry_frequency_hz: 遥测标称频率（Hz），必须为正。
+        margin_frames: 抗抖动余量帧数。
+
+    Returns:
+        推导出的环深（帧数）。
+    """
+    if telemetry_frequency_hz <= 0:
+        raise ValueError("telemetry_frequency_hz must be positive")
+    window_frames = math.ceil(extrapolation_ms / 1000.0 * telemetry_frequency_hz)
+    depth = window_frames + max(0, margin_frames)
+    return max(_AUTO_DEPTH_MIN, min(_AUTO_DEPTH_MAX, depth))
 
 
 @dataclass
@@ -51,19 +88,39 @@ class TelemetryBuffer:
     支持超时检测和获取最新有效帧。
 
     Args:
-        max_frames: 缓冲区最大帧数。
+        max_frames: 缓冲区最大帧数（``vil_settings.auto_buffer_depth`` 为真时被覆盖）。
         max_latency_ms: 超过此延迟认为帧过期（毫秒）。
+        vil_settings: VIL 配置；提供且开启自动环深时，按外推窗口 × 频率推导帧数。
     """
 
     def __init__(
         self,
         max_frames: int = 10,
         max_latency_ms: int = 500,
+        vil_settings: Optional[VILSettings] = None,
     ) -> None:
-        self._buffer: RingBuffer[TelemetryFrame] = RingBuffer(max_size=max_frames)
+        depth = max_frames
+        if vil_settings is not None and vil_settings.auto_buffer_depth:
+            depth = compute_auto_buffer_depth(
+                vil_settings.extrapolation_ms, vil_settings.telemetry_frequency_hz
+            )
+            if depth != max_frames:
+                logger.info(
+                    f"Auto buffer depth {depth} frames "
+                    f"(extrapolation={vil_settings.extrapolation_ms}ms, "
+                    f"freq={vil_settings.telemetry_frequency_hz}Hz), "
+                    f"override configured max_frames={max_frames}"
+                )
+        self._max_frames: int = depth
+        self._buffer: RingBuffer[TelemetryFrame] = RingBuffer(max_size=depth)
         self._max_latency_ms: float = float(max_latency_ms)
         self._total_received: int = 0
         self._total_expired: int = 0
+
+    @property
+    def max_frames(self) -> int:
+        """当前环深（自动推导后的实际生效值）。"""
+        return self._max_frames
 
     def push(self, frame: TelemetryFrame) -> None:
         """推入新帧数据。
@@ -75,6 +132,8 @@ class TelemetryBuffer:
             frame: 遥测帧数据。
         """
         frame.receive_time = time.time()
+        # P1-9：收帧即记录端到端延迟直方图样本（Grafana 用 histogram_quantile 求分位数）
+        observe_vil_latency(frame.latency_ms)
         if frame.latency_ms > self._max_latency_ms:
             frame.is_fresh = False
             self._total_expired += 1

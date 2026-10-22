@@ -17,6 +17,14 @@
 - huntersim_kafka_consume_errors_total     Kafka 消费轮询错误计数
 - huntersim_cloud_upload_total             bag 上传结果计数（success/failed）
 - huntersim_cloud_upload_dropped_total     上传队列溢出丢弃计数（P0-4）
+
+指标清单（V2.7.0 P1 新增）：
+- huntersim_kafka_consumer_rebuilds_total  Kafka 消费者自愈重建计数（P1-8）
+- huntersim_cloud_dlq_published_total      坏消息进 DLQ 计数（P1-8）
+- huntersim_vil_message_dropped_total      VIL 乱序/重复消息丢弃计数（P1-9）
+- huntersim_vil_latency_seconds            VIL 端到端延迟直方图（P50/P95/P99，P1-9）
+- huntersim_execution_lease_reclaims_total 僵尸租约强制回收计数（P1-7）
+- huntersim_auth_token_events_total        Token 续期/吊销计数（P1-6）
 """
 
 from __future__ import annotations
@@ -110,6 +118,53 @@ CLOUD_UPLOAD_DROPPED_TOTAL = Counter(
     "Bag upload jobs dropped due to a full upload queue.",
 )
 
+# ─── V2.7.0 P1：数据链路韧性与可观测 ────────────────────────────────────────
+
+KAFKA_CONSUMER_REBUILDS_TOTAL = Counter(
+    "huntersim_kafka_consumer_rebuilds_total",
+    "VIL Kafka consumer self-heal rebuilds after consecutive poll errors.",
+)
+
+KAFKA_CONSUMED_TOTAL = Counter(
+    "huntersim_kafka_consumed_total",
+    "VIL telemetry messages consumed from Kafka (self-heal observability).",
+)
+
+# 消费滞后（最新 offset - 当前 position）估算：无 partition 分配时为 0
+KAFKA_CONSUMER_LAG = Gauge(
+    "huntersim_kafka_consumer_lag",
+    "Approximate VIL Kafka consumer lag (end offset - position), best-effort.",
+)
+
+CLOUD_DLQ_PUBLISHED_TOTAL = Counter(
+    "huntersim_cloud_dlq_published_total",
+    "Malformed VIL telemetry messages forwarded to the dead-letter topic.",
+)
+
+VIL_MESSAGE_DROPPED_TOTAL = Counter(
+    "huntersim_vil_message_dropped_total",
+    "Out-of-order or duplicate VIL telemetry messages dropped by the ordering guard.",
+    labelnames=("reason",),
+)
+
+# VIL 端到端延迟直方图（毫秒→秒观测）：Grafana 用 histogram_quantile 求 P50/P95/P99
+VIL_LATENCY_SECONDS = Histogram(
+    "huntersim_vil_latency_seconds",
+    "VIL end-to-end telemetry latency in seconds (P50/P95/P99 via histogram_quantile).",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0, 5.0),
+)
+
+EXECUTION_LEASE_RECLAIMS_TOTAL = Counter(
+    "huntersim_execution_lease_reclaims_total",
+    "Zombie engine leases force-reclaimed by admin (stale heartbeat).",
+)
+
+AUTH_TOKEN_EVENTS_TOTAL = Counter(
+    "huntersim_auth_token_events_total",
+    "JWT token lifecycle events (event=refresh|revoke|revoked_hit).",
+    labelnames=("event",),
+)
+
 # ─── app.state 派生 Gauge（抓取时刻刷新）────────────────────────────────────
 
 _GAUGE_SPECS: tuple[tuple[str, str, str], ...] = (
@@ -165,6 +220,16 @@ def observe_http_request(method: str, path: str, status_code: int, elapsed_secon
     ).observe(elapsed_seconds)
 
 
+def observe_vil_latency(latency_ms: float) -> None:
+    """记录一帧 VIL 端到端延迟样本（毫秒入参，按秒观测）。
+
+    供 ``TelemetryBuffer`` / 健康监控在收帧时调用，直方图支持在 Grafana
+    用 ``histogram_quantile`` 求 P50/P95/P99（P1-9）。
+    """
+    if latency_ms >= 0.0:
+        VIL_LATENCY_SECONDS.observe(latency_ms / 1000.0)
+
+
 def counter_value(metric: Any, **labels: str) -> float:
     """读取 Counter 当前累计值（测试断言辅助；未初始化返回 0）。"""
     try:
@@ -206,19 +271,28 @@ def metric_exists(name: str) -> bool:
 
 
 __all__ = [
+    "AUTH_TOKEN_EVENTS_TOTAL",
     "CARLA_RPC_ERRORS_TOTAL",
+    "CLOUD_DLQ_PUBLISHED_TOTAL",
     "CLOUD_UPLOAD_DROPPED_TOTAL",
     "CLOUD_UPLOAD_TOTAL",
+    "EXECUTION_LEASE_RECLAIMS_TOTAL",
     "HTTP_REQUEST_DURATION_SECONDS",
     "INSTANCE_LIFECYCLE_TOTAL",
     "KAFKA_CONSUME_ERRORS_TOTAL",
+    "KAFKA_CONSUMER_LAG",
+    "KAFKA_CONSUMER_REBUILDS_TOTAL",
+    "KAFKA_CONSUMED_TOTAL",
     "LOGIN_REJECTIONS_TOTAL",
     "RATE_LIMITED_REJECTIONS_TOTAL",
     "SERVICE_START_TIME",
+    "VIL_LATENCY_SECONDS",
+    "VIL_MESSAGE_DROPPED_TOTAL",
     "counter_value",
     "histogram_count",
     "metric_exists",
     "normalize_api_path",
     "observe_http_request",
+    "observe_vil_latency",
     "update_app_state_gauges",
 ]

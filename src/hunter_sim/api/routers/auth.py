@@ -24,14 +24,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from hunter_sim.api.deps import (
     Principal,
     create_access_token,
+    current_principal,
     get_api_settings,
     get_settings,
+    mint_access_token,
     require_admin,
 )
 from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.middleware.rate_limit import LoginFailureGuard
 from hunter_sim.api.models import ApiKeyCreateRequest, ApiResponse, TokenRequest, TokenResponse
-from hunter_sim.common.metrics import LOGIN_REJECTIONS_TOTAL
+from hunter_sim.common.metrics import AUTH_TOKEN_EVENTS_TOTAL, LOGIN_REJECTIONS_TOTAL
 from hunter_sim.common.models import APISettings
 from hunter_sim.common.utils import get_logger
 
@@ -139,6 +141,121 @@ async def issue_token(
         expires_in=api_settings.jwt_expire_minutes * 60,
     )
     return ApiResponse(data=payload.model_dump())
+
+
+@router.post(
+    "/auth/refresh",
+    response_model=ApiResponse,
+    summary="滑动续期 JWT 访问令牌",
+    description=(
+        "用一个当前有效（未过期且未吊销）的 Bearer Token 换取得到已重新签发、"
+        "有效期刷新的新 Token；旧 Token 的 ``jti`` 就地吊销（轮换，需状态库）。"
+        "用于长时批量任务/WS 监控中途续期，避免重新输入凭据。需 ``API_JWT_REFRESH_ENABLED``"
+        "与 ``STATE_ENABLED=true``。"
+    ),
+)
+async def refresh_token(
+    request: Request,
+    api_settings: APISettings = Depends(get_api_settings),
+) -> ApiResponse:
+    """POST /api/v1/sim/auth/refresh
+
+    仅接受中间件已认证写入的 ``request.state.token_payload``（含 jti）。
+
+    Raises:
+        HTTPException: 未启用续期/无状态库返回 503；旧 Token 被吊销返回 401。
+    """
+    if not api_settings.jwt_refresh_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token refresh is disabled (API_JWT_REFRESH_ENABLED=false)",
+        )
+    store = _require_store(request)
+    payload = getattr(request.state, "token_payload", None)
+    if not isinstance(payload, dict) or not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A valid bearer token is required to refresh",
+        )
+    old_jti = str(payload.get("jti", ""))
+    if old_jti and store.is_token_revoked(old_jti):
+        AUTH_TOKEN_EVENTS_TOTAL.labels(event="revoked_hit").inc()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    principal = current_principal(request)
+    new_token, new_jti, _ = mint_access_token(
+        principal.user_id,
+        api_settings,
+        extra_claims={"role": principal.role},
+        tenant=principal.tenant,
+    )
+    # 旧 Token 就地吊销（若自然过期则 jti 不再有意义，写入也无害）：best-effort
+    if old_jti:
+        try:
+            store.revoke_token(old_jti, expires_at=float(payload.get("exp", 0.0) or 0.0),
+                               user_id=principal.user_id)
+        except Exception as exc:  # noqa: BLE001  旧 jti 写入失败不阻断新 Token 签发
+            logger.warning(f"Failed to revoke previous token jti on refresh: {exc}")
+    AUTH_TOKEN_EVENTS_TOTAL.labels(event="refresh").inc()
+    audit_log(
+        "auth.token.refresh",
+        principal.user_id,
+        new_jti,
+        detail=f"rotated_from={old_jti or 'none'}",
+        tenant=principal.tenant,
+        auth_type="jwt",
+    )
+    logger.info(f"Refreshed access token for '{principal.user_id}' (new jti={new_jti})")
+    body = TokenResponse(
+        access_token=new_token,
+        expires_in=api_settings.jwt_expire_minutes * 60,
+    )
+    return ApiResponse(data=body.model_dump())
+
+
+@router.post(
+    "/auth/revoke",
+    response_model=ApiResponse,
+    summary="吊销当前 JWT 访问令牌（退出登录）",
+    description=(
+        "将当前 Bearer Token 的 ``jti`` 加入吊销名单，立即失效（幂等）。"
+        "需 ``STATE_ENABLED=true``；未携带 jti 的旧 Token 无可吊销。"
+    ),
+)
+async def revoke_token(
+    request: Request,
+    api_settings: APISettings = Depends(get_api_settings),
+) -> ApiResponse:
+    """POST /api/v1/sim/auth/revoke"""
+    store = _require_store(request)
+    payload = getattr(request.state, "token_payload", None)
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A bearer token is required to revoke",
+        )
+    jti = str(payload.get("jti", ""))
+    if not jti:
+        return ApiResponse(data={"revoked": False, "reason": "token has no jti claim"})
+    principal = current_principal(request)
+    first_time = store.revoke_token(
+        jti, expires_at=float(payload.get("exp", 0.0) or 0.0), user_id=principal.user_id
+    )
+    if first_time:
+        AUTH_TOKEN_EVENTS_TOTAL.labels(event="revoke").inc()
+        audit_log(
+            "auth.token.revoke",
+            principal.user_id,
+            jti,
+            tenant=principal.tenant,
+            auth_type="jwt",
+        )
+    logger.info(f"Revoked access token jti={jti} for '{principal.user_id}'")
+    return ApiResponse(data={"revoked": True, "jti": jti})
 
 
 # ─── 服务账号 API Key（V2.5.0） ──────────────────────────────────────────────

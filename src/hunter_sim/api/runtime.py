@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, cast
 
 from fastapi import HTTPException, Request, status
@@ -169,9 +170,13 @@ def _execution_plane(app: Any) -> ExecutionPlane:
             endpoints = parse_engine_endpoints(spec, base, max_engines)
             app.state.execution_endpoints = endpoints
         delta = getattr(base, "fixed_delta_seconds", _FIXED_DELTA_SECONDS)
+        # V2.7.0 P1-7：启用心跳时给租约池配置 TTL（禁用时 0=永不判僵）
+        exec_cfg = settings.execution if settings is not None else None
+        heartbeat_on = bool(getattr(exec_cfg, "lease_heartbeat_enabled", False)) if exec_cfg else False
+        lease_ttl = float(getattr(exec_cfg, "lease_ttl_seconds", 0) or 0) if heartbeat_on else 0.0
 
         plane = ExecutionPlane(
-            EnginePool(endpoints),
+            EnginePool(endpoints, lease_ttl_seconds=lease_ttl),
             lambda endpoint: _resolve_map_manager(app, endpoint),
             lock=_runtime_lock(app),
             fixed_delta_seconds=delta,
@@ -314,6 +319,36 @@ def release_all_scene_runners(app: Any) -> int:
     return released
 
 
+def force_release_execution_lease(app: Any, instance_id: str) -> bool:
+    """管理强制回收僵尸租约（V2.7.0 P1-7）：释放运行器并归还引擎端点。
+
+    Returns:
+        是否确实释放了运行器或租约。
+    """
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is not None:
+        released = bool(plane.force_release(instance_id))
+        if plane.active_engine_count == 0:
+            app.state.scene_world_map_id = None
+        return released
+    return bool(release_scene_runner(app, instance_id))
+
+
+def renew_execution_heartbeats(app: Any) -> int:
+    """对存活运行器批量续租引擎心跳（健康巡检周期调用，P1-7）。
+
+    无执行平面或未启用心跳（TTL<=0）时返回 0，不阻断主流程。
+    """
+    plane = getattr(app.state, "execution_plane", None)
+    if plane is None:
+        return 0
+    try:
+        return int(plane.renew_live_leases())
+    except Exception as exc:  # noqa: BLE001  心跳续租失败不影响健康巡检
+        logger.debug(f"Execution lease heartbeat renewal failed: {exc}")
+        return 0
+
+
 # ─── 场景持久化 / 状态查询 ───────────────────────────────────────────────────
 
 
@@ -417,23 +452,62 @@ def _restore_persisted_scene(app: Any, instance_id: str, runner: Any) -> None:
         logger.warning(f"Restore persisted scene for instance {instance_id} failed: {exc}")
 
 
+# ── P1-10：快照写节流（每实例 (last_status, last_write_ts)，随 app.state 存活）──
+_GUARD_INIT_LOCK = threading.Lock()
+
+
+def _snapshot_write_guard(app: Any) -> dict[str, Any]:
+    """惰性初始化并返回 app 级写节流守卫（线程安全）。"""
+    guard = getattr(app.state, "_snapshot_write_guard", None)
+    if guard is None:
+        with _GUARD_INIT_LOCK:
+            guard = getattr(app.state, "_snapshot_write_guard", None)
+            if guard is None:
+                guard = {"lock": threading.Lock(), "last": {}}
+                setattr(app.state, "_snapshot_write_guard", guard)
+    return cast(dict[str, Any], guard)
+
+
+def _should_write_snapshot(app: Any, instance_id: str, status_value: str) -> bool:
+    """判断本次快照回调是否应落库：状态跃迁必写，同状态按最小间隔节流。"""
+    settings = getattr(app.state, "settings", None)
+    state_cfg = getattr(settings, "state", None) if settings is not None else None
+    interval = float(getattr(state_cfg, "snapshot_write_interval_seconds", 0.0) or 0.0)
+    if interval <= 0.0:
+        return True  # 未启用节流（测试/默认配置）
+    guard = _snapshot_write_guard(app)
+    now = time.time()
+    with cast(threading.Lock, guard["lock"]):
+        last = cast("dict[str, tuple[str, float]]", guard["last"]).get(instance_id)
+        if last is not None and last[0] == status_value and (now - last[1]) < interval:
+            return False
+        cast("dict[str, tuple[str, float]]", guard["last"])[instance_id] = (status_value, now)
+        return True
+
+
 def _scene_state_callback(app: Any, instance_id: str) -> Any:
-    """场景状态变化 → 更新持久化快照。"""
+    """场景状态变化 → 更新持久化快照（P1-10 写节流）。
+
+    同一实例、同一状态在 ``STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS`` 内只落库一次；
+    状态跃迁（status 变化）不受节流限制必写，保证恢复语义不丢关键节点。
+    """
 
     def _callback(snapshot: Any) -> None:
         store = getattr(app.state, "state_store", None)
         if store is None:
             return
-        try:
-            store.update_scene_snapshot(
-                instance_id=instance_id,
-                status=snapshot.status.value,
-                progress=float(getattr(snapshot, "progress", 0.0)),
-                elapsed_seconds=float(getattr(snapshot, "elapsed_seconds", 0.0)),
-                error_message=str(getattr(snapshot, "error_message", "") or ""),
-            )
-        except Exception as exc:  # noqa: BLE001  持久化失败只影响快照新鲜度
-            logger.debug(f"Persist scene snapshot for instance {instance_id} failed: {exc}")
+        status_value = str(snapshot.status.value)
+        if _should_write_snapshot(app, instance_id, status_value):
+            try:
+                store.update_scene_snapshot(
+                    instance_id=instance_id,
+                    status=status_value,
+                    progress=float(getattr(snapshot, "progress", 0.0)),
+                    elapsed_seconds=float(getattr(snapshot, "elapsed_seconds", 0.0)),
+                    error_message=str(getattr(snapshot, "error_message", "") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001  持久化失败只影响快照新鲜度
+                logger.debug(f"Persist scene snapshot for instance {instance_id} failed: {exc}")
 
     return _callback
 
@@ -528,10 +602,12 @@ __all__ = [
     "describe_execution",
     "ensure_scene_runner",
     "ensure_scene_runner_or_http",
+    "force_release_execution_lease",
     "get_scene_runner",
     "init_runtime_state",
     "persist_scene",
     "persisted_scene_state",
     "release_all_scene_runners",
     "release_scene_runner",
+    "renew_execution_heartbeats",
 ]

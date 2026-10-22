@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_time ON audit_logs(tenant, created_at);
+
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    jti        TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL DEFAULT 0,
+    revoked_at REAL NOT NULL
+);
 """
 
 # 服务重启后执行面已丢失：运行中的场景统一回到「已就绪（可重新启动）」
@@ -699,6 +706,49 @@ class StateStore:
                     )
                     updated += cursor.rowcount
         return updated
+
+    # ─── JWT 吊销名单（V2.7.0 P1-6） ────────────────────────────────────────
+
+    def revoke_token(self, jti: str, expires_at: float = 0.0, user_id: str = "") -> bool:
+        """登记一个已吊销的 JWT ``jti``（幂等）；返回是否首次写入。
+
+        ``expires_at`` 用于自然过期后的名单清理（吊销一个本就过期的 Token 无意义）。
+        """
+        if not jti:
+            return False
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "INSERT INTO revoked_tokens (jti, user_id, expires_at, revoked_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(jti) DO NOTHING",
+                    (jti, user_id, float(expires_at), time.time()),
+                )
+        return bool(cursor.rowcount > 0)
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """查询 ``jti`` 是否在吊销名单中（空 jti 视为未吊销）。"""
+        if not jti:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)
+            ).fetchone()
+        return row is not None
+
+    def prune_revoked_tokens(self, before: Optional[float] = None) -> int:
+        """清理已自然过期的吊销记录（``expires_at`` 早于 ``before``），返回清理数。
+
+        吊销名单只需覆盖到 Token 自身过期为止：过期 Token 无论是否吊销都会被判无效，
+        因此定期裁剪防止名单无限增长。
+        """
+        cutoff = time.time() if before is None else float(before)
+        with self._lock:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "DELETE FROM revoked_tokens WHERE expires_at > 0 AND expires_at < ?",
+                    (cutoff,),
+                )
+        return int(cursor.rowcount)
 
     def close(self) -> None:
         """关闭数据库连接。"""

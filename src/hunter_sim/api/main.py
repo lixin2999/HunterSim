@@ -41,10 +41,11 @@ from hunter_sim.api.runtime import (
     init_runtime_state,
     release_all_scene_runners,
     release_scene_runner,
+    renew_execution_heartbeats,
 )
 from hunter_sim.common.metrics import CARLA_RPC_ERRORS_TOTAL
 from hunter_sim.common.models import HunterSimSettings, InstanceStatus, SceneStatus
-from hunter_sim.common.utils import get_logger, set_default_log_level
+from hunter_sim.common.utils import configure_logging, get_logger
 from hunter_sim.engine.map_manager import MapManager
 from hunter_sim.execution.engine_pool import parse_engine_endpoints
 from hunter_sim.persistence.state_store import StateStore
@@ -107,9 +108,19 @@ def _enforce_production_guards(settings: HunterSimSettings) -> None:
 
 
 def _configure_logging(settings: HunterSimSettings) -> int:
-    """使 HUNTER_SIM_LOG_LEVEL 真正生效（同步已创建模块 logger）。"""
-    level = set_default_log_level(settings.log_level)
-    logger.info(f"Log level set to {settings.log_level}")
+    """P1-11 日志统一：级别 + JSON 结构化开关 + 可选轮转文件，request_id 由中间件贯穿。"""
+    level = configure_logging(
+        log_level=settings.log_level,
+        json_logs=settings.log_json,
+        log_file=settings.log_file,
+        log_max_bytes=settings.log_max_bytes,
+        log_backup_count=settings.log_backup_count,
+    )
+    logger.info(
+        f"Logging configured: level={settings.log_level} "
+        f"format={'json' if settings.log_json else 'text'} "
+        f"file={settings.log_file or 'stdout-only'}"
+    )
     return level
 
 
@@ -334,6 +345,8 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             state.active_instance_count = len(live_ids)
             _refresh_carla_state(state, settings)
             _refresh_disk_usage(state)
+            # V2.7.0 P1-7：对存活运行器续引擎心跳（僵尸持有者因无存活循环而追旧）
+            renew_execution_heartbeats(app)
             expired = list(mgr.check_expired_instances()) if mgr is not None else []
             # 超时实例同样要回收场景运行器（否则 tick 线程与 Actor 残留）
             for instance_id in expired:

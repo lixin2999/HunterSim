@@ -198,6 +198,43 @@ class ExecutionPlane:
         with self._registry_lock:
             return self._runners.get(instance_id)
 
+    def heartbeat(self, instance_id: str) -> bool:
+        """为存活运行器续一次引擎心跳（V2.7.0 P1-7）。
+
+        仅当运行器存在且 ``is_running`` 为真时才续租；线程已死的僵尸运行器
+        不会刷新心跳，租约因而逐渐变旧并被 ``/execution`` 标为 ``stale``。
+        不支持 ``is_running`` 的运行器（测试桩）按存活处理，避免误伤。
+        """
+        with self._registry_lock:
+            runner = self._runners.get(instance_id)
+        if runner is None:
+            return False
+        alive = getattr(runner, "is_running", True)
+        try:
+            alive = bool(alive)
+        except Exception:  # noqa: BLE001  is_running 不应抛；防御性按存活处理
+            alive = True
+        return self._pool.renew(instance_id) if alive else False
+
+    def renew_live_leases(self) -> int:
+        """对当前全部存活运行器批量续租（健康巡检周期调用），返回续租数。"""
+        with self._registry_lock:
+            instance_ids = list(self._runners)
+        return sum(1 for iid in instance_ids if self.heartbeat(iid))
+
+    def stale_instance_ids(self) -> list[str]:
+        """返回僵尸租约对应的实例 ID（心跳超时且无存活运行器）。"""
+        return [lease.instance_id for lease in self._pool.stale_leases()]
+
+    def force_release(self, instance_id: str) -> bool:
+        """管理强制回收：释放运行器与引擎租约（用于僵尸持有者，P1-7）。
+
+        与 ``release`` 的区别：即使运行器对象不存在也强制归还租约（僵尸清理）。
+        """
+        released = self.release(instance_id)
+        pool_released = self._pool.release(instance_id)
+        return released or pool_released
+
     def snapshot(self) -> dict[str, Any]:
         """执行面快照（引擎、租约、运行器）。"""
         payload = self._pool.snapshot()

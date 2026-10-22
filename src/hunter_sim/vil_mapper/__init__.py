@@ -12,7 +12,11 @@ from hunter_sim.vil_mapper.data_health_monitor import (
 )
 from hunter_sim.vil_mapper.pose_extrapolator import PoseExtrapolator
 from hunter_sim.vil_mapper.state_visualizer import PerceptionOverlay, StateVisualizer
-from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer, TelemetryFrame
+from hunter_sim.vil_mapper.telemetry_buffer import (
+    TelemetryBuffer,
+    TelemetryFrame,
+    compute_auto_buffer_depth,
+)
 from hunter_sim.vil_mapper.vil_data_consumer import VILDataConsumer
 from hunter_sim.vil_mapper.vil_sync_service import VILSyncService, VILSyncStats
 
@@ -21,7 +25,7 @@ __all__ = [
     "DataHealthMonitor", "DataHealthReport", "DataHealthStatus",
     "PoseExtrapolator",
     "PerceptionOverlay", "StateVisualizer",
-    "TelemetryBuffer", "TelemetryFrame",
+    "TelemetryBuffer", "TelemetryFrame", "compute_auto_buffer_depth",
     "VILDataConsumer",
     "VILSyncService", "VILSyncStats",
 ]

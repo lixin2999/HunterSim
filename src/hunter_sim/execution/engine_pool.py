@@ -62,12 +62,28 @@ class EngineEndpoint:
 
 @dataclass
 class EngineLease:
-    """引擎租约：记录哪个实例在哪个端点上运行哪个地图。"""
+    """引擎租约：记录哪个实例在哪个端点上运行哪个地图。
+
+    V2.7.0 P1-7：新增 ``last_renew_at`` 心跳时间戳，运行中的实例持续续租；
+    心跳长时间未刷即视为僵尸持有者（线程已死但租约仍在）。
+    """
 
     instance_id: str
     endpoint: EngineEndpoint
     map_id: str
     acquired_at: float = field(default_factory=time.time)
+    last_renew_at: float = field(default_factory=time.time)
+
+    def renew(self, now: Optional[float] = None) -> None:
+        """刷一次心跳时间（默认当前时刻）。"""
+        self.last_renew_at = time.time() if now is None else float(now)
+
+    def is_stale(self, ttl_seconds: float, now: Optional[float] = None) -> bool:
+        """心跳是否超过 ``ttl_seconds`` 未续（ttl<=0 视为禁用，永不判僵）。"""
+        if ttl_seconds <= 0:
+            return False
+        current = time.time() if now is None else float(now)
+        return (current - self.last_renew_at) > ttl_seconds
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 API 响应字段。"""
@@ -76,6 +92,7 @@ class EngineLease:
             "engine": self.endpoint.to_dict(),
             "map_id": self.map_id,
             "acquired_at": self.acquired_at,
+            "last_renew_at": self.last_renew_at,
         }
 
 
@@ -166,12 +183,16 @@ class EnginePool:
         endpoints: 已声明的引擎库存（用于容量与快照展示）。
     """
 
-    def __init__(self, endpoints: Optional[Iterable[EngineEndpoint]] = None) -> None:
+    def __init__(
+        self, endpoints: Optional[Iterable[EngineEndpoint]] = None, lease_ttl_seconds: float = 0.0
+    ) -> None:
         self._known: dict[str, EngineEndpoint] = {
             ep.key: ep for ep in (endpoints or [])
         }
         self._leases: dict[str, EngineLease] = {}
         self._lock = threading.RLock()
+        # 心跳 TTL（秒）：0 表示禁用僵判定（单引擎/未启用心跳）
+        self._ttl_seconds = float(lease_ttl_seconds)
 
     @property
     def capacity(self) -> int:
@@ -236,22 +257,49 @@ class EnginePool:
         with self._lock:
             return self._leases.get(instance_id)
 
+    def renew(self, instance_id: str) -> bool:
+        """为实例租约刷一次心跳（P1-7）；无租约时返回 False。
+
+        由健康巡检周期对存活运行器调用；僵尸持有者因无存活运行器而不再被续，
+        心跳逐渐过期直至被判为僵尸。
+        """
+        with self._lock:
+            lease = self._leases.get(instance_id)
+            if lease is None:
+                return False
+            lease.renew()
+            return True
+
+    def stale_leases(self) -> list[EngineLease]:
+        """返回心跳超时的僵尸租约（TTL<=0 时为空）。"""
+        with self._lock:
+            return [lease for lease in self._leases.values() if lease.is_stale(self._ttl_seconds)]
+
     def snapshot(self) -> dict[str, Any]:
         """执行面快照（供 ``GET /execution`` 与排障使用）。"""
         with self._lock:
             leases = {iid: lease.to_dict() for iid, lease in self._leases.items()}
+            for iid, lease in self._leases.items():
+                leases[iid]["stale"] = lease.is_stale(self._ttl_seconds)
             engines: list[dict[str, Any]] = []
             for key, endpoint in sorted(self._known.items()):
-                lease = self._holder_of(key)
+                holder = self._holder_of(key)
                 item = endpoint.to_dict()
-                item["holder"] = lease.instance_id if lease else None
-                item["map_id"] = lease.map_id if lease else None
-                item["acquired_at"] = lease.acquired_at if lease else None
+                item["holder"] = holder.instance_id if holder else None
+                item["map_id"] = holder.map_id if holder else None
+                item["acquired_at"] = holder.acquired_at if holder else None
+                item["last_renew_at"] = holder.last_renew_at if holder else None
+                item["stale"] = bool(holder and holder.is_stale(self._ttl_seconds))
                 engines.append(item)
+            stale_count = sum(
+                1 for lease in self._leases.values() if lease.is_stale(self._ttl_seconds)
+            )
         return {
             "engines": engines,
             "capacity": len(engines),
             "active_leases": len(leases),
+            "stale_leases": stale_count,
+            "lease_ttl_seconds": self._ttl_seconds,
             "leases": list(leases.values()),
         }
 

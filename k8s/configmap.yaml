@@ -32,6 +32,23 @@ data:
   api_login_max_failed_attempts: "5"
   api_login_backoff_base_seconds: "2"
   api_login_backoff_max_seconds: "60"
+  # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸回收（admin 可通过 DELETE /execution/leases/{id} 强收）
+  execution_lease_heartbeat_enabled: "true"
+  execution_lease_ttl_seconds: "120"
+  # 场景快照写节流（V2.7.0）：同状态最小落库间隔（秒），状态跃迁必写；0 为不节流
+  state_snapshot_write_interval_seconds: "1"
+  # Kafka 消费自愈与坏消息 DLQ（V2.7.0）：连续错误达阈值重建消费者；dlq_topic 空则仅计数不转发
+  kafka_enable_self_heal: "true"
+  kafka_rebuild_after_errors: "10"
+  kafka_dlq_topic: ""
+  # VIL 链路强化（V2.7.0）：乱序/去重闸门 + 环深按外推窗口×频率自动推导
+  vil_ordering_guard_enabled: "true"
+  vil_auto_buffer_depth: "true"
+  # JWT 吊销与滑动续期（V2.7.0，依赖 state_enabled=true）
+  api_jwt_revocation_enabled: "true"
+  api_jwt_refresh_enabled: "true"
+  # 统一日志（V2.7.0）：生产采集建议置 "true"（JSON 行 + request_id 贯穿）
+  log_json: "false"
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

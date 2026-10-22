@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.6.0
+          image: hunter-sim:2.7.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -146,6 +146,66 @@ spec:
             # HunterCore bag 上传有界队列（V2.6.0，仅 HUNTER_CORE_ENABLED=true 时生效）
             - name: HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE
               value: "32"
+            # 稳定性加固（V2.7.0）：租约心跳 + 僵尸回收（GET /execution 看 stale，admin 可强收）
+            - name: EXECUTION_LEASE_HEARTBEAT_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: execution_lease_heartbeat_enabled
+            - name: EXECUTION_LEASE_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: execution_lease_ttl_seconds
+            # 场景快照写节流（V2.7.0）：同状态最小落库间隔，降低 SQLite 单写者压力
+            - name: STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: state_snapshot_write_interval_seconds
+            # Kafka 消费自愈与 DLQ / VIL 乱序闸门与自动环深（V2.7.0）
+            - name: KAFKA_ENABLE_SELF_HEAL
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: kafka_enable_self_heal
+            - name: KAFKA_REBUILD_AFTER_ERRORS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: kafka_rebuild_after_errors
+            - name: KAFKA_DLQ_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: kafka_dlq_topic
+            - name: VIL_ORDERING_GUARD_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: vil_ordering_guard_enabled
+            - name: VIL_AUTO_BUFFER_DEPTH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: vil_auto_buffer_depth
+            # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
+            - name: API_JWT_REVOCATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: api_jwt_revocation_enabled
+            - name: API_JWT_REFRESH_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: api_jwt_refresh_enabled
+            # 统一日志（V2.7.0）：生产采集置 true（JSON 行 + request_id 贯穿）
+            - name: HUNTER_SIM_LOG_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: log_json
           resources:
             requests:
               memory: "512Mi"

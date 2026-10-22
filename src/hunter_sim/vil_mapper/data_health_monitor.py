@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -33,6 +34,9 @@ class DataHealthReport:
         status: 当前健康状态。
         current_latency_ms: 最新帧延迟（毫秒）。
         avg_latency_ms: 平均延迟（毫秒）。
+        p50_latency_ms: 延迟窗口中位数（毫秒，P1-9）。
+        p95_latency_ms: 延迟窗口 P95 分位数（毫秒，P1-9）。
+        p99_latency_ms: 延迟窗口 P99 分位数（毫秒，P1-9）。
         expiry_rate: 超时帧比率 (0~1)。
         fps: 当前有效数据接收帧率。
         frames_received: 累计接收帧数。
@@ -44,6 +48,9 @@ class DataHealthReport:
     status: DataHealthStatus
     current_latency_ms: float
     avg_latency_ms: float
+    p50_latency_ms: float
+    p95_latency_ms: float
+    p99_latency_ms: float
     expiry_rate: float
     fps: float
     frames_received: int
@@ -116,6 +123,8 @@ class DataHealthMonitor:
             if self._latency_window
             else 0.0
         )
+        # P1-9：延迟分位数（最近窗口内排序取分位），供报告与健康接口展示链路尾延迟
+        p50_ms, p95_ms, p99_ms = self._latency_percentiles()
 
         # FPS 估算
         fps: float = 0.0
@@ -132,6 +141,9 @@ class DataHealthMonitor:
             status=new_status,
             current_latency_ms=current_latency_ms,
             avg_latency_ms=avg_latency_ms,
+            p50_latency_ms=p50_ms,
+            p95_latency_ms=p95_ms,
+            p99_latency_ms=p99_ms,
             expiry_rate=self._buffer.expiry_rate,
             fps=fps,
             frames_received=self._buffer.total_received,
@@ -150,6 +162,19 @@ class DataHealthMonitor:
     def current_status(self) -> DataHealthStatus:
         """当前健康状态（只读）。"""
         return self._current_status
+
+    def _latency_percentiles(self) -> tuple[float, float, float]:
+        """计算延迟窗口的 P50/P95/P99（最近秩法，空窗口返回 0）。"""
+        if not self._latency_window:
+            return 0.0, 0.0, 0.0
+        ordered = sorted(self._latency_window)
+        n = len(ordered)
+
+        def _quantile(q: float) -> float:
+            rank = max(1, math.ceil(q * n))
+            return ordered[min(rank - 1, n - 1)]
+
+        return _quantile(0.50), _quantile(0.95), _quantile(0.99)
 
     def _determine_status(self, latency_ms: float, frame_age_ms: float) -> DataHealthStatus:
         """根据延迟判断健康状态。"""

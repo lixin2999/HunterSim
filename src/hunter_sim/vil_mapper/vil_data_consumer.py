@@ -19,7 +19,14 @@ from typing import Any, Optional
 from pydantic import ValidationError as PydanticValidationError
 
 from hunter_sim.common.exceptions import KafkaConnectionError
-from hunter_sim.common.metrics import KAFKA_CONSUME_ERRORS_TOTAL
+from hunter_sim.common.metrics import (
+    CLOUD_DLQ_PUBLISHED_TOTAL,
+    KAFKA_CONSUMED_TOTAL,
+    KAFKA_CONSUMER_LAG,
+    KAFKA_CONSUMER_REBUILDS_TOTAL,
+    KAFKA_CONSUME_ERRORS_TOTAL,
+    VIL_MESSAGE_DROPPED_TOTAL,
+)
 from hunter_sim.common.models import (
     DetectedObject,
     KafkaSettings,
@@ -45,6 +52,7 @@ class VILDataConsumer:
         vil_settings: VIL 参数配置。
         vehicle_id: 目标实车 ID。
         buffer: 遥测数据缓冲区。
+        producer_factory: 可选 Kafka 生产者工厂（DLQ 转发用，单测注入）。
     """
 
     def __init__(
@@ -53,17 +61,25 @@ class VILDataConsumer:
         vil_settings: VILSettings,
         vehicle_id: str,
         buffer: TelemetryBuffer,
+        producer_factory: Any = None,
     ) -> None:
         self._settings = settings
         self._vil_settings = vil_settings
         self._vehicle_id = vehicle_id
         self._buffer = buffer
+        self._producer_factory = producer_factory
         self._consumer: Any = None
+        self._dlq_producer: Any = None
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._lock = threading.Lock()
         self._msg_count: int = 0
         self._error_count: int = 0
+        # V2.7.0 P1-8：连续轮询错误计数（达阈值触发消费者重建）
+        self._consecutive_errors: int = 0
+        # V2.7.0 P1-9：乱序/重复防护（按 timestamp + seq 单调）
+        self._last_timestamp: Optional[float] = None
+        self._last_seq: Optional[int] = None
         logger.info(
             f"VILDataConsumer initialized: vehicle_id={vehicle_id}, "
             f"bootstrap={settings.bootstrap_servers}"
@@ -98,6 +114,13 @@ class VILDataConsumer:
             except Exception as exc:
                 logger.warning(f"Error closing Kafka consumer: {exc}")
             self._consumer = None
+        if self._dlq_producer is not None:
+            try:
+                self._dlq_producer.flush(timeout=2.0)
+                self._dlq_producer.close(timeout=2.0)
+            except Exception as exc:  # noqa: BLE001  关闭 DLQ 生产者失败不影响停止
+                logger.warning(f"Error closing DLQ producer: {exc}")
+            self._dlq_producer = None
         logger.info(
             f"VILDataConsumer stopped: received={self._msg_count}, errors={self._error_count}"
         )
@@ -112,43 +135,112 @@ class VILDataConsumer:
         """返回消费统计。"""
         return {"received": self._msg_count, "errors": self._error_count}
 
-    def _consume_loop(self) -> None:
-        """Kafka 消费主循环（在独立线程中运行）。"""
+    def _create_consumer(self, topics: list[str]) -> Any:
+        """构建（或重建）KafkaConsumer（V2.7.0 P1-8：拆出便于自愈重建）。"""
+        from kafka import KafkaConsumer  # noqa: PLC0415  延迟导入
+
+        consumer_kwargs: dict[str, Any] = {
+            "bootstrap_servers": self._settings.bootstrap_servers.split(","),
+            "group_id": self._settings.group_id,
+            "auto_offset_reset": self._settings.auto_offset_reset,
+            "enable_auto_commit": self._settings.enable_auto_commit,
+            "value_deserializer": lambda v: v,
+            "consumer_timeout_ms": 1000,
+        }
+        if self._settings.username:
+            consumer_kwargs["sasl_username"] = self._settings.username.get_secret_value()
+            consumer_kwargs["sasl_password"] = (
+                self._settings.password.get_secret_value() if self._settings.password else ""
+            )
+        return KafkaConsumer(*topics, **consumer_kwargs)
+
+    def _rebuild_consumer(self) -> bool:
+        """关闭并重建消费者（P1-8 自愈）；返回是否重建成功。"""
+        old = self._consumer
+        self._consumer = None
+        if old is not None:
+            try:
+                old.close(timeout_ms=1000)
+            except Exception as exc:  # noqa: BLE001  旧连接关闭失败不阻断重建
+                logger.warning(f"Closing stale Kafka consumer failed: {exc}")
+        KAFKA_CONSUMER_REBUILDS_TOTAL.inc()
         try:
-            from kafka import KafkaConsumer  # noqa: PLC0415
+            self._consumer = self._create_consumer(self._build_topic_list())
+            logger.warning(
+                f"Rebuilt VIL Kafka consumer after consecutive errors "
+                f"(rebuilds total via metric huntersim_kafka_consumer_rebuilds_total)"
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001  重建失败下一轮再试
+            logger.error(f"Kafka consumer rebuild failed: {exc}")
+            return False
+
+    def _update_lag(self) -> None:
+        """尽力估算并上报消费滞后（P1-8）：无 assignment/API 时静默跳过。"""
+        consumer = self._consumer
+        if consumer is None:
+            return
+        try:
+            assignment = consumer.assignment()
+            if not assignment:
+                return
+            positions = {tp: consumer.position([tp])[tp] for tp in assignment}
+            end_offsets = consumer.end_offsets(list(assignment))
+            lag = sum(
+                max(0, int(end_offsets[tp]) - int(positions[tp]))
+                for tp in assignment
+                if tp in end_offsets and tp in positions
+            )
+            KAFKA_CONSUMER_LAG.set(lag)
+        except Exception as exc:  # noqa: BLE001  滞后估算失败不影响消费
+            logger.debug(f"Kafka lag estimation skipped: {exc}")
+
+    def _consume_loop(self) -> None:
+        """Kafka 消费主循环（在独立线程中运行，含自愈重建）。"""
+        try:
+            import kafka  # noqa: F401,PLC0415  探测依赖（具体构造延迟到 _create_consumer）
         except ImportError:
             logger.error("kafka-python not installed, VIL consumer disabled")
             return
 
         topics = self._build_topic_list()
         try:
-            consumer_kwargs: dict[str, Any] = {
-                "bootstrap_servers": self._settings.bootstrap_servers.split(","),
-                "group_id": self._settings.group_id,
-                "auto_offset_reset": self._settings.auto_offset_reset,
-                "enable_auto_commit": self._settings.enable_auto_commit,
-                "value_deserializer": lambda v: v,
-                "consumer_timeout_ms": 1000,
-            }
-            if self._settings.username:
-                consumer_kwargs["sasl_username"] = self._settings.username.get_secret_value()
-                consumer_kwargs["sasl_password"] = (
-                    self._settings.password.get_secret_value() if self._settings.password else ""
-                )
-
-            self._consumer = KafkaConsumer(*topics, **consumer_kwargs)
+            self._consumer = self._create_consumer(topics)
             logger.info(f"Kafka consumer connected, topics={topics}")
 
+            rebuild_after = max(1, int(self._settings.rebuild_after_errors))
+            self_heal = bool(self._settings.enable_self_heal)
+
             while self._running.is_set():
+                consumer = self._consumer
+                if consumer is None:
+                    # 上次重建失败：退避后重试，不直接放弃循环
+                    time.sleep(1.0)
+                    if self._rebuild_consumer():
+                        self._consecutive_errors = 0
+                    continue
                 try:
-                    msg_iter = self._consumer.poll(timeout_ms=200)
+                    msg_iter = consumer.poll(timeout_ms=200)
+                    # 本轮成功：清零连续错误，刷新滞后
+                    self._consecutive_errors = 0
+                    self._update_lag()
                     for tp, messages in msg_iter.items():
                         for msg in messages:
                             self._handle_message(msg.topic, msg.value)
                 except Exception as exc:
                     self._error_count += 1
+                    self._consecutive_errors += 1
                     KAFKA_CONSUME_ERRORS_TOTAL.inc()
-                    logger.warning(f"Kafka poll error: {exc}")
+                    logger.warning(
+                        f"Kafka poll error (consecutive={self._consecutive_errors}): {exc}"
+                    )
+                    if self_heal and self._consecutive_errors >= rebuild_after:
+                        logger.error(
+                            f"Kafka consumer unhealthy after {self._consecutive_errors} "
+                            "consecutive errors; triggering self-heal rebuild"
+                        )
+                        self._rebuild_consumer()
+                        self._consecutive_errors = 0
                     time.sleep(1.0)
 
         except Exception as exc:
@@ -156,6 +248,45 @@ class VILDataConsumer:
             raise KafkaConnectionError(self._settings.bootstrap_servers, str(exc)) from exc
         finally:
             self._running.clear()
+
+    def _get_dlq_producer(self) -> Any:
+        """惰性创建 DLQ 生产者（P1-8）：未配置 dlq_topic 或创建失败返回 None。"""
+        if self._dlq_producer is not None:
+            return self._dlq_producer
+        if not self._settings.dlq_topic:
+            return None
+        try:
+            if self._producer_factory is not None:
+                self._dlq_producer = self._producer_factory()
+            else:
+                from kafka import KafkaProducer  # noqa: PLC0415  延迟导入
+
+                producer_kwargs: dict[str, Any] = {
+                    "bootstrap_servers": self._settings.bootstrap_servers.split(","),
+                }
+                if self._settings.username:
+                    producer_kwargs["sasl_username"] = self._settings.username.get_secret_value()
+                    producer_kwargs["sasl_password"] = (
+                        self._settings.password.get_secret_value() if self._settings.password else ""
+                    )
+                self._dlq_producer = KafkaProducer(**producer_kwargs)
+        except Exception as exc:  # noqa: BLE001  DLQ 不可用时降级为仅计数丢弃
+            logger.warning(f"DLQ producer unavailable (bad messages will be counted-dropped): {exc}")
+            self._dlq_producer = None
+        return self._dlq_producer
+
+    def _send_to_dlq(self, source_topic: str, raw: bytes) -> None:
+        """将坏消息转发到死信队列（P1-8）；无 DLQ 时仅计数。"""
+        producer = self._get_dlq_producer()
+        if producer is None:
+            return
+        try:
+            producer.send(self._settings.dlq_topic, value=raw)
+            CLOUD_DLQ_PUBLISHED_TOTAL.inc()
+            logger.warning(f"Forwarded malformed message from '{source_topic}' to DLQ "
+                           f"'{self._settings.dlq_topic}'")
+        except Exception as exc:  # noqa: BLE001  DLQ 写入失败不阻断消费
+            logger.warning(f"DLQ publish failed (message dropped): {exc}")
 
     def _build_topic_list(self) -> list[str]:
         """构建订阅 Topic 列表。"""
@@ -165,13 +296,19 @@ class VILDataConsumer:
         return topics
 
     def _handle_message(self, topic: str, raw: bytes) -> None:
-        """解析单条 Kafka 消息，更新缓冲区。"""
+        """解析单条 Kafka 消息，更新缓冲区。
+
+        V2.7.0 P1-8：无法解码/解析的坏消息转发 DLQ（而非静默丢弃）；
+        P1-9：遥测按 timestamp+seq 丢弃乱序/重复消息。
+        """
         self._msg_count += 1
+        KAFKA_CONSUMED_TOTAL.inc()
         try:
             payload: dict[str, Any] = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.warning(f"Failed to decode Kafka message from {topic}: {exc}")
             self._error_count += 1
+            self._send_to_dlq(topic, raw)
             return
 
         # 只处理目标车辆数据（设计文档 §4.2.2：vehicle_id 过滤）
@@ -182,15 +319,64 @@ class VILDataConsumer:
 
         try:
             if topic == self._settings.telemetry_topic:
+                if not self._accept_in_order(payload):
+                    return
                 frame = self._parse_telemetry(payload)
                 self._buffer.push(frame)
             else:
                 cmd_frame = self._parse_command_result(payload)
                 if cmd_frame is not None:
                     self._buffer.push(cmd_frame)
-        except (KeyError, ValueError, PydanticValidationError) as exc:
+        except (KeyError, ValueError, TypeError, PydanticValidationError) as exc:
             logger.warning(f"Parse error on topic {topic}: {exc}")
             self._error_count += 1
+            self._send_to_dlq(topic, raw)
+
+    def _accept_in_order(self, payload: dict[str, Any]) -> bool:
+        """遥测消息单调性/去重闸门（V2.7.0 P1-9）。
+
+        仅对 telemetry 主题生效（command_result 回写最新帧不参与排序）。
+        优先比较 ``seq``（若存在），否则回退到 ``timestamp``；丢弃时计数
+        ``huntersim_vil_message_dropped_total`` 并返回 False。未启用防护时直通。
+        """
+        if not getattr(self._vil_settings, "ordering_guard_enabled", False):
+            return True
+        ts = payload.get("timestamp")
+        ts_val: Optional[float] = None
+        if ts is not None:
+            try:
+                ts_val = float(ts)
+            except (TypeError, ValueError):
+                ts_val = None
+        seq_val: Optional[int] = None
+        raw_seq = payload.get("seq")
+        if raw_seq is not None:
+            try:
+                seq_val = int(raw_seq)
+            except (TypeError, ValueError):
+                seq_val = None
+
+        accepted = True
+        reason = ""
+        with self._lock:
+            if seq_val is not None and self._last_seq is not None and seq_val <= self._last_seq:
+                accepted, reason = False, "duplicate_seq"
+            elif (
+                seq_val is None
+                and ts_val is not None
+                and self._last_timestamp is not None
+                and ts_val < self._last_timestamp
+            ):
+                accepted, reason = False, "out_of_order"
+            if accepted:
+                if seq_val is not None:
+                    self._last_seq = seq_val
+                if ts_val is not None:
+                    self._last_timestamp = ts_val
+        if not accepted:
+            VIL_MESSAGE_DROPPED_TOTAL.labels(reason=reason).inc()
+            logger.debug(f"Dropped {reason} telemetry message (seq={seq_val}, ts={ts_val})")
+        return accepted
 
     def _parse_telemetry(self, payload: dict[str, Any]) -> TelemetryFrame:
         """解析 telemetry_clean 格式消息。"""

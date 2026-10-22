@@ -56,23 +56,46 @@ def create_access_token(
     extra_claims: Optional[dict[str, Any]] = None,
     tenant: str = "",
 ) -> str:
-    """生成 JWT access token。
+    """生成 JWT access token（仅返回编码后的字符串）。
+
+    详见 ``mint_access_token``；本函数为既有调用方保留的便捷包装。
+    """
+    token, _, _ = mint_access_token(subject, api_settings, extra_claims, tenant)
+    return token
+
+
+def mint_access_token(
+    subject: str,
+    api_settings: APISettings,
+    extra_claims: Optional[dict[str, Any]] = None,
+    tenant: str = "",
+    jti: Optional[str] = None,
+) -> tuple[str, str, int]:
+    """签发 access token 并返回 ``(token, jti, exp_epoch)``（V2.7.0 P1-6）。
+
+    每次签发写入唯一 ``jti``，供吊销名单与滑动续期轮换识别；``jti`` 也可由调用方
+    指定（测试/回放可重现）。
 
     Args:
         subject: 用户标识（user_id）。
         api_settings: API 配置（包含 jwt_secret 等）。
         extra_claims: 额外载荷字段。
-        tenant: 租户 ID（V2.5.0）；为空时不写入 claim，由服务端按默认租户解析。
+        tenant: 租户 ID（V2.5.0）；为空时不写入 claim。
+        jti: 指定令牌唯一标识；None 时自动生成。
 
     Returns:
-        编码后的 JWT 字符串。
+        ``(编码后的 JWT 字符串, jti, 过期绝对时间 epoch 秒)``。
     """
+    import uuid  # noqa: PLC0415  仅签发时使
+
     now = datetime.now(timezone.utc)
     expire = now + timedelta(minutes=api_settings.jwt_expire_minutes)
+    token_jti = jti or uuid.uuid4().hex
     payload: dict[str, Any] = {
         "sub": subject,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
+        "jti": token_jti,
     }
     if extra_claims:
         payload.update(extra_claims)
@@ -81,7 +104,7 @@ def create_access_token(
     token = jwt.encode(
         payload, api_settings.jwt_secret.get_secret_value(), algorithm=api_settings.jwt_algorithm
     )
-    return cast(str, token)
+    return cast(str, token), token_jti, int(expire.timestamp())
 
 
 def decode_token(token: str, api_settings: APISettings) -> dict[str, Any]:

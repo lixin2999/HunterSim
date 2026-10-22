@@ -1,4 +1,4 @@
-# HunterSim 开发/单机部署编排（V2.6.0）
+# HunterSim 开发/单机部署编排（V2.7.0）
 # 使用：
 #   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
@@ -10,6 +10,11 @@
 # 平台参数见下方 PLATFORM_*（默认单租户 default，API Key 与审计默认开启）。
 # V2.6.0：安全治理 P0——按 IP 限流（API_RATE_LIMIT_*）、/auth/token 失败指数退避（API_LOGIN_*）、
 # cloud bag 上传有界队列（HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE）、/metrics 标准化 Prometheus 指标。
+# V2.7.0：稳定性与链路加固 P1——租约心跳/僵尸回收（EXECUTION_LEASE_*）、快照写节流
+# （STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS）、Kafka 消费自愈与 DLQ（KAFKA_ENABLE_SELF_HEAL/
+# KAFKA_REBUILD_AFTER_ERRORS/KAFKA_DLQ_TOPIC）、VIL 乱序闸门与自动环深（VIL_*）、JWT 吊销/续期
+# （API_JWT_REVOCATION_ENABLED/API_JWT_REFRESH_ENABLED，需 STATE_ENABLED=true）、structlog 统一
+# 日志与 request_id 贯穿（HUNTER_SIM_LOG_JSON/HUNTER_SIM_LOG_FILE）。
 
 services:
   # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
@@ -102,7 +107,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.6.0
+    image: hunter-sim:2.7.0
     ports:
       - "8080:8080"
     environment:
@@ -142,6 +147,24 @@ services:
       API_LOGIN_BACKOFF_MAX_SECONDS: ${API_LOGIN_BACKOFF_MAX_SECONDS:-60}
       # HunterCore bag 上传有界队列（V2.6.0，队满丢最旧并计数）
       HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
+      # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸判定（心跳超 TTL 未续可被 admin 强制回收）
+      EXECUTION_LEASE_HEARTBEAT_ENABLED: ${EXECUTION_LEASE_HEARTBEAT_ENABLED:-true}
+      EXECUTION_LEASE_TTL_SECONDS: ${EXECUTION_LEASE_TTL_SECONDS:-120}
+      # 场景快照写节流（V2.7.0）：同状态最小落库间隔；状态跃迁必写
+      STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS: ${STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS:-1}
+      # Kafka 消费自愈与坏消息 DLQ（V2.7.0）
+      KAFKA_ENABLE_SELF_HEAL: ${KAFKA_ENABLE_SELF_HEAL:-true}
+      KAFKA_REBUILD_AFTER_ERRORS: ${KAFKA_REBUILD_AFTER_ERRORS:-10}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-}
+      # VIL 链路强化（V2.7.0）：乱序/去重闸门 + 环深自动推导
+      VIL_ORDERING_GUARD_ENABLED: ${VIL_ORDERING_GUARD_ENABLED:-true}
+      VIL_AUTO_BUFFER_DEPTH: ${VIL_AUTO_BUFFER_DEPTH:-true}
+      # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
+      API_JWT_REVOCATION_ENABLED: ${API_JWT_REVOCATION_ENABLED:-true}
+      API_JWT_REFRESH_ENABLED: ${API_JWT_REFRESH_ENABLED:-true}
+      # 统一日志（V2.7.0）：生产采集可置 JSON；容器环境文件轮转留空由 docker logs 托管
+      HUNTER_SIM_LOG_JSON: ${HUNTER_SIM_LOG_JSON:-false}
+      HUNTER_SIM_LOG_FILE: ${HUNTER_SIM_LOG_FILE:-}
     depends_on:
       kafka:
         condition: service_healthy

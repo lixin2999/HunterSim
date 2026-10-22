@@ -1,4 +1,4 @@
-# HunterSim Windows 单机全容器编排（V2.5.0）
+# HunterSim Windows 单机全容器编排（V2.7.0）
 #
 # 前提（详见 deployment_and_operations.md「Windows 单机全容器拓扑」）：
 #   - Docker Desktop for Windows，后端切换为 WSL2
@@ -60,7 +60,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: hunter-sim:2.6.0
+    image: hunter-sim:2.7.0
     ports:
       - "8080:8080"
     environment:
@@ -98,6 +98,22 @@ services:
       API_LOGIN_BACKOFF_MAX_SECONDS: ${API_LOGIN_BACKOFF_MAX_SECONDS:-60}
       # HunterCore bag 上传有界队列（V2.6.0，队满丢最旧并计数）
       HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
+      # 稳定性加固（V2.7.0）：租约心跳/僵尸回收 + 快照写节流
+      EXECUTION_LEASE_HEARTBEAT_ENABLED: ${EXECUTION_LEASE_HEARTBEAT_ENABLED:-true}
+      EXECUTION_LEASE_TTL_SECONDS: ${EXECUTION_LEASE_TTL_SECONDS:-120}
+      STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS: ${STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS:-1}
+      # Kafka 消费自愈与 DLQ / VIL 乱序闸门与自动环深（V2.7.0）
+      KAFKA_ENABLE_SELF_HEAL: ${KAFKA_ENABLE_SELF_HEAL:-true}
+      KAFKA_REBUILD_AFTER_ERRORS: ${KAFKA_REBUILD_AFTER_ERRORS:-10}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-}
+      VIL_ORDERING_GUARD_ENABLED: ${VIL_ORDERING_GUARD_ENABLED:-true}
+      VIL_AUTO_BUFFER_DEPTH: ${VIL_AUTO_BUFFER_DEPTH:-true}
+      # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
+      API_JWT_REVOCATION_ENABLED: ${API_JWT_REVOCATION_ENABLED:-true}
+      API_JWT_REFRESH_ENABLED: ${API_JWT_REFRESH_ENABLED:-true}
+      # 统一日志（V2.7.0）：生产采集可置 JSON；容器环境文件轮转留空由 docker logs 托管
+      HUNTER_SIM_LOG_JSON: ${HUNTER_SIM_LOG_JSON:-false}
+      HUNTER_SIM_LOG_FILE: ${HUNTER_SIM_LOG_FILE:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

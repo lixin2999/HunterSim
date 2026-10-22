@@ -23,6 +23,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 平台化（V2.5.0） | 多租户隔离与租户配额；服务账号 API Key（`hsk_...`，仅存哈希）；RBAC 角色层级；场景库版本化（同名自增版本/软删除/按 ID 下发）；批量任务与审计事件落库；平台概览 `GET /platform/overview` 与审计查询 `GET /audit` |
 | 安全治理 | JWT/API Key 统一主体与角色分级（创建实例需 operator+，销毁实例与地图上传、管理面需 admin）、车辆模型白名单、场景安全审核、地图上传审核（含路径穿越双重校验）、租户级隔离、审计落库 |
 | 并发安全与限流（V2.6.0） | 装配锁与运行器注册表启动期预建；引擎级装配锁支撑多引擎并行 `load_world`；按 IP 令牌桶限流（429 + `Retry-After`）与 `/auth/token` 失败指数退避；cloud bag 上传队列有界化；标准化 Prometheus 指标 + Grafana 预置盘 |
+| 稳定性与链路加固（V2.7.0） | JWT 吊销/滑动续期（`jti` + 吊销名单）；引擎租约心跳 + 僵尸判定 + admin 强制回收（`DELETE /execution/leases/{id}`）；Kafka 消费自愈与坏消息 DLQ；VIL 乱序/去重闸门、环深自动推导、延迟 P50/P95/P99；快照写节流（状态跃迁必写）；structlog 统一日志 + request_id 贯穿 |
 
 ---
 
@@ -259,14 +260,14 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 | 前缀 | 组 | 关键项（默认值） |
 |------|------|------------------|
-| `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) |
+| `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) · **V2.7.0**：`log_json`(false，JSON 行渲染) · `log_file`(空=仅 stdout，非空启用轮转文件) · `log_max_bytes`(10485760) · `log_backup_count`(5) |
 | `CARLA_` | CARLA 连接 | `host`(127.0.0.1) · `rpc_port`(2000) · `stream_port`(2001) · `tm_port`(8000) · `fixed_delta_seconds`(0.02) |
-| `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) |
-| `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` |
-| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) · **V2.6.0**：`rate_limit_enabled`(true) · `rate_limit_per_minute`(1000) · `login_max_failed_attempts`(5) · `login_backoff_base_seconds`(2.0) · `login_backoff_max_seconds`(60) |
+| `KAFKA_` | 数据总线 | `bootstrap_servers`(localhost:9092) · `telemetry_topic`(telemetry_clean) · **V2.7.0**：`enable_self_heal`(true) · `rebuild_after_errors`(10) · `dlq_topic`(空=不转发) |
+| `VIL_` | 虚实映射 | `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `buffer_max_frames`(10) · `calibration_*` · **V2.7.0**：`ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true，环深按窗口×频率推导) |
+| `API_` | 接口服务 | `host`(0.0.0.0) · `port`(8080) · `jwt_secret` · `max_concurrent_instances`(2) · `stream_base_url`(webrtc://localhost:8080) · **V2.6.0**：`rate_limit_enabled`(true) · `rate_limit_per_minute`(1000) · `login_max_failed_attempts`(5) · `login_backoff_base_seconds`(2.0) · `login_backoff_max_seconds`(60) · **V2.7.0**：`jwt_revocation_enabled`(true) · `jwt_refresh_enabled`(true)，均需状态库 |
 | `RESOURCE_` | 资源管理 | `instance_max_lifetime_seconds`(7200) · `max_retry_count`(3) · `max_instances_per_user`(5) · `max_instances_total`(50) · `gpu_memory_warning_threshold`(0.90) · `resources_dir`(resources) |
-| `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) |
-| `STATE_` | 状态持久化（V2.4.0） | `enabled`(false，compose/K8s 为 true) · `db_path`(data/state/hunter_sim.db) · `recover_instances`(true) · `restore_scenes`(true) · `busy_timeout_seconds`(5.0) |
+| `EXECUTION_` | 执行面（V2.4.0） | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · **V2.7.0**：`lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120，超时未续租判定僵尸) |
+| `STATE_` | 状态持久化（V2.4.0） | `enabled`(false，compose/K8s 为 true) · `db_path`(data/state/hunter_sim.db) · `recover_instances`(true) · `restore_scenes`(true) · `busy_timeout_seconds`(5.0) · **V2.7.0**：`snapshot_write_interval_seconds`(1.0，同状态落库最小间隔；跃迁必写；0 不节流) |
 | `PLATFORM_` | 平台化（V2.5.0） | `default_tenant`(default) · `max_instances_per_tenant`(20) · `api_keys_enabled`(true) · `audit_enabled`(true) |
 | `HUNTER_CORE_` | HunterCore 接入 | `enabled`(False) · `vehicle_id`(SIM_HUNTER_SE_001) · `kafka_bootstrap`(192.168.31.35:9092) · `security_protocol`(SASL_SSL) · `sasl_mechanism`(SCRAM-SHA-512) · `sasl_username/password` · `gateway_url`(http://192.168.31.35:8080) · `jwt_token` · `rosbag_bucket`(hunter-rosbag) · **V2.6.0**：`upload_queue_max_size`(32，bag 上传后台队列容量，队满丢最旧) |
 | `GUI_` | 桌面客户端 | `theme`(dark) · `default_map`(Town03) · `stream_fps`(30) · `scenario_runner_path`(None) |
@@ -281,7 +282,7 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 
 | 分组 | 方法与路径 |
 |------|-----------|
-| 认证 | `POST /auth/token`（换取 JWT） · `POST /auth/api-keys`⁺（签发服务账号） · `GET /auth/api-keys`⁺ · `DELETE /auth/api-keys/{key_id}`⁺ |
+| 认证 | `POST /auth/token`（换取 JWT） · `POST /auth/refresh`（V2.7.0，滑动续期+旧 Token 轮换吊销） · `POST /auth/revoke`（V2.7.0，退出登录） · `POST /auth/api-keys`⁺（签发服务账号） · `GET /auth/api-keys`⁺ · `DELETE /auth/api-keys/{key_id}`⁺ |
 | 健康/指标 | `GET /health` · `GET /health/live` · `GET /health/ready` · `GET /health/performance-targets` · `GET /metrics` |
 | 实例 | `POST /instances`（operator+） · `GET /instances` · `GET /instances/{id}` · `POST /instances/{id}/{start\|stop\|pause\|resume}` · `DELETE /instances/{id}`⁺ |
 | 实例子资源 | `GET /instances/{id}/status` · `POST /instances/{id}/scene`（`scene_config` 或 `library_scene_id`） · `POST /instances/{id}/weather` · `POST /instances/{id}/vil/calibrate` · `GET /instances/{id}/screenshot` · `GET /instances/{id}/stream` |
@@ -289,12 +290,14 @@ curl "$BASE/platform/overview?tenant=*" -H "Authorization: Bearer $TOKEN"
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch`（operator+） · `GET /scenarios`（任务中心） · `GET /scenarios/{task_id}/report` |
 | 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
-| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
+| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器，V2.7.0 含 `stale` 僵尸标志） · `DELETE /execution/leases/{instance_id}`⁺（V2.7.0，强制回收僵尸租约） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
 | 实时推送 | `WS /ws/sim/{instance_id}/status?token=<JWT>`（握手需令牌，缺失/非法 4401，越权 4403） |
 
 > ⁺ 需 `role=admin`；`POST /instances` 需 `operator` 及以上（admin 天然满足）。完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
 
 > **限流与登录退避（V2.6.0）**：`/api/v1/sim/**` 按客户端 IP 令牌桶限流（`API_RATE_LIMIT_PER_MINUTE`，默认 1000/min；`/health*`、`/metrics`、`/ws/` 豁免，`API_RATE_LIMIT_ENABLED=false` 可关闭），超限返回 `429` + `Retry-After`；`/auth/token` 同 IP 连续失败达 `API_LOGIN_MAX_FAILED_ATTEMPTS`（默认 5）后指数退避（`API_LOGIN_BACKOFF_BASE_SECONDS` 2s 起、封顶 `API_LOGIN_BACKOFF_MAX_SECONDS` 60s），成功登录即复位。
+
+> **令牌生命周期与僵尸回收（V2.7.0）**：`POST /auth/refresh` 用有效 Token 换新 Token 并就地吊销旧 Token（轮换），`POST /auth/revoke` 立即吊销当前 Token，均依赖状态库（`STATE_ENABLED=true`）；引擎租约心跳超 `EXECUTION_LEASE_TTL_SECONDS` 未续在 `GET /execution` 标记 `stale=true`，admin 可 `DELETE /execution/leases/{instance_id}` 强制回收；日志携带 `request_id` 贯穿全链路，客户端可传 `X-Request-ID` 复用自定义追踪号。
 
 ---
 
