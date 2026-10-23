@@ -10,12 +10,17 @@
 # 版本必须与 CARLA server 严格一致；无 wheel 的平台可用 --build-arg INSTALL_CARLA=false 关闭
 # （此时服务仍可启动，下发场景返回 503 并给出诊断原因）。
 
+# 国内/慢速网络环境可通过 --build-arg 切换 PyPI 镜像源（默认官方源，不改变既有构建行为）
+# 示例：--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=pypi.org
+
 FROM python:3.12-slim AS base
 
 # ── 构建阶段 ────────────────────────────────────────────────────────────────
 FROM base AS builder
 
-RUN pip install --no-cache-dir build setuptools wheel
+RUN pip install --no-cache-dir --retries 5 --timeout 120 build setuptools wheel
 
 WORKDIR /app
 COPY pyproject.toml README.md ./
@@ -38,14 +43,20 @@ USER hunter
 WORKDIR /home/hunter/app
 
 # 安装 Python 依赖
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=pypi.org
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --user -r requirements.txt \
+        --retries 5 --timeout 120 \
+        --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}"
 
 # 安装 CARLA Python SDK（与 CARLA server 版本一致，详见文件头说明）
 ARG CARLA_VERSION=0.9.16
 ARG INSTALL_CARLA=true
 RUN if [ "$INSTALL_CARLA" = "true" ]; then \
-        pip install --no-cache-dir --user "carla==${CARLA_VERSION}"; \
+        pip install --no-cache-dir --user "carla==${CARLA_VERSION}" \
+            --retries 5 --timeout 120 \
+            --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}"; \
     else \
         echo "Skip CARLA SDK install (INSTALL_CARLA=${INSTALL_CARLA})"; \
     fi
