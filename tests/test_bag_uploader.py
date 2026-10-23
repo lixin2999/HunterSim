@@ -51,9 +51,9 @@ class FakeClient:
 
 
 def _settings(**overrides: object) -> CloudSettings:
-    base: dict[str, Any] = {"enabled": True, "vehicle_id": "SIM_001", "jwt_token": SecretStr("t0k")}
+    base: dict[str, Any] = {"enabled": True, "sim_id": "sim-001", "jwt_token": SecretStr("t0k")}
     base.update(overrides)
-    return CloudSettings(**base)
+    return CloudSettings(**base)  # type: ignore[arg-type]
 
 
 @pytest.fixture()

@@ -50,11 +50,19 @@ class BagUploader:
 
     Args:
         settings: HunterCore 接入配置。
+        sim_id: 当前仿真实例 ID，用于 presign/complete 中的 vehicle_id 字段
+            （= 方案 sensor_file vehicle_id 格式 SIM-{sim_id}）。
         client_factory: 可选 httpx.Client 工厂（单测注入桩）；默认惰性构建 httpx 客户端。
     """
 
-    def __init__(self, settings: CloudSettings, client_factory: Optional[ClientFactory] = None) -> None:
+    def __init__(
+        self,
+        settings: CloudSettings,
+        sim_id: str = "",
+        client_factory: Optional[ClientFactory] = None,
+    ) -> None:
         self._settings = settings
+        self._sim_id = sim_id or settings.sim_id
         self._client_factory = client_factory
         self._available = False
 
@@ -76,8 +84,18 @@ class BagUploader:
         """上传器是否可用。"""
         return self._available
 
-    def upload(self, file_path: Path, data_type: str = "rosbag") -> Optional[BagUploadResult]:
+    def upload(
+        self,
+        file_path: Path,
+        data_type: str = "rosbag",
+        on_uploaded: Optional[Callable[[BagUploadResult], None]] = None,
+    ) -> Optional[BagUploadResult]:
         """上传单个 bag 文件；不可用时返回 None（不抛出，不阻断仿真）。
+
+        Args:
+            file_path: 待上传文件路径。
+            data_type: 文件类型（rosbag 等）。
+            on_uploaded: 上传成功后的回调（用于触发 sensor_file 发布）。
 
         Raises:
             UploadError: 已启用但流程某步失败。
@@ -96,7 +114,10 @@ class BagUploader:
                 etags = self._upload_multipart(client, presign, file_path)
             else:
                 self._upload_single(client, presign, file_path)
-            self._complete(client, presign, size, md5, sha256, data_type, etags if method == "multipart" else None)
+            self._complete(
+                client, presign, size, md5, sha256, data_type,
+                etags if method == "multipart" else None,
+            )
         finally:
             if self._client_factory is None:
                 client.close()
@@ -109,14 +130,18 @@ class BagUploader:
             sha256=sha256,
         )
         logger.info(f"rosbag 上传完成：{result.object_key}（{size} bytes）")
+        if on_uploaded is not None:
+            on_uploaded(result)
         return result
 
     # ── 三步流程 ──────────────────────────────────────────────────────────
     def _presign(self, client: Any, file_name: str, size: int) -> dict[str, Any]:
         """第 1-2 步：申请预签名地址。"""
         part_count = _part_count(size) if size > _MULTIPART_THRESHOLD else 1
+        # sensor_file 契约 vehicle_id 格式： SIM-{sim_id}
+        resolved_vid = f"SIM-{self._sim_id}" if self._sim_id else "SIM-unknown"
         body = {
-            "vehicle_id": self._settings.vehicle_id,
+            "vehicle_id": resolved_vid,
             "bucket": self._settings.rosbag_bucket,
             "data_type": "rosbag",
             "file_name": file_name,
@@ -165,8 +190,9 @@ class BagUploader:
         etags: Optional[list[dict[str, Any]]],
     ) -> None:
         """第 4-6 步：上报完成，服务端做完整性校验。"""
+        resolved_vid = f"SIM-{self._sim_id}" if self._sim_id else "SIM-unknown"
         body: dict[str, Any] = {
-            "vehicle_id": self._settings.vehicle_id,
+            "vehicle_id": resolved_vid,
             "bucket": presign["bucket"],
             "object_key": presign["object_key"],
             "size_bytes": size,

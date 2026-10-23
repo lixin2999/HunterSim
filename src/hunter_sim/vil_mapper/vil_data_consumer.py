@@ -1,12 +1,12 @@
-"""VIL Kafka 数据接入服务（PROMPT-ENG-002-A）。
+"""VIL Kafka 数据接入服务（V2.10.0：消费 carla.{sim_id}.vil_state）。
 
-从 Kafka 实时消费实车遥测数据，解析后推入 TelemetryBuffer。
+从 Kafka 实时消费平台转发的实车遥测数据，解析后推入 TelemetryBuffer。
 支持多 Topic 订阅、自动重连、反序列化异常处理。
 
 Topics：
-- telemetry_clean: 车辆定位 + 车辆状态（10Hz）
-- hunter.{vehicle_id}.command_result: 控制指令回读（10Hz）
-- perception_result: 感知结果（10Hz，可选）
+- carla.{sim_id}.vil_state：平台转发的实车定位 + 状态（10Hz）
+- legacy_telemetry_topic：兼容单机调试的旧 telemetry_clean（可选）
+- hunter.{vehicle_id}.command_result：控制指令回读（10Hz）
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from hunter_sim.common.metrics import (
     KAFKA_CONSUMER_REBUILDS_TOTAL,
     KAFKA_CONSUME_ERRORS_TOTAL,
     VIL_MESSAGE_DROPPED_TOTAL,
+    VIL_STATE_CONSUMED_TOTAL,
+    observe_vil_e2e_lag,
 )
 from hunter_sim.common.models import (
     DetectedObject,
@@ -52,6 +54,7 @@ class VILDataConsumer:
         vil_settings: VIL 参数配置。
         vehicle_id: 目标实车 ID。
         buffer: 遥测数据缓冲区。
+        sim_id: 当前实例的 sim_id（优先于 settings.sim_id，用于渲染 carla.{sim_id}.vil_state Topic）。
         producer_factory: 可选 Kafka 生产者工厂（DLQ 转发用，单测注入）。
     """
 
@@ -61,11 +64,13 @@ class VILDataConsumer:
         vil_settings: VILSettings,
         vehicle_id: str,
         buffer: TelemetryBuffer,
+        sim_id: str = "",
         producer_factory: Any = None,
     ) -> None:
         self._settings = settings
         self._vil_settings = vil_settings
         self._vehicle_id = vehicle_id
+        self._sim_id = sim_id or settings.sim_id  # 优先用参数，次先 settings
         self._buffer = buffer
         self._producer_factory = producer_factory
         self._consumer: Any = None
@@ -81,7 +86,7 @@ class VILDataConsumer:
         self._last_timestamp: Optional[float] = None
         self._last_seq: Optional[int] = None
         logger.info(
-            f"VILDataConsumer initialized: vehicle_id={vehicle_id}, "
+            f"VILDataConsumer initialized: vehicle_id={vehicle_id}, sim_id={self._sim_id}, "
             f"bootstrap={settings.bootstrap_servers}"
         )
 
@@ -289,17 +294,37 @@ class VILDataConsumer:
             logger.warning(f"DLQ publish failed (message dropped): {exc}")
 
     def _build_topic_list(self) -> list[str]:
-        """构建订阅 Topic 列表。"""
-        topics = [self._settings.telemetry_topic]
+        """构建订阅 Topic 列表（渲染 carla.{sim_id}.vil_state 模板）。"""
+        topic = self._settings.telemetry_topic
+        # 渲染 {sim_id} 模板
+        if "{sim_id}" in topic:
+            topic = topic.format(sim_id=self._sim_id) if self._sim_id else topic
+        topics = [topic]
+        # 兼容单机调试的旧 telemetry_clean Topic
+        if self._settings.legacy_telemetry_topic:
+            topics.append(self._settings.legacy_telemetry_topic)
+        # 控制指令回读 Topic
         command_topic = self._settings.command_topic.format(vehicle_id=self._vehicle_id)
         topics.append(command_topic)
         return topics
 
+    def _get_primary_telemetry_topic(self) -> str:
+        """返回渲染后的主遥测 Topic（用于 _handle_message 判断）。"""
+        topic = self._settings.telemetry_topic
+        if "{sim_id}" in topic and self._sim_id:
+            topic = topic.format(sim_id=self._sim_id)
+        return topic
+
     def _handle_message(self, topic: str, raw: bytes) -> None:
         """解析单条 Kafka 消息，更新缓冲区。
 
-        V2.7.0 P1-8：无法解码/解析的坏消息转发 DLQ（而非静默丢弃）；
-        P1-9：遥测按 timestamp+seq 丢弃乱序/重复消息。
+        支持两种遥测格式：
+        1. carla.{sim_id}.vil_state（新）：含 pose/twist 字段；
+        2. telemetry_clean（旧）：含 position/velocity 字段。
+
+        V2.7.0 P1-8：无法解码/解析的坏消息转发 DLQ；
+        V2.7.0 P1-9：遥测按 timestamp+seq 丢弃乱序/重复消息。
+        V2.10.0：增加 sim_id 一致性校验。
         """
         self._msg_count += 1
         KAFKA_CONSUMED_TOTAL.inc()
@@ -311,17 +336,53 @@ class VILDataConsumer:
             self._send_to_dlq(topic, raw)
             return
 
-        # 只处理目标车辆数据（设计文档 §4.2.2：vehicle_id 过滤）
+        # V2.10.0： sim_id 一致性校验（vil_state 格式）
+        if self._sim_id and "sim_id" in payload:
+            msg_sim_id = str(payload.get("sim_id", ""))
+            if msg_sim_id != self._sim_id:
+                logger.debug(
+                    f"Skip vil_state from mismatched sim_id "
+                    f"(expected={self._sim_id}, got={msg_sim_id})"
+                )
+                return
+
+        # 旧格式兼容： vehicle_id 过滤
         remote_vid = payload.get("vehicle_id")
         if remote_vid is not None and str(remote_vid) != self._vehicle_id:
-            logger.debug(f"Skip message from non-target vehicle '{remote_vid}'")
-            return
+            # 尝试匹配 sim_id（vil_state 格式 vehicle_id 可能为空）
+            inner_payload = payload.get("payload", {})
+            if not ("pose" in inner_payload or "pose" in payload):
+                logger.debug(f"Skip message from non-target vehicle '{remote_vid}'")
+                return
+
+        primary_telemetry_topic = self._get_primary_telemetry_topic()
+        legacy_topic = self._settings.legacy_telemetry_topic
+        is_telemetry = (
+            topic == primary_telemetry_topic
+            or (legacy_topic and topic == legacy_topic)
+        )
 
         try:
-            if topic == self._settings.telemetry_topic:
+            if is_telemetry:
                 if not self._accept_in_order(payload):
                     return
-                frame = self._parse_telemetry(payload)
+                # 判断格式：新版 vil_state（有 pose 字段）或旧版 telemetry_clean
+                inner = payload.get("payload", payload)
+                if "pose" in inner:
+                    # V2.10.0: carla.{sim_id}.vil_state 格式
+                    frame = self._parse_vil_state(payload)
+                    VIL_STATE_CONSUMED_TOTAL.inc()
+                    # 记录端到端延迟
+                    msg_ts = payload.get("timestamp")
+                    if msg_ts is not None:
+                        try:
+                            lag_ms = (time.time() - float(msg_ts)) * 1000.0
+                            observe_vil_e2e_lag(lag_ms)
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    # 旧版 telemetry_clean 格式
+                    frame = self._parse_telemetry(payload)
                 self._buffer.push(frame)
             else:
                 cmd_frame = self._parse_command_result(payload)
@@ -461,6 +522,16 @@ class VILDataConsumer:
             vehicle_state=vehicle_state,
             perception=perception,
         )
+
+    def _parse_vil_state(self, payload: dict[str, Any]) -> TelemetryFrame:
+        """解析 carla.{sim_id}.vil_state 格式消息（V2.10.0）。
+
+        调用 ``cloud.vil_state_parser.parse_vil_state`` 将 vil_state 信封转换为
+        内部 ``TelemetryFrame``。
+        """
+        from hunter_sim.cloud.vil_state_parser import parse_vil_state  # noqa: PLC0415
+
+        return parse_vil_state(payload, vehicle_id=self._vehicle_id)
 
     def _parse_command_result(self, payload: dict[str, Any]) -> Optional[TelemetryFrame]:
         """解析 command_result 格式消息，更新已有帧的 control_cmd 字段。"""

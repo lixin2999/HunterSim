@@ -5,6 +5,7 @@
   comfort_metrics / success_criteria / events / grade）
 - 批量汇总与趋势对比（设计文档 §9.5）
 - 等级判定（S/A/B/C/D）与事件时间线
+- 批量报告制品发布辅能（V2.10.0 平台接入）
 """
 
 from __future__ import annotations
@@ -319,3 +320,42 @@ class EvaluationReportGenerator:
             logger.info(f"HTML report saved: {fp}")
 
         return paths
+
+    @staticmethod
+    def to_artifact_info(
+        evaluator: BatchEvaluator,
+        report_id: str = "",
+        sim_id: str = "",
+        bucket: str = "hunter-scene-assets",
+    ) -> dict[str, Any]:
+        """将批量评估报告序列化为字节，并返回发布制品所需的元数据。
+
+        供 V2.10.0 平台接入：调用方将返回的字段直接传入
+        ``SimDataProducer.publish_artifact()``。
+
+        Args:
+            evaluator: 已包含所有场景结果的批量评估器。
+            report_id: 报告 ID（空则自动生成时间戳 ID）。
+            sim_id: 当前仿真实例 ID，用于构造 object_key。
+            bucket: 对象存储 Bucket。
+
+        Returns:
+            含 ``name``/``bucket``/``object_key``/``size_bytes``/``sha256``/``media_type``/``json_bytes`` 的字典。
+        """
+        import hashlib
+
+        if not report_id:
+            report_id = f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        data = evaluator.summary()
+        data["report_id"] = report_id
+        json_bytes: bytes = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        object_key = f"scenarios/simulations/{sim_id}/reports/{report_id}.json"
+        return {
+            "name": f"{report_id}.json",
+            "bucket": bucket,
+            "object_key": object_key,
+            "size_bytes": len(json_bytes),
+            "sha256": hashlib.sha256(json_bytes).hexdigest(),
+            "media_type": "application/json",
+            "json_bytes": json_bytes,
+        }

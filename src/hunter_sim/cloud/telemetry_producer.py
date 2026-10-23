@@ -1,10 +1,12 @@
-"""HunterCore Kafka 遥测生产者（V2.2.0）。
+"""HunterCore Kafka 遥测生产者（@deprecated，V2.2.0）。
+
+.. deprecated:: 2.10.0
+    已由 ``cloud.sim_data_producer.SimDataProducer`` 替代。
+    本类仅供单实例脱机调试使用，不再被 ``CloudConnector`` 调用。
+    生产环境请直接使用 ``SimDataProducer``。
 
 以"车端"身份向 Kafka（SASL_SSL / SCRAM-SHA-512）发布
-`hunter.{vehicle_id}.telemetry / event / health`，key=vehicle_id 保证单车有序。
-
-遵循 CARLA/可选依赖隔离规范：`kafka` 惰性导入，缺失或未启用时整体降级为 no-op
-（消息进有界内存缓冲，`flush()` 尽力重投），绝不阻断仿真主循环。
+``hunter.{vehicle_id}.telemetry / event / health``，key=vehicle_id 保证单车有序。
 """
 
 from __future__ import annotations
@@ -29,14 +31,29 @@ ProducerFactory = Callable[[CloudSettings], Any]
 class TelemetryProducer:
     """Kafka 遥测生产者（best-effort，不阻断仿真）。
 
+    .. deprecated:: 2.10.0
+        请直接使用 ``SimDataProducer``。本类仅供单实例脱机调试。
+
     Args:
         settings: HunterCore 接入配置。
+        vehicle_id: 单实例调试模式车辆 ID（从 settings.sim_id 或环变量读取）。
         producer_factory: 可选生产者工厂（默认惰性构建 kafka-python KafkaProducer）；
             单测注入桩对象，需提供 `send(topic, key, value)` / `flush()` / `close()`。
     """
 
-    def __init__(self, settings: CloudSettings, producer_factory: Optional[ProducerFactory] = None) -> None:
+    # 旧版 Topic 默认模板（单实例调试用）
+    _LEGACY_TELEMETRY_TOPIC = "hunter.{vehicle_id}.telemetry"
+    _LEGACY_EVENT_TOPIC = "hunter.{vehicle_id}.event"
+    _LEGACY_HEALTH_TOPIC = "hunter.{vehicle_id}.health"
+
+    def __init__(
+        self,
+        settings: CloudSettings,
+        vehicle_id: str = "",
+        producer_factory: Optional[ProducerFactory] = None,
+    ) -> None:
         self._settings = settings
+        self._vehicle_id = vehicle_id or getattr(settings, "vehicle_id", "") or settings.sim_id or "SIM_UNKNOWN"
         self._factory = producer_factory
         self._producer: Any = None
         self._available = False
@@ -129,24 +146,24 @@ class TelemetryProducer:
     def publish_telemetry(self, state: VehicleState, seq: Optional[int] = None) -> bool:
         """发布一帧遥测（seq 缺省自动递增）。"""
         payload = build_telemetry(
-            self._settings.vehicle_id, self._seq if seq is None else seq, state
+            self._vehicle_id, self._seq if seq is None else seq, state
         )
-        return self._send(self._resolve(self._settings.telemetry_topic), payload)
+        return self._send(self._resolve(self._LEGACY_TELEMETRY_TOPIC), payload)
 
     def publish_event(self, timestamp: float, event_type: str, **kwargs: Any) -> bool:
         """发布一条事件（等级自动映射）。"""
-        payload = build_event(self._settings.vehicle_id, timestamp, event_type, **kwargs)
-        return self._send(self._resolve(self._settings.event_topic), payload)
+        payload = build_event(self._vehicle_id, timestamp, event_type, **kwargs)
+        return self._send(self._resolve(self._LEGACY_EVENT_TOPIC), payload)
 
     def publish_health(self, timestamp: float, status: str = "auto_driving") -> bool:
         """发布一条健康心跳。"""
-        payload = build_health(self._settings.vehicle_id, timestamp, status=status)
-        return self._send(self._resolve(self._settings.health_topic), payload)
+        payload = build_health(self._vehicle_id, timestamp, status=status)
+        return self._send(self._resolve(self._LEGACY_HEALTH_TOPIC), payload)
 
     # ── 内部 ──────────────────────────────────────────────────────────────
     def _resolve(self, topic_template: str) -> str:
         """把 `{vehicle_id}` 模板替换为实际车辆 ID。"""
-        return topic_template.format(vehicle_id=self._settings.vehicle_id)
+        return topic_template.format(vehicle_id=self._vehicle_id)
 
     def _send(self, topic: str, payload: dict[str, Any]) -> bool:
         """发送一条 JSON 消息；同步失败立即入缓冲，异步失败经 errback 回捞（不抛出）。
@@ -155,7 +172,7 @@ class TelemetryProducer:
         都是**异步错误**，不会同步抛出；必须挂 errback 才能在真实链路上发现并
         重投，否则遥测会静默丢失（仅体现为 `publish_*` 返回 True）。
         """
-        key = self._settings.vehicle_id.encode("utf-8")
+        key = self._vehicle_id.encode("utf-8")
         value = json.dumps(payload, default=str).encode("utf-8")
         if not self._available or self._producer is None:
             self._buffer_message(topic, key, value)

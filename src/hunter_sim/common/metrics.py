@@ -30,6 +30,16 @@
 - huntersim_user_events_total              平台用户管理/登录计数（P2-13）
 - huntersim_scheduling_decisions_total     地图感知调度决策计数（P2-14）
 - huntersim_carla_supervisor_events_total  托管 CARLA 进程事件计数（P2-15）
+
+指标清单（V2.10.0 平台接入新增）：
+- huntersim_sim_status_published_total     sim_status 消息发布计数
+- huntersim_sim_event_published_total      sim_event 消息发布计数
+- huntersim_sim_metrics_published_total    sim_metrics 消息发布计数
+- huntersim_sensor_file_published_total    sensor_file 消息发布计数
+- huntersim_sim_data_producer_errors_total SimDataProducer 发送/DLQ 错误计数
+- huntersim_sim_data_buffer_size           SimDataProducer 有界缓冲当前深度 Gauge
+- huntersim_vil_state_consumed_total       carla.{sim_id}.vil_state 消费计数
+- huntersim_vil_e2e_lag_ms                 VIL 端到端延迟（ms）Histogram
 """
 
 from __future__ import annotations
@@ -191,6 +201,51 @@ CARLA_SUPERVISOR_EVENTS_TOTAL = Counter(
     labelnames=("event",),
 )
 
+# ─── V2.10.0 平台接入：SimDataProducer / VIL 数据链路 ───────────────────
+
+SIM_STATUS_PUBLISHED_TOTAL = Counter(
+    "huntersim_sim_status_published_total",
+    "sim_status messages published to sensor_data topic.",
+)
+
+SIM_EVENT_PUBLISHED_TOTAL = Counter(
+    "huntersim_sim_event_published_total",
+    "sim_event messages published to sensor_data topic.",
+)
+
+SIM_METRICS_PUBLISHED_TOTAL = Counter(
+    "huntersim_sim_metrics_published_total",
+    "sim_metrics messages published to sensor_data topic.",
+)
+
+SENSOR_FILE_PUBLISHED_TOTAL = Counter(
+    "huntersim_sensor_file_published_total",
+    "sensor_file messages published after successful bag upload.",
+)
+
+SIM_DATA_PRODUCER_ERRORS_TOTAL = Counter(
+    "huntersim_sim_data_producer_errors_total",
+    "SimDataProducer send/DLQ/serialization errors.",
+    labelnames=("sim_id", "op"),
+)
+
+SIM_DATA_BUFFER_SIZE = Gauge(
+    "huntersim_sim_data_buffer_size",
+    "Current depth of the SimDataProducer bounded in-memory buffer.",
+    labelnames=("sim_id",),
+)
+
+VIL_STATE_CONSUMED_TOTAL = Counter(
+    "huntersim_vil_state_consumed_total",
+    "carla.{sim_id}.vil_state messages consumed by VILDataConsumer.",
+)
+
+VIL_E2E_LAG_MS = Histogram(
+    "huntersim_vil_e2e_lag_ms",
+    "VIL end-to-end message lag in milliseconds (publisher ts -> consumer ts).",
+    buckets=(1, 5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000),
+)
+
 # ─── app.state 派生 Gauge（抓取时刻刷新）────────────────────────────────────
 
 _GAUGE_SPECS: tuple[tuple[str, str, str], ...] = (
@@ -256,6 +311,16 @@ def observe_vil_latency(latency_ms: float) -> None:
         VIL_LATENCY_SECONDS.observe(latency_ms / 1000.0)
 
 
+def observe_vil_e2e_lag(lag_ms: float) -> None:
+    """记录 VIL 端到端消息延迟（毫秒直方图，V2.10.0 平台接入链路）。
+
+    Args:
+        lag_ms: 发布端 timestamp 到消费端本地时间的差值（毫秒）。
+    """
+    if lag_ms >= 0.0:
+        VIL_E2E_LAG_MS.observe(lag_ms)
+
+
 def counter_value(metric: Any, **labels: str) -> float:
     """读取 Counter 当前累计值（测试断言辅助；未初始化返回 0）。"""
     try:
@@ -313,15 +378,24 @@ __all__ = [
     "LOGIN_REJECTIONS_TOTAL",
     "RATE_LIMITED_REJECTIONS_TOTAL",
     "SCHEDULING_DECISIONS_TOTAL",
+    "SENSOR_FILE_PUBLISHED_TOTAL",
     "SERVICE_START_TIME",
+    "SIM_DATA_BUFFER_SIZE",
+    "SIM_DATA_PRODUCER_ERRORS_TOTAL",
+    "SIM_EVENT_PUBLISHED_TOTAL",
+    "SIM_METRICS_PUBLISHED_TOTAL",
+    "SIM_STATUS_PUBLISHED_TOTAL",
     "USER_EVENTS_TOTAL",
+    "VIL_E2E_LAG_MS",
     "VIL_LATENCY_SECONDS",
     "VIL_MESSAGE_DROPPED_TOTAL",
+    "VIL_STATE_CONSUMED_TOTAL",
     "counter_value",
     "histogram_count",
     "metric_exists",
     "normalize_api_path",
     "observe_http_request",
+    "observe_vil_e2e_lag",
     "observe_vil_latency",
     "update_app_state_gauges",
 ]

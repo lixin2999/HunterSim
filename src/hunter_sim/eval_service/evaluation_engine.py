@@ -280,6 +280,77 @@ class EvaluationEngine:
         )
 
     @staticmethod
+    def publish_results(
+        sim_data_producer: Any,
+        sim_id: str,
+        vehicle_id: str,
+        scene_id: str,
+        result: SceneEvaluationResult,
+        eval_bucket: str = "hunter-scene-assets",
+    ) -> None:
+        """将评估结果发布到平台（ sim_metrics + artifact）。
+
+        应在场景终止评估完成后调用。无 ``sim_data_producer`` 时安全返回。
+
+        Args:
+            sim_data_producer: ``SimDataProducer`` 实例。
+            sim_id: 仿真实例 ID。
+            vehicle_id: 孪生车 ID。
+            scene_id: 场景 ID。
+            result: 单场景评估结果。
+            eval_bucket: 产物文件存储 Bucket。
+        """
+        if sim_data_producer is None:
+            return
+        try:
+            import json as _json
+            import time as _time
+
+            from hunter_sim.cloud.sim_data_mapper import build_sim_metrics  # noqa: PLC0415
+
+            seq_metrics = sim_data_producer.next_seq()
+            metrics_msg = build_sim_metrics(
+                sim_id=sim_id,
+                vehicle_id=vehicle_id or None,
+                scene_id=scene_id,
+                seq=seq_metrics,
+                ts=_time.time(),
+                grade=result.grade.value,
+                passed=result.passed,
+                safety=result.safety.to_dict(),
+                efficiency=result.efficiency.to_dict(),
+                comfort=result.comfort.to_dict(),
+                task={
+                    "completion_rate": result.efficiency.completion_rate,
+                    "scene_duration_s": result.efficiency.scene_duration_s,
+                },
+                success_criteria_result=result.success_criteria,
+                takeover_required=result.takeover,
+            )
+            sim_data_producer.publish_metrics(metrics_msg)
+
+            # 发布 artifact：将评估结果作为 eval.json 登记到平台
+            result_dict = result.to_dict()
+            json_bytes = _json.dumps(result_dict, default=str).encode("utf-8")
+            size_bytes = len(json_bytes)
+            import hashlib
+            sha256 = hashlib.sha256(json_bytes).hexdigest()
+            object_key = f"scenarios/simulations/{sim_id}/{scene_id}/eval.json"
+            seq_artifact = sim_data_producer.next_seq()
+            sim_data_producer.publish_artifact(
+                name="eval.json",
+                bucket=eval_bucket,
+                object_key=object_key,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_type="application/json",
+                vehicle_id=vehicle_id or None,
+                scene_id=scene_id,
+            )
+        except Exception as exc:  # noqa: BLE001  发布失败不阻断主流程
+            logger.warning(f"publish_results failed: {type(exc).__name__}: {exc}")
+
+    @staticmethod
     def _frame_time_s(frame: dict[str, Any]) -> float:
         """读取帧时间戳（秒）：兼容规范字段 time_stamp 与遥测/录制字段 timestamp（审查项 R）。"""
         value = frame.get("time_stamp")

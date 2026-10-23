@@ -43,6 +43,8 @@ class TestDetectedEvent:
             "time_stamp": 2.5,
             "description": "desc",
             "data": {"a": 1},
+            "event_level": "info",
+            "sim_time": 0.0,
         }
 
 

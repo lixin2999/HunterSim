@@ -24,6 +24,7 @@ from hunter_sim.api.deps import (
 from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.models import (
     ApiResponse,
+    BatchScenarioRequest,
     CalibrationRequest,
     CreateInstanceRequest,
     InstanceResponse,
@@ -45,7 +46,7 @@ from hunter_sim.api.routers.scenes import (
     set_weather_impl,
 )
 from hunter_sim.common.exceptions import InstanceStateError, ResourceError
-from hunter_sim.common.models import InstanceStatus
+from hunter_sim.common.models import InstanceStatus, QualityLevel, SimMode
 from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
@@ -226,6 +227,9 @@ async def create_instance(
             vehicle_model=body.vehicle_model,
             replay_config=body.replay_config.model_dump() if body.replay_config else None,
             tenant=target_tenant,
+            sim_id=body.sim_id,
+            calibration=body.calibration.model_dump() if body.calibration else None,
+            kafka_topics=body.kafka_topics.model_dump(exclude_defaults=True) if body.kafka_topics else None,
         )
 
         audit_log(
@@ -239,15 +243,18 @@ async def create_instance(
         settings = get_settings()
         data = {
             "sim_instance_id": inst.sim_instance_id,
+            "sim_id": inst.sim_id or inst.sim_instance_id,
             "status": inst.status.value,
             "carla_server": {
                 "host": inst.carla_host,
                 "rpc_port": inst.carla_rpc_port,
                 "stream_port": inst.carla_stream_port,
             },
+            "vil_state_topic": inst.vil_state_topic,
+            "sensor_data_topic": inst.sensor_data_topic,
             "stream_url": f"{settings.api.stream_base_url}/sim/{inst.sim_instance_id}",
             "next_step": [
-                f"POST /api/v1/sim/instances/{inst.sim_instance_id}/scene（下发场景：加载地图并生成自车）",
+                f"POST /api/v1/sim/instances/{inst.sim_instance_id}/scene（下发场景）",
                 f"POST /api/v1/sim/instances/{inst.sim_instance_id}/start（启动场景运行）",
             ],
         }
@@ -547,5 +554,70 @@ async def get_instance_stream(
                 "rpc_port": inst.carla_rpc_port,
                 "stream_port": inst.carla_stream_port,
             },
+        }
+    )
+
+
+# ─── 批量场景（V2.10.0 平台接入）──────────────────────────────────────────
+
+
+@router.post("/batch", response_model=ApiResponse, status_code=status.HTTP_202_ACCEPTED,
+             summary="批量创建场景实例")
+async def batch_scenarios(
+    body: BatchScenarioRequest,
+    request: Request,
+    principal: Principal = Depends(require_operator),
+) -> ApiResponse:
+    """POST /api/v1/sim/instances/batch（设计文档 §12.1 / §9.5）
+
+    顺序创建多个仿真实例，单 CARLA Server 串行运行。
+    返回任务 ID 及各实例的 sim_instance_id 列表。
+    失败不中断——已创建的实例不回滚，失败项记录错误信息。
+    """
+    mgr = _get_instance_manager(request)
+    user_id = principal.user_id
+    task_id = body.task_id or f"batch-{int(asyncio.get_event_loop().time())}"
+    results: list[dict[str, Any]] = []
+
+    for idx, scene_cfg in enumerate(body.scenes):
+        try:
+            # 每个场景创建一个独立实例
+            inst = mgr.create_instance(
+                mode=SimMode(scene_cfg.get("mode", "sil")),
+                map_id=scene_cfg.get("map", "Town03"),
+                quality=QualityLevel(scene_cfg.get("quality", "medium")),
+                user_id=user_id,
+                vehicle_id=scene_cfg.get("vehicle_id", ""),
+                scene_id=scene_cfg.get("scene_id", f"{task_id}-{idx:04d}"),
+                vehicle_model=scene_cfg.get("vehicle_model", "hunter.se"),
+                tenant=principal.tenant,
+            )
+            results.append({
+                "index": idx,
+                "sim_instance_id": inst.sim_instance_id,
+                "sim_id": inst.sim_id or inst.sim_instance_id,
+                "sensor_data_topic": inst.sensor_data_topic,
+                "status": "created",
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"batch[{idx}] create failed: {exc}")
+            results.append({
+                "index": idx,
+                "scene_id": scene_cfg.get("scene_id", f"{task_id}-{idx:04d}"),
+                "status": "failed",
+                "error": str(exc),
+            })
+
+    audit_log(
+        "instance.batch_create", user_id, task_id,
+        f"total={len(body.scenes)} succeeded={sum(1 for r in results if r.get('status') == 'created')}",
+        tenant=principal.tenant,
+        auth_type=principal.auth_type,
+    )
+    return ApiResponse(
+        data={
+            "task_id": task_id,
+            "total": len(body.scenes),
+            "results": results,
         }
     )

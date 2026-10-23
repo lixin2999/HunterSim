@@ -61,10 +61,10 @@ def _endpoint_addr(endpoint: Any) -> tuple[str, int]:
 
 @dataclass
 class SimInstance:
-    """仿真实例数据模型（设计文档 §10.2.2）。
+    """仿真实例数据模型（V2.10.0：平台接入扩展）。
 
     Attributes:
-        sim_instance_id: 实例唯一 ID。
+        sim_instance_id: 实例唯一 ID（= sim_id）。
         status: 生命周期状态。
         mode: 仿真模式（vil/sil/replay）。
         map_id: 当前地图。
@@ -76,14 +76,18 @@ class SimInstance:
         scene_id: 关联场景 ID。
         vehicle_id: 关联实车 ID。
         user_id: 操作用户 ID。
-        tenant: 所属租户 ID（V2.5.0 平台化隔离）。
+        tenant: 所属租户 ID。
         create_time: 创建时间戳（epoch 秒）。
         start_time: 启动时间戳（未启动为 0）。
-        docker_container_id: 容器 ID（§10.2.3 容器化部署）。
-        resource_limits: 容器资源限额（cpu/memory/gpu limit）。
+        docker_container_id: 容器 ID。
+        resource_limits: 容器资源限额。
         max_lifetime_s: 最大运行时长。
         retry_count: 异常重试次数。
         error_message: 失败原因。
+        sim_id: 等同于 sim_instance_id，方便平台传递。
+        calibration: VIL 标定快照字典。
+        vil_state_topic: 实例创建时渲染的 vil_state Topic 全名。
+        sensor_data_topic: 实例创建时渲染的 sensor_data Topic 全名。
     """
 
     sim_instance_id: str
@@ -111,7 +115,11 @@ class SimInstance:
     retry_count: int = 0
     error_message: str = ""
     restored: bool = False
-    """是否由启动恢复流程从持久化存储重建（执行面需重新装配）。"""
+    # V2.10.0 平台接入字段
+    sim_id: str = ""           # 等于 sim_instance_id，方便传递
+    calibration: dict[str, Any] = field(default_factory=dict)  # VIL 标定快照
+    vil_state_topic: str = ""  # 实例创建时渲染的完整 Topic 名
+    sensor_data_topic: str = ""
 
     def is_expired(self) -> bool:
         """检查实例是否超过最大运行时间。"""
@@ -283,8 +291,11 @@ class SimInstanceManager:
         vehicle_model: str = "hunter.se",
         replay_config: Optional[dict[str, Any]] = None,
         tenant: str = "",
+        sim_id: str = "",
+        calibration: Optional[dict[str, Any]] = None,
+        kafka_topics: Optional[dict[str, str]] = None,
     ) -> SimInstance:
-        """创建新仿真实例。
+        """创建新仿真实例（V2.10.0：支持 sim_id/calibration/kafka_topics）。
 
         Args:
             mode: 仿真模式。
@@ -293,9 +304,12 @@ class SimInstanceManager:
             user_id: 操作用户 ID。
             vehicle_id: 关联实车 ID（VIL 模式）。
             scene_id: 关联场景 ID。
-            vehicle_model: 自车模型 ID（文档 §12.2）。
-            replay_config: replay 模式回放配置（文档 §12.2）。
-            tenant: 租户 ID（V2.5.0）；为空时取平台默认租户。
+            vehicle_model: 自车模型 ID。
+            replay_config: replay 模式回放配置。
+            tenant: 租户 ID；为空时取平台默认租户。
+            sim_id: 平台指定的 sim_id（空则使用生成的 uuid）。
+            calibration: VIL 初始标定字典（VilCalibration.model_dump()）。
+            kafka_topics: 平台下发的 Topic 配置字典（KafkaTopicConfig.model_dump()）。
 
         Returns:
             创建的 SimInstance。
@@ -303,19 +317,25 @@ class SimInstanceManager:
         Raises:
             ResourceError: GPU 资源不足或超出租户并发配额。
         """
-        tenant = tenant or self._platform.default_tenant
-        # 租户配额先行校验：必须在 GPU 分配前拒绝，避免分配后失败泄漏 GPU 名额
-        self._check_tenant_quota(tenant)
-        instance_id = str(uuid.uuid4())
-        gpu_id: int = -1
+        import datetime as _dt  # noqa: PLC0415
 
+        tenant = tenant or self._platform.default_tenant
+        self._check_tenant_quota(tenant)
+
+        # sim_id: 优先使用平台指定值，否则生成 sim-{date}-{random4}
+        if sim_id:
+            instance_id = sim_id
+        else:
+            _date_str = _dt.date.today().strftime("%Y%m%d")
+            import random as _rand  # noqa: PLC0415
+            instance_id = (
+                f"sim-{_date_str}-{_rand.randint(0, 9999):04d}-{str(uuid.uuid4())[:8]}"
+            )
+
+        gpu_id: int = -1
         if self._gpu_pool is not None:
-            # 过载降级：支持降低画质以提高并发数（文档 §10.3.1）
             allocate_ex = getattr(self._gpu_pool, "allocate_ex", None)
-            if (
-                self._settings.gpu_allow_overload_downgrade
-                and callable(allocate_ex)
-            ):
+            if self._settings.gpu_allow_overload_downgrade and callable(allocate_ex):
                 gpu_id, quality = allocate_ex(quality, allow_downgrade=True)
             else:
                 gpu_id = self._gpu_pool.allocate(quality)
@@ -326,8 +346,19 @@ class SimInstanceManager:
                     "All GPUs at capacity.",
                 )
 
+        # 渲染 Topic 名
+        sensor_data_topic = (
+            (kafka_topics or {}).get("sensor_data_topic")
+            or f"carla.{instance_id}.sensor_data"
+        )
+        vil_state_topic = (
+            (kafka_topics or {}).get("vil_state_topic")
+            or f"carla.{instance_id}.vil_state"
+        )
+
         instance = SimInstance(
             sim_instance_id=instance_id,
+            sim_id=instance_id,
             status=InstanceStatus.CREATED,
             mode=mode,
             map_id=map_id,
@@ -340,12 +371,12 @@ class SimInstanceManager:
             vehicle_model=vehicle_model,
             replay_config=dict(replay_config or {}),
             max_lifetime_s=self._settings.instance_max_lifetime_seconds,
+            calibration=dict(calibration or {}),
+            vil_state_topic=vil_state_topic,
+            sensor_data_topic=sensor_data_topic,
         )
 
         with self._lock:
-            # 引擎端点分配（V2.4.0）：声明库存时独占分配，耗尽即拒绝创建；
-            # 未声明库存时所有实例共享单引擎，由执行面保证单场景约束
-            # V2.8.0 P2-14：分配时带地图亲和，同地图空闲端点优先复用
             instance.carla_host, instance.carla_rpc_port, instance.carla_stream_port = (
                 self._assign_endpoint(map_id)
             )

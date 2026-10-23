@@ -208,6 +208,7 @@ def _execution_plane(app: Any) -> ExecutionPlane:
             lock=_runtime_lock(app),
             fixed_delta_seconds=delta,
             runners=_runners(app),
+            cloud_settings=getattr(settings, "cloud", None) if settings is not None else None,
         )
         app.state.execution_plane = plane
         logger.info(

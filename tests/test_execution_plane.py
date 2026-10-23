@@ -53,12 +53,13 @@ class _StubMapManager:
 class _StubRunner:
     """运行器桩：记录销毁状态与回调。"""
 
-    def __init__(self, world: Any, on_state_change: Any = None, on_event: Any = None) -> None:
+    def __init__(self, world: Any, on_state_change: Any = None, on_event: Any = None, **kwargs: Any) -> None:
         self.world = world
         self.on_state_change = on_state_change
         self.on_event = on_event
         self.destroyed = False
         self.loaded_configs: list[Any] = []
+        self.runner_kwargs = kwargs  # 记录 sim_data_producer/sim_id 等注入参数
 
     def destroy(self) -> None:
         self.destroyed = True

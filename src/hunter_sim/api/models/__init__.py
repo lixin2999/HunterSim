@@ -58,8 +58,34 @@ class ReplayWindow(BaseModel):
     end_time: str = Field("", description="回放结束时间（ISO8601）")
 
 
+class VilCalibration(BaseModel):
+    """VIL 初始标定参数字段（方案 §6.1.1）。
+
+    实例创建时平台可下发初始标定，实例层存储此快照。
+    """
+
+    calibration_id: str = Field("", description="标定记录 ID")
+    map_x: float = Field(0.0, description="odom 原点地图 X（米）")
+    map_y: float = Field(0.0, description="odom 原点地图 Y（米）")
+    map_heading: float = Field(0.0, ge=-360.0, le=360.0, description="odom 原点地图航向（度）")
+    odom_x: float = Field(0.0, description="标定时刻 odom X（米）")
+    odom_y: float = Field(0.0, description="标定时刻 odom Y（米）")
+    odom_heading: float = Field(0.0, ge=-360.0, le=360.0, description="标定时刻 odom 航向（度）")
+
+
+class KafkaTopicConfig(BaseModel):
+    """平台下发的 Topic 配置（方案 §6.1.1）。
+
+    实例创建时平台可将具体 Topic 名下发给 CARLA 实例，
+    覆盖本地默认模板配置。
+    """
+
+    vil_state_topic: str = Field("", description="平台指定的 vil_state Topic 全名（空则由模板渲染）")
+    sensor_data_topic: str = Field("", description="平台指定的 sensor_data Topic 全名（空则由模板渲染）")
+
+
 class CreateInstanceRequest(BaseModel):
-    """POST /instances 请求体（设计文档 §12.2）。
+    """POST /instances 请求体（V2.10.0：平台接入扩展）。
 
     兼容旧字段名 `map_id`（与 `map` 等效）。
     """
@@ -73,11 +99,15 @@ class CreateInstanceRequest(BaseModel):
         description="地图 ID（如 Town03）",
     )
     vehicle_model: str = Field("hunter.se", description="自车模型 ID")
-    quality: QualityLevel = Field(QualityLevel.MEDIUM, description="渲染画质（Low/Medium/Epic，不区分大小写）")
+    quality: QualityLevel = Field(QualityLevel.MEDIUM, description="渲染画质（Low/Medium/Epic）")
     scene_id: str = Field("", description="可选，预加载场景 ID")
     vehicle_id: str = Field("", description="VIL 模式必填，关联实车 ID")
     replay_config: Optional[ReplayWindow] = Field(None, description="replay 模式回放配置")
-    tenant: str = Field("", description="目标租户（V2.5.0，空取调用主体租户；跨租户仅 admin）")
+    tenant: str = Field("", description="目标租户（空取调用主体租户；跨租户仅 admin）")
+    # V2.10.0 平台接入扩展字段
+    sim_id: str = Field("", description="平台指定的 sim_id（空则由本服务生成）")
+    calibration: Optional[VilCalibration] = Field(None, description="VIL 初始标定（方案 §6.1.1）")
+    kafka_topics: Optional[KafkaTopicConfig] = Field(None, description="平台下发的 Topic 配置")
 
     @field_validator("quality", mode="before")
     @classmethod
@@ -87,7 +117,7 @@ class CreateInstanceRequest(BaseModel):
 
 
 class InstanceResponse(BaseModel):
-    """实例信息响应体。"""
+    """实例信息响应体（V2.10.0：新增平台契约字段）。"""
 
     sim_instance_id: str
     status: InstanceStatus
@@ -104,6 +134,13 @@ class InstanceResponse(BaseModel):
     create_time: float
     start_time: float
     error_message: str = ""
+    # V2.10.0 平台接入扩展字段
+    sim_id: str = Field("", description="等于 sim_instance_id，方便平台读取")
+    carla_status: str = Field("", description="CARLA 原始大写状态（排障用）")
+    vil_state_topic: str = Field("", description="实例渲染的 vil_state Topic 全名")
+    sensor_data_topic: str = Field("", description="实例渲染的 sensor_data Topic 全名")
+    ego_state: dict = Field(default_factory=dict, description="自车快照（x/y/heading/velocity）")
+    actors_count: int = Field(0, description="当前世界 Actor 数")
 
 
 # ─── 场景管理 ─────────────────────────────────────────────────────────────────

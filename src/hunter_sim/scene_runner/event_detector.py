@@ -31,6 +31,8 @@ class DetectedEvent:
         time_stamp: 事件发生仿真时间戳。
         description: 事件描述。
         data: 附加数据字典（碰撞对象 ID、速度值等）。
+        event_level: 事件级别（info/warning/critical），V2.10.0 新增。
+        sim_time: 当前仿真时间轴（秒）， V2.10.0 新增（用于 build_sim_event）。
     """
 
     event_id: str
@@ -38,6 +40,8 @@ class DetectedEvent:
     time_stamp: float
     description: str = ""
     data: dict[str, Any] = field(default_factory=dict)
+    event_level: str = "info"   # info/warning/critical
+    sim_time: float = 0.0       # 当前仿真时刻（秒）
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为字典（供 WebSocket 推送）。"""
@@ -47,6 +51,8 @@ class DetectedEvent:
             "time_stamp": self.time_stamp,
             "description": self.description,
             "data": self.data,
+            "event_level": self.event_level,
+            "sim_time": self.sim_time,
         }
 
 

@@ -72,7 +72,7 @@ def test_cloud_and_gui_dotenv_apply(tmp_path: Path) -> None:
     _write_env(
         tmp_path,
         "HUNTER_CORE_ENABLED=true\n"
-        "HUNTER_CORE_VEHICLE_ID=SIM_X9\n"
+        "HUNTER_CORE_SIM_ID=SIM_X9\n"
         "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.31.35:9092\n"
         "HUNTER_CORE_JWT_TOKEN=abc.def.ghi\n"
         "GUI_THEME=light\n"
@@ -81,7 +81,7 @@ def test_cloud_and_gui_dotenv_apply(tmp_path: Path) -> None:
     )
     settings = HunterSimSettings()
     assert settings.cloud.enabled is True
-    assert settings.cloud.vehicle_id == "SIM_X9"
+    assert settings.cloud.sim_id == "SIM_X9"
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
     assert settings.cloud.jwt_token is not None
     assert settings.cloud.jwt_token.get_secret_value() == "abc.def.ghi"
@@ -95,7 +95,7 @@ def test_cloud_defaults_are_noop(tmp_path: Path) -> None:
     settings = HunterSimSettings()
     assert settings.cloud.enabled is False
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
-    assert settings.cloud.telemetry_topic == "hunter.{vehicle_id}.telemetry"
+    assert settings.cloud.sensor_data_topic_template == "carla.{sim_id}.sensor_data"
     assert settings.gui.theme == "dark"
     assert settings.gui.scenario_runner_path is None
 

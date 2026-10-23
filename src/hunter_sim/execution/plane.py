@@ -47,8 +47,7 @@ class ExecutionPlane:
     V2.6.0 锁粒度拆分：注册表互斥（``lock``，与 API 层共享）只保护字典
     读写与租约领取；耗时的 ``load_world``/同步模式切换/运行器销毁在
     **引擎级锁**（按端点 host:rpc_port 懒创建）下执行，不同引擎的实例
-    装配可并行，同一端点的 CARLA 操作仍串行为单线程（CARLA Client 非
-    线程安全）。
+    装配可并行，同一端点的 CARLA 操作仍串行为单线程（CARLA Client 非线程安全）。
 
     Args:
         pool: 引擎租约池。
@@ -57,6 +56,7 @@ class ExecutionPlane:
         lock: 注册表互斥锁（与 API 层共享同一把锁，保护运行器注册表）。
         fixed_delta_seconds: 同步模式固定步长。
         runners: 复用的运行器注册表（与 ``app.state.scene_runners`` 同对象）。
+        cloud_settings: 可选 CloudSettings（启用时为每个实例创建独立 SimDataProducer）。
     """
 
     def __init__(
@@ -67,6 +67,7 @@ class ExecutionPlane:
         lock: Optional[threading.RLock] = None,
         fixed_delta_seconds: float = _DEFAULT_FIXED_DELTA_SECONDS,
         runners: Optional[dict[str, Any]] = None,
+        cloud_settings: Optional[Any] = None,
     ) -> None:
         self._pool = pool
         self._resolve_map_manager = map_manager_resolver
@@ -77,9 +78,12 @@ class ExecutionPlane:
         self._runner_engines: dict[str, str] = {}
         # 端点 key → 引擎级装配/销毁锁（在注册表锁内懒创建，避免建锁竞态）
         self._engine_locks: dict[str, threading.RLock] = {}
-        # V2.9.0：在途装配计数与取消标记（解决“装配窗口内销毁实例”的泄漏竞态）
+        # V2.9.0：在途装配计数与取消标记（解决"装配窗口内销毁实例"的泄漏竞态）
         self._assembling: dict[str, int] = {}
         self._cancelled: set[str] = set()
+        # V2.10.0：平台发布相关
+        self._cloud_settings = cloud_settings
+        self._cloud_producers: dict[str, Any] = {}  # sim_id -> SimDataProducer
 
     @property
     def pool(self) -> EnginePool:
@@ -162,6 +166,7 @@ class ExecutionPlane:
                     world,
                     on_state_change=on_state_change,
                     on_event=on_event,
+                    **self._build_runner_kwargs(instance),
                 )
         except ExecutionUnavailable:
             with self._registry_lock:
@@ -391,6 +396,43 @@ class ExecutionPlane:
             )
         except Exception as exc:  # noqa: BLE001  同步模式失败时退回异步推进
             logger.warning(f"Cannot enable synchronous mode: {exc}")
+
+    # ── V2.10.0 平台发布工厂辅助 ──────────────────────────────────────
+
+    def _build_runner_kwargs(self, instance: Any) -> dict[str, Any]:
+        """为 SceneRunnerService 构造平台发布相关关键字参数。
+
+        若 ``cloud_settings`` 未启用或为 None，返回空字典（不注入任何平台参数）。
+        否则为当前实例创建独立的 ``SimDataProducer``，并返回 sim_id 等字段。
+        """
+        kwargs: dict[str, Any] = {
+            "sim_id": getattr(instance, "sim_id", instance.sim_instance_id),
+            "vehicle_id": getattr(instance, "vehicle_id", ""),
+            "scene_id": getattr(instance, "scene_id", ""),
+        }
+        if self._cloud_settings is None or not self._cloud_settings.enabled:
+            return kwargs
+
+        sim_id = kwargs["sim_id"]
+        # 复用已创建的 producer（实例重复装配时）
+        producer = self._cloud_producers.get(sim_id)
+        if producer is None:
+            from hunter_sim.cloud.sim_data_producer import SimDataProducer  # noqa: PLC0415
+
+            producer = SimDataProducer(self._cloud_settings, sim_id=sim_id)
+            producer.connect()
+            self._cloud_producers[sim_id] = producer
+        kwargs["sim_data_producer"] = producer
+        return kwargs
+
+    def close_cloud_producer(self, sim_id: str) -> None:
+        """关闭并移除指定实例的 SimDataProducer（实例销毁时调用）。"""
+        producer = self._cloud_producers.pop(sim_id, None)
+        if producer is not None:
+            try:
+                producer.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Closing SimDataProducer[{sim_id}] failed: {exc}")
 
 
 __all__ = ["ExecutionPlane", "ExecutionUnavailable", "MapManagerResolver"]

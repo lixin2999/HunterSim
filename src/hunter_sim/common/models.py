@@ -237,7 +237,7 @@ class CarlaSettings(BaseSettings):
 
 
 class KafkaSettings(BaseSettings):
-    """Kafka 数据总线配置。"""
+    """Kafka 数据总线配置（V2.10.0：消费 carla.{sim_id}.vil_state）。"""
 
     model_config = SettingsConfigDict(
         env_prefix="KAFKA_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -247,7 +247,14 @@ class KafkaSettings(BaseSettings):
     group_id: str = Field("carla-vil", description="VIL 消费组 ID（设计文档 §4.2.2）")
     auto_offset_reset: str = Field("latest", pattern="^(earliest|latest|none)$")
     enable_auto_commit: bool = True
-    telemetry_topic: str = Field("telemetry_clean")
+    telemetry_topic: str = Field(
+        "carla.{sim_id}.vil_state",
+        description="VIL 状态 Topic（平台转发；{sim_id} 在运行时渲染）",
+    )
+    legacy_telemetry_topic: str = Field(
+        "", description="兼容单机调试的旧 telemetry_clean Topic（空则不订阅）"
+    )
+    sim_id: str = Field("", description="当前 VIL 实例的 sim_id（用于渲染 Topic 名）")
     command_topic: str = Field("hunter.{vehicle_id}.command_result")
     username: Optional[SecretStr] = None
     password: Optional[SecretStr] = None
@@ -453,17 +460,18 @@ class PlatformSettings(BaseSettings):
 
 
 class CloudSettings(BaseSettings):
-    """HunterCore 数据采集分析平台接入配置（V2.2.0）。
+    """HunterCore 数据采集分析平台接入配置（V2.10.0：平台契约重构）。
 
-    桌面客户端把 CARLA 数字孪生车当作“车端”，向 HunterCore 回传遥测与 bag：
+    接入链路（方案 §5）：
 
-    - Kafka 遥测：`hunter.{vehicle_id}.telemetry/event/health`（SASL_SSL/SCRAM-SHA-512，
-      key=vehicle_id，Schema 对齐 `contracts/kafka/schemas/telemetry.schema.json`）；
-    - MinIO bag：经 data-collector `POST /api/v1/data/files/presign` 预签名直传，
-      完成后 `POST /api/v1/data/files/complete` 做 MD5/SHA-256 校验。
+    - Kafka 数据面：发布 `carla.{sim_id}.sensor_data`（6 类消息 type 区分），
+      key=sim_id，acks=all，SASL_SSL/SCRAM-SHA-512；
+      DLQ：`carla.{sim_id}.sensor_data.dlq`；
+    - VIL 消费面：订阅 `carla.{sim_id}.vil_state`（由 KafkaSettings 管理）；
+    - MinIO bag：经 data-collector `POST /api/v1/data/files/presign` 预签名直传。
 
-    默认指向单机验证环境 `192.168.31.35`；`enabled=false` 时连接器整体降级为 no-op，
-    不影响本地仿真。凭据（SASL 口令 / JWT）仅经环境变量或 `.env` 注入，禁止硬编码。
+    `enabled=false` 时连接器整体降级为 no-op，不影响本地仿真。
+    凭据（SASL 口令 / JWT）仅经环境变量或 `.env` 注入，禁止硬编码。
     """
 
     model_config = SettingsConfigDict(
@@ -471,25 +479,36 @@ class CloudSettings(BaseSettings):
     )
 
     enabled: bool = Field(False, description="是否启用 HunterCore 数据回传")
-    vehicle_id: str = Field("SIM_HUNTER_SE_001", description="数字孪生车标识（= Kafka 消息 key）")
-    # ── Kafka 遥测总线 ──
+    # ── Kafka 数据面（发布 carla.{sim_id}.sensor_data）──
     kafka_bootstrap: str = Field("192.168.31.35:9092", description="Kafka broker（SASL_SSL）")
     security_protocol: str = Field("SASL_SSL", description="Kafka 安全协议")
     sasl_mechanism: str = Field("SCRAM-SHA-512", description="SASL 机制")
     sasl_username: Optional[SecretStr] = None
     sasl_password: Optional[SecretStr] = None
     ca_cert_path: Optional[str] = Field(None, description="SASL_SSL CA 证书路径（None 用系统信任链）")
-    telemetry_interval_s: float = Field(0.1, gt=0.0, le=1.0, description="遥测发布周期（秒），默认 10Hz")
-    telemetry_topic: str = Field("hunter.{vehicle_id}.telemetry")
-    event_topic: str = Field("hunter.{vehicle_id}.event")
-    health_topic: str = Field("hunter.{vehicle_id}.health")
+    # ── sim_id 与 Topic 模板 ──
+    sim_id: str = Field("", description="当前实例 sim_id（空=运行时由 instance_manager 分配）")
+    sim_id_prefix: str = Field("sim", description="GUI 单实例模式 sim_id 前缀")
+    sensor_data_topic_template: str = Field(
+        "carla.{sim_id}.sensor_data",
+        description="sensor_data Topic 模板（{sim_id} 在 SimDataProducer 初始化时渲染）",
+    )
+    sensor_data_dlq_template: str = Field(
+        "carla.{sim_id}.sensor_data.dlq",
+        description="sensor_data DLQ Topic 模板",
+    )
+    sensor_data_acks: str = Field("all", description="acks=all 保证可靠性")
+    sensor_data_max_inflight: int = Field(5, ge=1, le=100, description="最大未确认批次")
+    # ── 发布频率 ──
+    status_report_interval_s: float = Field(1.0, description="sim_status 定时上报周期（秒）")
+    telemetry_proxy_interval_s: float = Field(0.1, description="sim_telemetry 发布周期（秒，10Hz）")
     # ── data-collector 文件上传（经 api-gateway）──
     gateway_url: str = Field("http://192.168.31.35:8080", description="api-gateway 基础地址")
     jwt_token: Optional[SecretStr] = Field(None, description="data-collector REST Bearer JWT")
-    rosbag_bucket: str = Field("hunter-rosbag", description="bag 上传 Bucket（车端仅三个可写）")
+    rosbag_bucket: str = Field("hunter-rosbag", description="bag 上传 Bucket")
     upload_timeout_s: float = Field(60.0, gt=0.0, description="预签名/直传 HTTP 超时（秒）")
     upload_queue_max_size: int = Field(
-        32, ge=1, le=1024, description="bag 上传后台队列容量（V2.6.0：有界防积压，满时丢最旧）"
+        32, ge=1, le=1024, description="bag 上传后台队列容量（有界防积压，满时丢最旧）"
     )
 
 

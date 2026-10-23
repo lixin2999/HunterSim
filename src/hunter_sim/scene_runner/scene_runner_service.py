@@ -1,8 +1,13 @@
-"""场景运行主服务（PROMPT-ENG-003-B）。
+"""场景运行主服务（V2.10.0：平台接入）。
 
 SceneRunnerService 管理场景完整生命周期：
 创建 → 加载 → 就绪 → 运行（支持暂停/恢复）→ 完成/失败 → 销毁。
 支持两种运行模式：ScenarioRunner（OpenSCENARIO）和自定义 Python 脚本。
+
+接入平台发布链路（可选，注入 sim_data_producer 后启用）：
+- sim_status   ：状态变化 + 1Hz 定时发布
+- sim_telemetry：10Hz 自车遥测发布
+- sim_event    ：检测事件发布
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import threading
 import time
 
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.exceptions import (
@@ -39,6 +45,10 @@ class SceneRunnerService:
         world: CARLA World 对象（已加载地图）。
         on_state_change: 状态变化回调，用于 WebSocket 推送。
         on_event: 事件触发回调。
+        sim_data_producer: 可选 SimDataProducer 实例（平台发布链路）。
+        sim_id: 当前仿真实例 ID（平台契约用）。
+        vehicle_id: 当前孪生车 ID（SIL 模式为空）。
+        scene_id: 当前场景 ID（平台契约用）。
     """
 
     def __init__(
@@ -46,10 +56,18 @@ class SceneRunnerService:
         world: Any,
         on_state_change: Optional[Callable[[SceneStateSnapshot], None]] = None,
         on_event: Optional[Callable[[DetectedEvent], None]] = None,
+        sim_data_producer: Optional[Any] = None,
+        sim_id: str = "",
+        vehicle_id: str = "",
+        scene_id: str = "",
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
         self._on_event = on_event
+        self._sim_data_producer = sim_data_producer
+        self._sim_id = sim_id
+        self._vehicle_id = vehicle_id
+        self._scene_id = scene_id
 
         # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
         self._weather_manager = WeatherManager(world)
@@ -62,6 +80,11 @@ class SceneRunnerService:
         self._config: Optional[SceneConfig] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
+        # 平台发布节流时间戳
+        self._last_status_publish: float = 0.0
+        self._last_telemetry_publish: float = 0.0
+        self._status_interval: float = 1.0      # sim_status 1Hz
+        self._telemetry_interval: float = 0.1   # sim_telemetry 10Hz
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -298,6 +321,16 @@ class SceneRunnerService:
                 self._weather_manager.update_transition()
                 tick_count += 1
 
+                # V2.10.0：平台发布链路（sim_telemetry 10Hz + sim_status 1Hz）
+                if self._sim_data_producer is not None:
+                    now = time.time()
+                    if now - self._last_telemetry_publish >= self._telemetry_interval:
+                        self._last_telemetry_publish = now
+                        self._publish_sim_telemetry(tick_count * delta_seconds)
+                    if now - self._last_status_publish >= self._status_interval:
+                        self._last_status_publish = now
+                        self._publish_sim_status()
+
             except CarlaSimulationError as exc:
                 logger.error(f"Scene tick error: {exc}")
                 with self._lock:
@@ -360,3 +393,165 @@ class SceneRunnerService:
                 self._weather_manager.set_weather(profile)
         except Exception as exc:  # noqa: BLE001  天气下发失败不应阻断场景加载
             logger.warning(f"Apply scene weather failed: {exc}")
+
+    # ── V2.10.0 平台发布辅助方法 ─────────────────────────────────────────
+
+    def _publish_sim_status(self) -> None:
+        """发布 sim_status 消息（状态变化 + 1Hz 定时调用）。
+
+        无 sim_data_producer 时安全返回。
+        """
+        if self._sim_data_producer is None:
+            return
+        try:
+            from hunter_sim.cloud.sim_data_mapper import SimStatusPayload, build_sim_status  # noqa: PLC0415
+
+            snapshot = self.get_state_snapshot()
+            if snapshot is None:
+                return
+            payload = SimStatusPayload(
+                status=snapshot.status.value.upper(),
+                progress_percent=round(snapshot.progress * 100.0, 2),
+                elapsed_time=round(snapshot.elapsed_seconds, 3),
+                total_time=self._config.duration_seconds if self._config else 60.0,
+                actors_count=self._get_actor_count(),
+                collisions=self._get_collision_count(),
+                lane_invasions=self._get_lane_invasion_count(),
+                ego_state=self._get_ego_state(),
+                message=snapshot.error_message or None,
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            msg = build_sim_status(
+                sim_id=self._sim_id,
+                scene_id=snapshot.scene_id or self._scene_id,
+                payload=payload,
+            )
+            self._sim_data_producer.publish_status(msg)
+        except Exception as exc:  # noqa: BLE001  发布失败不阻断仿真
+            logger.debug(f"_publish_sim_status failed: {exc}")
+
+    def _publish_sim_telemetry(self, sim_time: float) -> None:
+        """发布 sim_telemetry 消息（10Hz）。
+
+        Args:
+            sim_time: 当前仿真时间轴（秒）。
+        """
+        if self._sim_data_producer is None:
+            return
+        try:
+            from hunter_sim.cloud.sim_data_mapper import build_sim_telemetry  # noqa: PLC0415
+
+            ego = self._get_ego_state()
+            seq = self._sim_data_producer.next_seq()
+            msg = build_sim_telemetry(
+                sim_id=self._sim_id,
+                vehicle_id=self._vehicle_id or None,
+                scene_id=self._scene_id,
+                seq=seq,
+                ts=time.time(),
+                pose={
+                    "x": ego.get("x", 0.0),
+                    "y": ego.get("y", 0.0),
+                    "z": 0.0,
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "heading": ego.get("heading", 0.0),
+                },
+                twist={
+                    "vx": ego.get("velocity", 0.0),
+                    "vy": 0.0,
+                    "vz": 0.0,
+                    "wx": 0.0,
+                    "wy": 0.0,
+                    "wz": 0.0,
+                },
+                velocity={
+                    "m_s": ego.get("velocity", 0.0),
+                    "km_h": round(ego.get("velocity", 0.0) * 3.6, 3),
+                },
+                steering=ego.get("steering", 0.0),
+                acceleration={"ax": 0.0, "ay": 0.0, "az": 0.0},
+            )
+            self._sim_data_producer.publish_telemetry(msg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"_publish_sim_telemetry failed: {exc}")
+
+    def publish_event_to_platform(self, event: DetectedEvent) -> None:
+        """发布单条事件到平台 sim_event（由 on_event 回调链调用）。
+
+        注意：本方法设计为与现有 ``on_event`` 回调链并联，不会中断现有推送。
+        """
+        if self._sim_data_producer is None:
+            return
+        try:
+            self._sim_data_producer.publish_event(
+                vehicle_id=self._vehicle_id or None,
+                scene_id=self._scene_id,
+                event_type=event.event_type,
+                event_level=event.event_level,
+                sim_time=event.sim_time or event.time_stamp,
+                description=event.description,
+                data=event.data,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"publish_event_to_platform failed: {exc}")
+
+    def _get_actor_count(self) -> int:
+        """获取世界中当前 Actor 数量（失败时返回 0）。"""
+        try:
+            return len(self._world.get_actors())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _get_collision_count(self) -> int:
+        """获取碰撞计数（从事件检测器读）。"""
+        if self._event_detector is None:
+            return 0
+        return sum(
+            1 for e in self._event_detector.detected_events
+            if "collision" in e.event_type.lower()
+        )
+
+    def _get_lane_invasion_count(self) -> int:
+        """获取车道偏离计数。"""
+        if self._event_detector is None:
+            return 0
+        return sum(
+            1 for e in self._event_detector.detected_events
+            if "lane" in e.event_type.lower()
+        )
+
+    def _get_ego_state(self) -> dict[str, Any]:
+        """获取自车状态字典。
+
+        尝试从 scenario 获取车辆 actor，否则通过 world 查找 vehicle 类型 Actor。
+        失败时返回零值字典。
+        """
+        default: dict[str, Any] = {
+            "x": 0.0, "y": 0.0, "heading": 0.0, "velocity": 0.0, "steering": 0.0
+        }
+        try:
+            vehicle = None
+            scenario = self._scenario
+            if scenario is not None and hasattr(scenario, "get_ego_vehicle"):
+                vehicle = scenario.get_ego_vehicle()  # type: ignore[union-attr]
+            if vehicle is None:
+                # 内置场景 BuiltinScenario 持有 _ego_vehicle
+                vehicle = getattr(scenario, "_ego_vehicle", None)
+            if vehicle is None:
+                return default
+            loc = vehicle.get_location()
+            rot = vehicle.get_rotation()
+            vel = vehicle.get_velocity()
+            import math  # noqa: PLC0415
+            speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+            ctrl = vehicle.get_control()
+            return {
+                "x": round(loc.x, 4),
+                "y": round(loc.y, 4),
+                "heading": round(math.radians(rot.yaw), 6),
+                "velocity": round(speed, 4),
+                "steering": round(float(ctrl.steer), 6),
+            }
+        except Exception:  # noqa: BLE001
+            return default

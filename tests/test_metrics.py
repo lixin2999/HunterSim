@@ -143,3 +143,69 @@ class TestMetricsEndpoint:
     def test_metrics_use_standard_exporter(self, client: Any) -> None:
         body = client.get("/api/v1/sim/metrics").text
         assert "python_info" in body or "process_" in body
+
+
+# ─── V2.10.0 平台接入新指标 ──────────────────────────────────────────────────
+
+
+class TestPlatformIntegrationMetrics:
+    """验证 V2.10.0 新注册的 8 个指标存在且可正常打点。"""
+
+    def test_sim_status_published_total(self) -> None:
+        from hunter_sim.common.metrics import SIM_STATUS_PUBLISHED_TOTAL
+        assert metric_exists("huntersim_sim_status_published_total")
+        before = counter_value(SIM_STATUS_PUBLISHED_TOTAL)
+        SIM_STATUS_PUBLISHED_TOTAL.inc()
+        assert counter_value(SIM_STATUS_PUBLISHED_TOTAL) == before + 1
+
+    def test_sim_event_published_total(self) -> None:
+        from hunter_sim.common.metrics import SIM_EVENT_PUBLISHED_TOTAL
+        assert metric_exists("huntersim_sim_event_published_total")
+        before = counter_value(SIM_EVENT_PUBLISHED_TOTAL)
+        SIM_EVENT_PUBLISHED_TOTAL.inc()
+        assert counter_value(SIM_EVENT_PUBLISHED_TOTAL) == before + 1
+
+    def test_sim_metrics_published_total(self) -> None:
+        from hunter_sim.common.metrics import SIM_METRICS_PUBLISHED_TOTAL
+        assert metric_exists("huntersim_sim_metrics_published_total")
+        before = counter_value(SIM_METRICS_PUBLISHED_TOTAL)
+        SIM_METRICS_PUBLISHED_TOTAL.inc()
+        assert counter_value(SIM_METRICS_PUBLISHED_TOTAL) == before + 1
+
+    def test_sensor_file_published_total(self) -> None:
+        from hunter_sim.common.metrics import SENSOR_FILE_PUBLISHED_TOTAL
+        assert metric_exists("huntersim_sensor_file_published_total")
+        before = counter_value(SENSOR_FILE_PUBLISHED_TOTAL)
+        SENSOR_FILE_PUBLISHED_TOTAL.inc()
+        assert counter_value(SENSOR_FILE_PUBLISHED_TOTAL) == before + 1
+
+    def test_vil_state_consumed_total(self) -> None:
+        from hunter_sim.common.metrics import VIL_STATE_CONSUMED_TOTAL
+        assert metric_exists("huntersim_vil_state_consumed_total")
+        before = counter_value(VIL_STATE_CONSUMED_TOTAL)
+        VIL_STATE_CONSUMED_TOTAL.inc()
+        assert counter_value(VIL_STATE_CONSUMED_TOTAL) == before + 1
+
+    def test_sim_data_producer_errors_total_labels(self) -> None:
+        from hunter_sim.common.metrics import SIM_DATA_PRODUCER_ERRORS_TOTAL
+        assert metric_exists("huntersim_sim_data_producer_errors_total")
+        # 带标签
+        SIM_DATA_PRODUCER_ERRORS_TOTAL.labels(sim_id="sim-test", op="send").inc()
+
+    def test_sim_data_buffer_size_labeled(self) -> None:
+        from hunter_sim.common.metrics import SIM_DATA_BUFFER_SIZE
+        assert metric_exists("huntersim_sim_data_buffer_size")
+        SIM_DATA_BUFFER_SIZE.labels(sim_id="sim-test").set(5)
+
+    def test_vil_e2e_lag_ms_histogram(self) -> None:
+        from hunter_sim.common.metrics import VIL_E2E_LAG_MS, observe_vil_e2e_lag
+        assert metric_exists("huntersim_vil_e2e_lag_ms")
+        before = histogram_count(VIL_E2E_LAG_MS)
+        observe_vil_e2e_lag(15.0)
+        assert histogram_count(VIL_E2E_LAG_MS) >= before + 1
+
+    def test_observe_vil_e2e_lag_ignores_negative(self) -> None:
+        from hunter_sim.common.metrics import VIL_E2E_LAG_MS, observe_vil_e2e_lag
+        before = histogram_count(VIL_E2E_LAG_MS)
+        observe_vil_e2e_lag(-10.0)  # 负值不记录
+        assert histogram_count(VIL_E2E_LAG_MS) == before

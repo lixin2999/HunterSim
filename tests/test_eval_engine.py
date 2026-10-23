@@ -298,3 +298,85 @@ class TestFrameDtDerivation:
         ]
         com = EvaluationEngine._compute_comfort(states)
         assert com.avg_jerk_ms3 == pytest.approx(1.0)
+
+
+# ─── publish_results（V2.10.0 平台接入）────────────────────────────────────
+
+
+class _FakeSimDataProducer:
+    """记录所有发布调用的桩 SimDataProducer。"""
+
+    def __init__(self) -> None:
+        self.published_metrics: list[dict] = []
+        self.published_artifacts: list[dict] = []
+        self._seq = 0
+
+    def next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def publish_metrics(self, message: dict) -> bool:
+        self.published_metrics.append(message)
+        return True
+
+    def publish_artifact(self, **kwargs: object) -> bool:
+        self.published_artifacts.append(kwargs)
+        return True
+
+
+class TestPublishResults:
+    """V2.10.0：EvaluationEngine.publish_results 将结果发布到 sim_metrics + artifact。"""
+
+    def _make_result(self) -> SceneEvaluationResult:
+        safety = SafetyMetrics(
+            collision_count=0, min_ttc_s=5.0, min_distance_m=3.0,
+            emergency_brake_count=0, lane_invasion_count=0, red_light_count=0,
+        )
+        efficiency = EfficiencyMetrics(
+            avg_speed_ms=8.0, max_speed_ms=12.0, total_distance_m=100.0,
+            scene_duration_s=15.0, completion_rate=1.0,
+        )
+        comfort = ComfortMetrics(
+            avg_acceleration_ms2=0.5, max_acceleration_ms2=1.0,
+            avg_jerk_ms3=1.0, steering_smoothness_rad_s=0.1,
+        )
+        return SceneEvaluationResult(
+            scene_id="scene-test",
+            timestamp="2026-10-23T00:00:00Z",
+            passed=True,
+            grade=EvalGrade.A,
+            safety=safety,
+            efficiency=efficiency,
+            comfort=comfort,
+            success_criteria={"collision_free": True},
+            events=[],
+            takeover=False,
+        )
+
+    def test_publish_results_calls_metrics_and_artifact(self) -> None:
+        fake = _FakeSimDataProducer()
+        result = self._make_result()
+        EvaluationEngine.publish_results(
+            sim_data_producer=fake,
+            sim_id="sim-test",
+            vehicle_id="HUNTER-001",
+            scene_id="scene-test",
+            result=result,
+        )
+        assert len(fake.published_metrics) == 1
+        assert len(fake.published_artifacts) == 1
+        art = fake.published_artifacts[0]
+        assert art["name"] == "eval.json"
+        assert "sim-test" in art["object_key"]
+
+    def test_publish_results_none_noop(self) -> None:
+        """None producer 安全返回，不抛异常。"""
+        result = self._make_result()
+        EvaluationEngine.publish_results(
+            sim_data_producer=None,
+            sim_id="sim-test",
+            vehicle_id="",
+            scene_id="scene-test",
+            result=result,
+        )
+        # 无异常即通过
