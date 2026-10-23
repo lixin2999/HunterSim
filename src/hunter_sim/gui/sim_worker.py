@@ -19,7 +19,7 @@ from PySide6.QtCore import QThread, Signal
 
 from hunter_sim.common.models import VehicleControlCommand
 from hunter_sim.gui.camera_bridge import image_to_rgb_array
-from hunter_sim.gui.sim_presets import MOUNT_PRESETS, build_rgb_camera_config
+from hunter_sim.gui.sim_presets import MOUNT_PRESETS, build_rgb_camera_config, pick_spawn_point
 
 
 class SimWorker(QThread):
@@ -65,8 +65,8 @@ class SimWorker(QThread):
     def request_blueprints(self, prefix: str) -> None:
         self._commands.put(("blueprints", (prefix,)))
 
-    def request_spawn(self, blueprint: str, x: float, y: float, z: float) -> None:
-        self._commands.put(("spawn", (blueprint, x, y, z)))
+    def request_spawn(self, blueprint: str, x: float, y: float, z: float, use_spawn_point: bool = False) -> None:
+        self._commands.put(("spawn", (blueprint, x, y, z, use_spawn_point)))
 
     def request_attach_sensor(
         self,
@@ -188,23 +188,37 @@ class SimWorker(QThread):
         names = sorted({bp.id for bp in self._blueprint_library.filter(prefix)})
         self.blueprintsReady.emit(names)
 
-    def _do_spawn(self, blueprint: str, x: float, y: float, z: float) -> None:
+    def _do_spawn(self, blueprint: str, x: float, y: float, z: float, use_spawn_point: bool = False) -> None:
         if self._world is None or self._carla is None:
             self.errorOccurred.emit("未连接 CARLA")
             return
         bp = self._blueprint_library.find(blueprint)
-        transform = self._carla.Transform(
-            self._carla.Location(x=x, y=y, z=z),
-            self._carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
-        )
+        # 世界原点 (0,0) 在多数地图上非法（空地/水面/路网外），勾选“使用出生点”
+        # 或坐标仍为默认 (0,0) 时，回退到地图自带的合法出生点，避免 try_spawn_actor 静默失败。
+        if use_spawn_point or (x == 0.0 and y == 0.0):
+            spawn_points = self._world.get_map().get_spawn_points()
+            chosen = pick_spawn_point(spawn_points)
+            if chosen is None:
+                self.errorOccurred.emit("地图无可用出生点，请手动填写合法坐标后重试")
+                return
+            transform = chosen
+        else:
+            transform = self._carla.Transform(
+                self._carla.Location(x=x, y=y, z=z),
+                self._carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
+            )
         actor = self._world.try_spawn_actor(bp, transform)
         if actor is None:
-            self.logLine.emit(f"生成失败（位置非法/被占）：{blueprint} @ ({x},{y},{z})")
+            loc = transform.location
+            self.logLine.emit(
+                f"生成失败（位置非法/被占）：{blueprint} @ ({loc.x:.1f},{loc.y:.1f},{loc.z:.1f})；"
+                "可勾选“使用地图出生点”或改用其他坐标"
+            )
             return
         self._actors[actor.id] = actor
         if self._ego is None and blueprint.startswith("vehicle."):
             self._ego = actor
-            self.logLine.emit(f"自车已生成 id={actor.id}（{blueprint}）")
+            self.logLine.emit(f"自车已生成 id={actor.id}（{blueprint}）→ 在 Add Sensor 的 Parent 选 {actor.id}")
         else:
             self.logLine.emit(f"已生成 {blueprint} id={actor.id}")
         self.actorsChanged.emit(list(self._actors))

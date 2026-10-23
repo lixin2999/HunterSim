@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import pytest
 
@@ -15,6 +17,8 @@ from hunter_sim.gui.sim_presets import (
     CAMERA_BLUEPRINTS,
     MOUNT_PRESETS,
     build_rgb_camera_config,
+    choose_spawn_point_index,
+    pick_spawn_point,
     resolve_mount_transform,
 )
 from hunter_sim.gui.theme import stylesheet
@@ -84,3 +88,38 @@ def test_stylesheet_known_and_fallback() -> None:
     assert dark != light
     assert "QWidget" in dark and "QWidget" in light
     assert stylesheet("nope") == dark
+
+
+def test_choose_spawn_point_index_empty() -> None:
+    """无出生点（count<=0）返回 None，支撑“地图无可用出生点”错误分支。"""
+    assert choose_spawn_point_index(0) is None
+    assert choose_spawn_point_index(-1) is None
+
+
+def test_choose_spawn_point_index_prefers_valid() -> None:
+    """preferred 落在范围内时直接采用，保证可确定性定位。"""
+    assert choose_spawn_point_index(10, preferred=3) == 3
+    assert choose_spawn_point_index(10, preferred=0) == 0
+
+
+def test_choose_spawn_point_index_fallback_out_of_range() -> None:
+    """preferred 越界时忽略，回退随机索引（仍落在 [0, count)）。"""
+    idx = choose_spawn_point_index(5, preferred=99, rng=random.Random(1))
+    assert idx is not None and 0 <= idx < 5
+
+
+def test_choose_spawn_point_index_random_deterministic() -> None:
+    """无 preferred 时随机选择，固定种子可复现且索引合法。"""
+    a = choose_spawn_point_index(20, rng=random.Random(42))
+    b = choose_spawn_point_index(20, rng=random.Random(42))
+    assert a == b
+    assert a is not None and 0 <= a < 20
+
+
+def test_pick_spawn_point_selects_element() -> None:
+    """pick_spawn_point 按索引从序列取实际对象；空序列返回 None。"""
+    points = [f"pt-{i}" for i in range(7)]
+    assert pick_spawn_point(points, preferred=2) == "pt-2"
+    assert pick_spawn_point([]) is None
+    chosen = pick_spawn_point(points, rng=random.Random(7))
+    assert chosen in points

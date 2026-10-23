@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
 )
 
@@ -59,7 +58,11 @@ class SensorPanel(QGroupBox):
         self._resolution = QComboBox()
         self._resolution.addItems(list(RESOLUTIONS))
 
-        self._parent = QSpinBox(minimum=0, maximum=1000000, value=0)
+        # Parent 为可编辑下拉：生成 Actor 后自动回填其 id（CARLA id 自分配、非 0），
+        # 避免手填 0 导致“父 Actor 不存在：0”；仍可手动输入未列出的 id。
+        self._parent = QComboBox()
+        self._parent.setEditable(True)
+        self._parent.setToolTip("选择已生成的父 Actor（先 Spawn Actor 再挂载传感器）")
         self._rel_x = QDoubleSpinBox(minimum=-100.0, maximum=100.0, decimals=2, value=0.0)
         self._rel_y = QDoubleSpinBox(minimum=-100.0, maximum=100.0, decimals=2, value=0.0)
         self._rel_z = QDoubleSpinBox(minimum=-100.0, maximum=100.0, decimals=2, value=1.6)
@@ -89,8 +92,14 @@ class SensorPanel(QGroupBox):
         layout.addLayout(row)
 
     def set_parents(self, actor_ids: list[int]) -> None:
-        """刷新 Parent 下拉可选的 actor id（保留当前输入）。"""
-        self._parent.setMaximum(max(1000000, max(actor_ids, default=0)))
+        """用已生成 actor id 刷新 Parent 下拉（保留当前输入）。"""
+        current = self._parent.currentText()
+        self._parent.blockSignals(True)
+        self._parent.clear()
+        self._parent.addItems([str(actor_id) for actor_id in actor_ids])
+        if current:
+            self._parent.setCurrentText(current)
+        self._parent.blockSignals(False)
 
     def _on_preset_changed(self, text: str) -> None:
         custom = text == "Custom"
@@ -108,9 +117,17 @@ class SensorPanel(QGroupBox):
             width,
             height,
             self._fov.value(),
-            self._parent.value(),
+            _parse_actor_id(self._parent.currentText()),
             self._rel_x.value(),
             self._rel_y.value(),
             self._rel_z.value(),
             self._pitch.value(),
         )
+
+
+def _parse_actor_id(text: str) -> int:
+    """把 Parent 输入解析为 int；非数字（空/占位）回退 0（由 worker 统一报“父 Actor 不存在”）。"""
+    try:
+        return int(text.strip())
+    except ValueError:
+        return 0
