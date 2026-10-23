@@ -17,6 +17,7 @@ from starlette.responses import PlainTextResponse
 from hunter_sim.api.main import create_app
 from hunter_sim.api.middleware.rate_limit import (
     _BUCKET_MAX_KEYS,
+    _FAILURE_STATE_MAX_KEYS,
     LoginFailureGuard,
     RateLimitMiddleware,
     TokenBucket,
@@ -193,6 +194,24 @@ class TestLoginFailureGuard:
         guard.reset("ip")
         assert guard.failures("ip") == 0
         assert guard.retry_after("ip") is None
+
+    def test_idle_states_pruned_at_soft_cap(self) -> None:
+        """V2.10.0：失败状态按 IP 单调增长，达上限时回收长期空闲项。"""
+        guard = LoginFailureGuard(max_failures=2)
+        now = time.monotonic()
+        for i in range(_FAILURE_STATE_MAX_KEYS):
+            guard._states[f"stale-{i}"] = (1, 0.0, now - 4000.0)
+        guard.record_failure("new-comer")
+        assert len(guard._states) <= 2
+        assert guard.failures("new-comer") == 1
+
+    def test_idle_state_reclaimed_on_query(self) -> None:
+        """V2.10.0：查询过期的失败记录时顺带回收，退避不再生效。"""
+        guard = LoginFailureGuard(max_failures=1)
+        now = time.monotonic()
+        guard._states["ip"] = (3, now + 100.0, now - 4000.0)
+        assert guard.retry_after("ip") is None
+        assert guard.failures("ip") == 0
 
 
 # ─── /auth/token 退避集成路径 ────────────────────────────────────────────────

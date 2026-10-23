@@ -68,6 +68,34 @@ def _resolve_app_version() -> str:
 
 _APP_VERSION = _resolve_app_version()
 
+# JWT 吊销名单裁剪周期（V2.10.0）：每小时一次，避免每个巡检周期都扫表
+_REVOKED_TOKEN_PRUNE_INTERVAL_SECONDS = 3600.0
+
+
+def _prune_revoked_tokens(state: Any) -> int:
+    """按小时节流清理已自然过期的 JWT 吊销记录（V2.10.0）。
+
+    ``revoked_tokens`` 只需覆盖到 Token 自身过期为止；此前 ``prune_revoked_tokens``
+    已实现但无调用点，吊销名单会随登录/续期单调增长。
+    """
+    store = getattr(state, "state_store", None)
+    prune = getattr(store, "prune_revoked_tokens", None)
+    if not callable(prune):
+        return 0
+    now = time.time()
+    last = float(getattr(state, "_revoked_prune_at", 0.0) or 0.0)
+    if now - last < _REVOKED_TOKEN_PRUNE_INTERVAL_SECONDS:
+        return 0
+    state._revoked_prune_at = now
+    try:
+        removed = int(prune())
+    except Exception as exc:  # noqa: BLE001  裁剪失败不影响健康巡检
+        logger.debug(f"Prune revoked tokens failed: {exc}")
+        return 0
+    if removed:
+        logger.info(f"Pruned {removed} expired revoked token(s)")
+    return removed
+
 # 探测失败摘要最大长度：异常文本可能很长，/health 只保留可读部分
 _MAX_PROBE_ERROR_CHARS = 200
 
@@ -389,6 +417,8 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             _refresh_disk_usage(state)
             # V2.7.0 P1-7：对存活运行器续引擎心跳（僵尸持有者因无存活循环而追旧）
             renew_execution_heartbeats(app)
+            # V2.10.0：吊销名单按小时裁剪，防止 revoked_tokens 单调增长
+            _prune_revoked_tokens(state)
             expired = list(mgr.check_expired_instances()) if mgr is not None else []
             # 超时实例同样要回收场景运行器（否则 tick 线程与 Actor 残留）
             for instance_id in expired:

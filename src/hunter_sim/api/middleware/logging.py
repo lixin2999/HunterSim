@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import uuid
 from typing import Callable, Optional
+from urllib.parse import parse_qsl, urlencode
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -25,6 +26,22 @@ _audit_logger = get_logger("hunter_sim.audit")
 # 审计落库 sink（V2.5.0）：由 main 注入 StateStore.append_audit
 _AuditSink = Callable[[str, str, str, str, str, str], None]
 _audit_sink: Optional[_AuditSink] = None
+
+# 查询参数中的敏感键（V2.10.0）：日志只保留键名，避免 Token/密钥落盘
+_SENSITIVE_QUERY_KEYS = frozenset({"token", "access_token", "api_key", "password"})
+
+
+def _sanitize_query(query: str) -> Optional[str]:
+    """脱敏查询串中的敏感参数（值替换为 ``***``）；空串返回 None。"""
+    if not query:
+        return None
+    pairs = parse_qsl(query, keep_blank_values=True)
+    if not pairs:
+        return None
+    return urlencode([
+        (key, "***" if key.lower() in _SENSITIVE_QUERY_KEYS else value)
+        for key, value in pairs
+    ])
 
 
 def set_audit_sink(sink: Optional[_AuditSink]) -> None:
@@ -124,7 +141,7 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
                 "request_id": request_id,
                 "method": request.method,
                 "path": str(request.url.path),
-                "query": str(request.url.query) if request.url.query else None,
+                "query": _sanitize_query(str(request.url.query)),
                 "status": response.status_code,
                 "elapsed_ms": round(elapsed_ms, 2),
                 "client": request.client.host if request.client else "unknown",

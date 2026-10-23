@@ -374,9 +374,7 @@ class EnginePool:
                 item["last_renew_at"] = holder.last_renew_at if holder else None
                 item["stale"] = bool(holder and holder.is_stale(self._ttl_seconds))
                 engines.append(item)
-            stale_count = sum(
-                1 for lease in self._leases.values() if lease.is_stale(self._ttl_seconds)
-            )
+            stale_count = sum(1 for item in leases.values() if item["stale"])
         return {
             "engines": engines,
             "capacity": len(engines),

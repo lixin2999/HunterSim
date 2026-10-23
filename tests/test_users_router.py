@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from hunter_sim.api.deps import create_access_token, decode_token
 from hunter_sim.api.main import create_app
+from hunter_sim.api.routers import auth as auth_router
 from hunter_sim.api.routers import users as users_router
 from hunter_sim.common.models import (
     APISettings,
@@ -488,3 +489,37 @@ class TestRefreshRevalidatesUser:
         payload = decode_token(response.json()["data"]["access_token"], api_settings)
         assert payload["sub"] == api_settings.admin_username
         assert payload["role"] == "admin"
+
+    def test_refresh_rejected_when_users_disabled(
+        self,
+        users_client: TestClient,
+        admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """V2.10.0：关闭用户体系后，用户表账号的旧 Token 不得继续续期。"""
+        assert _create(users_client, admin_headers, "refoff").status_code == 200
+        headers = _login(users_client, "refoff")
+        disabled_settings = _users_settings(users_enabled=False)
+        monkeypatch.setattr(auth_router, "get_settings", lambda: disabled_settings)
+
+        response = users_client.post(f"{_PREFIX}/auth/refresh", headers=headers)
+
+        assert response.status_code == 401
+        assert "PLATFORM_USERS_ENABLED" in response.json()["message"]
+
+    def test_builtin_admin_refresh_allowed_when_users_disabled(
+        self, users_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """内置管理员不依赖用户表，关闭用户体系后仍可续期。"""
+        api_settings = users_client.app.state.settings.api
+        token = create_access_token(
+            api_settings.admin_username, api_settings, extra_claims={"role": "admin"}
+        )
+        disabled_settings = _users_settings(users_enabled=False)
+        monkeypatch.setattr(auth_router, "get_settings", lambda: disabled_settings)
+
+        response = users_client.post(
+            f"{_PREFIX}/auth/refresh", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200, response.text

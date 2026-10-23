@@ -250,6 +250,7 @@ class TestUserTable:
         assert record["created_by"] == "root"
         assert record["iterations"] == 1_000
         assert record["disabled_at"] == 0
+        assert record["disabled"] is False
         assert store.count_users() == 1
 
     def test_username_is_trimmed_and_blank_rejected(self, store: StateStore) -> None:
@@ -334,6 +335,18 @@ class TestUserTable:
     def test_update_unknown_user_returns_none(self, store: StateStore) -> None:
         assert store.update_user("ghost", role="admin") is None
         assert store.delete_user("ghost") is False
+
+    def test_get_user_derives_disabled_flag(self, store: StateStore) -> None:
+        """V2.10.0：get_user 与 list_users 结构对齐，同样派生布尔 disabled。"""
+        store.create_user("mallory", "Mallory-Pass-01", iterations=1_000)
+        record = store.get_user("mallory")
+        assert record is not None and record["disabled"] is False
+
+        store.update_user("mallory", disabled=True)
+        disabled = store.get_user("mallory")
+        assert disabled is not None
+        assert disabled["disabled"] is True
+        assert float(disabled["disabled_at"]) > 0.0
 
     def test_delete_user(self, store: StateStore) -> None:
         store.create_user("karl", "Karl-Pass-01", iterations=1_000)

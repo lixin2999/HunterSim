@@ -263,13 +263,14 @@ class ExecutionPlane:
         """
         with self._registry_lock:
             runner = self._runners.get(instance_id)
-        if runner is None:
-            return False
-        alive = getattr(runner, "is_running", True)
-        try:
-            alive = bool(alive)
-        except Exception:  # noqa: BLE001  is_running 不应抛；防御性按存活处理
-            alive = True
+            if runner is None:
+                return False
+            # V2.10.0：存活判定与取运行器同属注册表临界区，避免释放/替换竞态
+            alive = getattr(runner, "is_running", True)
+            try:
+                alive = bool(alive)
+            except Exception:  # noqa: BLE001  is_running 不应抛；防御性按存活处理
+                alive = True
         return self._pool.renew(instance_id) if alive else False
 
     def renew_live_leases(self) -> int:
@@ -279,7 +280,11 @@ class ExecutionPlane:
         return sum(1 for iid in instance_ids if self.heartbeat(iid))
 
     def stale_instance_ids(self) -> list[str]:
-        """返回僵尸租约对应的实例 ID（心跳超时且无存活运行器）。"""
+        """返回心跳已超时的租约对应实例 ID（不区分运行器是否存活）。
+
+        V2.10.0：新 docstring 与实现对齐；存活性由 ``heartbeat`` 负责
+        （存活运行器会持续续租，因此不会出现在这里）。
+        """
         return [lease.instance_id for lease in self._pool.stale_leases()]
 
     def endpoint_key_of(self, instance_id: str) -> str:

@@ -31,6 +31,9 @@ logger = get_logger(__name__)
 _BUCKET_IDLE_SECONDS = 600.0
 # 桶数量软上限：达到后触发一次全量空闲回收
 _BUCKET_MAX_KEYS = 4096
+# 登录失败状态空闲回收（V2.10.0）：长期无失败的 IP 不保留计数，防止按 IP 单调增长
+_FAILURE_STATE_IDLE_SECONDS = 3600.0
+_FAILURE_STATE_MAX_KEYS = 4096
 
 
 class TokenBucket:
@@ -163,9 +166,19 @@ class LoginFailureGuard:
         self._max_failures = max(1, int(max_failures))
         self._base_seconds = float(base_seconds)
         self._max_seconds = float(max_seconds)
-        # key -> (failures, blocked_until_monotonic)
-        self._states: dict[str, tuple[int, float]] = {}
+        # key -> (failures, blocked_until_monotonic, last_seen_monotonic)
+        self._states: dict[str, tuple[int, float, float]] = {}
         self._lock = threading.Lock()
+
+    def _prune_locked(self, now: float) -> None:
+        """回收长期无失败记录的主体（调用方已持锁，V2.10.0）。"""
+        stale = [
+            key
+            for key, (_, _, last_seen) in self._states.items()
+            if now - last_seen > _FAILURE_STATE_IDLE_SECONDS
+        ]
+        for key in stale:
+            self._states.pop(key, None)
 
     def retry_after(self, key: str) -> Optional[float]:
         """查询是否处于退避期。
@@ -175,22 +188,32 @@ class LoginFailureGuard:
         """
         now = time.monotonic()
         with self._lock:
-            failures, blocked_until = self._states.get(key, (0, 0.0))
+            state = self._states.get(key)
+            if state is None:
+                return None
+            failures, blocked_until, last_seen = state
+            # 长时间无失败的记录已无退避意义：顺带回收，避免只在写入时清理
+            if now - last_seen > _FAILURE_STATE_IDLE_SECONDS:
+                self._states.pop(key, None)
+                return None
         if failures >= self._max_failures and blocked_until > now:
             return blocked_until - now
         return None
 
     def record_failure(self, key: str) -> None:
         """记一次失败，并按指数退避更新拒绝窗口。"""
+        now = time.monotonic()
         with self._lock:
-            failures, _ = self._states.get(key, (0, 0.0))
+            if key not in self._states and len(self._states) >= _FAILURE_STATE_MAX_KEYS:
+                self._prune_locked(now)
+            failures, _, _ = self._states.get(key, (0, 0.0, now))
             failures += 1
             blocked_until = 0.0
             if failures >= self._max_failures:
                 exponent = min(failures - self._max_failures, 16)
                 delay = min(self._base_seconds * (2**exponent), self._max_seconds)
-                blocked_until = time.monotonic() + delay
-            self._states[key] = (failures, blocked_until)
+                blocked_until = now + delay
+            self._states[key] = (failures, blocked_until, now)
 
     def reset(self, key: str) -> None:
         """成功登录后清零该主体计数。"""
@@ -200,7 +223,8 @@ class LoginFailureGuard:
     def failures(self, key: str) -> int:
         """当前连续失败次数（测试与诊断辅助）。"""
         with self._lock:
-            return self._states.get(key, (0, 0.0))[0]
+            state = self._states.get(key)
+            return state[0] if state is not None else 0
 
 
 __all__ = ["LoginFailureGuard", "RateLimitMiddleware", "TokenBucket"]

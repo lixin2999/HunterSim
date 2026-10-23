@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Set
 
+from fastapi.concurrency import run_in_threadpool
 from jose import JWTError, jwt
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -92,7 +93,7 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
             if not user_id:
                 return _unauthorized("Token missing 'sub' claim")
             # V2.7.0 P1-6：吊销名单校验（仅当启用且状态库可用时生效）
-            if self._is_revoked(request, payload):
+            if await self._is_revoked(request, payload):
                 logger.warning(
                     f"Rejected revoked token jti='{payload.get('jti', '')}' for '{user_id}'"
                 )
@@ -105,13 +106,15 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-    def _is_revoked(self, request: Request, payload: dict[str, Any]) -> bool:
+    async def _is_revoked(self, request: Request, payload: dict[str, Any]) -> bool:
         """判断已解码载荷的 ``jti`` 是否命中吊销名单（P1-6）。
 
         仅当 ``jwt_revocation_enabled`` 且请求应用挂载了状态库时才判定；读库异常
         按未吊销处理（不阻断鉴权主链路），与 API Key 校验的降级语义一致。
         状态库经 ``request.app.state`` 获取（BaseHTTPMiddleware 的 ``self.app``
         是包装后的内层 ASGI 应用，不具备 ``state``）。
+
+        V2.10.0：SQLite 查询改经线程池，避免每个请求在事件循环内同步读库。
         """
         if not getattr(self._settings, "jwt_revocation_enabled", False):
             return False
@@ -123,7 +126,7 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         if not callable(checker):
             return False
         try:
-            return bool(checker(jti))
+            return bool(await run_in_threadpool(checker, jti))
         except Exception as exc:  # noqa: BLE001  读吊销名单失败不阻断鉴权
             logger.warning(f"Token revocation check failed (treating as valid): {exc}")
             return False
@@ -138,7 +141,8 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         verify = getattr(store, "verify_api_key", None)
         if not callable(verify):
             return _unauthorized("API key authentication requires state persistence")
-        info = verify(raw_key)
+        # V2.10.0：密钥摘要校验为用户可控的高成本计算，必须离开事件循环
+        info = await run_in_threadpool(verify, raw_key)
         if not info:
             logger.warning(
                 f"API key validation failed from {request.client.host if request.client else 'unknown'}"

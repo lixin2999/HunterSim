@@ -399,6 +399,9 @@ class TestDescribeExecution:
             "10.0.0.2:2100",
         }
         assert payload["active_leases"] == 0
+        assert payload["stale_leases"] == 0
+        assert payload["lease_ttl_seconds"] > 0.0
+        assert payload["map_affinity_enabled"] is True
         assert payload["persistence"]["enabled"] is False
 
     def test_with_plane_reports_leases(self) -> None:

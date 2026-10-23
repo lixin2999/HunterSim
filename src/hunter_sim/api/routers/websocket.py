@@ -23,6 +23,8 @@ router = APIRouter()
 _WS_UNAUTHORIZED = 4401
 _WS_FORBIDDEN = 4403
 _ADMIN_ROLE = "admin"
+# 单条消息发送超时：慢客户端不得阻塞整轮广播（V2.10.0）
+_WS_SEND_TIMEOUT_SECONDS = 5.0
 
 
 class WebSocketConnectionManager:
@@ -57,7 +59,10 @@ class WebSocketConnectionManager:
         logger.info(f"WebSocket disconnected: instance={instance_id}")
 
     async def broadcast(self, instance_id: str, payload: dict[str, Any]) -> None:
-        """向指定实例的所有订阅者推送消息。
+        """向指定实例的所有订阅者并发推送消息。
+
+        V2.10.0：改为 ``asyncio.gather`` 并发发送，并为单条发送设置超时；
+        原先串行 ``await send_text`` 时一个慢客户端会拖住同一实例的所有订阅者。
 
         Args:
             instance_id: 实例 ID。
@@ -67,17 +72,12 @@ class WebSocketConnectionManager:
             connections = list(self._connections.get(instance_id, []))
 
         message = json.dumps(payload, default=str)
-        disconnected: list[WebSocket] = []
-
-        for ws in connections:
-            try:
-                await ws.send_text(message)
-            except Exception:
-                disconnected.append(ws)
-
-        # 清理断开的连接
-        for ws in disconnected:
-            await self.disconnect(instance_id, ws)
+        results = await asyncio.gather(
+            *(_send_safely(ws, message) for ws in connections)
+        )
+        for ws, ok in zip(connections, results):
+            if not ok:
+                await self.disconnect(instance_id, ws)
 
     def get_connection_count(self, instance_id: str) -> int:
         """返回指定实例的活跃连接数。"""
@@ -91,6 +91,37 @@ _ws_manager = WebSocketConnectionManager()
 def get_ws_manager() -> WebSocketConnectionManager:
     """获取全局 WebSocket 管理器单例。"""
     return _ws_manager
+
+
+async def _send_safely(websocket: WebSocket, message: str) -> bool:
+    """向单个连接发送消息；失败或超时返回 False（V2.10.0）。"""
+    try:
+        await asyncio.wait_for(
+            websocket.send_text(message), timeout=_WS_SEND_TIMEOUT_SECONDS
+        )
+        return True
+    except Exception:  # noqa: BLE001  断连/超时统一交由调用方清理
+        return False
+
+
+async def _is_token_revoked(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    """查询 Token 的 ``jti`` 是否在吊销名单（V2.10.0：握手与长连接共用）。
+
+    读库失败按未吊销处理（不因状态库抖动断开全部订阅）；轮询查询经 ``to_thread``
+    避免在事件循环内同步访问 SQLite。
+    """
+    jti = str(payload.get("jti", ""))
+    if not jti:
+        return False
+    store = getattr(websocket.app.state, "state_store", None)
+    checker = getattr(store, "is_token_revoked", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(await asyncio.to_thread(checker, jti))
+    except Exception as exc:  # noqa: BLE001  读库失败不阻断订阅
+        logger.debug(f"WebSocket revocation check failed (treating as valid): {exc}")
+        return False
 
 
 def _extract_token(websocket: WebSocket) -> str:
@@ -124,6 +155,13 @@ async def _authorize(websocket: WebSocket, instance_id: str) -> bool:
     user_id = str(payload.get("sub", ""))
     tenant = str(payload.get("tenant") or get_default_tenant())
     role = get_user_role(payload)
+    # V2.10.0：握手即校验吊销名单，被吊销的 Token 不能再建立新订阅
+    if await _is_token_revoked(websocket, payload):
+        await websocket.close(code=_WS_UNAUTHORIZED, reason="Token has been revoked")
+        logger.warning(f"WebSocket revoked token rejected for instance {instance_id}")
+        return False
+    # 保存解码载荷，供长连接周期复核（避免在 scope 之外引入额外状态锁）
+    websocket.scope["token_payload"] = payload
     manager = getattr(websocket.app.state, "instance_manager", None)
     instance = manager.get_instance(instance_id) if manager is not None else None
     if instance is not None and role != _ADMIN_ROLE:
@@ -196,7 +234,14 @@ async def websocket_instance_status(websocket: WebSocket, instance_id: str) -> N
                 elif msg_type == "unsubscribe":
                     break
             except asyncio.TimeoutError:
-                # 60 秒无消息，发送心跳
+                # 60 秒无消息：先复核 Token 是否已被吊销（V2.10.0），再发送心跳
+                token_payload = websocket.scope.get("token_payload")
+                if isinstance(token_payload, dict) and await _is_token_revoked(
+                    websocket, token_payload
+                ):
+                    await websocket.close(code=_WS_UNAUTHORIZED, reason="Token has been revoked")
+                    logger.info(f"WebSocket closed for revoked token: instance={instance_id}")
+                    break
                 try:
                     await websocket.send_text(json.dumps({"type": "heartbeat", "timestamp": time.time()}))
                 except Exception:

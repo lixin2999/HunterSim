@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from jose import jwt
 
+from hunter_sim.api import main as main_mod
 from hunter_sim.api import runtime as runtime_mod
 from hunter_sim.api.deps import mint_access_token
 from hunter_sim.common import utils as utils_mod
@@ -216,6 +217,54 @@ class TestSnapshotWriteThrottle:
     def test_missing_settings_defaults_to_no_throttle(self) -> None:
         app = SimpleNamespace(state=SimpleNamespace())
         assert runtime_mod._should_write_snapshot(app, "i1", "running") is True
+
+    def test_forget_guard_entry_on_release(self) -> None:
+        """V2.10.0：实例释放后清理写节流状态，避免按实例单调增长。"""
+        app = _throttle_app(60.0)
+        assert runtime_mod._should_write_snapshot(app, "i1", "running") is True
+        guard = app.state._snapshot_write_guard
+        assert "i1" in guard["last"]
+
+        runtime_mod._forget_snapshot_guard(app, "i1")
+
+        assert "i1" not in guard["last"]
+
+    def test_soft_cap_drops_entries_without_live_runner(self) -> None:
+        """V2.10.0：守卫条目达软上限时清理无活跃运行器的残留键。"""
+        app = _throttle_app(60.0)
+        guard = runtime_mod._snapshot_write_guard(app)
+        guard["last"].update(
+            {
+                f"ghost-{i}": ("running", time.time())
+                for i in range(runtime_mod._SNAPSHOT_GUARD_MAX_KEYS)
+            }
+        )
+
+        assert runtime_mod._should_write_snapshot(app, "i1", "running") is True
+
+        assert list(guard["last"]) == ["i1"]
+
+
+# ─── V2.10.0：吊销名单按小时裁剪 ─────────────────────────────────────────────
+
+
+class TestRevokedTokenPrune:
+    def test_prune_runs_at_hourly_interval(self) -> None:
+        calls: list[int] = []
+        state = SimpleNamespace(
+            state_store=SimpleNamespace(prune_revoked_tokens=lambda: calls.append(1) or 2)
+        )
+
+        assert main_mod._prune_revoked_tokens(state) == 2
+        assert main_mod._prune_revoked_tokens(state) == 0  # 一小时内不重复扫表
+        assert len(calls) == 1
+
+        state._revoked_prune_at = time.time() - 3601.0
+        assert main_mod._prune_revoked_tokens(state) == 2
+        assert len(calls) == 2
+
+    def test_prune_skips_without_store(self) -> None:
+        assert main_mod._prune_revoked_tokens(SimpleNamespace()) == 0
 
 
 # ─── P1-11：统一日志装配 ─────────────────────────────────────────────────────

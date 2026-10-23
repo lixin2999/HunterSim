@@ -857,12 +857,23 @@ class StateStore:
         return record
 
     def get_user(self, username: str) -> Optional[dict[str, Any]]:
-        """读取用户记录（含摘要，仅供内部校验；对外展示请用 :meth:`list_users`）。"""
+        """读取用户记录（含摘要，仅供内部校验；对外展示请用 :meth:`list_users`）。
+
+        V2.10.0：与 :meth:`list_users` 对齐，同样派生布尔 ``disabled``；
+        原始 ``disabled_at`` 时间戳保留（``verify_user``/审计依赖）。
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        record = dict(row)
+        try:
+            record["disabled"] = float(record.get("disabled_at") or 0.0) > 0.0
+        except (TypeError, ValueError):
+            record["disabled"] = True  # 字段异常按已禁用（fail-closed）
+        return record
 
     def list_users(self, tenant: str = "") -> list[dict[str, Any]]:
         """列出用户（不含 pass_hash/salt，按创建时间升序）。"""

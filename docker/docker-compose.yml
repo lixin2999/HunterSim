@@ -111,7 +111,7 @@ services:
         CARLA_VERSION: ${CARLA_VERSION:-0.9.16}
         # 无 manylinux wheel 的平台（如 ARM）可置为 false，服务仍可启动但下发场景返回 503
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
-    image: hunter-sim:2.9.0
+    image: hunter-sim:2.10.0
     ports:
       - "8080:8080"
     environment:

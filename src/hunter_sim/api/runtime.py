@@ -148,12 +148,7 @@ def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
 
     try:
         base_client = getattr(app.state, "carla_client", None)
-        is_base_endpoint = (
-            settings is not None
-            and endpoint.host == settings.carla.host
-            and endpoint.rpc_port == settings.carla.rpc_port
-        )
-        if is_base_endpoint and base_client is not None:
+        if _is_base_endpoint(settings, endpoint) and base_client is not None:
             client = base_client
         else:
             client = carla.Client(endpoint.host, endpoint.rpc_port)
@@ -324,20 +319,26 @@ def release_scene_runner(app: Any, instance_id: str) -> bool:
     plane = getattr(app.state, "execution_plane", None)
     if plane is not None:
         released = bool(plane.release(instance_id))
-        if plane.active_engine_count == 0:
-            app.state.scene_world_map_id = None
+        # V2.10.0：全局地图字段与写节流守卫同属控制面状态，统一在控制面锁内更新/清理
+        with _runtime_lock(app):
+            if plane.active_engine_count == 0:
+                app.state.scene_world_map_id = None
+        _forget_snapshot_guard(app, instance_id)
         return released
 
     runners = _runners(app)
     runner = runners.pop(instance_id, None)
     if runner is None:
+        _forget_snapshot_guard(app, instance_id)
         return False
     try:
         runner.destroy()
     except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
         logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
-    if not runners:
-        app.state.scene_world_map_id = None
+    with _runtime_lock(app):
+        if not runners:
+            app.state.scene_world_map_id = None
+    _forget_snapshot_guard(app, instance_id)
     logger.info(f"Scene runtime released: instance={instance_id}")
     return True
 
@@ -347,7 +348,9 @@ def release_all_scene_runners(app: Any) -> int:
     plane = getattr(app.state, "execution_plane", None)
     if plane is not None:
         released = int(plane.release_all())
-        app.state.scene_world_map_id = None
+        with _runtime_lock(app):
+            app.state.scene_world_map_id = None
+        _clear_snapshot_guards(app)
         return released
     released = 0
     for instance_id in list(_runners(app)):
@@ -365,8 +368,10 @@ def force_release_execution_lease(app: Any, instance_id: str) -> bool:
     plane = getattr(app.state, "execution_plane", None)
     if plane is not None:
         released = bool(plane.force_release(instance_id))
-        if plane.active_engine_count == 0:
-            app.state.scene_world_map_id = None
+        with _runtime_lock(app):
+            if plane.active_engine_count == 0:
+                app.state.scene_world_map_id = None
+        _forget_snapshot_guard(app, instance_id)
         return released
     return bool(release_scene_runner(app, instance_id))
 
@@ -461,6 +466,11 @@ def describe_execution(app: Any) -> dict[str, Any]:
             spec = settings.execution.engine_endpoints if settings is not None else ""
             max_engines = settings.execution.max_engines if settings is not None else 8
             endpoints = parse_engine_endpoints(spec, base, max_engines)
+        # V2.10.0：回退快照与 ``ExecutionPlane.snapshot`` 保持同一契约，避免
+        # 客户端/看板在“执行平面尚未初始化”时读不到租约相关字段
+        exec_cfg = getattr(settings, "execution", None) if settings is not None else None
+        heartbeat_on = bool(getattr(exec_cfg, "lease_heartbeat_enabled", False)) if exec_cfg else False
+        lease_ttl = float(getattr(exec_cfg, "lease_ttl_seconds", 0) or 0) if heartbeat_on else 0.0
         payload = {
             "engines": [
                 {**ep.to_dict(), "holder": None, "map_id": None, "acquired_at": None}
@@ -468,6 +478,9 @@ def describe_execution(app: Any) -> dict[str, Any]:
             ],
             "capacity": len(endpoints),
             "active_leases": 0,
+            "stale_leases": 0,
+            "lease_ttl_seconds": lease_ttl,
+            "map_affinity_enabled": True,
             "leases": [],
             "runners": [],
         }
@@ -511,6 +524,8 @@ def _restore_persisted_scene(app: Any, instance_id: str, runner: Any) -> None:
 
 # ── P1-10：快照写节流（每实例 (last_status, last_write_ts)，随 app.state 存活）──
 _GUARD_INIT_LOCK = threading.Lock()
+# 守卫条目软上限：超过后清掉不属于任何活跃运行器的残留键（V2.10.0）
+_SNAPSHOT_GUARD_MAX_KEYS = 4096
 
 
 def _snapshot_write_guard(app: Any) -> dict[str, Any]:
@@ -535,11 +550,34 @@ def _should_write_snapshot(app: Any, instance_id: str, status_value: str) -> boo
     guard = _snapshot_write_guard(app)
     now = time.time()
     with cast(threading.Lock, guard["lock"]):
-        last = cast("dict[str, tuple[str, float]]", guard["last"]).get(instance_id)
-        if last is not None and last[0] == status_value and (now - last[1]) < interval:
+        last = cast("dict[str, tuple[str, float]]", guard["last"])
+        if len(last) >= _SNAPSHOT_GUARD_MAX_KEYS:
+            live = set(_runners(app))
+            for stale_id in [iid for iid in last if iid not in live]:
+                last.pop(stale_id, None)
+        previous = last.get(instance_id)
+        if previous is not None and previous[0] == status_value and (now - previous[1]) < interval:
             return False
-        cast("dict[str, tuple[str, float]]", guard["last"])[instance_id] = (status_value, now)
+        last[instance_id] = (status_value, now)
         return True
+
+
+def _forget_snapshot_guard(app: Any, instance_id: str) -> None:
+    """实例释放后清理其写节流状态（V2.10.0：避免按实例单调增长）。"""
+    guard = getattr(app.state, "_snapshot_write_guard", None)
+    if guard is None:
+        return
+    with cast(threading.Lock, guard["lock"]):
+        cast("dict[str, tuple[str, float]]", guard["last"]).pop(instance_id, None)
+
+
+def _clear_snapshot_guards(app: Any) -> None:
+    """服务关停/全量释放时清空全部写节流状态。"""
+    guard = getattr(app.state, "_snapshot_write_guard", None)
+    if guard is None:
+        return
+    with cast(threading.Lock, guard["lock"]):
+        cast("dict[str, tuple[str, float]]", guard["last"]).clear()
 
 
 def _scene_state_callback(app: Any, instance_id: str) -> Any:

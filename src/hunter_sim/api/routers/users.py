@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 
 from hunter_sim.api.deps import current_principal, get_settings, require_admin
 from hunter_sim.api.middleware.logging import audit_log
@@ -106,11 +107,13 @@ def _caller_context(request: Request) -> tuple[str, str]:
     return principal.user_id, tenant
 
 
-def _guard_last_admin(store: Any, username: str, operation: str) -> None:
+async def _guard_last_admin(store: Any, username: str, operation: str) -> None:
     """避免把最后一个可用 admin 降级/禁用/删除导致平台失去管理能力。
 
     内置管理员（API_ADMIN_USERNAME）不计入用户表，因此库里 0 个 admin 时
     仍可通过内置账号收尾，不在此处拦截。
+
+    V2.10.0：改为 async，数据库读取经线程池，避免阻塞事件循环。
     """
     builtin_admin = get_settings().api.admin_username
     if username == builtin_admin:
@@ -118,8 +121,9 @@ def _guard_last_admin(store: Any, username: str, operation: str) -> None:
             status_code=status.HTTP_409_CONFLICT,
             detail=f"User '{username}' is the built-in admin (configured via API_ADMIN_USERNAME) and cannot be modified here",
         )
-    admins = [item for item in store.list_users() if item["role"] == "admin" and not item["disabled"]]
-    target = store.get_user(username)
+    users = await run_in_threadpool(store.list_users)
+    admins = [item for item in users if item["role"] == "admin" and not item["disabled"]]
+    target = await run_in_threadpool(store.get_user, username)
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User '{username}' not found")
     if target["role"] == "admin" and len(admins) <= 1:
@@ -152,12 +156,13 @@ async def create_user(
     tenant = body.tenant or caller_tenant
     iterations = get_settings().platform.password_hash_iterations
 
-    if store.get_user(body.username) is not None:
+    if await run_in_threadpool(store.get_user, body.username) is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"User '{body.username}' already exists",
         )
-    record = store.create_user(
+    record = await run_in_threadpool(
+        store.create_user,
         username=body.username,
         password=body.password,
         role=body.role,
@@ -200,7 +205,7 @@ async def list_users(
     store = _require_store(request)
     items = [
         _public_view(item)
-        for item in store.list_users(tenant)
+        for item in await run_in_threadpool(store.list_users, tenant)
         if include_disabled or not item["disabled"]
     ]
     return ApiResponse(data={"items": items, "total": len(items)})
@@ -220,7 +225,7 @@ async def get_user(
     """GET /api/v1/sim/auth/users/{username}"""
     _ensure_users_enabled()
     store = _require_store(request)
-    record = store.get_user(username)
+    record = await run_in_threadpool(store.get_user, username)
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -257,9 +262,10 @@ async def update_user(
     if body.password is not None:
         _check_password_policy(username, body.password)
     if body.disabled or (body.role is not None and body.role != "admin"):
-        _guard_last_admin(store, username, "disable" if body.disabled else "downgrade")
+        await _guard_last_admin(store, username, "disable" if body.disabled else "downgrade")
 
-    record = store.update_user(
+    record = await run_in_threadpool(
+        store.update_user,
         username,
         role=body.role,
         tenant=body.tenant,
@@ -310,8 +316,8 @@ async def delete_user(
     _ensure_users_enabled()
     store = _require_store(request)
     caller, caller_tenant = _caller_context(request)
-    _guard_last_admin(store, username, "delete")
-    if not store.delete_user(username):
+    await _guard_last_admin(store, username, "delete")
+    if not await run_in_threadpool(store.delete_user, username):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{username}' not found",
@@ -351,7 +357,7 @@ async def change_password(
             detail="Password change requires a user login (bearer token)",
         )
     username = principal.user_id
-    record = store.get_user(username)
+    record = await run_in_threadpool(store.get_user, username)
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -360,16 +366,23 @@ async def change_password(
                 "(built-in admin or service account); manage it via API_ADMIN_PASSWORD / API keys"
             ),
         )
-    if not store.verify_password(body.old_password, str(record["pass_hash"])):
+    verified = await run_in_threadpool(
+        store.verify_password, body.old_password, str(record["pass_hash"])
+    )
+    if not verified:
         USER_EVENTS_TOTAL.labels(event="password_change_denied").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Current password is incorrect",
         )
     _check_password_policy(username, body.new_password)
-    if not store.update_user(
-        username, password=body.new_password, iterations=get_settings().platform.password_hash_iterations
-    ):
+    updated = await run_in_threadpool(
+        store.update_user,
+        username,
+        password=body.new_password,
+        iterations=get_settings().platform.password_hash_iterations,
+    )
+    if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{username}' not found",

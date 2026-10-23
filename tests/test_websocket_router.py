@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import hunter_sim.api.routers.websocket as ws_mod
 from hunter_sim.api.routers.websocket import WebSocketConnectionManager
 
 
@@ -104,6 +108,56 @@ class TestConnectionManager:
     def test_get_connection_count_empty(self) -> None:
         mgr = WebSocketConnectionManager()
         assert mgr.get_connection_count("none") == 0
+
+
+class _HangingWS(_FakeWS):
+    """发送永不返回的慢客户端替身。"""
+
+    async def send_text(self, text: str) -> None:
+        await asyncio.sleep(10)
+
+
+class TestBroadcastIsolation:
+    def test_slow_client_does_not_block_others(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """V2.10.0：并发发送 + 超时，慢客户端不得拖住同实例其他订阅者。"""
+        monkeypatch.setattr(ws_mod, "_WS_SEND_TIMEOUT_SECONDS", 0.05)
+        mgr = WebSocketConnectionManager()
+        slow, fast = _HangingWS(), _FakeWS()
+
+        async def _run() -> float:
+            await mgr.connect("i1", slow)
+            await mgr.connect("i1", fast)
+            started = time.monotonic()
+            await mgr.broadcast("i1", {"x": 1})
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(_run())
+        assert elapsed < 1.0
+        assert mgr.get_connection_count("i1") == 1  # 超时连接被清理
+        assert len(fast.sent) == 1
+
+
+class TestRevocationCheck:
+    def _ws(self, store: Any) -> Any:
+        return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(state_store=store)))
+
+    def test_revoked_jti_detected(self) -> None:
+        ws = self._ws(SimpleNamespace(is_token_revoked=lambda jti: jti == "j1"))
+        assert asyncio.run(ws_mod._is_token_revoked(ws, {"jti": "j1"})) is True
+        assert asyncio.run(ws_mod._is_token_revoked(ws, {"jti": "j2"})) is False
+
+    def test_missing_jti_or_store_is_valid(self) -> None:
+        assert asyncio.run(ws_mod._is_token_revoked(self._ws(None), {})) is False
+        assert asyncio.run(
+            ws_mod._is_token_revoked(self._ws(SimpleNamespace()), {"jti": "j1"})
+        ) is False
+
+    def test_store_failure_treated_as_valid(self) -> None:
+        def boom(jti: str) -> bool:
+            raise RuntimeError("db down")
+
+        ws = self._ws(SimpleNamespace(is_token_revoked=boom))
+        assert asyncio.run(ws_mod._is_token_revoked(ws, {"jti": "j1"})) is False
 
 
 class TestWebsocketEndpoint:

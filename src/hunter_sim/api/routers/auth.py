@@ -210,23 +210,38 @@ def _record_disabled(record: dict[str, Any]) -> bool:
         return True
 
 
-def _resolve_refresh_claims(principal: Principal, store: Any) -> tuple[str, str]:
+async def _resolve_refresh_claims(principal: Principal, store: Any) -> tuple[str, str]:
     """续期前重新确认账号仍有效，返回续期后的 ``(role, tenant)``（V2.9.0）。
 
     旧实现直接沿用 Token 里的 claim，导致禁用/降级/删除后仍能无限续期，
     账号吊销能力形同虚设。现以用户表当前值为准：
 
+    - ``PLATFORM_USERS_ENABLED=false``：用户体系已关闭，仅内置管理员可续期；
     - 用户表命中：禁用则 401，否则以其 ``role``/``tenant`` 为准（降级即时生效）；
     - 用户表未命中：仅内置管理员（``API_ADMIN_USERNAME``）可续期，其余（已删除用户/
       服务账号）返回 401。
+
+    V2.10.0：数据库读取改为线程池执行，避免阻塞事件循环（与登录路径一致）。
 
     Raises:
         HTTPException: 账号已禁用、已删除或无权续期（401）。
     """
     platform = get_settings().platform
+    admin_username = get_settings().api.admin_username
+    if not platform.users_enabled:
+        if principal.user_id == admin_username:
+            return principal.role or _ADMIN_ROLE, principal.tenant or platform.default_tenant
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "User management is disabled (PLATFORM_USERS_ENABLED=false); "
+                "re-login with the built-in admin account is required"
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     record: Optional[dict[str, Any]] = None
     try:
-        record = store.get_user(principal.user_id)
+        record = await run_in_threadpool(store.get_user, principal.user_id)
     except Exception as exc:  # noqa: BLE001  用户表不可用时不能“盲续期”
         logger.warning(f"User table unavailable during refresh: {exc}")
         raise HTTPException(
@@ -245,7 +260,7 @@ def _resolve_refresh_claims(principal: Principal, store: Any) -> tuple[str, str]
             str(record.get("role") or principal.role),
             str(record.get("tenant") or platform.default_tenant),
         )
-    if principal.user_id == get_settings().api.admin_username:
+    if principal.user_id == admin_username:
         return principal.role or _ADMIN_ROLE, principal.tenant or platform.default_tenant
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -292,7 +307,7 @@ async def refresh_token(
             detail="A valid bearer token is required to refresh",
         )
     old_jti = str(payload.get("jti", ""))
-    if old_jti and store.is_token_revoked(old_jti):
+    if old_jti and await run_in_threadpool(store.is_token_revoked, old_jti):
         AUTH_TOKEN_EVENTS_TOTAL.labels(event="revoked_hit").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -301,7 +316,7 @@ async def refresh_token(
         )
 
     principal = current_principal(request)
-    role, tenant = _resolve_refresh_claims(principal, store)
+    role, tenant = await _resolve_refresh_claims(principal, store)
     new_token, new_jti, _ = mint_access_token(
         principal.user_id,
         api_settings,
@@ -311,8 +326,12 @@ async def refresh_token(
     # 旧 Token 就地吊销（若自然过期则 jti 不再有意义，写入也无害）：best-effort
     if old_jti:
         try:
-            store.revoke_token(old_jti, expires_at=float(payload.get("exp", 0.0) or 0.0),
-                               user_id=principal.user_id)
+            await run_in_threadpool(
+                store.revoke_token,
+                old_jti,
+                expires_at=float(payload.get("exp", 0.0) or 0.0),
+                user_id=principal.user_id,
+            )
         except Exception as exc:  # noqa: BLE001  旧 jti 写入失败不阻断新 Token 签发
             logger.warning(f"Failed to revoke previous token jti on refresh: {exc}")
     AUTH_TOKEN_EVENTS_TOTAL.labels(event="refresh").inc()
@@ -357,8 +376,11 @@ async def revoke_token(
     if not jti:
         return ApiResponse(data={"revoked": False, "reason": "token has no jti claim"})
     principal = current_principal(request)
-    first_time = store.revoke_token(
-        jti, expires_at=float(payload.get("exp", 0.0) or 0.0), user_id=principal.user_id
+    first_time = await run_in_threadpool(
+        store.revoke_token,
+        jti,
+        expires_at=float(payload.get("exp", 0.0) or 0.0),
+        user_id=principal.user_id,
     )
     if first_time:
         AUTH_TOKEN_EVENTS_TOTAL.labels(event="revoke").inc()
@@ -403,10 +425,11 @@ async def create_api_key(
     tenant = body.tenant or caller_tenant
     store = _require_store(request)
 
-    raw_key, key_id, salt, key_hash = store.generate_api_key()
+    raw_key, key_id, salt, key_hash = await run_in_threadpool(store.generate_api_key)
     now = time.time()
     expires_at = (now + body.expires_in_days * 86400.0) if body.expires_in_days else 0.0
-    store.save_api_key(
+    await run_in_threadpool(
+        store.save_api_key,
         {
             "key_id": key_id,
             "name": body.name,
@@ -418,7 +441,7 @@ async def create_api_key(
             "created_by": admin_id,
             "created_at": now,
             "expires_at": expires_at,
-        }
+        },
     )
     audit_log(
         "auth.api_key.create",
@@ -472,7 +495,7 @@ async def list_api_keys(
             "last_used_at": item["last_used_at"],
             "revoked": float(item["revoked_at"]) > 0,
         }
-        for item in store.list_api_keys(tenant or caller_tenant)
+        for item in await run_in_threadpool(store.list_api_keys, tenant or caller_tenant)
     ]
     return ApiResponse(data={"items": items, "total": len(items)})
 
@@ -495,7 +518,7 @@ async def revoke_api_key(
     caller_tenant = principal.tenant if isinstance(principal, Principal) else platform.default_tenant
     store = _require_store(request)
     target_tenant = tenant or caller_tenant
-    if not store.revoke_api_key(key_id, tenant=target_tenant):
+    if not await run_in_threadpool(store.revoke_api_key, key_id, tenant=target_tenant):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"API key '{key_id}' not found or already revoked",
