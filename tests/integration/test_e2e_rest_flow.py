@@ -300,7 +300,7 @@ class TestJwtRefreshRevoke:
 
 
 class TestLeaseReclaim:
-    def test_admin_can_reclaim_and_operator_forbidden(self, e2e_app: Any) -> None:
+    def test_admin_reclaims_only_stale_lease(self, e2e_app: Any) -> None:
         build, _ = e2e_app
         app, _ = build()
         with TestClient(app) as client:
@@ -325,14 +325,30 @@ class TestLeaseReclaim:
             )
             assert resp.status_code == 403
 
-            # 管理员强制回收：租约归还
+            # V2.9.0：活跃租约拒绝强制回收（否则会挖断正在运行的场景）
+            resp = client.delete(f"{_API}/execution/leases/{instance_id}", headers=headers)
+            assert resp.status_code == 409, resp.text
+            assert "still alive" in resp.json()["message"]
+
+            # 模拟僵尸持有者（心跳远超 TTL）→ 允许回收
+            plane = client.app.state.execution_plane
+            lease = plane.lease_of(instance_id)
+            assert lease is not None
+            lease.renew(now=time.time() - 10_000.0)
+
             resp = client.delete(f"{_API}/execution/leases/{instance_id}", headers=headers)
             assert resp.status_code == 200, resp.text
-            assert resp.json()["data"]["reclaimed"] is True
+            data = resp.json()["data"]
+            assert data["reclaimed"] is True
+            assert data["instance_failed"] is True
 
             resp = client.get(f"{_API}/execution", headers=headers)
             leases = resp.json()["data"]["leases"]
-            assert instance_id not in {lease["instance_id"] for lease in leases}
+            assert instance_id not in {item["instance_id"] for item in leases}
+
+            # 实例同步置终态，端点才会被控制面算作可分配
+            detail = client.get(f"{_API}/instances/{instance_id}", headers=headers)
+            assert detail.json()["data"]["status"] == "failed"
 
     def test_reclaim_unknown_instance_404(self, e2e_app: Any) -> None:
         build, _ = e2e_app

@@ -77,6 +77,9 @@ class ExecutionPlane:
         self._runner_engines: dict[str, str] = {}
         # 端点 key → 引擎级装配/销毁锁（在注册表锁内懒创建，避免建锁竞态）
         self._engine_locks: dict[str, threading.RLock] = {}
+        # V2.9.0：在途装配计数与取消标记（解决“装配窗口内销毁实例”的泄漏竞态）
+        self._assembling: dict[str, int] = {}
+        self._cancelled: set[str] = set()
 
     @property
     def pool(self) -> EnginePool:
@@ -128,6 +131,9 @@ class ExecutionPlane:
             except Exception as exc:  # EngineUnavailable 等 → 统一为执行面不可用
                 raise ExecutionUnavailable(str(exc)) from exc
             engine_lock = self._engine_lock(lease.endpoint.key)
+            # V2.9.0：登记在途装配，让并发 release()（实例销毁）能取消本次慢装配
+            self._assembling[instance_id] = self._assembling.get(instance_id, 0) + 1
+            self._cancelled.discard(instance_id)
 
         # 慢操作（load_world 可达 10~30s）在注册表锁外、引擎锁内执行
         try:
@@ -135,6 +141,9 @@ class ExecutionPlane:
                 # 同实例并发调用在等锁期间可能已被先者装配：事后再查一次避免重复 load
                 with self._registry_lock:
                     raced = self._runners.get(instance_id)
+                    if raced is not None:
+                        # 早退也要释放装配名额（否则 release() 会误判仍有在途装配）
+                        self._release_assembly_slot(instance_id)
                 if raced is not None:
                     return raced
                 map_manager = self._resolve_map_manager(lease.endpoint)
@@ -155,18 +164,45 @@ class ExecutionPlane:
                     on_event=on_event,
                 )
         except ExecutionUnavailable:
+            with self._registry_lock:
+                self._release_assembly_slot(instance_id)
+                self._cancelled.discard(instance_id)
             self._pool.release(instance_id)
             raise
         except Exception as exc:
+            with self._registry_lock:
+                self._release_assembly_slot(instance_id)
+                self._cancelled.discard(instance_id)
             self._pool.release(instance_id)
             raise ExecutionUnavailable(
                 f"Failed to assemble scene runtime on engine "
                 f"'{lease.endpoint.key}' for map '{instance.map_id}': {exc}"
             ) from exc
 
+        cancelled = False
         with self._registry_lock:
-            self._runners[instance_id] = runner
-            self._runner_engines[instance_id] = lease.endpoint.key
+            # 递减与“查取消/登记运行器”必须同一临界区，否则存在毫秒级竞态窗口
+            self._release_assembly_slot(instance_id)
+            if instance_id in self._cancelled:
+                self._cancelled.discard(instance_id)
+                cancelled = True
+            else:
+                self._runners[instance_id] = runner
+                self._runner_engines[instance_id] = lease.endpoint.key
+
+        if cancelled:
+            # V2.9.0：装配期间实例已被销毁/释放——丢弃刚建好的运行器与租约，
+            # 避免“实例已不存在但仍占引擎/仍在 tick”的泄漏
+            self._pool.release(instance_id)
+            with engine_lock:
+                try:
+                    runner.destroy()
+                except Exception as exc:  # noqa: BLE001  取消路径的销毁失败不阻断
+                    logger.warning(f"Cancelled runner destroy failed for {instance_id}: {exc}")
+            logger.info(f"Execution plane assembly cancelled: instance={instance_id}")
+            raise ExecutionUnavailable(
+                f"Scene assembly cancelled: instance '{instance_id}' was released while loading"
+            )
 
         logger.info(
             f"Execution plane assembled: instance={instance_id}, "
@@ -177,6 +213,9 @@ class ExecutionPlane:
     def release(self, instance_id: str) -> bool:
         """释放实例运行器并归还引擎租约，返回是否确实释放。"""
         with self._registry_lock:
+            # V2.9.0：若有在途装配，登记取消标记；装配完成时自弃运行器与租约
+            if self._assembling.get(instance_id):
+                self._cancelled.add(instance_id)
             runner = self._runners.pop(instance_id, None)
             engine_key = self._runner_engines.pop(instance_id, None)
             released = self._pool.release(instance_id)
@@ -282,6 +321,22 @@ class ExecutionPlane:
         released = self.release(instance_id)
         pool_released = self._pool.release(instance_id)
         return released or pool_released
+
+    def lease_of(self, instance_id: str) -> Any | None:
+        """实例当前引擎租约（无租约返回 None，V2.9.0 回收前判定）。"""
+        return self._pool.get(instance_id)
+
+    def is_stale_lease(self, instance_id: str) -> bool:
+        """实例租约是否已心跳超时（僵尸持有者；无租约或未启用心跳时为 False）。"""
+        return bool(self._pool.is_stale(instance_id))
+
+    def _release_assembly_slot(self, instance_id: str) -> None:
+        """递减在途装配计数（调用方必须持注册表锁）。"""
+        pending = self._assembling.get(instance_id, 0) - 1
+        if pending > 0:
+            self._assembling[instance_id] = pending
+        else:
+            self._assembling.pop(instance_id, None)
 
     def snapshot(self) -> dict[str, Any]:
         """执行面快照（引擎、租约、运行器）。"""

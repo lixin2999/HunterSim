@@ -32,7 +32,7 @@ data:
   api_login_max_failed_attempts: "5"
   api_login_backoff_base_seconds: "2"
   api_login_backoff_max_seconds: "60"
-  # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸回收（admin 可通过 DELETE /execution/leases/{id} 强收）
+  # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸回收（V2.9.0 起 admin 仅可强收 stale 租约，活跃租约 409）
   execution_lease_heartbeat_enabled: "true"
   execution_lease_ttl_seconds: "120"
   # 场景快照写节流（V2.7.0）：同状态最小落库间隔（秒），状态跃迁必写；0 为不节流

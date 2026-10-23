@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -281,3 +284,163 @@ class TestEngineRestartRoute:
             )
 
         assert resp.status_code == 403
+
+
+# ─── V2.9.0：僵尸租约回收（仅限 stale + 实例置 FAILED） ────────────────
+
+
+def _create_instance(client: TestClient, headers: dict[str, str]) -> str:
+    created = client.post(
+        "/api/v1/sim/instances",
+        json={"mode": "sil", "map": "Town03", "quality": "low"},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    return str(created.json()["data"]["sim_instance_id"])
+
+
+def _install_lease_plane(
+    client: TestClient, instance_id: str, *, ttl: float, age_seconds: float = 0.0
+) -> Any:
+    """把真实执行面（含租约池）注入运行中应用，模拟某实例占有引擎端点。"""
+    from hunter_sim.common.models import InstanceStatus
+    from hunter_sim.execution.engine_pool import EngineEndpoint, EnginePool
+    from hunter_sim.execution.plane import ExecutionPlane
+
+    endpoint = EngineEndpoint("127.0.0.1", 2000, 2001)
+    pool = EnginePool([endpoint], lease_ttl_seconds=ttl)
+    plane = ExecutionPlane(pool, lambda ep: None)
+    lease = pool.acquire(instance_id, endpoint, "Town03")
+    if age_seconds:
+        lease.renew(now=time.time() - age_seconds)
+    # 真实装配路径会先把实例置 LOADING/READY，回收要求该状态可转 FAILED
+    manager = client.app.state.instance_manager
+    manager.transition(instance_id, InstanceStatus.LOADING)
+    manager.transition(instance_id, InstanceStatus.READY)
+    client.app.state.execution_plane = plane
+    client.app.state.engine_pool = pool
+    return plane
+
+
+class TestLeaseReclaim:
+    def test_live_lease_is_rejected(
+        self, tmp_path: Any, auth_headers: dict[str, str]
+    ) -> None:
+        from hunter_sim.api.main import create_app
+
+        app = create_app(_settings(tmp_path))
+        with TestClient(app) as client:
+            instance_id = _create_instance(client, auth_headers)
+            plane = _install_lease_plane(client, instance_id, ttl=60.0)
+
+            resp = client.delete(
+                f"/api/v1/sim/execution/leases/{instance_id}", headers=auth_headers
+            )
+
+            assert resp.status_code == 409
+            assert "still alive" in resp.json()["message"]
+            assert plane.pool.get(instance_id) is not None
+
+    def test_stale_lease_reclaim_fails_instance_and_frees_endpoint(
+        self, tmp_path: Any, auth_headers: dict[str, str]
+    ) -> None:
+        from hunter_sim.api.main import create_app
+
+        app = create_app(_settings(tmp_path))
+        with TestClient(app) as client:
+            instance_id = _create_instance(client, auth_headers)
+            plane = _install_lease_plane(client, instance_id, ttl=30.0, age_seconds=120.0)
+
+            resp = client.delete(
+                f"/api/v1/sim/execution/leases/{instance_id}", headers=auth_headers
+            )
+
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["data"] == {
+                "instance_id": instance_id,
+                "released": True,
+                "reclaimed": True,
+                "instance_failed": True,
+            }
+            assert plane.pool.get(instance_id) is None
+            assert plane.pool.is_endpoint_free("127.0.0.1:2000")
+            # 实例已置终态，控制面才会把端点算作可分配
+            detail = client.get(
+                f"/api/v1/sim/instances/{instance_id}", headers=auth_headers
+            ).json()["data"]
+            assert detail["status"] == "failed"
+
+    def test_unknown_lease_returns_404(
+        self, tmp_path: Any, auth_headers: dict[str, str]
+    ) -> None:
+        from hunter_sim.api.main import create_app
+
+        app = create_app(_settings(tmp_path))
+        with TestClient(app) as client:
+            resp = client.delete(
+                "/api/v1/sim/execution/leases/ghost", headers=auth_headers
+            )
+
+        assert resp.status_code == 404
+
+    def test_reclaim_requires_admin(
+        self, tmp_path: Any, user_headers: dict[str, str]
+    ) -> None:
+        from hunter_sim.api.main import create_app
+
+        app = create_app(_settings(tmp_path))
+        with TestClient(app) as client:
+            resp = client.delete(
+                "/api/v1/sim/execution/leases/ghost", headers=user_headers
+            )
+
+        assert resp.status_code == 403
+
+
+# ─── V2.9.0：引擎重启下沉线程（不阻塞事件循环） ────────────────────────
+
+
+class TestRestartNonBlocking:
+    def test_restart_does_not_block_event_loop(self, tmp_path: Any) -> None:
+        from hunter_sim.api.main import create_app
+        from hunter_sim.api.routers.execution import restart_engine
+
+        app = create_app(_settings(tmp_path))
+
+        class _SlowSupervisor:
+            enabled = True
+            managed_endpoints = ["127.0.0.1:2000"]
+
+            def __init__(self) -> None:
+                self.restart_calls: list[str] = []
+
+            def snapshot(self) -> dict[str, Any]:
+                return {"enabled": True}
+
+            def restart(self, endpoint_key: str) -> bool:
+                time.sleep(0.2)
+                self.restart_calls.append(endpoint_key)
+                return True
+
+        supervisor = _SlowSupervisor()
+        app.state.carla_supervisor = supervisor
+
+        async def _scenario() -> tuple[int, Any]:
+            request = SimpleNamespace(app=app)
+            task = asyncio.create_task(
+                restart_engine(  # type: ignore[arg-type]
+                    request=request, endpoint="127.0.0.1:2000", admin_id="root"
+                )
+            )
+            ticks = 0
+            while not task.done():
+                await asyncio.sleep(0.01)
+                ticks += 1
+            return ticks, await task
+
+        ticks, response = asyncio.run(_scenario())
+
+        # 阻塞实现下事件循环无法推进（ticks≈0）；下沉线程后应持续 tick
+        assert ticks >= 5
+        assert response.data == {"endpoint": "127.0.0.1:2000", "restarted": True}
+        assert supervisor.restart_calls == ["127.0.0.1:2000"]

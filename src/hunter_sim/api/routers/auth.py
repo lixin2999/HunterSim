@@ -195,6 +195,68 @@ async def issue_token(
     return ApiResponse(data=payload.model_dump())
 
 
+def _record_disabled(record: dict[str, Any]) -> bool:
+    """用户记录是否已禁用（V2.9.0 续期校验）。
+
+    ``StateStore.get_user`` 返回原始行（禁用标记是 ``disabled_at`` 时间戳），
+    而 ``list_users`` 另派生布尔 ``disabled``；两种口径都要认，否则禁用账号
+    仍能在续期时蒙混过关。字段异常时按“已禁用”处理（fail-closed）。
+    """
+    if bool(record.get("disabled")):
+        return True
+    try:
+        return float(record.get("disabled_at") or 0.0) > 0.0
+    except (TypeError, ValueError):
+        return True
+
+
+def _resolve_refresh_claims(principal: Principal, store: Any) -> tuple[str, str]:
+    """续期前重新确认账号仍有效，返回续期后的 ``(role, tenant)``（V2.9.0）。
+
+    旧实现直接沿用 Token 里的 claim，导致禁用/降级/删除后仍能无限续期，
+    账号吊销能力形同虚设。现以用户表当前值为准：
+
+    - 用户表命中：禁用则 401，否则以其 ``role``/``tenant`` 为准（降级即时生效）；
+    - 用户表未命中：仅内置管理员（``API_ADMIN_USERNAME``）可续期，其余（已删除用户/
+      服务账号）返回 401。
+
+    Raises:
+        HTTPException: 账号已禁用、已删除或无权续期（401）。
+    """
+    platform = get_settings().platform
+    record: Optional[dict[str, Any]] = None
+    try:
+        record = store.get_user(principal.user_id)
+    except Exception as exc:  # noqa: BLE001  用户表不可用时不能“盲续期”
+        logger.warning(f"User table unavailable during refresh: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="User table unavailable; retry later or re-login",
+        ) from exc
+    if record is not None:
+        if _record_disabled(record):
+            USER_EVENTS_TOTAL.labels(event="login_denied").inc()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account has been disabled; re-login is required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return (
+            str(record.get("role") or principal.role),
+            str(record.get("tenant") or platform.default_tenant),
+        )
+    if principal.user_id == get_settings().api.admin_username:
+        return principal.role or _ADMIN_ROLE, principal.tenant or platform.default_tenant
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=(
+            "Account is not stored in the user table (removed or built-in fallback); "
+            "re-login is required"
+        ),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @router.post(
     "/auth/refresh",
     response_model=ApiResponse,
@@ -239,11 +301,12 @@ async def refresh_token(
         )
 
     principal = current_principal(request)
+    role, tenant = _resolve_refresh_claims(principal, store)
     new_token, new_jti, _ = mint_access_token(
         principal.user_id,
         api_settings,
-        extra_claims={"role": principal.role},
-        tenant=principal.tenant,
+        extra_claims={"role": role},
+        tenant=tenant,
     )
     # 旧 Token 就地吊销（若自然过期则 jti 不再有意义，写入也无害）：best-effort
     if old_jti:
@@ -258,7 +321,7 @@ async def refresh_token(
         principal.user_id,
         new_jti,
         detail=f"rotated_from={old_jti or 'none'}",
-        tenant=principal.tenant,
+        tenant=tenant,
         auth_type="jwt",
     )
     logger.info(f"Refreshed access token for '{principal.user_id}' (new jti={new_jti})")

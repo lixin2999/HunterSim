@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.8.0`（V2.8.0 为**阶段六「多用户 / 调度智能化 / 引擎自愈 / 部署体验」（P2）**：平台用户表 + PBKDF2 慢哈希与角色/租户绑定（`/auth/users`、`/auth/password`，审计落到具体人）、地图感知调度（同地图优先复用空闲引擎，多引擎不再被「全局限一地图」误伤）、本地 CARLA 进程自愈看门狗（`CARLA_SUPERVISOR_*`，事件写审计）、部署预检 CLI `huntersim doctor` + `Makefile` + compose 健康依赖条件，并文档明确「单副本 + 重启恢复」为受支持形态，详见 [`release.md`](release.md)）。上一版本 `2.7.0` 为**阶段五「稳定性与数据链路加固」（P1）**：JWT 吊销/滑动续期、引擎租约心跳与僵尸回收、Kafka 消费自愈与 DLQ、VIL 乱序闸门与自动环深、快照写节流、structlog 统一日志 + request_id 贯穿、端到端集成测试。更早：`2.6.0` 为**阶段四「并发安全与稳定性加固」（P0）**——运行器注册表与装配锁启动期预建、引擎级装配锁、按 IP 限流与登录退避、cloud bag 上传队列有界化、标准化 Prometheus 指标 + Grafana 预置盘；`2.5.0` 为**阶段三「平台化」**（多租户隔离与配额、服务账号 API Key、RBAC 角色层级、场景库版本化、批量任务与审计落库、平台概览）；`2.4.0` 为**阶段二「执行面分离与状态持久化」**（引擎端点库存与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution`）；`2.3.0` 为**阶段一「可用性止血」**（打通 REST 场景闭环、`/auth/token`、生产启动闸门、WebSocket 鉴权、实例归属校验）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
+- **当前版本**：`2.9.0`（V2.9.0 为**阶段七「代码审查缺陷修复」（Blocker + High）**：多引擎部署按端点隔离 `MapManager` / `carla.Client`（不再把所有 `load_world` 打到 base 引擎，也不跨端点共用非线程安全 Client）、`/auth/refresh` 续期回查用户表（禁用/删除/降级即时生效）、僵尸租约强制回收收紧为仅限 `stale=true` 并联动实例置 `failed` 释放端点占用、引擎重启下沉工作线程（不阻塞事件循环）、装配窗口内销毁实例的取消闸门（杜绝孤儿运行器与僵尸租约），详见 [`release.md`](release.md)）。上一版本 `2.8.0` 为**阶段六「多用户 / 调度智能化 / 引擎自愈 / 部署体验」（P2）**：平台用户表 + PBKDF2 慢哈希与角色/租户绑定（`/auth/users`、`/auth/password`，审计落到具体人）、地图感知调度（同地图优先复用空闲引擎，多引擎不再被「全局限一地图」误伤）、本地 CARLA 进程自愈看门狗（`CARLA_SUPERVISOR_*`，事件写审计）、部署预检 CLI `huntersim doctor` + `Makefile` + compose 健康依赖条件，并文档明确「单副本 + 重启恢复」为受支持形态，详见 [`release.md`](release.md)）。`2.7.0` 为**阶段五「稳定性与数据链路加固」（P1）**：JWT 吊销/滑动续期、引擎租约心跳与僵尸回收、Kafka 消费自愈与 DLQ、VIL 乱序闸门与自动环深、快照写节流、structlog 统一日志 + request_id 贯穿、端到端集成测试。更早：`2.6.0` 为**阶段四「并发安全与稳定性加固」（P0）**——运行器注册表与装配锁启动期预建、引擎级装配锁、按 IP 限流与登录退避、cloud bag 上传队列有界化、标准化 Prometheus 指标 + Grafana 预置盘；`2.5.0` 为**阶段三「平台化」**（多租户隔离与配额、服务账号 API Key、RBAC 角色层级、场景库版本化、批量任务与审计落库、平台概览）；`2.4.0` 为**阶段二「执行面分离与状态持久化」**（引擎端点库存与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution`）；`2.3.0` 为**阶段一「可用性止血」**（打通 REST 场景闭环、`/auth/token`、生产启动闸门、WebSocket 鉴权、实例归属校验）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -25,6 +25,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 并发安全与限流（V2.6.0） | 装配锁与运行器注册表启动期预建；引擎级装配锁支撑多引擎并行 `load_world`；按 IP 令牌桶限流（429 + `Retry-After`）与 `/auth/token` 失败指数退避；cloud bag 上传队列有界化；标准化 Prometheus 指标 + Grafana 预置盘 |
 | 稳定性与链路加固（V2.7.0） | JWT 吊销/滑动续期（`jti` + 吊销名单）；引擎租约心跳 + 僵尸判定 + admin 强制回收（`DELETE /execution/leases/{id}`）；Kafka 消费自愈与坏消息 DLQ；VIL 乱序/去重闸门、环深自动推导、延迟 P50/P95/P99；快照写节流（状态跃迁必写）；structlog 统一日志 + request_id 贯穿 |
 | 多用户与运维演进（V2.8.0） | 平台用户表 + PBKDF2-HMAC-SHA256 慢哈希（逐条存迭代次数、恒时比对、用户名枚举时序对齐），登录写 `role/tenant` 入 JWT，审计归属到具体人；**地图感知调度**（同图优先复用空闲引擎，冲突判定下沉到端点级）；**本地 CARLA 进程自愈**（看门狗退避重启 + 重启预算封顶 + 事件写审计）；`huntersim doctor` 部署预检与 `Makefile` 统一日常回路；受支持形态 = **单副本 + 重启恢复**（见 §4.10） |
+| 审查缺陷修复（V2.9.0） | 多引擎**按端点隔离** `MapManager`/`carla.Client`（Blocker：此前所有端点共用 base 引擎的 Client）；`/auth/refresh` 回查用户表（禁用/删除/降级即时生效，令牌续期不再"一签永续"）；僵尸租约回收**仅限 `stale=true`**并联动实例置 `failed`（活跃租约 409）；引擎重启下沉工作线程（不阻塞事件循环）；装配-销毁竞态取消闸门（无孤儿运行器/僵尸租约） |
 
 ---
 
@@ -356,14 +357,14 @@ curl -X POST "$BASE/execution/engines/restart?endpoint=127.0.0.1:2000" -H "Autho
 | 场景（兼容） | `POST /scenes/load` · `GET /scenes/{id}/status` · `POST /scenes/{id}/{start\|stop\|pause\|resume}` · `POST /scenes/{id}/{weather\|calibrate}` · `GET /scenes/{id}/screenshot` |
 | 批量测试 | `POST /scenarios/batch`（operator+） · `GET /scenarios`（任务中心） · `GET /scenarios/{task_id}/report` |
 | 资源 | `GET /maps` · `POST /maps/upload`⁺（multipart） · `GET /vehicles` · `GET /environments` · `GET /resources/gpu` · `GET /resources/quota` |
-| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器，V2.7.0 含 `stale` 僵尸标志，V2.8.0 含端点 `map_id` 与 `carla_supervisor` 快照） · `DELETE /execution/leases/{instance_id}`⁺（V2.7.0，强制回收僵尸租约） · `POST /execution/engines/restart?endpoint=`⁺（V2.8.0，手动重启托管进程） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
+| 平台治理（V2.5.0） | `GET /execution`⁺（引擎库存/租约/运行器，V2.7.0 含 `stale` 僵尸标志，V2.8.0 含端点 `map_id` 与 `carla_supervisor` 快照） · `DELETE /execution/leases/{instance_id}`⁺（V2.7.0，强制回收僵尸租约；V2.9.0 起仅接受 `stale=true` 的租约且回收后实例置 `failed`） · `POST /execution/engines/restart?endpoint=`⁺（V2.8.0，手动重启托管进程） · `GET /audit`⁺（审计查询） · `GET /platform/overview`⁺（平台概览） |
 | 实时推送 | `WS /ws/sim/{instance_id}/status?token=<JWT>`（握手需令牌，缺失/非法 4401，越权 4403） |
 
 > ⁺ 需 `role=admin`；`POST /instances` 需 `operator` 及以上（admin 天然满足）。完整请求/响应示例见 [`user_manual.md`](user_manual.md)。
 
 > **限流与登录退避（V2.6.0）**：`/api/v1/sim/**` 按客户端 IP 令牌桶限流（`API_RATE_LIMIT_PER_MINUTE`，默认 1000/min；`/health*`、`/metrics`、`/ws/` 豁免，`API_RATE_LIMIT_ENABLED=false` 可关闭），超限返回 `429` + `Retry-After`；`/auth/token` 同 IP 连续失败达 `API_LOGIN_MAX_FAILED_ATTEMPTS`（默认 5）后指数退避（`API_LOGIN_BACKOFF_BASE_SECONDS` 2s 起、封顶 `API_LOGIN_BACKOFF_MAX_SECONDS` 60s），成功登录即复位。
 
-> **令牌生命周期与僵尸回收（V2.7.0）**：`POST /auth/refresh` 用有效 Token 换新 Token 并就地吊销旧 Token（轮换），`POST /auth/revoke` 立即吊销当前 Token，均依赖状态库（`STATE_ENABLED=true`）；引擎租约心跳超 `EXECUTION_LEASE_TTL_SECONDS` 未续在 `GET /execution` 标记 `stale=true`，admin 可 `DELETE /execution/leases/{instance_id}` 强制回收；日志携带 `request_id` 贯穿全链路，客户端可传 `X-Request-ID` 复用自定义追踪号。
+> **令牌生命周期与僵尸回收（V2.7.0）**：`POST /auth/refresh` 用有效 Token 换新 Token 并就地吊销旧 Token（轮换），`POST /auth/revoke` 立即吊销当前 Token，均依赖状态库（`STATE_ENABLED=true`）；引擎租约心跳超 `EXECUTION_LEASE_TTL_SECONDS` 未续在 `GET /execution` 标记 `stale=true`，admin 可 `DELETE /execution/leases/{instance_id}` 强制回收（**V2.9.0**：仅接受心跳超时的 `stale=true` 租约，活跃租约返回 `409`；回收后实例同步置 `failed`，端点不会被控制面继续计为已分配）；日志携带 `request_id` 贯穿全链路，客户端可传 `X-Request-ID` 复用自定义追踪号。
 
 > **多用户与引擎自愈（V2.8.0）**：`/auth/users*` 仅限 `admin`（无状态库 `503`，`PLATFORM_USERS_ENABLED=false` 则 `403`），对外视图不回显摘要/salt/迭代次数；`POST /auth/password` 需当前有效 Token 并校对旧口令（错误 `401`，内置账号 `409`）。用户表未命中时回退内置管理员，既有凭据与脚本不变；角色/租户写入 JWT，审计可按人回溯。`POST /execution/engines/restart?endpoint=127.0.0.1:2000`（admin）仅对**托管回环端点**生效：未启用托管 `409`、仅观测（未配 `CARLA_SUPERVISOR_BINARY_PATH`）`409`、端点不受管 `404`。
 

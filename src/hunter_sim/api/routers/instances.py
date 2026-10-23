@@ -424,9 +424,10 @@ async def destroy_instance(
     if inst is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instance '{instance_id}' not found")
     owner_id = inst.user_id
-    # 先释放场景运行器（join 运行线程最长 5s），再释放 GPU/配额，避免僵尸 tick 线程
-    if get_scene_runner(request.app, instance_id) is not None:
-        await asyncio.to_thread(release_scene_runner, request.app, instance_id)
+    # 先释放场景运行器（join 运行线程最长 5s），再释放 GPU/配额，避免僵尸 tick 线程。
+    # V2.9.0：无条件调用——装配中的实例尚无运行器，但 release 会登记取消标记，
+    # 让慢速 load_world 结束后自弃运行器与租约（否则实例已删但引擎被永久占用）
+    await asyncio.to_thread(release_scene_runner, request.app, instance_id)
     # destroy_instance 内部统一释放 GPU 与用户配额（§14.2，含超时自动回收路径）
     mgr.destroy_instance(instance_id)
     caller = current_principal(request)

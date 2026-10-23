@@ -95,13 +95,30 @@ def _runtime_lock(app: Any) -> threading.RLock:
     return lock
 
 
+def _is_base_endpoint(settings: Any, endpoint: EngineEndpoint) -> bool:
+    """端点是否为启动期装配的 base 引擎（``CARLA_HOST`` / ``CARLA_RPC_PORT``）。
+
+    无配置上下文（测试/未注入 settings）时返回 True，保持“复用已注入管理器”的旧行为。
+    """
+    if settings is None:
+        return True
+    carla = getattr(settings, "carla", None)
+    if carla is None:
+        return True
+    return bool(endpoint.host == carla.host and endpoint.rpc_port == carla.rpc_port)
+
+
 def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
     """按端点解析 MapManager。
 
     优先级：
     1. ``app.state.map_managers``（测试/多引擎注入，键为 endpoint.key 或 host）；
-    2. ``app.state.map_manager``（单引擎启动期装配的共享管理器）；
-    3. 惰性创建：复用启动期 ``carla_client`` 或按端点新建 ``carla.Client``。
+    2. ``app.state.map_manager``（启动期装配的共享管理器，**仅限 base 端点**）；
+    3. 惰性创建：base 端点复用 ``carla_client``，其余端点各自新建 ``carla.Client``。
+
+    V2.9.0 修复：第 2 级原先对所有端点无条件命中，导致多引擎部署时所有实例的
+    ``load_world`` 实际打在 base 引擎上，且不同端点锁下并发使用同一 ``carla.Client``
+    （非线程安全）。现仅当端点确为 base 端点时复用共享管理器。
     """
     managers = getattr(app.state, "map_managers", None)
     if isinstance(managers, dict):
@@ -111,8 +128,9 @@ def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
                 return manager
         return None
 
+    settings = getattr(app.state, "settings", None)
     shared = getattr(app.state, "map_manager", None)
-    if shared is not None:
+    if shared is not None and _is_base_endpoint(settings, endpoint):
         return shared
 
     cache = getattr(app.state, "execution_map_managers", None)
@@ -123,7 +141,6 @@ def _resolve_map_manager(app: Any, endpoint: EngineEndpoint) -> Any | None:
     if cached is not None:
         return cached
 
-    settings = getattr(app.state, "settings", None)
     try:
         import carla  # noqa: PLC0415  惰性导入：仅真实 CARLA 环境可用
     except ImportError:
@@ -352,6 +369,26 @@ def force_release_execution_lease(app: Any, instance_id: str) -> bool:
             app.state.scene_world_map_id = None
         return released
     return bool(release_scene_runner(app, instance_id))
+
+
+def mark_instance_failed(app: Any, instance_id: str, reason: str) -> bool:
+    """把实例置为 FAILED 终态（V2.9.0：僵尸租约回收后释放端点占用）。
+
+    避免“租约已被回收但实例仍 running”导致控制面 ``_assign_endpoint`` 继续把
+    端点算作已分配。状态机不允许（已终态/已销毁）时返回 False 并只记日志。
+
+    Returns:
+        是否确实完成了状态流转。
+    """
+    manager = getattr(app.state, "instance_manager", None)
+    if manager is None:
+        return False
+    try:
+        manager.transition(instance_id, InstanceStatus.FAILED, reason)
+        return True
+    except Exception as exc:  # noqa: BLE001  状态机拒绝时不影响回收结果
+        logger.debug(f"Instance {instance_id} could not transition to FAILED: {exc}")
+        return False
 
 
 def renew_execution_heartbeats(app: Any) -> int:
@@ -625,6 +662,7 @@ __all__ = [
     "force_release_execution_lease",
     "get_scene_runner",
     "init_runtime_state",
+    "mark_instance_failed",
     "persist_scene",
     "persisted_scene_state",
     "release_all_scene_runners",

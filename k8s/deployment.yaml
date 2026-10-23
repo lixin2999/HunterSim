@@ -31,7 +31,7 @@ spec:
     spec:
       containers:
         - name: sim-service
-          image: hunter-sim:2.8.0
+          image: hunter-sim:2.9.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -149,7 +149,7 @@ spec:
             # HunterCore bag 上传有界队列（V2.6.0，仅 HUNTER_CORE_ENABLED=true 时生效）
             - name: HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE
               value: "32"
-            # 稳定性加固（V2.7.0）：租约心跳 + 僵尸回收（GET /execution 看 stale，admin 可强收）
+            # 稳定性加固（V2.7.0）：租约心跳 + 僵尸回收（GET /execution 看 stale；V2.9.0 起仅 stale 可强收，活跃租约 409）
             - name: EXECUTION_LEASE_HEARTBEAT_ENABLED
               valueFrom:
                 configMapKeyRef:

@@ -407,3 +407,84 @@ class TestDegradedModes:
         )
         assert response.status_code == 503
         assert "STATE_ENABLED" in response.json()["message"]
+
+
+# ─── V2.9.0：续期回查用户表（禁用/删除/降级即时生效） ──────────────────────
+
+
+def _login(client: TestClient, username: str, password: str = _PASSWORD) -> dict[str, str]:
+    response = client.post(
+        f"{_PREFIX}/auth/token", json={"username": username, "password": password}
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['data']['access_token']}"}
+
+
+class TestRefreshRevalidatesUser:
+    """旧实现直接沿用 Token claim，账号禁用/删除后仍能无限续期。"""
+
+    def test_refresh_rejects_disabled_account(
+        self, users_client: TestClient, admin_headers: dict[str, str]
+    ) -> None:
+        assert _create(users_client, admin_headers, "refdis").status_code == 200
+        headers = _login(users_client, "refdis")
+        patched = users_client.patch(
+            f"{_PREFIX}/auth/users/refdis", json={"disabled": True}, headers=admin_headers
+        )
+        assert patched.status_code == 200
+
+        response = users_client.post(f"{_PREFIX}/auth/refresh", headers=headers)
+
+        assert response.status_code == 401
+        assert "disabled" in response.json()["message"]
+
+    def test_refresh_applies_role_downgrade(
+        self, users_client: TestClient, admin_headers: dict[str, str]
+    ) -> None:
+        # operator → viewer 降级：续期后以用户表为准，不再沿用 Token 里的旧角色
+        assert _create(users_client, admin_headers, "refview").status_code == 200
+        headers = _login(users_client, "refview")
+        patched = users_client.patch(
+            f"{_PREFIX}/auth/users/refview", json={"role": "viewer"}, headers=admin_headers
+        )
+        assert patched.status_code == 200
+
+        response = users_client.post(f"{_PREFIX}/auth/refresh", headers=headers)
+
+        assert response.status_code == 200, response.text
+        payload = decode_token(
+            response.json()["data"]["access_token"], users_client.app.state.settings.api
+        )
+        assert payload["role"] == "viewer"
+
+    def test_refresh_rejects_removed_account(
+        self, users_client: TestClient, admin_headers: dict[str, str]
+    ) -> None:
+        assert _create(users_client, admin_headers, "refgone").status_code == 200
+        headers = _login(users_client, "refgone")
+        removed = users_client.delete(
+            f"{_PREFIX}/auth/users/refgone", headers=admin_headers
+        )
+        assert removed.status_code == 200
+
+        response = users_client.post(f"{_PREFIX}/auth/refresh", headers=headers)
+
+        assert response.status_code == 401
+        assert "not stored" in response.json()["message"]
+
+    def test_builtin_admin_can_refresh_without_user_record(
+        self, users_client: TestClient
+    ) -> None:
+        api_settings = users_client.app.state.settings.api
+        token = create_access_token(
+            api_settings.admin_username, api_settings, extra_claims={"role": "admin"}
+        )
+
+        response = users_client.post(
+            f"{_PREFIX}/auth/refresh", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200, response.text
+        payload = decode_token(response.json()["data"]["access_token"], api_settings)
+        assert payload["sub"] == api_settings.admin_username
+        assert payload["role"] == "admin"

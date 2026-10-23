@@ -38,7 +38,7 @@ _RECOVERABLE_RUNNING = (InstanceStatus.RUNNING, InstanceStatus.PAUSED)
 _TRANSITIONS: dict[InstanceStatus, set[InstanceStatus]] = {
     InstanceStatus.CREATED:   {InstanceStatus.LOADING, InstanceStatus.DESTROYED},
     InstanceStatus.LOADING:   {InstanceStatus.READY, InstanceStatus.FAILED},
-    InstanceStatus.READY:     {InstanceStatus.RUNNING, InstanceStatus.DESTROYED},
+    InstanceStatus.READY:     {InstanceStatus.RUNNING, InstanceStatus.DESTROYED, InstanceStatus.FAILED},
     InstanceStatus.RUNNING:   {InstanceStatus.PAUSED, InstanceStatus.COMPLETED, InstanceStatus.FAILED},
     InstanceStatus.PAUSED:    {InstanceStatus.RUNNING, InstanceStatus.DESTROYED, InstanceStatus.FAILED},
     InstanceStatus.COMPLETED: {InstanceStatus.DESTROYED},

@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hunter_sim.common.exceptions import ConfigurationError
@@ -280,3 +282,39 @@ class TestMapAffinity:
         assert engines[second.key]["holder"] is None
         assert engines[second.key]["map_id"] == "Town04"
         assert engines[first.key]["map_id"] == "Town03"
+
+
+# ─── V2.9.0：租约僵化判定（强制回收前置条件） ──────────────────────────────
+
+
+class TestLeaseStaleness:
+    def test_ttl_zero_disables_staleness(self) -> None:
+        endpoint = EngineEndpoint("10.0.0.1", 2000, 2001)
+        pool = EnginePool([endpoint])
+        lease = pool.acquire("inst-1", endpoint, "Town03")
+        lease.renew(now=0.0)  # 极旧心跳
+
+        assert pool.lease_ttl_seconds == 0.0
+        assert pool.is_stale("inst-1") is False
+        assert pool.stale_leases() == []
+
+    def test_is_stale_after_ttl_expiry_and_renew_recovers(self) -> None:
+        endpoint = EngineEndpoint("10.0.0.1", 2000, 2001)
+        pool = EnginePool([endpoint], lease_ttl_seconds=30.0)
+        lease = pool.acquire("inst-1", endpoint, "Town03")
+
+        assert pool.lease_ttl_seconds == 30.0
+        assert pool.is_stale("inst-1") is False  # 刚领取即新鲜
+
+        lease.renew(now=time.time() - 60.0)
+        assert pool.is_stale("inst-1") is True
+        assert [item.instance_id for item in pool.stale_leases()] == ["inst-1"]
+
+        assert pool.renew("inst-1") is True  # 存活持有者续租后恢复
+        assert pool.is_stale("inst-1") is False
+
+    def test_is_stale_unknown_instance(self) -> None:
+        pool = EnginePool(lease_ttl_seconds=30.0)
+
+        assert pool.is_stale("ghost") is False
+        assert pool.renew("ghost") is False

@@ -3,10 +3,12 @@
 ``GET /api/v1/sim/execution`` 返回引擎库存、租约（哪个实例占用哪个引擎/地图）、
 运行器列表、持久化状态与 CARLA 进程托管情况，用于多引擎容量核对与重启恢复排障。
 仅管理员可见。``POST /api/v1/sim/execution/engines/restart`` 可手动重启托管的本地 CARLA。
+V2.9.0：强制回收仅限僵尸租约（心跳超时）并联动实例状态，重启不再阻塞事件循环。
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -14,7 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from hunter_sim.api.deps import require_admin
 from hunter_sim.api.middleware.logging import audit_log
 from hunter_sim.api.models import ApiResponse
-from hunter_sim.api.runtime import describe_execution, force_release_execution_lease
+from hunter_sim.api.runtime import (
+    describe_execution,
+    force_release_execution_lease,
+    mark_instance_failed,
+)
 from hunter_sim.common.metrics import EXECUTION_LEASE_RECLAIMS_TOTAL
 
 router = APIRouter()
@@ -49,12 +55,14 @@ async def get_execution_status(request: Request, _: str = Depends(require_admin)
     description=(
         "V2.7.0 P1-7：当 ``/execution`` 显示某端点持有者已僵（心跳超时、运行器无法推进）"
         "时，管理员可强制释放其实例运行器与引擎租约，使端点立即可被新实例复用。"
+        "V2.9.0：仅允许回收心跳超时（stale=true）的租约，活跃租约返回 409；"
+        "回收后实例同步置为 failed（终态），否则端点仍会被控制面计为已分配。"
     ),
 )
 async def reclaim_execution_lease(
     instance_id: str,
     request: Request,
-    _: str = Depends(require_admin),
+    admin_id: str = Depends(require_admin),
 ) -> ApiResponse:
     """DELETE /api/v1/sim/execution/leases/{instance_id}"""
     plane = getattr(request.app.state, "execution_plane", None)
@@ -68,10 +76,34 @@ async def reclaim_execution_lease(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No execution lease/runner for instance '{instance_id}'",
         )
+    if plane is not None and plane.lease_of(instance_id) is not None:
+        if not plane.is_stale_lease(instance_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Lease of instance '{instance_id}' is still alive (heartbeat within TTL); "
+                    "stop the scene or destroy the instance instead of force-reclaiming a live lease"
+                ),
+            )
     released = force_release_execution_lease(request.app, instance_id)
+    # V2.9.0：租约回收后必须把实例置为终态，否则 _assign_endpoint 仍把端点算作已分配
+    instance_failed = mark_instance_failed(
+        request.app, instance_id, "execution lease reclaimed by admin (stale holder)"
+    )
     EXECUTION_LEASE_RECLAIMS_TOTAL.inc()
+    audit_log(
+        "execution.lease.reclaim",
+        admin_id,
+        instance_id,
+        detail=f"released={released}, instance_failed={instance_failed}",
+    )
     return ApiResponse(
-        data={"instance_id": instance_id, "released": released, "reclaimed": True}
+        data={
+            "instance_id": instance_id,
+            "released": released,
+            "reclaimed": True,
+            "instance_failed": instance_failed,
+        }
     )
 
 
@@ -110,7 +142,7 @@ async def restart_engine(
                 "remote engines are restarted by their own orchestrator"
             ),
         )
-    restarted = bool(supervisor.restart(endpoint))
+    restarted = bool(await asyncio.to_thread(supervisor.restart, endpoint))
     audit_log(
         "engine.carla.manual_restart",
         admin_id,

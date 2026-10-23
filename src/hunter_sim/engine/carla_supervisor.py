@@ -351,6 +351,9 @@ class CarlaProcessSupervisor:
         """等待 RPC 端口可连通（期间进程若先退出则判失败）。"""
         deadline = time.time() + float(self._cfg.supervisor_ready_timeout_seconds)
         while time.time() < deadline:
+            # V2.9.0：服务关停/手动重启时立即返回，避免 stop 后仍等待就绪而遗留孤儿进程
+            if self._stop.is_set():
+                return False
             if process is not None and process.poll() is not None:
                 return False
             try:

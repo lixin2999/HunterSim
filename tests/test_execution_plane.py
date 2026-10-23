@@ -499,3 +499,109 @@ class TestEndpointMapAwareness:
 
         assert plane.map_conflict("10.0.0.1:2000", "inst-2", "Town04") == ("", "")
         assert plane.map_conflict("", "inst-2", "Town04") == ("", "")
+
+
+# ─── V2.9.0：装配-销毁竞态（取消闸门） ───────────────────────────────────────
+
+
+class _GatedMapManager(_StubMapManager):
+    """``load_map`` 阻塞在闸门上，便于在装配窗口内触发 ``release()``。"""
+
+    def __init__(self, opened: threading.Event, proceed: threading.Event) -> None:
+        super().__init__()
+        self.opened = opened
+        self.proceed = proceed
+
+    def load_map(self, map_id: str) -> _StubWorld:
+        self.opened.set()
+        if not self.proceed.wait(timeout=5.0):
+            raise AssertionError("assembly gate was never opened")
+        return super().load_map(map_id)
+
+
+class TestAssemblyCancellation:
+    """装配窗口内销毁实例：不得留下孤儿运行器或僵尸租约（V2.9.0 High5）。"""
+
+    def test_release_during_assembly_discards_runner_and_lease(self) -> None:
+        opened = threading.Event()
+        proceed = threading.Event()
+        built: list[_StubRunner] = []
+
+        def _factory(world: Any, **kwargs: Any) -> _StubRunner:
+            runner = _StubRunner(world, **kwargs)
+            built.append(runner)
+            return runner
+
+        plane = ExecutionPlane(
+            EnginePool([EngineEndpoint("10.0.0.1", 2000, 2001)]),
+            lambda endpoint: _GatedMapManager(opened, proceed),
+            runner_factory=_factory,
+        )
+        errors: list[ExecutionUnavailable] = []
+
+        def _assemble() -> None:
+            try:
+                plane.ensure_runner(_instance())
+            except ExecutionUnavailable as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=_assemble)
+        thread.start()
+        assert opened.wait(timeout=5.0), "assembly never reached load_map"
+        # 装配尚未完成（运行器未登记）：销毁实例应归还租约并登记取消标记
+        assert plane.get_runner("inst-1") is None
+        assert plane.release("inst-1") is True
+        proceed.set()
+        thread.join(timeout=10.0)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert "cancelled" in str(errors[0])
+        # 刚建好的运行器被自弃并销毁，租约与装配名额均无残留
+        assert built and built[0].destroyed is True
+        assert plane.get_runner("inst-1") is None
+        assert plane.active_engine_count == 0
+        assert plane.pool.is_endpoint_free("10.0.0.1:2000")
+        assert plane._assembling == {}
+        assert plane._cancelled == set()
+
+    def test_successful_assembly_leaves_no_cancel_state(self) -> None:
+        plane, _ = _plane()
+
+        plane.ensure_runner(_instance())
+
+        assert plane._assembling == {}
+        assert plane._cancelled == set()
+
+    def test_release_without_pending_assembly_does_not_mark_cancel(self) -> None:
+        plane, _ = _plane()
+
+        assert plane.release("inst-1") is False
+        runner = plane.ensure_runner(_instance())
+
+        assert plane.get_runner("inst-1") is runner
+        assert plane._cancelled == set()
+
+
+class TestLeaseStaleness:
+    """回收前置判定：租约心跳超时才允许强制回收（V2.9.0 High3）。"""
+
+    def test_is_stale_lease_tracks_heartbeat_ttl(self) -> None:
+        plane = ExecutionPlane(
+            EnginePool([EngineEndpoint("10.0.0.1", 2000, 2001)], lease_ttl_seconds=30.0),
+            lambda endpoint: _StubMapManager(),
+            runner_factory=_StubRunner,
+        )
+        assert plane.is_stale_lease("inst-1") is False  # 无租约
+
+        plane.ensure_runner(_instance())
+        lease = plane.lease_of("inst-1")
+        assert lease is not None
+        assert plane.is_stale_lease("inst-1") is False  # 刚领取即心跳新鲜
+
+        lease.renew(now=time.time() - 120.0)  # 模拟僵尸持有者
+        assert plane.is_stale_lease("inst-1") is True
+
+        assert plane.release("inst-1") is True
+        assert plane.lease_of("inst-1") is None
+        assert plane.is_stale_lease("inst-1") is False

@@ -346,8 +346,10 @@ def _assemble_services(app: FastAPI, settings: HunterSimSettings) -> InstanceHea
             settings.carla, managed_endpoints, event_sink=_supervisor_audit
         )
         state.carla_supervisor = supervisor
+        # V2.9.0：不再在启动路径同步 ensure_started（原实现会阻塞启动最长
+        # ready_timeout×端点数，且与看门狗首轮存在双拉起窗口）；看门狗启动后
+        # 立即执行首轮检查，进程就绪前 /health 保持 degraded。
         supervisor.start()
-        supervisor.ensure_started()
 
     monitor = getattr(state, "health_monitor", None)
     if monitor is None:

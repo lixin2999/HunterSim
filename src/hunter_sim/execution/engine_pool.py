@@ -282,6 +282,17 @@ class EnginePool:
         with self._lock:
             return [lease for lease in self._leases.values() if lease.is_stale(self._ttl_seconds)]
 
+    def is_stale(self, instance_id: str) -> bool:
+        """指定实例的租约是否已心跳超时（无租约或 TTL<=0 时为 False，V2.9.0）。"""
+        with self._lock:
+            lease = self._leases.get(instance_id)
+            return bool(lease is not None and lease.is_stale(self._ttl_seconds))
+
+    @property
+    def lease_ttl_seconds(self) -> float:
+        """租约心跳 TTL（0 表示未启用僵判定）。"""
+        return self._ttl_seconds
+
     # ─── 地图亲和调度（V2.8.0 P2-14） ──────────────────────────────────
 
     def note_loaded_map(self, endpoint_key: str, map_id: str) -> None:
@@ -301,7 +312,11 @@ class EnginePool:
             return self._endpoint_maps.get(endpoint_key, "")
 
     def is_endpoint_free(self, endpoint_key: str) -> bool:
-        """端点当前是否无活跃租约（僵租约视同空闲，已被心跳回收口径覆盖）。"""
+        """端点当前是否无租约。
+
+        注意：僵租约仍计为占用（本方法不做心跳判定）；需清理时先经
+        ``DELETE /execution/leases/{instance_id}`` 回收，或等心跳恢复。
+        """
         with self._lock:
             return self._holder_of(endpoint_key) is None
 

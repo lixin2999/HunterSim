@@ -15,7 +15,7 @@
 PYTHON ?= .venv/Scripts/python.exe
 PIP ?= $(PYTHON) -m pip
 COMPOSE_FILE ?= docker/docker-compose.yml
-IMAGE_TAG ?= hunter-sim:2.8.0
+IMAGE_TAG ?= hunter-sim:2.9.0
 UV_SYNC ?= uv sync
 
 .PHONY: help install sync dev-install doctor serve test coverage typecheck lint \

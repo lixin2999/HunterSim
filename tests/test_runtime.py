@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+import types
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,18 +19,21 @@ from starlette.requests import Request
 from hunter_sim.api.runtime import (
     InstanceNotFound,
     SceneRuntimeUnavailable,
+    _resolve_map_manager,
     _restore_persisted_scene,
     assert_instance_access,
     describe_execution,
     ensure_scene_runner,
     get_scene_runner,
     init_runtime_state,
+    mark_instance_failed,
     persist_scene,
     persisted_scene_state,
     release_all_scene_runners,
     release_scene_runner,
 )
 from hunter_sim.common.models import InstanceStatus
+from hunter_sim.execution.engine_pool import EngineEndpoint
 from hunter_sim.scene_runner.scene_runner_service import SceneRunnerService
 from tests.mocks.carla_mocks import MockWorld
 
@@ -463,3 +468,85 @@ class TestInitRuntimeState:
         assert runner is not None
         assert map_manager.loaded_maps == ["Town03"]
         assert app.state.scene_runtime_lock is not None
+
+
+# ─── V2.9.0：按端点隔离 MapManager（让多引擎不再共用 base Client） ──────────
+
+
+class TestMapManagerResolution:
+    def test_base_endpoint_reuses_shared_manager(self) -> None:
+        app, _, _, shared = _make_app()
+
+        resolved = _resolve_map_manager(app, EngineEndpoint("localhost", 2000, 2001))
+
+        assert resolved is shared
+
+    def test_other_endpoint_gets_own_manager_and_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _, _, shared = _make_app()
+        app.state.settings.carla.timeout_seconds = 12.5
+        clients: list[SimpleNamespace] = []
+
+        class _FakeClient:
+            def __init__(self, host: str, port: int) -> None:
+                self.record = SimpleNamespace(host=host, port=port, timeout=0.0)
+                clients.append(self.record)
+
+            def set_timeout(self, timeout: float) -> None:
+                self.record.timeout = timeout
+
+        fake_carla = types.ModuleType("carla")
+        fake_carla.Client = _FakeClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+
+        endpoint = EngineEndpoint("10.0.0.2", 2100, 2101)
+        resolved = _resolve_map_manager(app, endpoint)
+
+        assert resolved is not None
+        assert resolved is not shared  # 非 base 端点不得复用共享管理器
+        assert _resolve_map_manager(app, endpoint) is resolved  # 同端点命中缓存
+        assert len(clients) == 1
+        assert (clients[0].host, clients[0].port) == ("10.0.0.2", 2100)
+        assert clients[0].timeout == 12.5
+
+    def test_injected_endpoint_managers_take_precedence(self) -> None:
+        app, _, _, shared = _make_app()
+        injected = object()
+        app.state.map_managers = {"10.0.0.2:2100": injected}
+
+        assert _resolve_map_manager(app, EngineEndpoint("10.0.0.2", 2100, 2101)) is injected
+        # 未声明的端点在注入模式下返回 None（交由上层转不可用）
+        assert _resolve_map_manager(app, EngineEndpoint("10.0.0.3", 2200, 2201)) is None
+        assert _resolve_map_manager(app, EngineEndpoint("localhost", 2000, 2001)) is not shared
+
+
+# ─── V2.9.0：实例状态联动（僵尸租约回收后置终态释放端点） ──────────────────
+
+
+class TestMarkInstanceFailed:
+    def test_ready_instance_transitions_to_failed(self) -> None:
+        app, instance, manager, _ = _make_app(status=InstanceStatus.READY)
+
+        assert mark_instance_failed(app, "inst-1", "lease reclaimed") is True
+
+        assert instance.status == InstanceStatus.FAILED
+        assert manager.transitions[-1] == (
+            "inst-1",
+            InstanceStatus.FAILED,
+            "lease reclaimed",
+        )
+
+    def test_without_instance_manager_returns_false(self) -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+
+        assert mark_instance_failed(app, "inst-1", "lease reclaimed") is False
+
+    def test_rejected_transition_returns_false(self) -> None:
+        class _Rejecting:
+            def transition(self, *args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("invalid transition")
+
+        app = SimpleNamespace(state=SimpleNamespace(instance_manager=_Rejecting()))
+
+        assert mark_instance_failed(app, "inst-1", "lease reclaimed") is False
