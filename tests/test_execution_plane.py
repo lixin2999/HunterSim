@@ -606,3 +606,95 @@ class TestLeaseStaleness:
         assert plane.release("inst-1") is True
         assert plane.lease_of("inst-1") is None
         assert plane.is_stale_lease("inst-1") is False
+
+
+# ─── V2.12.0：平台发布 producer 生命周期与并发 ─────────────────────────────
+
+
+class _FakeCloudSettings:
+    """启用状态的 CloudSettings 最小桩。"""
+
+    enabled = True
+    status_report_interval_s = 2.0
+    telemetry_proxy_interval_s = 0.05
+
+
+class _FakeProducer:
+    """桩 SimDataProducer：记录 close 调用。"""
+
+    instances: list["_FakeProducer"] = []
+
+    def __init__(self, settings: Any, sim_id: str, **kwargs: Any) -> None:
+        self.settings = settings
+        self.sim_id = sim_id
+        self.connected = False
+        self.closed = False
+        _FakeProducer.instances.append(self)
+
+    def connect(self) -> bool:
+        self.connected = True
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestCloudProducerLifecycle:
+    """V2.12.0：每实例 producer 必须随实例释放而关闭（否则 Kafka 连接泄漏）。"""
+
+    def _plane(self) -> ExecutionPlane:
+        return ExecutionPlane(
+            EnginePool([EngineEndpoint("10.0.0.1", 2000, 2001)]),
+            lambda endpoint: _StubMapManager(),
+            runner_factory=_StubRunner,
+            cloud_settings=_FakeCloudSettings(),
+        )
+
+    def test_release_closes_producer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import hunter_sim.cloud.sim_data_producer as mod
+
+        _FakeProducer.instances.clear()
+        monkeypatch.setattr(mod, "SimDataProducer", _FakeProducer)
+        plane = self._plane()
+        instance = _instance()
+        instance.sim_id = "sim-a"
+        instance.vehicle_id = ""
+        instance.scene_id = ""
+
+        runner = plane.ensure_runner(instance)
+        producer = runner.runner_kwargs["sim_data_producer"]
+        assert producer.connected is True
+        # 上报周期注入自 CloudSettings，而非硬编码
+        assert runner.runner_kwargs["status_interval_s"] == pytest.approx(2.0)
+        assert runner.runner_kwargs["telemetry_interval_s"] == pytest.approx(0.05)
+
+        plane.release("inst-1")
+        assert producer.closed is True
+        assert plane._cloud_producers == {}
+        assert plane._instance_sim_ids == {}
+
+    def test_producer_recreated_after_release(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hunter_sim.cloud.sim_data_producer as mod
+
+        _FakeProducer.instances.clear()
+        monkeypatch.setattr(mod, "SimDataProducer", _FakeProducer)
+        plane = self._plane()
+        instance = _instance()
+        instance.sim_id = "sim-b"
+        instance.vehicle_id = ""
+        instance.scene_id = ""
+
+        first = plane.ensure_runner(instance)
+        plane.release("inst-1")
+        second = plane.ensure_runner(instance)
+
+        assert first.runner_kwargs["sim_data_producer"] is not second.runner_kwargs["sim_data_producer"]
+        assert len(_FakeProducer.instances) == 2
+
+    def test_disabled_cloud_settings_injects_no_producer(self) -> None:
+        plane, _ = _plane()
+        runner = plane.ensure_runner(_instance())
+        assert "sim_data_producer" not in runner.runner_kwargs
+        assert plane._cloud_producers == {}

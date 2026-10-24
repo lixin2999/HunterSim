@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -49,6 +50,7 @@ class SimStatusPayload:
         collisions: 碰撞计数。
         lane_invasions: 车道偏离计数。
         ego_state: 自车状态字典 {x, y, heading, velocity, steering}。
+        events_triggered: 已触发事件总数（方案 §5.4 sim_status 字段）。
         message: 可选错误/提示信息。
         updated_at: ISO8601 UTC 时间戳。
     """
@@ -61,6 +63,7 @@ class SimStatusPayload:
     collisions: int
     lane_invasions: int
     ego_state: dict[str, Any]
+    events_triggered: int = 0
     message: Optional[str] = None
     updated_at: str = ""
 
@@ -104,8 +107,12 @@ def build_sim_status(
     *,
     seq: int = 0,
     timestamp: Optional[float] = None,
+    vehicle_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """构建 sim_status 消息（SIL 模式 vehicle_id=None）。
+    """构建 sim_status 消息。
+
+    方案 §5.4 要求 SIL 模式 ``vehicle_id`` 可为 null，VIL 模式必须携带
+    孪生车 ID（平台据此建立车辆↔仿真会话绑定）。
 
     Args:
         sim_id: 仿真实例 ID。
@@ -113,6 +120,7 @@ def build_sim_status(
         payload: SimStatusPayload 实例。
         seq: 消息序号（由 SimDataProducer 管理）。
         timestamp: Unix 时间戳（None 则使用当前时间）。
+        vehicle_id: 孪生车 ID（SIL 模式保持 None）。
 
     Returns:
         符合方案 §5.4 格式的 dict 消息。
@@ -122,7 +130,7 @@ def build_sim_status(
     ts = timestamp if timestamp is not None else _time.time()
     return _envelope(
         sim_id=sim_id,
-        vehicle_id=None,
+        vehicle_id=vehicle_id or None,
         scene_id=scene_id,
         timestamp=ts,
         seq=seq,
@@ -164,6 +172,8 @@ def build_sim_telemetry(
         "pose": pose,
         "twist": twist,
         "velocity": velocity,
+        # 方案 §5.4 规范字段名；steering 保留为向后兼容别名
+        "steering_angle": round(steering, 6),
         "steering": round(steering, 6),
         "acceleration": acceleration,
     }
@@ -189,8 +199,12 @@ def build_sim_event(
     sim_time: float,
     description: str,
     data: Optional[dict[str, Any]] = None,
+    event_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """构建 sim_event 消息（方案 §5.4）。
+
+    方案 §7.3.1 规定 ``sim_event`` 以 ``event_id`` 做幂等键（其余类型用
+    ``(sim_id, seq)``），故 payload 必须携带稳定的 ``event_id``。
 
     Args:
         sim_id: 仿真实例 ID。
@@ -203,11 +217,13 @@ def build_sim_event(
         sim_time: 仿真时间轴时刻（秒）。
         description: 事件描述。
         data: 附加数据字典。
+        event_id: 事件幂等键（None 则生成 UUID4 hex）。
 
     Returns:
         符合方案 §5.4 sim_event 格式的 dict 消息。
     """
     payload: dict[str, Any] = {
+        "event_id": event_id or uuid.uuid4().hex,
         "event_type": event_type,
         "event_level": event_level,
         "sim_time": sim_time,
@@ -294,6 +310,9 @@ def build_sensor_file(
     frame_count: int,
     vehicle_id: Optional[str] = None,
     scene_id: str = "",
+    md5: str = "",
+    file_format: str = "",
+    topics: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """构建 sensor_file 消息（方案 §5.4）。
 
@@ -311,6 +330,9 @@ def build_sensor_file(
         frame_count: bag 内帧数。
         vehicle_id: 车辆 ID（可选）。
         scene_id: 场景 ID（可选）。
+        md5: 文件 MD5（方案 §5.4 要求；未知时为空串）。
+        file_format: 文件格式（rosbag2/mcap 等；未知时为空串）。
+        topics: bag 内包含的 Topic 列表（未知时为 None）。
 
     Returns:
         符合方案 §5.4 sensor_file 格式的 dict 消息。
@@ -319,11 +341,14 @@ def build_sensor_file(
         "bucket": bucket,
         "object_key": object_key,
         "size_bytes": size_bytes,
+        "md5": md5,
         "sha256": sha256,
         "sensor_type": sensor_type,
+        "format": file_format,
         "start_time": start_time,
         "end_time": end_time,
         "frame_count": frame_count,
+        "topics": list(topics or []),
     }
     return _envelope(
         sim_id=sim_id,

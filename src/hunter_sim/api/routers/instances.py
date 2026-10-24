@@ -134,6 +134,10 @@ def _instance_to_response(inst: Any) -> InstanceResponse:
         create_time=inst.create_time,
         start_time=inst.start_time,
         error_message=inst.error_message,
+        # V2.12.0：补齐平台契约字段（平台依赖 sim_id/Topic 建立绑定）
+        sim_id=getattr(inst, "sim_id", "") or inst.sim_instance_id,
+        vil_state_topic=getattr(inst, "vil_state_topic", ""),
+        sensor_data_topic=getattr(inst, "sensor_data_topic", ""),
     )
 
 
@@ -260,11 +264,14 @@ async def create_instance(
         }
         return ApiResponse(data=data)
     except ResourceError as exc:
-        # GPU 等资源不足：释放预占配额并返回 503
+        # GPU 等资源不足：释放预占配额并返回 503（入参非法/冲突按 hint 返回 400/409）
         if quota_mgr is not None:
             quota_mgr.release(user_id)
         logger.error(f"Resource allocation failed: {exc}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.http_status or status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except Exception:
         # 非 ResourceError 的任何失败（含审计/响应构造异常）同样归还配额名额，防名额永久泄漏
         if quota_mgr is not None:

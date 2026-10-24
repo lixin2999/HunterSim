@@ -35,6 +35,7 @@ from hunter_sim.cloud.sim_data_mapper import (
 from hunter_sim.common.metrics import (
     SENSOR_FILE_PUBLISHED_TOTAL,
     SIM_DATA_BUFFER_SIZE,
+    SIM_DATA_DROPPED_TOTAL,
     SIM_DATA_PRODUCER_ERRORS_TOTAL,
     SIM_EVENT_PUBLISHED_TOTAL,
     SIM_METRICS_PUBLISHED_TOTAL,
@@ -267,6 +268,9 @@ class SimDataProducer:
         frame_count: int = 0,
         vehicle_id: Optional[str] = None,
         scene_id: str = "",
+        md5: str = "",
+        file_format: str = "",
+        topics: Optional[list[str]] = None,
     ) -> bool:
         """构建并发布 sensor_file 消息（bag 上传完成后调用）。"""
         import time as _time  # noqa: PLC0415
@@ -286,6 +290,9 @@ class SimDataProducer:
             frame_count=frame_count,
             vehicle_id=vehicle_id,
             scene_id=scene_id,
+            md5=md5,
+            file_format=file_format,
+            topics=topics,
         )
         ok = self._send(msg)
         if ok:
@@ -348,12 +355,7 @@ class SimDataProducer:
             return False
         add_errback = getattr(future, "add_errback", None)
         if callable(add_errback):
-            try:
-                add_errback(
-                    lambda exc, t=topic, k=key, v=value: self._on_send_error(exc, t, k, v)
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            self._attach_errback(future, topic, key, value)
         return True
 
     def _on_send_error(self, exc: BaseException, topic: str, key: bytes, value: bytes) -> None:
@@ -366,10 +368,17 @@ class SimDataProducer:
         self._buffer_message(topic, key, value)
 
     def _buffer_message(self, topic: str, key: bytes, value: bytes) -> None:
-        """把一条消息放入有界重投缓冲（maxlen 满时自动丢弃最旧）。"""
+        """把一条消息放入有界重投缓冲（满了丢弃最旧并计入丢弃指标）。"""
         with self._lock:
+            overflow = len(self._buffer) >= _MAX_BUFFER
             self._buffer.append((topic, key, value))
             SIM_DATA_BUFFER_SIZE.labels(sim_id=self._sim_id).set(len(self._buffer))
+        if overflow:
+            SIM_DATA_DROPPED_TOTAL.labels(sim_id=self._sim_id, reason="buffer_overflow").inc()
+            logger.warning(
+                f"SimDataProducer[{self._sim_id}] 重投缓冲已满（{_MAX_BUFFER}），"
+                "丢弃最旧消息"
+            )
 
     def flush(self) -> int:
         """尽力重投缓冲消息，返回成功重投条数。"""
@@ -383,15 +392,31 @@ class SimDataProducer:
                 topic, key, value = self._buffer.popleft()
                 SIM_DATA_BUFFER_SIZE.labels(sim_id=self._sim_id).set(len(self._buffer))
             try:
-                self._producer.send(topic, key=key, value=value)
-                resent += 1
+                future = self._producer.send(topic, key=key, value=value)
             except Exception:  # noqa: BLE001
                 with self._lock:
                     self._buffer.appendleft((topic, key, value))
                 break
+            # 重投同样是异步投递：不注册 errback 会把失败静默吞掉
+            self._attach_errback(future, topic, key, value)
+            resent += 1
         if resent:
             logger.info(f"SimDataProducer[{self._sim_id}] 缓冲重投 {resent} 条")
         return resent
+
+    def _attach_errback(
+        self, future: Any, topic: str, key: bytes, value: bytes
+    ) -> None:
+        """为 send() 返回的 Future 注册异步失败回调（不支持时静默跳过）。"""
+        add_errback = getattr(future, "add_errback", None)
+        if not callable(add_errback):
+            return
+        try:
+            add_errback(
+                lambda exc, t=topic, k=key, v=value: self._on_send_error(exc, t, k, v)
+            )
+        except Exception:  # noqa: BLE001  桩对象注册失败不影响发送
+            pass
 
     def send_to_dlq(self, original_topic: str, raw_value: bytes, reason: str = "") -> None:
         """将消息转发到 DLQ（broker 不可达 / Schema 校验失败时调用）。"""

@@ -172,8 +172,8 @@ class VILDataConsumer:
         try:
             self._consumer = self._create_consumer(self._build_topic_list())
             logger.warning(
-                f"Rebuilt VIL Kafka consumer after consecutive errors "
-                f"(rebuilds total via metric huntersim_kafka_consumer_rebuilds_total)"
+                "Rebuilt VIL Kafka consumer after consecutive errors "
+                "(rebuilds total via metric huntersim_kafka_consumer_rebuilds_total)"
             )
             return True
         except Exception as exc:  # noqa: BLE001  重建失败下一轮再试
@@ -189,7 +189,7 @@ class VILDataConsumer:
             assignment = consumer.assignment()
             if not assignment:
                 return
-            positions = {tp: consumer.position([tp])[tp] for tp in assignment}
+            positions = consumer.position(list(assignment))
             end_offsets = consumer.end_offsets(list(assignment))
             lag = sum(
                 max(0, int(end_offsets[tp]) - int(positions[tp]))
@@ -209,6 +209,13 @@ class VILDataConsumer:
             return
 
         topics = self._build_topic_list()
+        if not topics:
+            logger.error(
+                "No Kafka topic to subscribe (empty SIM_ID and no legacy/command topic); "
+                "VIL consumer disabled"
+            )
+            self._running.clear()
+            return
         try:
             self._consumer = self._create_consumer(topics)
             logger.info(f"Kafka consumer connected, topics={topics}")
@@ -294,19 +301,41 @@ class VILDataConsumer:
             logger.warning(f"DLQ publish failed (message dropped): {exc}")
 
     def _build_topic_list(self) -> list[str]:
-        """构建订阅 Topic 列表（渲染 carla.{sim_id}.vil_state 模板）。"""
+        """构建订阅 Topic 列表（渲染 carla.{sim_id}.vil_state 模板）。
+
+        sim_id 未配置时**不订阅字面量模板**（否则会静默卡在一个永远无数据的
+        Topic 上），只保留显式配置的 legacy/command Topic 并记告警。
+        """
         topic = self._settings.telemetry_topic
-        # 渲染 {sim_id} 模板
+        topics: list[str] = []
         if "{sim_id}" in topic:
-            topic = topic.format(sim_id=self._sim_id) if self._sim_id else topic
-        topics = [topic]
+            if self._sim_id:
+                topics.append(topic.format(sim_id=self._sim_id))
+            else:
+                logger.warning(
+                    f"telemetry_topic '{topic}' requires sim_id but SIM_ID is empty; "
+                    "vil_state topic will not be subscribed"
+                )
+        else:
+            topics.append(topic)
         # 兼容单机调试的旧 telemetry_clean Topic
         if self._settings.legacy_telemetry_topic:
             topics.append(self._settings.legacy_telemetry_topic)
-        # 控制指令回读 Topic
-        command_topic = self._settings.command_topic.format(vehicle_id=self._vehicle_id)
-        topics.append(command_topic)
+        # 控制指令回读 Topic（模板可能同时含 {vehicle_id}/{sim_id}）
+        topics.extend(self._render_template(self._settings.command_topic, "command_topic"))
         return topics
+
+    def _render_template(self, template: str, label: str) -> list[str]:
+        """渲染 Topic 模板；缺变量时跳过并告警（不抛 KeyError 中断订阅）。"""
+        if not template:
+            return []
+        try:
+            return [template.format(vehicle_id=self._vehicle_id, sim_id=self._sim_id)]
+        except (KeyError, IndexError) as exc:
+            logger.warning(
+                f"{label} '{template}' has unsupported placeholder {exc}; skipped"
+            )
+            return []
 
     def _get_primary_telemetry_topic(self) -> str:
         """返回渲染后的主遥测 Topic（用于 _handle_message 判断）。"""
@@ -340,6 +369,7 @@ class VILDataConsumer:
         if self._sim_id and "sim_id" in payload:
             msg_sim_id = str(payload.get("sim_id", ""))
             if msg_sim_id != self._sim_id:
+                VIL_MESSAGE_DROPPED_TOTAL.labels(reason="sim_id_mismatch").inc()
                 logger.debug(
                     f"Skip vil_state from mismatched sim_id "
                     f"(expected={self._sim_id}, got={msg_sim_id})"
@@ -385,9 +415,9 @@ class VILDataConsumer:
                     frame = self._parse_telemetry(payload)
                 self._buffer.push(frame)
             else:
-                cmd_frame = self._parse_command_result(payload)
-                if cmd_frame is not None:
-                    self._buffer.push(cmd_frame)
+                # 控制指令回读：就地附加到最新帧，不重复入环（否则会污染
+                # total_received / 延迟直方图，且与消费线程存在写竞态）
+                self._parse_command_result(payload)
         except (KeyError, ValueError, TypeError, PydanticValidationError) as exc:
             logger.warning(f"Parse error on topic {topic}: {exc}")
             self._error_count += 1
@@ -533,14 +563,20 @@ class VILDataConsumer:
 
         return parse_vil_state(payload, vehicle_id=self._vehicle_id)
 
-    def _parse_command_result(self, payload: dict[str, Any]) -> Optional[TelemetryFrame]:
-        """解析 command_result 格式消息，更新已有帧的 control_cmd 字段。"""
+    def _parse_command_result(self, payload: dict[str, Any]) -> None:
+        """解析 command_result 格式消息，把控制回读附加到最新帧的 control_cmd。
+
+        早期实现在回调最新帧后将其重新 push 入环，导致同一条 10Hz 命令回读
+        被当成新遥测帧计入统计。命令回读不是独立遥测帧，故只就地补充字段。
+        """
         latest = self._buffer.get_latest()
         if latest is None:
-            return None
-        latest.control_cmd = {
-            "throttle": float(payload.get("throttle", 0.0)),
-            "steer": float(payload.get("steer", 0.0)),
-            "brake": float(payload.get("brake", 0.0)),
-        }
-        return latest
+            return
+        try:
+            latest.control_cmd = {
+                "throttle": float(payload.get("throttle", 0.0)),
+                "steer": float(payload.get("steer", 0.0)),
+                "brake": float(payload.get("brake", 0.0)),
+            }
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"Invalid command_result payload ignored: {exc}")

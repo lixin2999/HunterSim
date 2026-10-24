@@ -5,9 +5,9 @@ SceneRunnerService 管理场景完整生命周期：
 支持两种运行模式：ScenarioRunner（OpenSCENARIO）和自定义 Python 脚本。
 
 接入平台发布链路（可选，注入 sim_data_producer 后启用）：
-- sim_status   ：状态变化 + 1Hz 定时发布
+- sim_status   ：状态跃迁即时发布 + 周期定时发布（默认 1Hz，PAUSED 与终态均上报）
 - sim_telemetry：10Hz 自车遥测发布
-- sim_event    ：检测事件发布
+- sim_event     ：检测事件发布（与现有 on_event 回调链并联）
 """
 
 from __future__ import annotations
@@ -37,6 +37,9 @@ from hunter_sim.scene_runner.scene_state_manager import SceneStateSnapshot, Scen
 
 logger = get_logger(__name__)
 
+# 场景终态：到达后不再推进，需向平台补发最终 sim_status
+_TERMINAL_SCENE_STATUSES = (SceneStatus.COMPLETED, SceneStatus.FAILED)
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -49,6 +52,8 @@ class SceneRunnerService:
         sim_id: 当前仿真实例 ID（平台契约用）。
         vehicle_id: 当前孪生车 ID（SIL 模式为空）。
         scene_id: 当前场景 ID（平台契约用）。
+        status_interval_s: sim_status 周期上报间隔（秒，默认 1.0）。
+        telemetry_interval_s: sim_telemetry 上报间隔（秒，默认 0.1）。
     """
 
     def __init__(
@@ -60,6 +65,8 @@ class SceneRunnerService:
         sim_id: str = "",
         vehicle_id: str = "",
         scene_id: str = "",
+        status_interval_s: float = 1.0,
+        telemetry_interval_s: float = 0.1,
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -83,8 +90,11 @@ class SceneRunnerService:
         # 平台发布节流时间戳
         self._last_status_publish: float = 0.0
         self._last_telemetry_publish: float = 0.0
-        self._status_interval: float = 1.0      # sim_status 1Hz
-        self._telemetry_interval: float = 0.1   # sim_telemetry 10Hz
+        # 周期来自 CloudSettings（status_report_interval_s / telemetry_proxy_interval_s）
+        self._status_interval: float = max(0.05, float(status_interval_s))
+        self._telemetry_interval: float = max(0.01, float(telemetry_interval_s))
+        # 终态只补发一次（stop() 与运行循环结束都可能到达终态）
+        self._terminal_status_published: bool = False
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -168,7 +178,7 @@ class SceneRunnerService:
             self._apply_scene_weather(config)
             self._state_mgr = SceneStateManager(
                 scene_id=config.scene_id,
-                on_state_change=self._on_state_change,
+                on_state_change=self._handle_state_change,
             )
             self._state_mgr.set_duration(config.duration_seconds)
             self._state_mgr.transition_to(SceneStatus.LOADING)
@@ -176,7 +186,7 @@ class SceneRunnerService:
             # 初始化事件检测器
             self._event_detector = EventDetector(
                 event_definitions=config.scene_events,
-                on_event=self._on_event,
+                on_event=self._handle_event,
             )
 
             if scenario is None:
@@ -288,8 +298,13 @@ class SceneRunnerService:
                         self._state_mgr.transition_to(SceneStatus.FAILED, "Timeout")
                 break
 
-            # 暂停等待
+            # 暂停等待：仍按周期上报 sim_status(PAUSED)，否则平台看不到暂停态
             if self._state_mgr and self._state_mgr.status == SceneStatus.PAUSED:
+                if self._sim_data_producer is not None:
+                    now = time.time()
+                    if now - self._last_status_publish >= self._status_interval:
+                        self._last_status_publish = now
+                        self._publish_sim_status()
                 time.sleep(0.1)
                 continue
 
@@ -350,6 +365,8 @@ class SceneRunnerService:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
+        # 终态补发：运行循环 break 后平台需收到最终状态（而非停在最后一条 RUNNING）
+        self._publish_terminal_status()
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -396,35 +413,76 @@ class SceneRunnerService:
 
     # ── V2.10.0 平台发布辅助方法 ─────────────────────────────────────────
 
-    def _publish_sim_status(self) -> None:
-        """发布 sim_status 消息（状态变化 + 1Hz 定时调用）。
+    def _handle_state_change(self, snapshot: SceneStateSnapshot) -> None:
+        """状态跃迁回调：先转发外部回调，再立即发布 sim_status（不等待周期）。
 
-        无 sim_data_producer 时安全返回。
+        注意：``SceneStateManager`` 在持有**不可重入** ``Lock`` 时调用本回调，
+        因此这里必须直接用入参 ``snapshot``，绝不能回查 ``get_state_snapshot()``
+        （会自死锁）。
+        """
+        if self._on_state_change is not None:
+            self._on_state_change(snapshot)
+        if self._sim_data_producer is not None:
+            self._last_status_publish = time.time()
+            self._publish_sim_status(snapshot)
+            # 跃迁即终态：标记已上报，避免 _publish_terminal_status 重复补发
+            if snapshot.status in _TERMINAL_SCENE_STATUSES:
+                self._terminal_status_published = True
+
+    def _handle_event(self, event: DetectedEvent) -> None:
+        """事件回调：先转发外部回调，再并联发布 sim_event 到平台。"""
+        if self._on_event is not None:
+            self._on_event(event)
+        self.publish_event_to_platform(event)
+
+    def _publish_terminal_status(self) -> None:
+        """终态（COMPLETED/FAILED/CANCELED）补发一次 sim_status（幂等）。"""
+        if self._sim_data_producer is None or self._terminal_status_published:
+            return
+        snapshot = self.get_state_snapshot()
+        if snapshot is None:
+            return
+        if snapshot.status not in _TERMINAL_SCENE_STATUSES:
+            return
+        self._terminal_status_published = True
+        self._publish_sim_status()
+
+    def _publish_sim_status(self, snapshot: Optional[SceneStateSnapshot] = None) -> None:
+        """发布 sim_status 消息（状态跃迁 + 周期定时调用）。
+
+        无 sim_data_producer 时安全返回。seq 由 SimDataProducer 统一下发，
+        否则平台按 ``(sim_id, seq)`` 去重会把周期性状态全部丢弃。
+
+        Args:
+            snapshot: 已持有的状态快照（回调路径传入，避免重复取锁）；None 则现取。
         """
         if self._sim_data_producer is None:
             return
         try:
             from hunter_sim.cloud.sim_data_mapper import SimStatusPayload, build_sim_status  # noqa: PLC0415
 
-            snapshot = self.get_state_snapshot()
-            if snapshot is None:
+            snap = snapshot if snapshot is not None else self.get_state_snapshot()
+            if snap is None:
                 return
             payload = SimStatusPayload(
-                status=snapshot.status.value.upper(),
-                progress_percent=round(snapshot.progress * 100.0, 2),
-                elapsed_time=round(snapshot.elapsed_seconds, 3),
+                status=snap.status.value.upper(),
+                progress_percent=round(snap.progress * 100.0, 2),
+                elapsed_time=round(snap.elapsed_seconds, 3),
                 total_time=self._config.duration_seconds if self._config else 60.0,
                 actors_count=self._get_actor_count(),
                 collisions=self._get_collision_count(),
                 lane_invasions=self._get_lane_invasion_count(),
                 ego_state=self._get_ego_state(),
-                message=snapshot.error_message or None,
+                events_triggered=self._get_event_count(),
+                message=snap.error_message or None,
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
             msg = build_sim_status(
                 sim_id=self._sim_id,
-                scene_id=snapshot.scene_id or self._scene_id,
+                scene_id=snap.scene_id or self._scene_id,
                 payload=payload,
+                seq=self._sim_data_producer.next_seq(),
+                vehicle_id=self._vehicle_id or None,
             )
             self._sim_data_producer.publish_status(msg)
         except Exception as exc:  # noqa: BLE001  发布失败不阻断仿真
@@ -521,6 +579,12 @@ class SceneRunnerService:
             if "lane" in e.event_type.lower()
         )
 
+    def _get_event_count(self) -> int:
+        """获取已触发事件总数（方案 §5.4 sim_status.events_triggered）。"""
+        if self._event_detector is None:
+            return 0
+        return len(self._event_detector.detected_events)
+
     def _get_ego_state(self) -> dict[str, Any]:
         """获取自车状态字典。
 
@@ -534,7 +598,7 @@ class SceneRunnerService:
             vehicle = None
             scenario = self._scenario
             if scenario is not None and hasattr(scenario, "get_ego_vehicle"):
-                vehicle = scenario.get_ego_vehicle()  # type: ignore[union-attr]
+                vehicle = scenario.get_ego_vehicle()
             if vehicle is None:
                 # 内置场景 BuiltinScenario 持有 _ego_vehicle
                 vehicle = getattr(scenario, "_ego_vehicle", None)

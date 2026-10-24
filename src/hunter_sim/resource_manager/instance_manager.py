@@ -6,6 +6,7 @@ SimInstanceManager 管理仿真实例完整生命周期，
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -52,6 +53,9 @@ _TERMINAL_STATUSES = (
     InstanceStatus.FAILED,
     InstanceStatus.DESTROYED,
 )
+
+# 方案 §5.2：sim_id 同时用作 Kafka Topic 名片段，必须做白名单校验（防 Topic 名注入）
+SIM_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def _endpoint_addr(endpoint: Any) -> tuple[str, int]:
@@ -150,6 +154,10 @@ class SimInstance:
             "mode": self.mode.value,
             "vehicle_id": self.vehicle_id,
             "tenant": self.tenant,
+            "sim_id": self.sim_id or self.sim_instance_id,
+            "vil_state_topic": self.vil_state_topic,
+            "sensor_data_topic": self.sensor_data_topic,
+            "calibration": dict(self.calibration),
             "create_time": _iso(self.create_time),
             "start_time": _iso(self.start_time),
             "gpu_id": self.gpu_id,
@@ -183,6 +191,10 @@ class SimInstance:
             "retry_count": self.retry_count,
             "error_message": self.error_message,
             "restored": self.restored,
+            "sim_id": self.sim_id or self.sim_instance_id,
+            "calibration": dict(self.calibration),
+            "vil_state_topic": self.vil_state_topic,
+            "sensor_data_topic": self.sensor_data_topic,
         }
 
     @classmethod
@@ -235,6 +247,17 @@ class SimInstance:
             retry_count=int(record.get("retry_count", 0)),
             error_message=str(record.get("error_message", "")),
             restored=True,
+            # V2.12.0：持久化平台绑定（重启后 Topic/标定不丢）
+            sim_id=str(record.get("sim_id") or record["sim_instance_id"]),
+            calibration=dict(record.get("calibration") or {}),
+            vil_state_topic=str(
+                record.get("vil_state_topic")
+                or f"carla.{record['sim_instance_id']}.vil_state"
+            ),
+            sensor_data_topic=str(
+                record.get("sensor_data_topic")
+                or f"carla.{record['sim_instance_id']}.sensor_data"
+            ),
         )
 
 
@@ -315,15 +338,40 @@ class SimInstanceManager:
             创建的 SimInstance。
 
         Raises:
-            ResourceError: GPU 资源不足或超出租户并发配额。
+            ResourceError: sim_id 非法/重复、GPU 资源不足或超出租户并发配额。
         """
         import datetime as _dt  # noqa: PLC0415
 
         tenant = tenant or self._platform.default_tenant
+
+        # 方案 §6.4：按模式校验必填项与 VIL 会话互斥（同车只允许一个活动会话）
+        # 入参非法属调用方错误，显式指定 400，避免平台当作服务故障重试。
+        if mode == SimMode.VIL and not vehicle_id:
+            raise ResourceError(
+                "vehicle_id", "VIL mode requires a non-empty vehicle_id", http_status=400
+            )
+        if mode == SimMode.REPLAY and not replay_config:
+            raise ResourceError(
+                "replay_config", "REPLAY mode requires replay_config", http_status=400
+            )
+        if mode != SimMode.VIL and (vehicle_id and calibration):
+            raise ResourceError(
+                "mode",
+                f"{mode.value.upper()} mode must not carry VIL calibration/vehicle binding",
+                http_status=400,
+            )
+
         self._check_tenant_quota(tenant)
 
         # sim_id: 优先使用平台指定值，否则生成 sim-{date}-{random4}
         if sim_id:
+            # 方案 §5.2：白名单校验（sim_id 会拼进 Kafka Topic 名）
+            if not SIM_ID_PATTERN.match(sim_id):
+                raise ResourceError(
+                    "sim_id",
+                    f"Invalid sim_id '{sim_id}': must match {SIM_ID_PATTERN.pattern}",
+                    http_status=400,
+                )
             instance_id = sim_id
         else:
             _date_str = _dt.date.today().strftime("%Y%m%d")
@@ -331,6 +379,33 @@ class SimInstanceManager:
             instance_id = (
                 f"sim-{_date_str}-{_rand.randint(0, 9999):04d}-{str(uuid.uuid4())[:8]}"
             )
+
+        # 同一 sim_id 不允许重复创建：否则会覆盖旧实例并泄漏其 GPU 名额/端点租约
+        with self._lock:
+            if instance_id in self._instances:
+                raise ResourceError(
+                    "sim_id",
+                    f"sim_id '{instance_id}' already exists; destroy the old instance first",
+                    http_status=409,
+                )
+            if mode == SimMode.VIL and vehicle_id:
+                holder = next(
+                    (
+                        inst
+                        for inst in self._instances.values()
+                        if inst.mode == SimMode.VIL
+                        and inst.vehicle_id == vehicle_id
+                        and inst.status not in _TERMINAL_STATUSES
+                    ),
+                    None,
+                )
+                if holder is not None:
+                    raise ResourceError(
+                        "vehicle_id",
+                        f"vehicle '{vehicle_id}' already has an active VIL session "
+                        f"('{holder.sim_instance_id}'); one session per vehicle is allowed",
+                        http_status=409,
+                    )
 
         gpu_id: int = -1
         if self._gpu_pool is not None:

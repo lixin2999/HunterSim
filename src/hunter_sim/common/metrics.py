@@ -158,7 +158,7 @@ CLOUD_DLQ_PUBLISHED_TOTAL = Counter(
 
 VIL_MESSAGE_DROPPED_TOTAL = Counter(
     "huntersim_vil_message_dropped_total",
-    "Out-of-order or duplicate VIL telemetry messages dropped by the ordering guard.",
+    "VIL telemetry messages dropped (reason: out_of_order / duplicate_seq / sim_id_mismatch).",
     labelnames=("reason",),
 )
 
@@ -233,6 +233,12 @@ SIM_DATA_BUFFER_SIZE = Gauge(
     "huntersim_sim_data_buffer_size",
     "Current depth of the SimDataProducer bounded in-memory buffer.",
     labelnames=("sim_id",),
+)
+
+SIM_DATA_DROPPED_TOTAL = Counter(
+    "huntersim_sim_data_dropped_total",
+    "Messages discarded by SimDataProducer (reason=buffer_overflow).",
+    labelnames=("sim_id", "reason"),
 )
 
 VIL_STATE_CONSUMED_TOTAL = Counter(
@@ -381,6 +387,7 @@ __all__ = [
     "SENSOR_FILE_PUBLISHED_TOTAL",
     "SERVICE_START_TIME",
     "SIM_DATA_BUFFER_SIZE",
+    "SIM_DATA_DROPPED_TOTAL",
     "SIM_DATA_PRODUCER_ERRORS_TOTAL",
     "SIM_EVENT_PUBLISHED_TOTAL",
     "SIM_METRICS_PUBLISHED_TOTAL",

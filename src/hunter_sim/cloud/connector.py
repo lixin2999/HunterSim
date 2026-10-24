@@ -48,7 +48,7 @@ class CloudConnector:
     ) -> None:
         self._settings = settings
         self._producer: Optional[SimDataProducer] = None
-        self._producer_factory_raw: Optional[Callable] = producer_factory
+        self._producer_factory_raw: Optional[Callable[..., Any]] = producer_factory
         self._client_factory = client_factory
         self._sim_id: str = settings.sim_id  # 可在 start() 时覆盖
         self.uploader = BagUploader(settings, sim_id=self._sim_id, client_factory=client_factory)

@@ -10,7 +10,7 @@ from hunter_sim.common.exceptions import InstanceStateError, ResourceError
 from hunter_sim.common.models import InstanceStatus, QualityLevel, SimMode
 from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
 from hunter_sim.resource_manager.health_monitor import ResourceQuotaManager
-from hunter_sim.resource_manager.instance_manager import SimInstanceManager
+from hunter_sim.resource_manager.instance_manager import SimInstance, SimInstanceManager
 
 
 class TestGPUResourcePool:
@@ -127,9 +127,147 @@ class TestSimInstanceManager:
             map_id="Town03",
             quality=QualityLevel.MEDIUM,
             user_id="user_x",
+            vehicle_id="HUNTER-001",
         )
         assert inst.status == InstanceStatus.CREATED
         assert inst.gpu_id >= 0
+
+    def test_vil_requires_vehicle_id(self) -> None:
+        """方案 §6.4：VIL 模式缺 vehicle_id 必须拒绝创建。"""
+        mgr = self._make_manager()
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.VIL,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+            )
+
+    def test_replay_requires_config(self) -> None:
+        """方案 §6.4：REPLAY 模式缺 replay_config 必须拒绝创建。"""
+        mgr = self._make_manager()
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.REPLAY,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+            )
+
+    def test_sil_must_not_carry_calibration(self) -> None:
+        """SIL 模式不得携带 VIL 标定/车辆绑定。"""
+        mgr = self._make_manager()
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.SIL,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+                vehicle_id="HUNTER-001",
+                calibration={"calibration_id": "cal-1"},
+            )
+
+    def test_sim_id_pattern_validated(self) -> None:
+        """sim_id 会拼进 Kafka Topic 名，非法字符必须拒绝。"""
+        mgr = self._make_manager()
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.SIL,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+                sim_id="bad id.topic",
+            )
+
+    def test_validation_errors_hint_400(self) -> None:
+        """入参非法必须带 400 hint，避免被映射为 503 服务故障。"""
+        mgr = self._make_manager()
+        with pytest.raises(ResourceError) as exc_info:
+            mgr.create_instance(
+                mode=SimMode.VIL,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+            )
+        assert exc_info.value.http_status == 400
+
+        with pytest.raises(ResourceError) as exc_info:
+            mgr.create_instance(
+                mode=SimMode.SIL,
+                map_id="Town03",
+                quality=QualityLevel.MEDIUM,
+                sim_id="bad id.topic",
+            )
+        assert exc_info.value.http_status == 400
+
+    def test_conflict_hints_409(self) -> None:
+        """重复 sim_id / 同车 VIL 互斥属资源冲突，应返回 409 而非 503。"""
+        mgr = self._make_manager()
+        mgr.create_instance(
+            mode=SimMode.VIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+            vehicle_id="HUNTER-409", sim_id="sim-409-a",
+        )
+        with pytest.raises(ResourceError) as exc_info:
+            mgr.create_instance(
+                mode=SimMode.SIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+                sim_id="sim-409-a",
+            )
+        assert exc_info.value.http_status == 409
+
+        with pytest.raises(ResourceError) as exc_info:
+            mgr.create_instance(
+                mode=SimMode.VIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+                vehicle_id="HUNTER-409",
+            )
+        assert exc_info.value.http_status == 409
+
+    def test_resource_exhaustion_keeps_default_status(self) -> None:
+        """GPU/引擎/配额耗尽属真正的资源不可用，不加 hint 时仍降级为 503。"""
+        exc = ResourceError("gpu", "No GPU available for quality=high")
+        assert exc.http_status is None
+
+    def test_duplicate_sim_id_rejected(self) -> None:
+        """重复 sim_id 不得覆盖旧实例（否则泄漏 GPU 名额/租约）。"""
+        mgr = self._make_manager()
+        mgr.create_instance(
+            mode=SimMode.SIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+            sim_id="sim-dup-001",
+        )
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.SIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+                sim_id="sim-dup-001",
+            )
+
+    def test_one_vil_session_per_vehicle(self) -> None:
+        """方案 §6.4：同一 vehicle_id 只允许一个活动 VIL 会话。"""
+        mgr = self._make_manager()
+        mgr.create_instance(
+            mode=SimMode.VIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+            vehicle_id="HUNTER-777",
+        )
+        with pytest.raises(ResourceError):
+            mgr.create_instance(
+                mode=SimMode.VIL, map_id="Town03", quality=QualityLevel.MEDIUM,
+                vehicle_id="HUNTER-777",
+            )
+
+    def test_record_roundtrip_keeps_platform_binding(self) -> None:
+        """持久化往返不得丢失 sim_id/calibration/Topic 绑定。"""
+        inst = SimInstance(
+            sim_instance_id="sim-rt-001",
+            status=InstanceStatus.CREATED,
+            mode=SimMode.VIL,
+            map_id="Town03",
+            quality=QualityLevel.MEDIUM,
+            gpu_id=-1,
+            vehicle_id="HUNTER-002",
+            sim_id="sim-rt-001",
+            calibration={"calibration_id": "cal-9", "map_x": 1.5},
+            vil_state_topic="carla.sim-rt-001.vil_state",
+            sensor_data_topic="carla.sim-rt-001.sensor_data",
+        )
+        restored = SimInstance.from_record(inst.to_record())
+        assert restored.sim_id == "sim-rt-001"
+        assert restored.calibration["calibration_id"] == "cal-9"
+        assert restored.vil_state_topic == "carla.sim-rt-001.vil_state"
+        assert restored.sensor_data_topic == "carla.sim-rt-001.sensor_data"
+        assert restored.to_dict()["sim_id"] == "sim-rt-001"
 
     def test_single_engine_endpoint_shared_without_inventory(self) -> None:
         """未声明引擎库存（V2.4.0）：所有实例共享配置的单引擎端点。

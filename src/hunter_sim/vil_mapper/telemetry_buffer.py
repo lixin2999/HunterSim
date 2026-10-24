@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from hunter_sim.common.metrics import observe_vil_latency
 from hunter_sim.common.models import PerceptionResult, VehicleState, VILSettings
@@ -65,6 +65,9 @@ class TelemetryFrame:
         perception: 感知结果（可选）。
         control_cmd: 控制指令回读（可选）。
         is_fresh: 数据是否新鲜（未超时）。
+        calibration: 方案 §5.3 calibration 段（odom↔map 对齐，可选）。
+        source_seq: 方案 §5.3 source_seq（实车帧序号，0 表示未提供）。
+        forwarded_at: 方案 §5.3 forwarded_at（平台转发时刻，None 表示未提供）。
     """
 
     vehicle_id: str
@@ -74,11 +77,21 @@ class TelemetryFrame:
     perception: Optional[PerceptionResult] = None
     control_cmd: Optional[dict[str, float]] = None
     is_fresh: bool = True
+    calibration: Optional[dict[str, Any]] = None
+    source_seq: int = 0
+    forwarded_at: Optional[float] = None
 
     @property
     def latency_ms(self) -> float:
         """数据端到端延迟（毫秒）。"""
         return (self.receive_time - self.timestamp) * 1000.0
+
+    @property
+    def platform_forward_lag_ms(self) -> Optional[float]:
+        """平台转发耗时（毫秒，方案 §10.4 VIL_E2E_LAG 的转发段）。"""
+        if self.forwarded_at is None:
+            return None
+        return (self.forwarded_at - self.timestamp) * 1000.0
 
 
 class TelemetryBuffer:

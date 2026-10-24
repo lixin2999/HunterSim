@@ -184,3 +184,111 @@ class TestFormatDetection:
             "velocity": {"x": 5.0, "y": 0.0, "z": 0.0},
         }
         assert "pose" not in old_msg
+
+
+# ─── V2.12.0：方案 §5.3 标准扁平契约（无 payload 包裹）─────────────────────────
+
+
+def _scheme_v53_message(**overrides: Any) -> dict[str, Any]:
+    """按方案 §5.3 构造一条真实平台转发格式的 vil_state 消息。"""
+    msg: dict[str, Any] = {
+        "schema_version": "1.0.0",
+        "sim_id": "sim-20261023-0001",
+        "source_seq": 128,
+        "source_timestamp": 1724035200.5,
+        "forwarded_at": 1724035200.58,
+        "pose": {"frame": "map", "x": 12.5, "y": -3.0, "z": 0.0,
+                 "roll": 0.0, "pitch": 0.0, "yaw": 1.2},
+        "twist": {"linear": [8.0, 0.5, 0.0], "angular": [0.0, 0.0, 0.15]},
+        "chassis": {"velocity": 8.02, "steering_angle": 0.08,
+                    "control_mode": "auto", "vehicle_state": "driving",
+                    "fault_code": 0, "gear": 4},
+        "perception": {
+            "detected_objects": 1,
+            "fps": 12.5,
+            "latency_ms": 30.0,
+            "objects": [{
+                "object_id": "obj-1", "type": "car",
+                "x": 30.0, "y": 2.0, "z": 0.0, "yaw": 1.1,
+                "length": 4.6, "width": 1.9, "height": 1.5,
+                "vx": 3.0, "vy": 0.0, "confidence": 0.88,
+            }],
+        },
+        "planning": {"current_behavior": "lane_keep", "trajectory": []},
+        "control": {"target_velocity": 8.0, "target_steer": 0.06,
+                    "target_throttle": 0.4, "target_brake": 0.0},
+        "calibration": {
+            "calibration_id": "cal-2026-10", "map_x": 100.0, "map_y": 200.0,
+            "map_heading": 0.0, "odom_x": 0.0, "odom_y": 0.0, "odom_heading": 0.0,
+        },
+    }
+    msg.update(overrides)
+    return msg
+
+
+class TestSchemeV53Contract:
+    """脱离旧 telemetry_clean 写法，验证真实平台契约的字段映射。"""
+
+    def test_twist_linear_angular_arrays(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        vs = frame.vehicle_state
+        assert vs.velocity == pytest.approx((8.0, 0.5, 0.0))
+        assert vs.angular_velocity == pytest.approx((0.0, 0.0, 0.15))
+
+    def test_chassis_velocity_and_steering_angle(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        vs = frame.vehicle_state
+        assert vs.vehicle_speed == pytest.approx(8.02)
+        assert vs.steering == pytest.approx(0.08)
+        assert vs.gear == 4
+
+    def test_pose_yaw_field(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        assert frame.vehicle_state.transform.yaw == pytest.approx(1.2)
+        assert frame.vehicle_state.transform.x == pytest.approx(12.5)
+
+    def test_source_timestamp_preferred(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        assert frame.timestamp == pytest.approx(1724035200.5)
+        assert frame.source_seq == 128
+        assert frame.forwarded_at == pytest.approx(1724035200.58)
+        assert frame.platform_forward_lag_ms == pytest.approx(80.0, abs=0.1)
+
+    def test_string_object_id_does_not_raise(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        assert frame.perception is not None
+        obj = frame.perception.objects[0]
+        assert isinstance(obj.object_id, int)
+        # CRC32 稳定映射：同一字符串多次解析结果一致
+        again = parse_vil_state(_scheme_v53_message())
+        assert again.perception.objects[0].object_id == obj.object_id
+        assert obj.object_type == "car"
+        assert obj.confidence == pytest.approx(0.88)
+
+    def test_calibration_preserved(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        assert frame.calibration is not None
+        assert frame.calibration["calibration_id"] == "cal-2026-10"
+        assert frame.calibration["map_x"] == pytest.approx(100.0)
+
+    def test_control_target_fields(self) -> None:
+        frame = parse_vil_state(_scheme_v53_message())
+        assert frame.control_cmd is not None
+        assert frame.control_cmd["throttle"] == pytest.approx(0.4)
+        assert frame.control_cmd["steer"] == pytest.approx(0.06)
+        # chassis.steering_angle 是实际值，不应被 target 覆盖
+        assert frame.vehicle_state.steering == pytest.approx(0.08)
+
+    def test_missing_pose_raises_keyerror(self) -> None:
+        with pytest.raises(KeyError):
+            parse_vil_state({"twist": {}, "chassis": {}})
+
+    def test_non_dict_twist_raises_keyerror(self) -> None:
+        with pytest.raises(KeyError):
+            parse_vil_state({"pose": {"x": 0.0}, "twist": [1, 2, 3]})
+
+    def test_confidence_clamped(self) -> None:
+        msg = _scheme_v53_message()
+        msg["perception"]["objects"][0]["confidence"] = 1.7
+        frame = parse_vil_state(msg)
+        assert frame.perception.objects[0].confidence == pytest.approx(1.0)

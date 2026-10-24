@@ -139,7 +139,7 @@ class InstanceResponse(BaseModel):
     carla_status: str = Field("", description="CARLA 原始大写状态（排障用）")
     vil_state_topic: str = Field("", description="实例渲染的 vil_state Topic 全名")
     sensor_data_topic: str = Field("", description="实例渲染的 sensor_data Topic 全名")
-    ego_state: dict = Field(default_factory=dict, description="自车快照（x/y/heading/velocity）")
+    ego_state: dict[str, Any] = Field(default_factory=dict, description="自车快照（x/y/heading/velocity）")
     actors_count: int = Field(0, description="当前世界 Actor 数")
 
 

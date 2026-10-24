@@ -317,3 +317,94 @@ class TestPublishStatusFromPayload:
         parsed = json.loads(value)
         assert parsed["type"] == "sim_status"
         assert parsed["payload"]["status"] == "COMPLETED"
+
+
+# ─── V2.12.0：缓冲溢出可观测 + 重投异步失败不静默 ──────────────────────────
+
+
+class _ErrbackFuture:
+    """可记录 errback 注册的 Future 桩。"""
+
+    def __init__(self) -> None:
+        self.errbacks: list[Any] = []
+
+    def add_errback(self, fn: Any) -> None:
+        self.errbacks.append(fn)
+
+
+class _ErrbackProducer(FakeKafkaProducer):
+    """send 返回可记录 errback 的 Future。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.futures: list[_ErrbackFuture] = []
+
+    def send(self, topic: str, key: bytes = None, value: bytes = None) -> Any:  # noqa: ANN001
+        self.sent.append((topic, key, value))
+        future = _ErrbackFuture()
+        self.futures.append(future)
+        return future
+
+
+class TestV212Observability:
+    def test_buffer_overflow_increments_dropped_metric(self) -> None:
+        """满缓冲丢最旧时必须计数（不得静默丢数据）。"""
+        import hunter_sim.cloud.sim_data_producer as mod
+        from hunter_sim.common.metrics import SIM_DATA_DROPPED_TOTAL
+
+        fake = FakeKafkaProducer(fail_on_send=True)
+        p = SimDataProducer(
+            _settings(), sim_id="sim-drop", producer_factory=lambda s, sid: fake
+        )
+        p.connect()
+        before = SIM_DATA_DROPPED_TOTAL.labels(
+            sim_id="sim-drop", reason="buffer_overflow"
+        )._value.get()
+
+        # 直接塞满（避免构造 2000 次网络失败日志）
+        for _ in range(mod._MAX_BUFFER + 3):
+            p._buffer_message("t", b"k", b"v")
+
+        after = SIM_DATA_DROPPED_TOTAL.labels(
+            sim_id="sim-drop", reason="buffer_overflow"
+        )._value.get()
+        assert after - before == 3
+        assert p.buffered_count == mod._MAX_BUFFER
+
+    def test_flush_registers_errback(self) -> None:
+        """flush 重投的异步失败必须注册 errback（否则静默丢失）。"""
+        fake = _ErrbackProducer()
+        p = SimDataProducer(
+            _settings(), sim_id="sim-eb", producer_factory=lambda s, sid: fake
+        )
+        p.connect()
+        p._buffer_message("t", b"k", b"v")
+
+        assert p.flush() == 1
+        assert len(fake.futures) == 1
+        assert len(fake.futures[0].errbacks) == 1
+
+        # errback 被触发时消息应重入缓冲
+        fake.futures[0].errbacks[0](RuntimeError("async boom"))
+        assert p.buffered_count == 1
+
+    def test_send_registers_errback(self) -> None:
+        fake = _ErrbackProducer()
+        p = SimDataProducer(
+            _settings(), sim_id="sim-eb2", producer_factory=lambda s, sid: fake
+        )
+        p.connect()
+        assert p.publish_status({"type": "sim_status", "payload": {}}) is True
+        assert len(fake.futures[0].errbacks) == 1
+
+    def test_sensor_file_forwards_optional_fields(self) -> None:
+        p, fake = _producer(sim_id="sim-sf")
+        p.publish_sensor_file(
+            bucket="b", object_key="k", size_bytes=1, sha256="s",
+            md5="m", file_format="rosbag2", topics=["/tf"],
+        )
+        _, _, value = fake.sent[0]
+        payload = json.loads(value)["payload"]
+        assert payload["md5"] == "m"
+        assert payload["format"] == "rosbag2"
+        assert payload["topics"] == ["/tf"]

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 
 class HunterSimError(Exception):
     """HunterSim 系统异常基类。
@@ -116,10 +118,21 @@ class SensorSimulationError(SimulationError):
 
 
 class ResourceError(HunterSimError):
-    """仿真资源管理错误（GPU 不足、实例配额耗尽、容器启动失败等）。"""
+    """仿真资源管理错误（GPU 不足、实例配额耗尽、容器启动失败等）。
 
-    def __init__(self, resource_type: str, message: str) -> None:
+    Args:
+        resource_type: 资源类别（gpu/quota/engine/sim_id/vehicle_id/mode/...）。
+        message: 异常详细说明。
+        http_status: 可选的 HTTP 状态码提示。资源耗尽默认降为 503；
+            但入参非法（400）或资源冲突（409）不应让调用方误判为服务故障，
+            由抛出方显式指定。
+    """
+
+    def __init__(
+        self, resource_type: str, message: str, http_status: Optional[int] = None
+    ) -> None:
         super().__init__("resource_manager", f"resource({resource_type})", message)
+        self.http_status = http_status
 
 
 class SimTimeoutError(HunterSimError):

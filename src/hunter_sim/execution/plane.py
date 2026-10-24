@@ -83,7 +83,10 @@ class ExecutionPlane:
         self._cancelled: set[str] = set()
         # V2.10.0：平台发布相关
         self._cloud_settings = cloud_settings
+        # V2.12.0：producer 字典独立互斥锁（创建需建连，不可在注册表锁内做）
+        self._producer_lock: threading.RLock = threading.RLock()
         self._cloud_producers: dict[str, Any] = {}  # sim_id -> SimDataProducer
+        self._instance_sim_ids: dict[str, str] = {}  # instance_id -> sim_id
 
     @property
     def pool(self) -> EnginePool:
@@ -199,6 +202,7 @@ class ExecutionPlane:
             # V2.9.0：装配期间实例已被销毁/释放——丢弃刚建好的运行器与租约，
             # 避免“实例已不存在但仍占引擎/仍在 tick”的泄漏
             self._pool.release(instance_id)
+            self._close_producer_for_instance(instance_id)
             with engine_lock:
                 try:
                     runner.destroy()
@@ -216,7 +220,11 @@ class ExecutionPlane:
         return runner
 
     def release(self, instance_id: str) -> bool:
-        """释放实例运行器并归还引擎租约，返回是否确实释放。"""
+        """释放实例运行器并归还引擎租约，返回是否确实释放。
+
+        V2.12.0：同时关闭该实例的 ``SimDataProducer``（否则每个实例会泄漏
+        一条 Kafka 连接与有界重投缓冲，长时间运行后连接数单调增长）。
+        """
         with self._registry_lock:
             # V2.9.0：若有在途装配，登记取消标记；装配完成时自弃运行器与租约
             if self._assembling.get(instance_id):
@@ -225,6 +233,7 @@ class ExecutionPlane:
             engine_key = self._runner_engines.pop(instance_id, None)
             released = self._pool.release(instance_id)
             engine_lock = self._engine_locks.get(engine_key) if engine_key else None
+        self._close_producer_for_instance(instance_id)
         if runner is None:
             return released
 
@@ -403,36 +412,61 @@ class ExecutionPlane:
         """为 SceneRunnerService 构造平台发布相关关键字参数。
 
         若 ``cloud_settings`` 未启用或为 None，返回空字典（不注入任何平台参数）。
-        否则为当前实例创建独立的 ``SimDataProducer``，并返回 sim_id 等字段。
+        否则为当前实例创建/复用独立的 ``SimDataProducer``，并返回 sim_id 等字段。
         """
+        sim_id = getattr(instance, "sim_id", "") or instance.sim_instance_id
         kwargs: dict[str, Any] = {
-            "sim_id": getattr(instance, "sim_id", instance.sim_instance_id),
+            "sim_id": sim_id,
             "vehicle_id": getattr(instance, "vehicle_id", ""),
             "scene_id": getattr(instance, "scene_id", ""),
         }
         if self._cloud_settings is None or not self._cloud_settings.enabled:
             return kwargs
 
-        sim_id = kwargs["sim_id"]
-        # 复用已创建的 producer（实例重复装配时）
-        producer = self._cloud_producers.get(sim_id)
-        if producer is None:
-            from hunter_sim.cloud.sim_data_producer import SimDataProducer  # noqa: PLC0415
+        # 周期上报间隔来自 CloudSettings（不硬编码在运行器中）
+        kwargs["status_interval_s"] = float(
+            getattr(self._cloud_settings, "status_report_interval_s", 1.0)
+        )
+        kwargs["telemetry_interval_s"] = float(
+            getattr(self._cloud_settings, "telemetry_proxy_interval_s", 0.1)
+        )
 
-            producer = SimDataProducer(self._cloud_settings, sim_id=sim_id)
-            producer.connect()
-            self._cloud_producers[sim_id] = producer
+        # 建连是慢操作：在 producer 锁内完成，避免阻塞注册表临界区
+        with self._producer_lock:
+            producer = self._cloud_producers.get(sim_id)
+            if producer is None:
+                from hunter_sim.cloud.sim_data_producer import SimDataProducer  # noqa: PLC0415
+
+                producer = SimDataProducer(self._cloud_settings, sim_id=sim_id)
+                producer.connect()
+                self._cloud_producers[sim_id] = producer
+            self._instance_sim_ids[instance.sim_instance_id] = sim_id
         kwargs["sim_data_producer"] = producer
         return kwargs
 
     def close_cloud_producer(self, sim_id: str) -> None:
-        """关闭并移除指定实例的 SimDataProducer（实例销毁时调用）。"""
-        producer = self._cloud_producers.pop(sim_id, None)
-        if producer is not None:
-            try:
-                producer.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"Closing SimDataProducer[{sim_id}] failed: {exc}")
+        """关闭并移除指定 sim_id 的 SimDataProducer（按 sim_id 释放）。"""
+        with self._producer_lock:
+            producer = self._cloud_producers.pop(sim_id, None)
+        self._close_producer(sim_id, producer)
+
+    def _close_producer_for_instance(self, instance_id: str) -> None:
+        """按实例 ID 关闭并移除其 SimDataProducer（实例释放/装配取消路径）。"""
+        with self._producer_lock:
+            sim_id = self._instance_sim_ids.pop(instance_id, None)
+            producer = self._cloud_producers.pop(sim_id, None) if sim_id else None
+        if sim_id is not None:
+            self._close_producer(sim_id, producer)
+
+    @staticmethod
+    def _close_producer(sim_id: str, producer: Any) -> None:
+        """关闭 producer（None 或关闭失败均不抛）。"""
+        if producer is None:
+            return
+        try:
+            producer.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Closing SimDataProducer[{sim_id}] failed: {exc}")
 
 
 __all__ = ["ExecutionPlane", "ExecutionUnavailable", "MapManagerResolver"]

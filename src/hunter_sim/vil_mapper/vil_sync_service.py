@@ -109,6 +109,8 @@ class VILSyncService:
         self._stats = VILSyncStats()
         self._tick_times: list[float] = []
         self._latency_samples: list[float] = []
+        # 断流告警限频：50Hz tick 下逐帧 warn 会刷屏（每 5s 最多一条）
+        self._last_timeout_log: float = 0.0
         logger.info("VILSyncService initialized")
 
     @property
@@ -136,20 +138,31 @@ class VILSyncService:
 
         while self._running.is_set():
             t0 = time.perf_counter()
-            self._stats.total_ticks += 1
+            with self._lock:
+                self._stats.total_ticks += 1
 
             try:
                 self._do_sync_cycle()
-                self._stats.total_syncs += 1
+                with self._lock:
+                    self._stats.total_syncs += 1
             except SimTimeoutError as exc:
-                logger.warning(f"Sync timeout: {exc}")
-                self._stats.sync_errors += 1
+                # 数据中断：限制日志频率，避免 50Hz 刷屏
+                now = time.perf_counter()
+                with self._lock:
+                    self._stats.sync_errors += 1
+                    should_log = now - self._last_timeout_log >= 5.0
+                    if should_log:
+                        self._last_timeout_log = now
+                if should_log:
+                    logger.warning(f"Sync timeout: {exc}")
             except CarlaSimulationError as exc:
                 logger.error(f"CARLA sync error: {exc}")
-                self._stats.sync_errors += 1
+                with self._lock:
+                    self._stats.sync_errors += 1
             except Exception as exc:
                 logger.error(f"Unexpected sync error: {exc}", exc_info=True)
-                self._stats.sync_errors += 1
+                with self._lock:
+                    self._stats.sync_errors += 1
 
             # 执行 tick
             try:
@@ -164,11 +177,14 @@ class VILSyncService:
                 time.sleep(sleep_time)
 
             # FPS 统计
-            self._tick_times.append(time.perf_counter())
-            if len(self._tick_times) > 100:
-                self._tick_times.pop(0)
+            with self._lock:
+                self._tick_times.append(time.perf_counter())
+                if len(self._tick_times) > 100:
+                    self._tick_times.pop(0)
 
-        logger.info(f"VIL sync loop stopped (ticks={self._stats.total_ticks})")
+        with self._lock:
+            total_ticks = self._stats.total_ticks
+        logger.info(f"VIL sync loop stopped (ticks={total_ticks})")
 
     def stop(self) -> None:
         """停止同步循环。"""
@@ -224,9 +240,10 @@ class VILSyncService:
         self._apply_carla_velocity(frame.vehicle_state, carla_transform.yaw)
 
         latency_ms = (time.perf_counter() - t_start) * 1000.0
-        self._latency_samples.append(latency_ms)
-        if len(self._latency_samples) > 100:
-            self._latency_samples.pop(0)
+        with self._lock:
+            self._latency_samples.append(latency_ms)
+            if len(self._latency_samples) > 100:
+                self._latency_samples.pop(0)
 
     def _apply_carla_transform(self, transform: Transform) -> None:
         """将 Transform 应用到 CARLA Vehicle Actor。

@@ -249,3 +249,82 @@ class TestSimStatusPayload:
             ego_state={}, updated_at="2026-10-23T00:00:00+00:00",
         )
         assert p.updated_at == "2026-10-23T00:00:00+00:00"
+
+
+# ─── V2.12.0：对照方案 §5.4 / §7.3.1 的契约回归 ────────────────────────────
+
+
+def _status_payload() -> SimStatusPayload:
+    return SimStatusPayload(
+        status="RUNNING", progress_percent=10.0, elapsed_time=5.0,
+        total_time=50.0, actors_count=2, collisions=0, lane_invasions=0,
+        ego_state={},
+    )
+
+
+class TestV212Contract:
+    """方案 §5.4 字段表与 §7.3.1 幂等键要求的回归用例。"""
+
+    def test_sim_status_carries_vehicle_id_in_vil(self) -> None:
+        msg = build_sim_status(
+            "sim-1", "scene-1", _status_payload(), seq=1, vehicle_id="HUNTER-001"
+        )
+        assert msg["vehicle_id"] == "HUNTER-001"
+
+    def test_sim_status_sil_keeps_null_vehicle_id(self) -> None:
+        msg = build_sim_status("sim-1", "scene-1", _status_payload(), seq=1)
+        assert msg["vehicle_id"] is None
+
+    def test_sim_status_events_triggered(self) -> None:
+        payload = SimStatusPayload(
+            status="RUNNING", progress_percent=0.0, elapsed_time=0.0,
+            total_time=10.0, actors_count=1, collisions=0, lane_invasions=0,
+            ego_state={}, events_triggered=7,
+        )
+        msg = build_sim_status("sim-1", "scene-1", payload, seq=1)
+        assert msg["payload"]["events_triggered"] == 7
+
+    def test_telemetry_uses_steering_angle(self) -> None:
+        msg = build_sim_telemetry(
+            "sim-1", None, "scene-1", 1, 100.0, {}, {}, {}, 0.25, {}
+        )
+        assert msg["payload"]["steering_angle"] == pytest.approx(0.25, abs=1e-6)
+        # 兼容别名仍保留
+        assert msg["payload"]["steering"] == pytest.approx(0.25, abs=1e-6)
+
+    def test_sim_event_has_event_id(self) -> None:
+        msg = build_sim_event(
+            "sim-1", None, "scene-1", 2, 100.0, "collision", "critical", 1.0, "hit"
+        )
+        event_id = msg["payload"]["event_id"]
+        assert isinstance(event_id, str) and len(event_id) >= 8
+
+    def test_sim_event_event_id_is_stable_when_given(self) -> None:
+        msg = build_sim_event(
+            "sim-1", None, "scene-1", 2, 100.0, "collision", "critical", 1.0, "hit",
+            event_id="evt-fixed-1",
+        )
+        assert msg["payload"]["event_id"] == "evt-fixed-1"
+
+    def test_sensor_file_has_md5_format_topics(self) -> None:
+        msg = build_sensor_file(
+            sim_id="sim-1", seq=3, ts=100.0, bucket="b", object_key="k",
+            size_bytes=10, sha256="abc", sensor_type="rosbag",
+            start_time=0.0, end_time=1.0, frame_count=5,
+            md5="def", file_format="rosbag2", topics=["/carla/ego/odom"],
+        )
+        p = msg["payload"]
+        assert p["md5"] == "def"
+        assert p["format"] == "rosbag2"
+        assert p["topics"] == ["/carla/ego/odom"]
+
+    def test_sensor_file_optional_fields_default_empty(self) -> None:
+        msg = build_sensor_file(
+            sim_id="sim-1", seq=3, ts=100.0, bucket="b", object_key="k",
+            size_bytes=10, sha256="abc", sensor_type="rosbag",
+            start_time=0.0, end_time=1.0, frame_count=5,
+        )
+        p = msg["payload"]
+        assert p["md5"] == ""
+        assert p["format"] == ""
+        assert p["topics"] == []

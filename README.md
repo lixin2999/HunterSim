@@ -3,7 +3,7 @@
 HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真与虚实映射（VIL）平台。它以 CARLA 0.9.16 为渲染与物理引擎，以 ROS2 Humble 为传感器数据语义总线，通过 FastAPI 对外提供统一的 REST / WebSocket 控制接口，支持 **车辆在环（VIL）**、**软件在环（SIL）** 与 **数据回放（Replay）** 三种运行模式。自 V2.2.0 起额外提供 **Windows 桌面仿真客户端**（CarlaSceneX 风格，进程内直连 CARLA）与 **HunterCore 数据采集分析平台接入**。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`2.11.0`（V2.11.0 为 **CARLA 平台接入全量重构**：发布链路改为 `carla.{sim_id}.sensor_data`（6 类 type：sim_status/sim_telemetry/sim_event/sim_metrics/sensor_file/artifact）；消费链路改为 `carla.{sim_id}.vil_state`；引入 `SimDataProducer` 替代旧 `TelemetryProducer`；`CloudSettings`/`KafkaSettings` 重构；场景运行器自动发布平台消息；评估结果/artifact 回传；多实例 sim_id 隔离；8 个新 Prometheus 指标，详见 [`release.md`](release.md)）。上一版本 `2.10.0` 为**阶段八「代码审查缺陷修复」（Medium + Low）**：认证链路（用户 CRUD、PBKDF2 慢哈希、续期回查、JWT 吊销查询、API Key 校验）全部下沉线程池，高并发登录/鉴权不再阻塞事件循环；进程内状态回收（登录失败守卫按空闲 3600s + 4096 软上限清理、快照写节流守卫随实例释放清理、`revoked_tokens` 表按小时裁剪）；`PLATFORM_USERS_ENABLED=false` 时用户表账号续期改为 `401`（与登录路径语义对齐）；`StateStore.get_user()` 派生布尔 `disabled`，与 `list_users()` 结构一致；`GET /execution` 回退快照补齐 `stale_leases` / `lease_ttl_seconds` / `map_affinity_enabled`；WebSocket 广播并发化 + 单条 5s 超时、握手与 60s 心跳复核吊销名单（`4401`）；请求日志 query 中 Token/密钥脱敏为 `***`，详见 [`release.md`](release.md)）。上一版本 `2.9.0` 为**阶段七「代码审查缺陷修复」（Blocker + High）**：多引擎部署按端点隔离 `MapManager` / `carla.Client`（不再把所有 `load_world` 打到 base 引擎，也不跨端点共用非线程安全 Client）、`/auth/refresh` 续期回查用户表（禁用/删除/降级即时生效）、僵尸租约强制回收收紧为仅限 `stale=true` 并联动实例置 `failed` 释放端点占用、引擎重启下沉工作线程（不阻塞事件循环）、装配窗口内销毁实例的取消闸门（杜绝孤儿运行器与僵尸租约），详见 [`release.md`](release.md)）。`2.8.0` 为**阶段六「多用户 / 调度智能化 / 引擎自愈 / 部署体验」（P2）**：平台用户表 + PBKDF2 慢哈希与角色/租户绑定（`/auth/users`、`/auth/password`，审计落到具体人）、地图感知调度（同地图优先复用空闲引擎，多引擎不再被「全局限一地图」误伤）、本地 CARLA 进程自愈看门狗（`CARLA_SUPERVISOR_*`，事件写审计）、部署预检 CLI `huntersim doctor` + `Makefile` + compose 健康依赖条件，并文档明确「单副本 + 重启恢复」为受支持形态，详见 [`release.md`](release.md)）。`2.7.0` 为**阶段五「稳定性与数据链路加固」（P1）**：JWT 吊销/滑动续期、引擎租约心跳与僵尸回收、Kafka 消费自愈与 DLQ、VIL 乱序闸门与自动环深、快照写节流、structlog 统一日志 + request_id 贯穿、端到端集成测试。更早：`2.6.0` 为**阶段四「并发安全与稳定性加固」（P0）**——运行器注册表与装配锁启动期预建、引擎级装配锁、按 IP 限流与登录退避、cloud bag 上传队列有界化、标准化 Prometheus 指标 + Grafana 预置盘；`2.5.0` 为**阶段三「平台化」**（多租户隔离与配额、服务账号 API Key、RBAC 角色层级、场景库版本化、批量任务与审计落库、平台概览）；`2.4.0` 为**阶段二「执行面分离与状态持久化」**（引擎端点库存与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution`）；`2.3.0` 为**阶段一「可用性止血」**（打通 REST 场景闭环、`/auth/token`、生产启动闸门、WebSocket 鉴权、实例归属校验）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
+- **当前版本**：`2.12.0`（V2.12.0 为**接入方案代码审查缺陷修复**：对照《CARLA 仿真系统接入数据采集与分析系统方案》V1.0 逐条审查，重写 `vil_state` 解析器对齐 §5.3 扁平契约（`twist.linear[]`/`angular[]` 数组、`chassis.velocity`/`steering_angle`、字符串 `object_id` 经 CRC32 映射为非负 int、`calibration` 段、`source_seq`/`forwarded_at` 透传）；`sim_status.seq` 由恒 0 改为单调递增（修复平台 `(sim_id, seq)` 幂等键失效）、状态跃迁即时上报 + PAUSED 周期上报 + 终态幂等补发；`sim_event` 补 `event_id` 幂等键；打通 `publish_event_to_platform()`（原为死代码）；`ExecutionPlane` 实例释放即关闭云端 producer（修复 Kafka 连接/内存泄漏）；`sim_id` 正则校验 + 同车 VIL 会话互斥 + 实例持久化平台绑定；缓冲溢出/丢弃计数指标与 errback 补全；规避 `SceneStateManager` 回调自死锁；`mypy strict` 恢复 0 错误，详见 [`release.md`](release.md)）。上一版本 `2.11.0` 为 **CARLA 平台接入全量重构**：发布链路改为 `carla.{sim_id}.sensor_data`（6 类 type：sim_status/sim_telemetry/sim_event/sim_metrics/sensor_file/artifact）；消费链路改为 `carla.{sim_id}.vil_state`；引入 `SimDataProducer` 替代旧 `TelemetryProducer`；`CloudSettings`/`KafkaSettings` 重构；场景运行器自动发布平台消息；评估结果/artifact 回传；多实例 sim_id 隔离；8 个新 Prometheus 指标，详见 [`release.md`](release.md)）。上一版本 `2.10.0` 为**阶段八「代码审查缺陷修复」（Medium + Low）**：认证链路（用户 CRUD、PBKDF2 慢哈希、续期回查、JWT 吊销查询、API Key 校验）全部下沉线程池，高并发登录/鉴权不再阻塞事件循环；进程内状态回收（登录失败守卫按空闲 3600s + 4096 软上限清理、快照写节流守卫随实例释放清理、`revoked_tokens` 表按小时裁剪）；`PLATFORM_USERS_ENABLED=false` 时用户表账号续期改为 `401`（与登录路径语义对齐）；`StateStore.get_user()` 派生布尔 `disabled`，与 `list_users()` 结构一致；`GET /execution` 回退快照补齐 `stale_leases` / `lease_ttl_seconds` / `map_affinity_enabled`；WebSocket 广播并发化 + 单条 5s 超时、握手与 60s 心跳复核吊销名单（`4401`）；请求日志 query 中 Token/密钥脱敏为 `***`，详见 [`release.md`](release.md)）。上一版本 `2.9.0` 为**阶段七「代码审查缺陷修复」（Blocker + High）**：多引擎部署按端点隔离 `MapManager` / `carla.Client`（不再把所有 `load_world` 打到 base 引擎，也不跨端点共用非线程安全 Client）、`/auth/refresh` 续期回查用户表（禁用/删除/降级即时生效）、僵尸租约强制回收收紧为仅限 `stale=true` 并联动实例置 `failed` 释放端点占用、引擎重启下沉工作线程（不阻塞事件循环）、装配窗口内销毁实例的取消闸门（杜绝孤儿运行器与僵尸租约），详见 [`release.md`](release.md)）。`2.8.0` 为**阶段六「多用户 / 调度智能化 / 引擎自愈 / 部署体验」（P2）**：平台用户表 + PBKDF2 慢哈希与角色/租户绑定（`/auth/users`、`/auth/password`，审计落到具体人）、地图感知调度（同地图优先复用空闲引擎，多引擎不再被「全局限一地图」误伤）、本地 CARLA 进程自愈看门狗（`CARLA_SUPERVISOR_*`，事件写审计）、部署预检 CLI `huntersim doctor` + `Makefile` + compose 健康依赖条件，并文档明确「单副本 + 重启恢复」为受支持形态，详见 [`release.md`](release.md)）。`2.7.0` 为**阶段五「稳定性与数据链路加固」（P1）**：JWT 吊销/滑动续期、引擎租约心跳与僵尸回收、Kafka 消费自愈与 DLQ、VIL 乱序闸门与自动环深、快照写节流、structlog 统一日志 + request_id 贯穿、端到端集成测试。更早：`2.6.0` 为**阶段四「并发安全与稳定性加固」（P0）**——运行器注册表与装配锁启动期预建、引擎级装配锁、按 IP 限流与登录退避、cloud bag 上传队列有界化、标准化 Prometheus 指标 + Grafana 预置盘；`2.5.0` 为**阶段三「平台化」**（多租户隔离与配额、服务账号 API Key、RBAC 角色层级、场景库版本化、批量任务与审计落库、平台概览）；`2.4.0` 为**阶段二「执行面分离与状态持久化」**（引擎端点库存与独占租约、实例/场景绑定落 SQLite 重启恢复、`GET /execution`）；`2.3.0` 为**阶段一「可用性止血」**（打通 REST 场景闭环、`/auth/token`、生产启动闸门、WebSocket 鉴权、实例归属校验）。功能版本 `2.2.0` 新增 **Windows 桌面仿真客户端**、**Windows 单机全容器编排**与 **HunterCore 数据接入**。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · ROS2 Humble · Kafka 3.6 · FastAPI
 
 ---
@@ -28,6 +28,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的高保真虚拟仿真
 | 审查缺陷修复（V2.9.0） | 多引擎**按端点隔离** `MapManager`/`carla.Client`（Blocker：此前所有端点共用 base 引擎的 Client）；`/auth/refresh` 回查用户表（禁用/删除/降级即时生效，令牌续期不再"一签永续"）；僵尸租约回收**仅限 `stale=true`**并联动实例置 `failed`（活跃租约 409）；引擎重启下沉工作线程（不阻塞事件循环）；装配-销毁竞态取消闸门（无孤儿运行器/僵尸租约） |
 | 审查缺陷修复（V2.10.0） | 认证链路全量线程池化（用户 CRUD / PBKDF2 / 续期回查 / JWT 吊销查询 / API Key 校验），高并发鉴权不阻塞事件循环；进程内状态回收（登录失败守卫 3600s 空闲 + 4096 软上限、快照守卫随实例释放清理、`revoked_tokens` 按小时裁剪）；`PLATFORM_USERS_ENABLED=false` 时用户表账号续期 `401`；`get_user()` 派生 `disabled` 与 `list_users()` 对齐；`GET /execution` 回退快照补齐 3 字段；WS 广播并发 + 5s 单条超时、握手/心跳复核吊销（`4401`）；请求日志 query 敏感值脱敏 `***` |
 | 平台接入重构（V2.11.0） | 发布链路统一为 `carla.{sim_id}.sensor_data`（6 类 type）；消费链路改为 `carla.{sim_id}.vil_state`；`SimDataProducer` 替代旧 `TelemetryProducer`；场景运行器自动发布 sim_status/telemetry/event；评估结果发布 sim_metrics + artifact；bag 上传后自动发布 sensor_file；多实例 sim_id 隔离；新增 POST /instances/batch、POST /instances/{id}/vil/calibrate；8 个新监控指标 |
+| 接入方案审查修复（V2.12.0） | 按《接入方案 V1.0》逐条审查修复：`vil_state` 解析重写对齐 §5.3（数组 twist / `chassis.velocity` / CRC32 `object_id` / `calibration` / `source_seq`+`forwarded_at`）；`sim_status.seq` 改单调递增、跃迁即时 + PAUSED 周期 + 终态幂等补发；`sim_event` 补 `event_id`；`publish_event_to_platform` 由死代码接入事件链；`ExecutionPlane` 释放关闭云端 producer（修连接/内存泄漏）+ `_producer_lock`；`sim_id` 正则校验 + 同车 VIL 互斥 + 实例持久化平台绑定 + 响应回填 3 字段；缓冲溢出/丢弃指标 + errback；`SceneStateManager` 回调自死锁规避；`mypy strict` 0 错误 |
 
 ---
 
@@ -82,7 +83,7 @@ HunterSim/
 │   ├── resource_manager/   # 实例管理、GPU 资源池、健康监控
 │   ├── gui/                 # 桌面仿真客户端（V2.2.0，PySide6 可选依赖，惰性导入）
 │   ├── cli/                 # 运维 CLI（V2.8.0 P2-16）：huntersim doctor 部署预检 / version
-│   └── cloud/               # HunterCore 平台接入（V2.11.0 重构）：SimDataProducer + sim_data_mapper + vil_state_parser + bag_uploader + connector
+│   └── cloud/               # HunterCore 平台接入（V2.11.0 重构，V2.12.0 契约修复）：SimDataProducer + sim_data_mapper + vil_state_parser + bag_uploader + connector
 ├── configs/                 # 预设配置：weather_profiles / sensor_configs / scene_templates / traffic_config
 ├── docker/                  # Dockerfile / Dockerfile.carla / docker-compose / prometheus / alerts / alertmanager / grafana
 ├── k8s/                     # namespace / configmap / secret / deployment（含 CARLA GPU Pod + PVC）/ service
@@ -206,7 +207,7 @@ pip install -e ".[gui]"                 # 安装 PySide6；CARLA 同版本 0.9.1
 hunter-sim-gui                          # 或： python -m hunter_sim.gui.app
 ```
 
-### 4.6 HunterCore 平台接入（V2.2.0 引入，V2.11.0 重构）
+### 4.6 HunterCore 平台接入（V2.2.0 引入，V2.11.0 重构，V2.12.0 契约修复）
 
 将数字孪生车作为“车端”，向 HunterCore（`192.168.31.35`）回传类型化消息与 bag：
 
@@ -223,6 +224,15 @@ V2.11.0 发布链路：
 - `carla.{sim_id}.sensor_data` — 6 类消息（sim_status/sim_telemetry/sim_event/sim_metrics/sensor_file/artifact）
 - `carla.{sim_id}.sensor_data.dlq` — 死信队列
 - `carla.{sim_id}.vil_state` — 接收平台转发的实车状态
+
+V2.12.0 修复要点（按接入方案 V1.0 审查）：
+- `sim_status.seq` 单调递增；状态跃迁即时上报，`PAUSED` 按周期上报，终态幂等补发一次。
+- `sim_event` 携带 `event_id`（平台幂等键）；`sim_status` 携带 `vehicle_id` 与 `events_triggered`。
+- `vil_state` 解析对齐 §5.3 扁平契约（无 `payload` 包裹亦可解析），字符串 `object_id` 以 CRC32 稳定映射为非负 int。
+- 实例 `sim_id` 必须匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`；同一 `vehicle_id` 仅允许一个活动 VIL 会话；`sim_id` 重启后从 SQLite 恢复。
+- 云端 producer 随实例释放关闭（长期运行不再泄漏 Kafka 连接）；缓冲溢出计入 `huntersim_sim_data_dropped_total`。
+
+> 尚未闭环（见 `release.md`「待办 / 待确诊」）：`EvaluationEngine.publish_results()` 无生产调用方，故 `sim_metrics` / `artifact` 当前不会发出；`VILSyncService` 未装配。
 
 未配置凭据（`enabled=false`）时连接器整体降级为 no-op，不影响本地仿真。详见 [`deployment_and_operations.md`](deployment_and_operations.md)。
 
@@ -388,8 +398,8 @@ make doctor        # 部署预检（V2.8.0）
 flake8 src tests   # Lint（配置见 setup.cfg）
 ```
 
-- **测试**：1008+ 项单元 + 集成测试全绿（V2.11.0 新增平台接入测试：`test_sim_data_mapper`、`test_sim_data_producer`、`test_vil_state_parser`、`test_cloud_connector_sim`、`test_vil_data_consumer`、`test_scene_runner_service`）；行覆盖率 **≥80%** 门禁。
-- **类型**：`mypy src`（strict）**113 个源文件无问题**。
+- **测试**：1193 项单元 + 集成测试全绿（V2.12.0 在 V2.11.0 平台接入测试基础上补齐 54 例审查回归：`vil_state` §5.3 契约、`sim_status` 发布链、`sim_id` 校验与持久化、producer 生命周期、缓冲溢出/errback、VIL 消费加固、400/409 状态码语义、VIL 同步循环日志限频）；行覆盖率 **≥80%** 门禁。
+- **类型**：`mypy src/hunter_sim`（strict）**116 个源文件无问题**（V2.12.0 清零 3 处历史 strict 错误）。
 - CARLA / ROS2 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）实现无引擎运行。
 - 代码规范：flake8 + mypy（`setup.cfg` + `pyproject.toml`），命名遵循 PEP8，公共 API 全量类型注解。
 

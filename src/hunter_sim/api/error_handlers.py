@@ -87,7 +87,12 @@ def register_exception_handlers(app: FastAPI) -> None:
         if isinstance(exc, InstanceStateError):
             return _err_response(_ERR_CODES["instance_state"], str(exc), status.HTTP_409_CONFLICT)
         if isinstance(exc, ResourceError):
-            return _err_response(_ERR_CODES["resource"], str(exc), status.HTTP_503_SERVICE_UNAVAILABLE)
+            # 资源耗尽默认 503；入参非法/资源冲突由抛出方指定 400/409
+            return _err_response(
+                _ERR_CODES["resource"],
+                str(exc),
+                exc.http_status or status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         if isinstance(exc, SimTimeoutError):
             return _err_response(_ERR_CODES["timeout"], str(exc), status.HTTP_504_GATEWAY_TIMEOUT)
         if isinstance(exc, SensorSimulationError):

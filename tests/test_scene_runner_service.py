@@ -140,13 +140,89 @@ class TestPublishSimStatus:
             MockScenario.return_value.setup = MagicMock()
             runner.load_scene(config)
 
-        # 手动触发发布
+        # V2.12.0：状态跃迁（created→loading→ready）已即时发布，手动发布再增一条
+        baseline = len(producer.status_calls)
+        assert baseline >= 1
         runner._publish_sim_status()
-        assert len(producer.status_calls) == 1
-        msg = producer.status_calls[0]
+        assert len(producer.status_calls) == baseline + 1
+        msg = producer.status_calls[-1]
         assert msg["type"] == "sim_status"
         assert msg["sim_id"] == "sim-runner-test"
         assert "payload" in msg
+
+    def test_state_transition_publishes_immediately(self) -> None:
+        """状态跃迁必须即时上报（不等 1Hz 周期）。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        config = _minimal_config()
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch.object(runner, "_cleanup"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(config)
+        statuses = [m["payload"]["status"] for m in producer.status_calls]
+        assert "LOADING" in statuses
+        assert "READY" in statuses
+
+    def test_status_seqs_are_monotonic(self) -> None:
+        """seq 必须来自 SimDataProducer 且单调递增（否则平台去重会丢掉全部状态）。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        config = _minimal_config()
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch.object(runner, "_cleanup"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(config)
+        runner._publish_sim_status()
+        seqs = [m["seq"] for m in producer.status_calls]
+        assert seqs == sorted(seqs)
+        assert len(set(seqs)) == len(seqs)
+        assert seqs[0] >= 1
+
+    def test_status_carries_vehicle_id_and_events_triggered(self) -> None:
+        """方案 §5.4：VIL 模式 sim_status 必须携带 vehicle_id 与 events_triggered。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        config = _minimal_config()
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch.object(runner, "_cleanup"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(config)
+        msg = producer.status_calls[-1]
+        assert msg["vehicle_id"] == "veh-test"
+        assert msg["payload"]["events_triggered"] == 0
+
+    def test_terminal_status_published_once(self) -> None:
+        """终态必须补发且只补发一次（stop 与循环退出都可能到达终态）。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        config = _minimal_config()
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch.object(runner, "_cleanup"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(config)
+
+        runner._state_mgr.transition_to(SceneStatus.RUNNING)
+        runner._state_mgr.transition_to(SceneStatus.COMPLETED)
+        baseline = len(producer.status_calls)
+        assert producer.status_calls[-1]["payload"]["status"] == "COMPLETED"
+        runner._publish_terminal_status()
+        assert len(producer.status_calls) == baseline
+
+    def test_event_published_to_platform(self) -> None:
+        """事件回调必须并联发到平台 simple_event（V2.12.0 接线）。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        event = DetectedEvent(
+            event_id="e2", event_type="collision", time_stamp=2.0,
+            description="bump", event_level="critical", sim_time=2.0,
+        )
+        runner._handle_event(event)
+        assert len(producer.event_calls) == 1
+        assert producer.event_calls[0]["event_type"] == "collision"
 
     def test_status_payload_has_correct_fields(self) -> None:
         producer = _FakeProducer()
@@ -159,7 +235,7 @@ class TestPublishSimStatus:
             runner.load_scene(config)
 
         runner._publish_sim_status()
-        payload = producer.status_calls[0]["payload"]
+        payload = producer.status_calls[-1]["payload"]
         # SimStatusPayload 字段应序列化到 dict
         assert "status" in payload
         assert "progress_percent" in payload

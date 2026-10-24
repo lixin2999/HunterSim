@@ -14,6 +14,9 @@ import json
 import time
 from typing import Any
 
+import pytest
+
+from hunter_sim.common.metrics import VIL_MESSAGE_DROPPED_TOTAL
 from hunter_sim.common.models import KafkaSettings, VILSettings
 from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer
 from hunter_sim.vil_mapper.vil_data_consumer import VILDataConsumer
@@ -248,3 +251,77 @@ class TestPrimaryTopicResolution:
         )
         # 无 sim_id → 保留原始模板
         assert "{sim_id}" in consumer._get_primary_telemetry_topic()
+
+
+# ── 测试：V2.12.0 审查加固 ──────────────────────────────────────────────────────
+
+
+class TestV212Hardening:
+    def test_command_result_does_not_repush_frame(self) -> None:
+        """命令回读只就地补充最新帧，不得重复计入接收统计。"""
+        consumer = _make_consumer()
+        consumer._handle_message("carla.sim-test-001.vil_state", _vil_state_msg(seq=1))
+        assert consumer._buffer.total_received == 1
+
+        cmd = json.dumps({"throttle": 0.4, "steer": 0.1, "brake": 0.0}).encode()
+        consumer._handle_message("hunter.veh-1.command_result", cmd)
+
+        assert consumer._buffer.total_received == 1
+        latest = consumer._buffer.get_latest()
+        assert latest is not None
+        assert latest.control_cmd is not None
+        assert latest.control_cmd["throttle"] == pytest.approx(0.4)
+
+    def test_command_result_without_frame_is_noop(self) -> None:
+        consumer = _make_consumer()
+        consumer._handle_message("hunter.veh-1.command_result", b'{"throttle": 0.2}')
+        assert consumer._buffer.total_received == 0
+        assert consumer._buffer.get_latest() is None
+
+    def test_command_result_invalid_value_ignored(self) -> None:
+        """非法控制值只告警，不得打断消费、不得污染帧。"""
+        consumer = _make_consumer()
+        consumer._handle_message("carla.sim-test-001.vil_state", _vil_state_msg(seq=1))
+        consumer._handle_message(
+            "hunter.veh-1.command_result", b'{"throttle": "not-a-number"}'
+        )
+        latest = consumer._buffer.get_latest()
+        assert latest is not None
+        assert latest.control_cmd is None
+        assert consumer.stats["errors"] == 0
+
+    def test_unknown_placeholder_skipped(self) -> None:
+        """command_topic 含未知占位符时跳过，而非抛 KeyError 中断订阅。"""
+        consumer = _make_consumer(command_topic="hunter.{unknown_field}.cmd")
+        assert consumer._render_template("hunter.{unknown_field}.cmd", "command_topic") == []
+        topics = consumer._build_topic_list()
+        assert not any("{unknown_field}" in t for t in topics)
+        assert "carla.sim-test-001.vil_state" in topics
+
+    def test_empty_sim_id_does_not_subscribe_template(self) -> None:
+        """sim_id 为空时不订阅字面量模板（否则永远收不到数据）。"""
+        settings = KafkaSettings(
+            bootstrap_servers="localhost:9092",
+            telemetry_topic="carla.{sim_id}.vil_state",
+            sim_id="",
+        )
+        consumer = VILDataConsumer(
+            settings=settings,
+            vil_settings=VILSettings(),
+            vehicle_id="v1",
+            buffer=TelemetryBuffer(),
+            sim_id="",
+        )
+        topics = consumer._build_topic_list()
+        assert not any("{sim_id}" in t for t in topics)
+        assert topics == ["hunter.v1.command_result"]
+
+    def test_sim_id_mismatch_counts_dropped_metric(self) -> None:
+        consumer = _make_consumer(sim_id="sim-metric")
+        before = VIL_MESSAGE_DROPPED_TOTAL.labels(reason="sim_id_mismatch")._value.get()
+        consumer._handle_message(
+            "carla.sim-metric.vil_state", _vil_state_msg(sim_id="sim-other")
+        )
+        after = VIL_MESSAGE_DROPPED_TOTAL.labels(reason="sim_id_mismatch")._value.get()
+        assert after - before == 1
+        assert consumer._buffer.get_latest() is None

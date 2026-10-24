@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Generator
 
 import pytest
@@ -26,9 +27,13 @@ def _cleanup_instances(client: TestClient) -> Generator[None, None, None]:
 
 
 def _create(client: TestClient, auth_headers: dict, mode: str = "sil") -> str:
+    body: dict = {"mode": mode, "map_id": "Town05", "quality": "medium"}
+    # 方案 §6.4：VIL 模式必须携带 vehicle_id
+    if mode == "vil":
+        body["vehicle_id"] = f"HUNTER-{uuid.uuid4().hex[:6]}"
     resp = client.post(
         "/api/v1/sim/instances",
-        json={"mode": mode, "map_id": "Town05", "quality": "medium"},
+        json=body,
         headers=auth_headers,
     )
     assert resp.status_code == 201
@@ -371,3 +376,48 @@ class TestSecurityInterfaces:
         )
         assert resp.status_code == 422
         assert "whitelist" in resp.text
+
+
+class TestV212ValidationStatusCodes:
+    """V2.12.0：入参非法返回 400、资源冲突返回 409，不再一律 503。"""
+
+    def test_vil_without_vehicle_id_is_400(
+        self, client: TestClient, auth_headers: dict
+    ) -> None:
+        resp = client.post(
+            "/api/v1/sim/instances",
+            json={"mode": "vil", "map_id": "Town05", "quality": "medium"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "vehicle_id" in resp.text
+
+    def test_invalid_sim_id_is_400(self, client: TestClient, auth_headers: dict) -> None:
+        resp = client.post(
+            "/api/v1/sim/instances",
+            json={
+                "mode": "sil",
+                "map_id": "Town05",
+                "quality": "medium",
+                "sim_id": "bad id.topic",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "sim_id" in resp.text
+
+    def test_duplicate_sim_id_is_409(
+        self, client: TestClient, auth_headers: dict
+    ) -> None:
+        body = {
+            "mode": "sil",
+            "map_id": "Town05",
+            "quality": "medium",
+            "sim_id": "sim-v212-dup",
+        }
+        assert client.post(
+            "/api/v1/sim/instances", json=body, headers=auth_headers
+        ).status_code == 201
+        resp = client.post("/api/v1/sim/instances", json=body, headers=auth_headers)
+        assert resp.status_code == 409
+        assert "already exists" in resp.text
