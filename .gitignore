@@ -87,8 +87,7 @@ Desktop.ini
 # Jupyter
 .ipynb_checkpoints/
 
-# release.md、user_manual.md、deployment_and_operations.md保持同步更新但不追踪管理
-release.md
+# user_manual.md、deployment_and_operations.md保持同步更新但不追踪管理
 user_manual.md
 deployment_and_operations.md
 
