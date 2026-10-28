@@ -141,6 +141,14 @@ class TestVilStateParsing:
         consumer._handle_message(topic, _vil_state_msg(seq=5))  # 重复
         assert consumer._buffer.total_received == 1
 
+    def test_reset_ordering_guard_accepts_new_session_seq(self) -> None:
+        consumer = _make_consumer(vil=VILSettings(ordering_guard_enabled=True))
+        topic = "carla.sim-test-001.vil_state"
+        consumer._handle_message(topic, _vil_state_msg(seq=5))
+        consumer.reset_ordering_guard()
+        consumer._handle_message(topic, _vil_state_msg(seq=1))  # 新会话从头计数
+        assert consumer._buffer.total_received == 2
+
     def test_perception_objects_parsed(self) -> None:
         consumer = _make_consumer()
         topic = "carla.sim-test-001.vil_state"

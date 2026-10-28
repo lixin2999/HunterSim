@@ -12,10 +12,10 @@ SceneRunnerService 管理场景完整生命周期：
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
-from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.exceptions import (
@@ -67,6 +67,9 @@ class SceneRunnerService:
         scene_id: str = "",
         status_interval_s: float = 1.0,
         telemetry_interval_s: float = 0.1,
+        pose_driver: Optional[Callable[[float], None]] = None,
+        sample_sink: Optional[Callable[[dict[str, Any], float], None]] = None,
+        status_provider: Optional[Callable[[], Optional[tuple[str, Optional[str]]]]] = None,
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -75,6 +78,10 @@ class SceneRunnerService:
         self._sim_id = sim_id
         self._vehicle_id = vehicle_id
         self._scene_id = scene_id
+        # VIL 扩展点：每 tick 前驱动自车位姿；每 tick 后采样；状态覆盖（数据中断→PAUSED）
+        self._pose_driver = pose_driver
+        self._sample_sink = sample_sink
+        self._status_provider = status_provider
 
         # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
         self._weather_manager = WeatherManager(world)
@@ -100,6 +107,25 @@ class SceneRunnerService:
     def weather_manager(self) -> WeatherManager:
         """天气管理器（供 API 层天气控制与渐变过渡）。"""
         return self._weather_manager
+
+    @property
+    def world(self) -> Any:
+        """底层 CARLA World（VIL 运行时绑定用）。"""
+        return self._world
+
+    @property
+    def ego_vehicle(self) -> Any:
+        """当前场景自车 Actor（未就绪时返回 None）。"""
+        scenario = self._scenario
+        if scenario is None:
+            return None
+        getter = getattr(scenario, "ego_actor", None)
+        if getter is not None:
+            return getter
+        getter = getattr(scenario, "get_ego_vehicle", None)
+        if callable(getter):
+            return getter()
+        return getattr(scenario, "_ego_vehicle", None)
 
     @property
     def current_scene_id(self) -> Optional[str]:
@@ -330,11 +356,22 @@ class SceneRunnerService:
 
                     self._scenario.tick(self._world, timestamp, delta_seconds)
 
+                # VIL：在唯一一次 world.tick() 之前应用实车位姿（禁止并行 tick 循环）
+                if self._pose_driver is not None:
+                    self._pose_driver(delta_seconds)
+
                 # 推进仿真
                 self._world.tick()
                 # 推进天气渐变过渡（文档 §3.4.1：每 tick 推进一步）
                 self._weather_manager.update_transition()
                 tick_count += 1
+
+                # 评估/回传采样钩子（VIL 轨迹、指标计算用）
+                if self._sample_sink is not None:
+                    try:
+                        self._sample_sink(self._get_ego_state(), tick_count * delta_seconds)
+                    except Exception as exc:  # noqa: BLE001  采样失败不阻断仿真
+                        logger.debug(f"sample_sink failed: {exc}")
 
                 # V2.10.0：平台发布链路（sim_telemetry 10Hz + sim_status 1Hz）
                 if self._sim_data_producer is not None:
@@ -464,8 +501,14 @@ class SceneRunnerService:
             snap = snapshot if snapshot is not None else self.get_state_snapshot()
             if snap is None:
                 return
+            status_value = snap.status.value.upper()
+            message = snap.error_message or None
+            if self._status_provider is not None:
+                override = self._status_provider()
+                if override is not None:
+                    status_value, message = override[0], override[1]
             payload = SimStatusPayload(
-                status=snap.status.value.upper(),
+                status=status_value,
                 progress_percent=round(snap.progress * 100.0, 2),
                 elapsed_time=round(snap.elapsed_seconds, 3),
                 total_time=self._config.duration_seconds if self._config else 60.0,
@@ -474,8 +517,8 @@ class SceneRunnerService:
                 lane_invasions=self._get_lane_invasion_count(),
                 ego_state=self._get_ego_state(),
                 events_triggered=self._get_event_count(),
-                message=snap.error_message or None,
-                updated_at=datetime.now(timezone.utc).isoformat(),
+                message=message,
+                updated_at=time.time(),
             )
             msg = build_sim_status(
                 sim_id=self._sim_id,
@@ -500,6 +543,8 @@ class SceneRunnerService:
             from hunter_sim.cloud.sim_data_mapper import build_sim_telemetry  # noqa: PLC0415
 
             ego = self._get_ego_state()
+            speed = float(ego.get("velocity", 0.0))
+            yaw = float(ego.get("yaw", 0.0))
             seq = self._sim_data_producer.next_seq()
             msg = build_sim_telemetry(
                 sim_id=self._sim_id,
@@ -510,25 +555,24 @@ class SceneRunnerService:
                 pose={
                     "x": ego.get("x", 0.0),
                     "y": ego.get("y", 0.0),
-                    "z": 0.0,
-                    "roll": 0.0,
-                    "pitch": 0.0,
-                    "heading": ego.get("heading", 0.0),
+                    "z": ego.get("z", 0.0),
+                    "roll": ego.get("roll", 0.0),
+                    "pitch": ego.get("pitch", 0.0),
+                    # 契约字段名为 yaw；heading 作为兼容别名保留
+                    "yaw": yaw,
+                    "heading": yaw,
                 },
                 twist={
-                    "vx": ego.get("velocity", 0.0),
-                    "vy": 0.0,
+                    "vx": speed * math.cos(yaw),
+                    "vy": speed * math.sin(yaw),
                     "vz": 0.0,
                     "wx": 0.0,
                     "wy": 0.0,
                     "wz": 0.0,
                 },
-                velocity={
-                    "m_s": ego.get("velocity", 0.0),
-                    "km_h": round(ego.get("velocity", 0.0) * 3.6, 3),
-                },
+                velocity=speed,
                 steering=ego.get("steering", 0.0),
-                acceleration={"ax": 0.0, "ay": 0.0, "az": 0.0},
+                acceleration=float(ego.get("acceleration", 0.0)),
             )
             self._sim_data_producer.publish_telemetry(msg)
         except Exception as exc:  # noqa: BLE001
@@ -585,6 +629,10 @@ class SceneRunnerService:
             return 0
         return len(self._event_detector.detected_events)
 
+    def get_ego_state(self) -> dict[str, Any]:
+        """获取自车状态字典（平台适配器/进度视图使用）。"""
+        return self._get_ego_state()
+
     def _get_ego_state(self) -> dict[str, Any]:
         """获取自车状态字典。
 
@@ -592,7 +640,14 @@ class SceneRunnerService:
         失败时返回零值字典。
         """
         default: dict[str, Any] = {
-            "x": 0.0, "y": 0.0, "heading": 0.0, "velocity": 0.0, "steering": 0.0
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "heading": 0.0,
+            "yaw": 0.0,
+            "velocity": 0.0,
+            "steering": 0.0,
+            "acceleration": 0.0,
         }
         try:
             vehicle = None
@@ -607,15 +662,27 @@ class SceneRunnerService:
             loc = vehicle.get_location()
             rot = vehicle.get_rotation()
             vel = vehicle.get_velocity()
-            import math  # noqa: PLC0415
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             ctrl = vehicle.get_control()
+            yaw = round(math.radians(rot.yaw), 6)
             return {
                 "x": round(loc.x, 4),
                 "y": round(loc.y, 4),
-                "heading": round(math.radians(rot.yaw), 6),
+                "z": round(loc.z, 4),
+                "heading": yaw,
+                "yaw": yaw,
                 "velocity": round(speed, 4),
-                "steering": round(float(ctrl.steer), 6),
+                "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
+                "acceleration": round(self._acceleration_magnitude(vehicle), 4),
             }
         except Exception:  # noqa: BLE001
             return default
+
+    @staticmethod
+    def _acceleration_magnitude(vehicle: Any) -> float:
+        """读取加速度向量模长（不支持时回退 0）。"""
+        try:
+            accel = vehicle.get_acceleration()
+            return float(math.sqrt(accel.x ** 2 + accel.y ** 2 + accel.z ** 2))
+        except Exception:  # noqa: BLE001
+            return 0.0

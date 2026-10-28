@@ -434,6 +434,28 @@ def _cmd_version(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_carla_manager(args: argparse.Namespace) -> int:
+    """``huntersim carla-manager`` 子命令：启动平台控制平面（默认 8090）。"""
+    from hunter_sim.platform_adapter.app import create_app
+    from hunter_sim.platform_adapter.config import AdapterSettings
+
+    overrides: dict[str, Any] = {}
+    if args.host:
+        overrides["host"] = args.host
+    if args.port:
+        overrides["port"] = args.port
+    if args.db_path:
+        overrides["db_path"] = args.db_path
+    adapter = AdapterSettings(**overrides)
+
+    import uvicorn  # noqa: PLC0415  仅 carla-manager 需要（doctor 不拉 Web 依赖）
+
+    app = create_app(adapter_settings=adapter)
+    print(f"CARLA manager listening on http://{adapter.host}:{adapter.port}")
+    uvicorn.run(app, host=adapter.host, port=adapter.port, log_level=args.log_level)
+    return EXIT_OK
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """``huntersim doctor`` 子命令。"""
     settings, error = _load_settings()
@@ -485,6 +507,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--path", default=".", help="磁盘与状态库检查的基准路径（默认当前目录）"
     )
     doctor.set_defaults(handler=_cmd_doctor)
+
+    manager = subparsers.add_parser(
+        "carla-manager",
+        help="启动 CARLA 管理面控制平面（HunterCore ↔ HunterSim，默认 8090）",
+        description=(
+            "启动平台控制平面：创建/下发/查询/控制仿真实例。单世界串行执行；"
+            "地图加载在后台完成，create/submit 立即返回。仅监听内网，不加鉴权头。"
+        ),
+    )
+    manager.add_argument("--host", default="", help="监听地址（默认取 ADAPTER_HOST）")
+    manager.add_argument("--port", type=int, default=0, help="监听端口（默认取 ADAPTER_PORT=8090）")
+    manager.add_argument("--db-path", default="", help="实例注册表路径（默认取 ADAPTER_DB_PATH）")
+    manager.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="uvicorn 日志级别",
+    )
+    manager.set_defaults(handler=_cmd_carla_manager)
 
     version_parser = subparsers.add_parser("version", help="打印包版本")
     version_parser.set_defaults(handler=_cmd_version)

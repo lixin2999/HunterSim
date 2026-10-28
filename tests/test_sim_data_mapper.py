@@ -94,22 +94,22 @@ class TestBuildSimTelemetry:
             ts=1724035200.123,
             pose={"x": 10.0, "y": 20.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "heading": 1.57},
             twist={"vx": 5.0, "vy": 0.0, "vz": 0.0, "wx": 0.0, "wy": 0.0, "wz": 0.1},
-            velocity={"m_s": 5.0, "km_h": 18.0},
+            velocity=5.0,
             steering=0.05,
-            acceleration={"ax": 0.5, "ay": 0.0, "az": -9.8},
+            acceleration=0.5,
         )
         _assert_envelope(msg, "sim_telemetry")
         assert msg["vehicle_id"] == "HUNTER-001"
         p = msg["payload"]
         assert p["pose"]["x"] == pytest.approx(10.0)
         assert p["twist"]["vx"] == pytest.approx(5.0)
-        assert p["velocity"]["km_h"] == pytest.approx(18.0)
+        assert p["velocity"] == pytest.approx(5.0)
         assert p["steering"] == pytest.approx(0.05, abs=1e-6)
-        assert p["acceleration"]["az"] == pytest.approx(-9.8)
+        assert p["acceleration"] == pytest.approx(0.5)
 
     def test_sil_mode_vehicle_id_none(self) -> None:
         msg = build_sim_telemetry("sim-test-001", None, "", 0, time.time(),
-                                  {}, {}, {}, 0.0, {})
+                                  {}, {}, 0.0, 0.0, 0.0)
         assert msg["vehicle_id"] is None
 
 
@@ -239,16 +239,15 @@ class TestSimStatusPayload:
             total_time=60.0, actors_count=3, collisions=0, lane_invasions=0,
             ego_state={},
         )
-        assert p.updated_at != ""
-        assert "T" in p.updated_at  # ISO8601 格式
+        assert p.updated_at > 0.0  # Unix epoch 秒（契约 number）
 
     def test_updated_at_explicit(self) -> None:
         p = SimStatusPayload(
             status="COMPLETED", progress_percent=100.0, elapsed_time=60.0,
             total_time=60.0, actors_count=0, collisions=0, lane_invasions=0,
-            ego_state={}, updated_at="2026-10-23T00:00:00+00:00",
+            ego_state={}, updated_at=1729555200.0,
         )
-        assert p.updated_at == "2026-10-23T00:00:00+00:00"
+        assert p.updated_at == 1729555200.0
 
 
 # ─── V2.12.0：对照方案 §5.4 / §7.3.1 的契约回归 ────────────────────────────
@@ -286,7 +285,7 @@ class TestV212Contract:
 
     def test_telemetry_uses_steering_angle(self) -> None:
         msg = build_sim_telemetry(
-            "sim-1", None, "scene-1", 1, 100.0, {}, {}, {}, 0.25, {}
+            "sim-1", None, "scene-1", 1, 100.0, {}, {}, 0.0, 0.25, 0.0
         )
         assert msg["payload"]["steering_angle"] == pytest.approx(0.25, abs=1e-6)
         # 兼容别名仍保留

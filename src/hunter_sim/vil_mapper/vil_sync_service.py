@@ -22,6 +22,9 @@ from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer, TelemetryFra
 
 logger = get_logger(__name__)
 
+# 断流减速斜率（m/s²）：3.0 接近常规舒适制动，避免瞬时停车
+_DECELERATION_MS2 = 3.0
+
 
 class VehicleActorProtocol(Protocol):
     """CARLA Vehicle Actor 协议（供类型检查）。"""
@@ -31,6 +34,10 @@ class VehicleActorProtocol(Protocol):
     def set_velocity(self, vector: Any) -> None: ...
 
     def set_angular_velocity(self, vector: Any) -> None: ...
+
+    def get_velocity(self) -> Any: ...
+
+    def get_transform(self) -> Any: ...
 
 
 class WorldProtocol(Protocol):
@@ -111,6 +118,8 @@ class VILSyncService:
         self._latency_samples: list[float] = []
         # 断流告警限频：50Hz tick 下逐帧 warn 会刷屏（每 5s 最多一条）
         self._last_timeout_log: float = 0.0
+        # 断流减速步长计算（外部 tick 调用 apply_once 时使用）
+        self._last_step_time: float = 0.0
         logger.info("VILSyncService initialized")
 
     @property
@@ -192,21 +201,38 @@ class VILSyncService:
         logger.info("VIL sync loop stop requested")
 
     def _do_sync_cycle(self) -> None:
-        """执行一次完整的同步循环步骤。"""
-        # 1. 健康检查
-        report = self._health.check()
-        if report.status == DataHealthStatus.INTERRUPTED:
+        """执行一次完整的同步循环步骤（兼容旧入口，中断时抛 SimTimeoutError）。"""
+        outcome = self.apply_once()
+        if outcome == "interrupted":
             raise SimTimeoutError(
                 "vil_data_wait",
                 self._settings.max_data_latency_ms / 1000.0,
                 module="vil_mapper",
             )
 
+    def apply_once(self) -> str:
+        """在外部 tick 循环中应用一次实车位姿（**不**调用 ``world.tick()``）。
+
+        适配器把本方法挂到 ``SceneRunnerService`` 的每 tick 钩子上，避免出现
+        第二个 ``world.tick()`` 导致帧同步错乱。
+
+        数据中断（超过 ``max_data_latency_ms``）或尚无首帧时执行减速/停车，
+        不保持最后一帧位姿（方案要求"减速/停车"而非"冻结"）。
+
+        Returns:
+            ``"applied"`` / ``"no_data"`` / ``"interrupted"``。
+        """
+        # 1. 健康检查
+        report = self._health.check()
+        if report.status == DataHealthStatus.INTERRUPTED:
+            self._decelerate()
+            return "interrupted"
+
         # 2. 获取最新帧
         frame: Optional[TelemetryFrame] = self._buffer.get_latest()
         if frame is None:
-            logger.debug("No telemetry frame available, skipping sync")
-            return
+            self._decelerate()
+            return "no_data"
 
         t_start = time.perf_counter()
 
@@ -244,6 +270,42 @@ class VILSyncService:
             self._latency_samples.append(latency_ms)
             if len(self._latency_samples) > 100:
                 self._latency_samples.pop(0)
+        return "applied"
+
+    def _decelerate(self) -> None:
+        """断流时按固定减速度逐步减速至停车（不保持最后位姿）。"""
+        try:
+            velocity = self._vehicle.get_velocity()
+            transform = self._vehicle.get_transform()
+        except Exception:  # noqa: BLE001  桩/受限 Actor 不支持读取时跳过
+            return
+        try:
+            speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+        except Exception:  # noqa: BLE001
+            return
+        now = time.perf_counter()
+        dt = min(0.5, max(0.0, now - self._last_step_time)) if self._last_step_time else 0.02
+        self._last_step_time = now
+        new_speed = max(0.0, speed - _DECELERATION_MS2 * dt)
+        if speed <= 0.05:
+            new_speed = 0.0
+        try:
+            yaw = math.radians(getattr(getattr(transform, "rotation", None), "yaw", 0.0))
+        except Exception:  # noqa: BLE001
+            yaw = 0.0
+        try:
+            import carla  # noqa: PLC0415  无 SDK 时保持静默降级
+
+            self._vehicle.set_velocity(
+                carla.Vector3D(
+                    x=new_speed * math.cos(yaw),
+                    y=new_speed * math.sin(yaw),
+                    z=0.0,
+                )
+            )
+            self._vehicle.set_angular_velocity(carla.Vector3D(x=0.0, y=0.0, z=0.0))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"decelerate skipped: {exc}")
 
     def _apply_carla_transform(self, transform: Transform) -> None:
         """将 Transform 应用到 CARLA Vehicle Actor。

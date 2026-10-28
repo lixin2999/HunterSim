@@ -469,6 +469,12 @@ class VILDataConsumer:
             logger.debug(f"Dropped {reason} telemetry message (seq={seq_val}, ts={ts_val})")
         return accepted
 
+    def reset_ordering_guard(self) -> None:
+        """清空乱序/去重闸门状态（会话或场景切换后 seq/timestamp 可能重新计数）。"""
+        with self._lock:
+            self._last_seq = None
+            self._last_timestamp = None
+
     def _parse_telemetry(self, payload: dict[str, Any]) -> TelemetryFrame:
         """解析 telemetry_clean 格式消息。"""
         ts: float = float(payload.get("timestamp", time.time()))

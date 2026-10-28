@@ -25,9 +25,9 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 
@@ -52,7 +52,7 @@ class SimStatusPayload:
         ego_state: 自车状态字典 {x, y, heading, velocity, steering}。
         events_triggered: 已触发事件总数（方案 §5.4 sim_status 字段）。
         message: 可选错误/提示信息。
-        updated_at: ISO8601 UTC 时间戳。
+        updated_at: Unix epoch 秒（契约要求 number）。
     """
 
     status: str
@@ -65,11 +65,11 @@ class SimStatusPayload:
     ego_state: dict[str, Any]
     events_triggered: int = 0
     message: Optional[str] = None
-    updated_at: str = ""
+    updated_at: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.updated_at:
-            self.updated_at = datetime.now(timezone.utc).isoformat()
+            self.updated_at = time.time()
 
 
 # ─── 信封辅助 ──────────────────────────────────────────────────────────────────
@@ -147,9 +147,10 @@ def build_sim_telemetry(
     ts: float,
     pose: dict[str, Any],
     twist: dict[str, Any],
-    velocity: dict[str, Any],
+    velocity: float,
     steering: float,
-    acceleration: dict[str, Any],
+    acceleration: float,
+    sim_time: Optional[float] = None,
 ) -> dict[str, Any]:
     """构建 sim_telemetry 消息（方案 §5.4）。
 
@@ -159,11 +160,12 @@ def build_sim_telemetry(
         scene_id: 当前场景 ID。
         seq: 单调递增序号。
         ts: Unix 时间戳（秒）。
-        pose: 位姿 {x, y, z, roll, pitch, heading}。
-        twist: 速度 {vx, vy, vz, wx, wy, wz}。
-        velocity: 速度标量 {m_s, km_h}。
+        pose: 位姿 {x, y, z, roll, pitch, yaw}。
+        twist: 速度向量 {vx, vy, vz, wx, wy, wz}。
+        velocity: 速度标量（m/s，契约要求 number）。
         steering: 方向盘角度（弧度）。
-        acceleration: 加速度 {ax, ay, az}。
+        acceleration: 加速度标量（m/s²，契约要求 number）。
+        sim_time: 仿真时间轴时刻（秒，可选）。
 
     Returns:
         符合方案 §5.4 sim_telemetry 格式的 dict 消息。
@@ -171,12 +173,14 @@ def build_sim_telemetry(
     payload: dict[str, Any] = {
         "pose": pose,
         "twist": twist,
-        "velocity": velocity,
+        "velocity": round(float(velocity), 6),
         # 方案 §5.4 规范字段名；steering 保留为向后兼容别名
         "steering_angle": round(steering, 6),
         "steering": round(steering, 6),
-        "acceleration": acceleration,
+        "acceleration": round(float(acceleration), 6),
     }
+    if sim_time is not None:
+        payload["sim_time"] = max(0.0, float(sim_time))
     return _envelope(
         sim_id=sim_id,
         vehicle_id=vehicle_id,

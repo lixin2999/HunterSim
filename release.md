@@ -1246,3 +1246,146 @@ Windows 实机使用桌面客户端（HUNTER SE — CARLA 仿真客户端）：�
 - `sensor_file` 的 `start_time`/`end_time`/`frame_count` 仍传 0（沿用 V2.11.0 待办）。
 
 ---
+
+## V2.13.0 — HunterCore CARLA 管理面闭环（2026-10-28）
+
+### 概述
+
+新增独立包 `hunter_sim.platform_adapter`，以 `huntersim carla-manager` 进程提供 **CARLA 管理面控制平面**（默认 `127.0.0.1:8090`，仅内网、无鉴权头、不暴露 Ingress/NodePort）。HunterCore `scene-service` 通过 `CARLA_MANAGEMENT_ENDPOINT` 调用 8 个端点，完成实例创建、场景下发、进度/结果轮询与暂停/恢复/停止全链路。
+
+适配器复用既有执行面（`ExecutionPlane` / `SceneRunnerService`）、数据面（`SimDataProducer` / `sim_data_mapper` / `VILDataConsumer` / `VILSyncService`）与评估/产物能力，不复制场景执行逻辑。V2.12.0 遗留的 `sim_metrics`/`artifact` 发布、`VILSyncService` 装配、VIL 断流 `PAUSED` 三项已在管理面链路闭环，并修正 `sim_telemetry` 的 `pose.yaw`、数值型 `velocity`/`acceleration` 等契约偏差。
+
+### 核心变更
+
+| 类别 | 模块 | 内容 |
+|------|------|------|
+| 控制平面 | `platform_adapter/app.py` | 新增 8 个平台端点与 `GET /health`；生命周期内完成注册表连接、重启恢复、执行器启停；实例视图同时返回 `sim_instance_id`/`instance_id`/`id`，状态使用平台词汇并附 `carla_status` |
+| 串行调度 | `platform_adapter/executor.py` | 单 CARLA 世界串行队列：同一时刻只运行一个场景；`create`/`submit` 立即返回，地图加载（10~30s）在后台完成；相邻 revision 合并，只执行最新场景 |
+| 幂等与合并 | `platform_adapter/service.py` | `sim_id` 命中非终态实例直接返回；同 `scene_id` 已有活动实例返回已有实例；`create` 后紧随的 `submit` 若配置等价（忽略 `quality`）不重启世界，配置真正变化才提高 revision 并重跑 |
+| 重启恢复 | `platform_adapter/store.py` | 独立 SQLite 注册表（实例/场景/sim_id/进度/结果/看门狗截止时间），启动时把所有非终态实例标记为 `failed(message=adapter restarted)`，避免平台永久轮询 |
+| 看门狗 | `platform_adapter/executor.py` | 超时阈值 `duration × 3 + 120s`（`ADAPTER_WATCHDOG_FACTOR` / `ADAPTER_WATCHDOG_GRACE_SECONDS`），超时停止运行器并置 `failed(message=watchdog_timeout)`；运行期间 0.5s 级落库进度 |
+| 场景映射 | `platform_adapter/scene_mapper.py` | 只读平台已合并的 `scene_config`，**不重复应用 `param_overrides`、不改 `map`**；不支持的参与者行为/仿真模式显式失败（`unsupported_behavior:<value>` / `unsupported_mode:<mode>`），不做静默降级；`replay` 明确不支持 |
+| VIL 数据面 | `platform_adapter/vil.py`、`vil_mapper/vil_sync_service.py` | VIL 运行时消费 `carla.{sim_id}.vil_state`（默认消费组 `carla-vil`），latest-wins + odom→map 标定 + `extrapolation_ms` 外推；`apply_once()` 挂到场景唯一 tick，禁止第二个 `world.tick()`；断流按 3.0 m/s² 减速至停车并上报 `PAUSED(message=vil_data_interrupted)`；会话/场景切换清空帧缓存与乱序闸门 |
+| 回传面 | `platform_adapter/executor.py`、`platform_adapter/artifacts.py` | 场景结束后用 `EvaluationEngine` 生成评估结果，发布 `sim_metrics` 与 `artifact`；产物 `eval.json`/`events.jsonl`/`run.log` 先落本地，再尽力预签名上传 `hunter-scene-assets`，失败不阻断结果；`object_key` 形如 `scenarios/simulations/{sim_id}/{scene_id}/{name}` |
+| 遥测契约 | `cloud/sim_data_mapper.py`、`scene_runner/scene_runner_service.py` | `sim_telemetry.pose` 统一提供 `yaw`（保留 `heading` 别名）与真实 `z`（`roll`/`pitch` 字段保留、缺省 0）；`velocity`/`acceleration` 改为契约要求的 number；`twist.vx/vy` 由速度与航向分解；`twist` 保留向量语义；支持可选 `sim_time`；`sim_status.updated_at` 改为 Unix epoch 秒（平台对外视图仍为 ISO8601 UTC） |
+| 运行器扩展点 | `execution/plane.py`、`scene_runner/scene_runner_service.py` | 新增 `runner_hooks`（`pose_driver` / `sample_sink` / `status_provider`）与 `producer_for_sim_id()` / `producer_for_instance()`；`SceneRunnerService` 暴露 `world`/`ego_vehicle`/`get_ego_state()`，供 VIL 绑定与进度视图读取 |
+| CLI | `cli/main.py` | 新增 `huntersim carla-manager`，支持 `--host` / `--port` / `--db-path` / `--log-level`，默认取 `ADAPTER_*` 环境变量 |
+
+### 控制平面端点（默认 8090，仅内网）
+
+| 方法与路径 | 语义 |
+|------------|------|
+| `POST /api/v1/instances` | 创建实例并立即入队；请求含 `scene_id`/`scene_name`/`scene_config`/`sim_id`/`mode`/`vehicle_id`/`vil`/`quality`；响应回显平台 `sim_id` 与三种实例 ID 键名 |
+| `GET /api/v1/instances?scene_id=` | 按场景查询进行中/历史实例；无匹配返回 **200** + `{"items": []}`；不带参数时返回全部（创建时间倒序） |
+| `POST /api/v1/instances/{id}/scenario` | 下发/重发场景配置；`scene_config` 已由平台合并 `param_overrides`；不存在返回 **404** |
+| `GET /api/v1/instances/{id}` | 进度快照（状态/进度/碰撞/车道偏离/自车状态/时间戳）；不存在返回 **404** |
+| `GET /api/v1/instances/{id}/result` | 结果视图；**非终态也返回 200 + 当前状态**（平台据此映射 3003），终态附 `success`/`evaluation`/`success_criteria_result`/`artifacts`/`failure_reason` |
+| `POST /api/v1/instances/{id}/pause` | 幂等暂停；`status=running` 且 `carla_status=PAUSED`、`message=paused` |
+| `POST /api/v1/instances/{id}/resume` | 幂等恢复；终态实例原样返回 |
+| `POST /api/v1/instances/{id}/stop` | 幂等停止并回收 CARLA 资源；终态为 `canceled` |
+| `GET /health` | 容器 liveness/readiness 探针 |
+
+响应中的平台状态映射如下（未知原始状态**按失败处理**，不猜测）：
+
+| CARLA/内部状态 | 平台状态 | 说明 |
+|----------------|----------|------|
+| `CREATED` / `LOADING` / `READY` / `PENDING` | `pending` | 世界加载中 |
+| `RUNNING` | `running` | 正常运行 |
+| `PAUSED` | `running` | 通过 `message=paused` 表达暂停 |
+| `COMPLETED` / `SUCCEEDED` | `succeeded` | 场景正常结束 |
+| `FAILED` | `failed` | 失败原因写入 `message` |
+| `CANCELED` / `CANCELLED` | `canceled` | 平台停止或回收 |
+| 其他未知值 | `failed` | fail-closed |
+
+### 执行与恢复语义
+
+- **单世界串行**：适配器只维护一个执行队列；实例按创建顺序执行，同一时刻只有一个场景运行，符合 CARLA 单世界约束。多实例请求排队而非并发加载。
+- **立即返回**：`create` 只做幂等检查与入队，`submit` 只更新配置/revision；两者都不等待 `load_world`。平台应按 `pending → running → 终态` 轮询。
+- **场景合并**：平台 `create` 时已携带完整 `scene_config`，随后的 `submit` 通常是同一份配置；适配器用规范化 JSON 比较（忽略 `quality` 元数据），配置等价时不重启，避免重复 `load_world`。
+- **重启恢复**：进程重启不会续跑旧世界；所有 `pending`/`running` 实例统一置 `failed`，`message=adapter restarted`，由平台决定是否重新创建。已进入终态的实例保留结果可查。
+- **看门狗**：从场景开始加载起计时，阈值 `duration × 3 + grace`；超时后停止运行器、释放端点并置 `failed(message=watchdog_timeout)`，防止单场景占满世界。
+- **失败可见**：场景映射错误直接写实例 `message`（如 `unsupported_mode:replay`、`unsupported_behavior:xxx`、`invalid_scene_config:map`），不会以“成功但空跑”掩盖；执行环境不可用写 `execution_unavailable:<detail>`，内部异常写 `adapter_internal_error:<type>`。
+- **平台已合并配置**：适配器不重新应用 `param_overrides`，也不修改 `scene_config.map`。平台需要覆盖参数时应在下发前完成合并。
+
+### VIL 数据面
+
+- **订阅**：`carla.{sim_id}.vil_state`，默认消费组 `carla-vil`（可由 `KAFKA_GROUP_ID` 覆盖）；`sim_id` 取平台 create 时原样回显的值，空值不订阅字面量模板。
+- **标定**：平台 `vil.calibration` 的 `map_x/map_y/map_heading/odom_x/odom_y/odom_heading` 转为 `CalibrationParams`：
+  - `yaw0 = -map_heading - odom_heading`
+  - `x0 = map_x - (odom_x*cos(yaw0) - odom_y*sin(yaw0))`
+  - `y0 = map_y + (odom_x*sin(yaw0) + odom_y*cos(yaw0))`
+- **同步**：`TelemetryBuffer` latest-wins；`PoseExtrapolator` 在 `extrapolation_ms` 内做延迟补偿；每 tick 在 `world.tick()` 之前应用一次位姿，避免与场景运行器并发 tick。
+- **断流**：超过 `max_data_latency_ms` 或尚无首帧时，按 3.0 m/s² 逐步减速至停车（不冻结在最后一帧）；健康状态判定为中断后，`sim_status` 上报 `PAUSED`、`message=vil_data_interrupted`；恢复收帧后回到 `RUNNING`。
+- **会话切换**：自车 Actor 替换/场景重载时清空帧缓存并重置 `VILDataConsumer` 的 seq/timestamp 闸门，避免新会话首帧被误判为乱序丢弃。
+- **配置覆盖**：`vil.extrapolation_ms` 与 `vil.data_timeout_ms` 可按实例覆盖（分别钳制 0~1000ms、100~5000ms）。
+
+### 回传面与产物
+
+- `sim_metrics`：场景结束后发布评估等级、`passed`、安全/效率/舒适分项、任务完成率、成功判据结果、接管标记。
+- `artifact`：每个产物发布 `name`/`bucket`/`object_key`/`size_bytes`/`sha256`/`media_type`，Bucket 默认 `hunter-scene-assets`。
+- 产物生成：`eval.json`（评估结果）、`events.jsonl`（检测事件）、`run.log`（运行摘要）。
+- 上传：配置 `HUNTER_CORE_ENABLED=true` 且 `HUNTER_CORE_JWT_TOKEN` 有效时调用 data-collector `/api/v1/data/files/presign` 与 `/complete`；上传失败只告警，本地副本与结果登记仍保留（`object_key` 使用约定键）。
+- 无 producer（未启用平台接入）时，指标/产物发布安全跳过，不影响场景结果与 `GET .../result`。
+
+### 新增配置（`ADAPTER_*`）
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `ADAPTER_HOST` | `127.0.0.1` | 监听地址；仅内网/本机，不要设为 `0.0.0.0` 后暴露公网 |
+| `ADAPTER_PORT` | `8090` | 控制平面端口（平台 `CARLA_MANAGEMENT_ENDPOINT` 对应） |
+| `ADAPTER_DB_PATH` | `data/adapter/carla_instances.db` | 实例注册表 SQLite 路径（重启恢复/幂等） |
+| `ADAPTER_ARTIFACTS_DIR` | `data/adapter/artifacts` | 产物本地暂存目录 |
+| `ADAPTER_ARTIFACT_BUCKET` | `hunter-scene-assets` | 产物对象存储 Bucket |
+| `ADAPTER_BUSY_TIMEOUT_SECONDS` | `5.0` | SQLite 忙等待超时 |
+| `ADAPTER_WATCHDOG_FACTOR` | `3.0` | 看门狗时长倍数 |
+| `ADAPTER_WATCHDOG_GRACE_SECONDS` | `120` | 看门狗基础宽限（秒） |
+| `ADAPTER_PROGRESS_INTERVAL_SECONDS` | `0.5` | 进度落库间隔（秒） |
+| `ADAPTER_DEFAULT_DURATION_SECONDS` | `60` | 场景未提供 duration 时的默认时长 |
+| `ADAPTER_MAX_SCENE_SECONDS` | `7200` | 平台下发时长上限；超限映射失败 |
+
+平台侧对应配置：`CARLA_MANAGEMENT_ENDPOINT=http://127.0.0.1:8090`（跨机部署填内网地址）；创建实例、下发场景为**非幂等**调用，平台不自动重试，暂停/恢复/停止为幂等调用。
+
+### CLI
+
+```bash
+huntersim carla-manager                    # 默认读取 ADAPTER_*，监听 127.0.0.1:8090
+huntersim carla-manager --host 0.0.0.0 --port 8090
+huntersim carla-manager --db-path data/adapter/carla_instances.db --log-level debug
+```
+
+### V2.12.0 待办闭环情况
+
+| V2.12.0 待办 | V2.13.0 状态 | 说明 |
+|--------------|--------------|------|
+| `EvaluationEngine.publish_results()` 无生产调用方 | **管理面链路已闭环** | 执行器直接实例化 `EvaluationEngine`，场景结束后发布 `sim_metrics` 与 `artifact`；`publish_results()` 本身仍未被调用 |
+| `VILSyncService` 未被实例化 | **管理面链路已闭环** | `VILRuntime` 按实例创建并绑定 `VILSyncService`，挂到场景唯一 tick 循环 |
+| VIL 断流未上报 `sim_status(PAUSED)` | **已闭环** | `status_provider` 在断流时覆盖为 `PAUSED(message=vil_data_interrupted)` |
+| `VILSyncService`/`VILDataConsumer` 与 `SimDataProducer` 未打通 | **管理面链路已闭环** | VIL 实例经 `SceneRunnerService` 发布 `sim_telemetry`/`sim_status`/`sim_event`；适配器另外发布 `sim_metrics`/`artifact` |
+| `sensor_file.start_time`/`end_time`/`frame_count` 仍为 0 | **未修复** | 沿用 V2.11.0 待办，bag 上传链路未改动 |
+
+> 上述闭环仅适用于 `carla-manager` 管理面装配路径；`/api/v1/sim` 旧 REST 入口的 VIL 装配不在本次改动范围。
+
+### 测试验证
+
+- 全量回归 `pytest -q`：**1289 passed**，0 failure。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 126 source files**。
+- 覆盖率：全仓 **84.77%**；`platform_adapter` 包 **88.76%**。
+- 新增适配器测试 **95 例**（7 个文件）：
+  - `test_platform_adapter_app.py`（20）：8 端点契约、空查询、404、ISO 时间戳、状态映射、生命周期恢复
+  - `test_platform_adapter_executor.py`（23）：串行队列、revision 合并、看门狗、暂停/恢复/取消、评估/发布、重启清理
+  - `test_platform_adapter_vil.py`（12）：标定公式、外推、断流减速、PAUSED 覆盖、会话切换重置
+  - `test_platform_adapter_mapper.py`（12）：场景/参与者/事件/天气映射、`param_overrides` 不重复应用、不支持行为/模式显式失败
+  - `test_platform_adapter_service.py`（11）：`sim_id`/`scene_id` 幂等、create/submit 合并、控制语义
+  - `test_platform_adapter_artifacts.py`（10）：产物落盘、object_key、预签名上传成功/失败降级
+  - `test_platform_adapter_store.py`（7）：注册表 CRUD、幂等查询、重启标记
+- 既有文件补充：`test_vil_data_consumer.py` 增加乱序闸门重置 1 例；`test_sim_data_mapper.py` 同步 `sim_telemetry`/`updated_at` 契约断言。
+
+### 待办 / 已知边界
+
+- `sensor_file` 的 `start_time`/`end_time`/`frame_count` 仍传 0（V2.11.0 遗留）。
+- `sim_telemetry.sim_time` 已支持但当前场景运行器未传，消息中不出现该字段；平台侧应按可选字段处理。
+- 管理面单实例串行，不支持同一进程并行跑多个 CARLA 世界；需要并行请部署多个管理面进程/端口并在平台侧分片。
+- 适配器无鉴权，安全边界依赖网络隔离；禁止把 8090 暴露到公网或经 Ingress/NodePort 转发。
+- 产物预签名上传失败只保留本地文件与约定 `object_key`；需要可下载时需修复 JWT/MinIO 连通后重跑或手工补传。
+
+---

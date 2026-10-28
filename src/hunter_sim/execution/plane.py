@@ -108,6 +108,7 @@ class ExecutionPlane:
         instance: Any,
         on_state_change: Optional[Callable[..., None]] = None,
         on_event: Optional[Callable[..., None]] = None,
+        runner_hooks: Optional[dict[str, Any]] = None,
     ) -> Any:
         """确保实例已装配运行器并返回（可能触发地图加载，阻塞）。
 
@@ -119,6 +120,7 @@ class ExecutionPlane:
             instance: 仿真实例（需含 sim_instance_id/map_id/carla_* 字段）。
             on_state_change: 场景状态变化回调（持久化/推送）。
             on_event: 场景事件回调。
+            runner_hooks: 额外运行器关键字参数（VIL pose_driver/sample_sink 等）。
 
         Returns:
             SceneRunnerService（或注入的运行器）。
@@ -169,7 +171,7 @@ class ExecutionPlane:
                     world,
                     on_state_change=on_state_change,
                     on_event=on_event,
-                    **self._build_runner_kwargs(instance),
+                    **self._runner_kwargs(instance, runner_hooks),
                 )
         except ExecutionUnavailable:
             with self._registry_lock:
@@ -407,6 +409,28 @@ class ExecutionPlane:
             logger.warning(f"Cannot enable synchronous mode: {exc}")
 
     # ── V2.10.0 平台发布工厂辅助 ──────────────────────────────────────
+
+    def _runner_kwargs(
+        self, instance: Any, runner_hooks: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """合并平台发布参数与调用方注入的运行器钩子（VIL 等）。"""
+        kwargs = self._build_runner_kwargs(instance)
+        if runner_hooks:
+            kwargs.update(runner_hooks)
+        return kwargs
+
+    def producer_for_sim_id(self, sim_id: str) -> Any | None:
+        """按 sim_id 取已接入的 ``SimDataProducer``（未启用/未创建返回 None）。"""
+        if not sim_id:
+            return None
+        with self._producer_lock:
+            return self._cloud_producers.get(sim_id)
+
+    def producer_for_instance(self, instance_id: str) -> Any | None:
+        """按实例 ID 取 ``SimDataProducer``（未启用/未创建返回 None）。"""
+        with self._producer_lock:
+            sim_id = self._instance_sim_ids.get(instance_id)
+        return self.producer_for_sim_id(sim_id) if sim_id else None
 
     def _build_runner_kwargs(self, instance: Any) -> dict[str, Any]:
         """为 SceneRunnerService 构造平台发布相关关键字参数。
