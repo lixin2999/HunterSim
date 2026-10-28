@@ -127,6 +127,8 @@ class InstanceRecord:
         scene_config: 平台下发的场景配置（已合并）。
         vil_config: VIL 配置（含 calibration）。
         result: 终态结果（evaluation/artifacts 等）。
+        recording_path: 传感器录制文件本地路径（未录制为空串）。
+        recording_bytes: 传感器录制文件大小（字节）。
         revision: 场景下发版本号（用于队列合并去重）。
         created_at/updated_at/started_at/finished_at: Unix 时间戳。
         watchdog_deadline: 看门狗绝对截止时间戳（0 表示未启动）。
@@ -151,6 +153,8 @@ class InstanceRecord:
     scene_config: dict[str, Any] = field(default_factory=dict)
     vil_config: Optional[dict[str, Any]] = None
     result: Optional[dict[str, Any]] = None
+    recording_path: str = ""
+    recording_bytes: int = 0
     revision: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -184,6 +188,8 @@ class InstanceRecord:
             "collisions": self.collisions,
             "lane_invasions": self.lane_invasions,
             "ego_state": dict(self.ego_state),
+            "recording_path": self.recording_path or None,
+            "recording_bytes": self.recording_bytes,
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
             "started_at": _iso(self.started_at),

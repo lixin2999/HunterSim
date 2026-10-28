@@ -1,5 +1,6 @@
-# HunterSim K8s 配置（非敏感）
+# HunterSim K8s 配置（非敏感，V3.0.0）
 # deployment.yaml 引用 hunter-sim-config（环境变量）与 hunter-sim-configs（配置文件挂载）
+# 敏感项（SASL 账号口令、data-collector JWT）见 secret.yaml，不在此处出现。
 
 apiVersion: v1
 kind: ConfigMap
@@ -7,53 +8,50 @@ metadata:
   name: hunter-sim-config
   namespace: hunter-sim
 data:
-  # Windows 宿主机上运行的 CARLA Server 地址（双机分离部署）
-  carla_host: "192.168.1.100"
+  # ── CARLA 引擎 ──
+  # 集群内引擎填 carla-engine-svc；双机分离部署填宿主机 IP
+  carla_host: "carla-engine-svc"
   carla_rpc_port: "2000"
   carla_stream_port: "2001"
+  # ── Kafka（VIL 遥测消费 + sensor_data 回传）──
   kafka_bootstrap_servers: "kafka:9092"
-  # prod 启动闸门禁止 "*"；按实际前端域名配置（JSON 数组）
-  cors_allow_origins: '["https://sim.example.com"]'
-  # 执行面（V2.4.0）：CARLA 引擎端点库存，逗号分隔 host:rpc[:stream[:tm]]。
-  # 单引擎填 carla-engine-svc:2000；多引擎扩 Pod 后按 StatefulSet 稳定 DNS 逐条列出。
-  execution_engine_endpoints: "carla-engine-svc:2000"
-  execution_max_engines: "8"
-  # 状态持久化（V2.4.0）：SQLite 落独立 RWO 卷，Pod 重建后实例/场景绑定可恢复
-  state_enabled: "true"
-  state_db_path: "/home/hunter/app/data/state/hunter_sim.db"
-  # 平台化（V2.5.0）：多租户、租户配额、服务账号 API Key、审计落库
-  platform_default_tenant: "default"
-  platform_max_instances_per_tenant: "20"
-  platform_api_keys_enabled: "true"
-  platform_audit_enabled: "true"
-  # 安全治理（V2.6.0）：按客户端 IP 限流 + /auth/token 失败指数退避（进程内计数，单副本权威）
-  api_rate_limit_enabled: "true"
-  api_rate_limit_per_minute: "1000"
-  api_login_max_failed_attempts: "5"
-  api_login_backoff_base_seconds: "2"
-  api_login_backoff_max_seconds: "60"
-  # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸回收（V2.9.0 起 admin 仅可强收 stale 租约，活跃租约 409）
-  execution_lease_heartbeat_enabled: "true"
-  execution_lease_ttl_seconds: "120"
-  # 场景快照写节流（V2.7.0）：同状态最小落库间隔（秒），状态跃迁必写；0 为不节流
-  state_snapshot_write_interval_seconds: "1"
-  # Kafka 消费自愈与坏消息 DLQ（V2.7.0）：连续错误达阈值重建消费者；dlq_topic 空则仅计数不转发
+  # 消费自愈与坏消息 DLQ：连续错误达阈值重建消费者；dlq_topic 空则仅计数不转发
   kafka_enable_self_heal: "true"
   kafka_rebuild_after_errors: "10"
   kafka_dlq_topic: ""
-  # VIL 链路强化（V2.7.0）：乱序/去重闸门 + 环深按外推窗口×频率自动推导
+  # ── VIL 链路对齐（V3.0.0）：10Hz 栅格降采样 + 时间对齐插值 ──
+  # target_hz 需与服务端仿真步长一致（fixed_delta_seconds=0.02 → 50Hz 上限内取 10）
+  vil_target_hz: "10.0"
   vil_ordering_guard_enabled: "true"
   vil_auto_buffer_depth: "true"
-  # JWT 吊销与滑动续期（V2.7.0，依赖 state_enabled=true）
-  api_jwt_revocation_enabled: "true"
-  api_jwt_refresh_enabled: "true"
-  # 统一日志（V2.7.0）：生产采集建议置 "true"（JSON 行 + request_id 贯穿）
+  # 超过该延迟即认定断流，实例置 PAUSED(vil_data_interrupted)
+  vil_max_data_latency_ms: "500"
+  # ── 资源与执行面（单世界串行）──
+  resource_instance_max_lifetime_seconds: "7200"
+  resource_health_check_interval_seconds: "10"
+  execution_lease_heartbeat_enabled: "true"
+  execution_lease_ttl_seconds: "120"
+  # ── 控制面（8090）：实例注册表 / 产物 / 录制 / 画面 ──
+  # SQLite 与 mcap 录制挂载在 hunter-sim-data-pvc（RWO）上
+  adapter_db_path: "/home/hunter/app/data/adapter/carla_instances.db"
+  adapter_artifacts_dir: "/home/hunter/app/data/adapter/artifacts"
+  adapter_recordings_dir: "/home/hunter/app/data/adapter/recordings"
+  adapter_recording_retention_hours: "24"
+  adapter_stream_fps: "10"
+  # MJPEG 横向降采样上限（像素，0 = 不降采样）；降低内网带宽与前端解码开销
+  adapter_stream_max_width: "640"
+  adapter_screenshot_quality: "75"
+  adapter_artifact_bucket: "hunter-scene-assets"
+  adapter_max_scene_seconds: "7200"
+  # ── HunterCore 平台接入 ──
+  # 启用开关与 sim_id 由平台侧注入（HUNTER_CORE_ENABLED / HUNTER_CORE_SIM_ID）
+  hunter_core_kafka_bootstrap: "192.168.31.35:9092"
+  hunter_core_security_protocol: "SASL_SSL"
+  hunter_core_gateway_url: "http://192.168.31.35:8080"
+  hunter_core_rosbag_bucket: "hunter-rosbag"
+  # ── 日志 ──
+  # 生产采集建议置 "true"（JSON 行 + request_id 贯穿）
   log_json: "false"
-  # 多用户体系（V2.8.0 P2-13）：用户表登录 + admin 管理 /auth/users，
-  # 口令摘要迭代次数提升后旧记录仍可用（入库时逐条写入自身参数）
-  platform_users_enabled: "true"
-  platform_min_password_length: "10"
-  platform_password_hash_iterations: "100000"
 
 ---
 # 配置文件挂载源。生产环境建议由 configs/ 目录生成：

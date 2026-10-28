@@ -12,6 +12,10 @@ from typing import Optional
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 全局配置需要统一组装管理面配置；``platform_adapter.config`` 只依赖 pydantic，
+# 不反向引用本模块，不会形成循环导入。
+from hunter_sim.platform_adapter.config import AdapterSettings
+
 
 # ─── 枚举类型 ─────────────────────────────────────────────────────────────────
 
@@ -141,6 +145,8 @@ class VehicleState(BaseModel):
         brake: 制动开度。
         gear: 当前挡位。
         vehicle_speed: 车速标量（m/s）。
+        lights: 灯光状态（left_turn/right_turn/low_beam/hazard）；
+            缺省空字典表示实车未上报，仿真端不做任何灯光变更（V3.0.0）。
     """
 
     time_stamp: float
@@ -153,6 +159,7 @@ class VehicleState(BaseModel):
     brake: float = 0.0
     gear: int = 1
     vehicle_speed: float = 0.0
+    lights: dict[str, bool] = Field(default_factory=dict)
 
 
 class DetectedObject(BaseModel):
@@ -255,7 +262,6 @@ class KafkaSettings(BaseSettings):
         "", description="兼容单机调试的旧 telemetry_clean Topic（空则不订阅）"
     )
     sim_id: str = Field("", description="当前 VIL 实例的 sim_id（用于渲染 Topic 名）")
-    command_topic: str = Field("hunter.{vehicle_id}.command_result")
     username: Optional[SecretStr] = None
     password: Optional[SecretStr] = None
     # ── V2.7.0 P1-8：消费自愈与坏消息 DLQ ──
@@ -296,73 +302,39 @@ class VILSettings(BaseSettings):
         True,
         description="为真时环深按 ceil(extrapolation_ms/1000 × 频率)+余量自动推导（P1-9）",
     )
-
-
-class APISettings(BaseSettings):
-    """REST API 服务配置。"""
-
-    model_config = SettingsConfigDict(
-        env_prefix="API_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    # ── V3.0.0：栅格对齐与车辆状态同步开关 ──
+    target_hz: float = Field(
+        10.0,
+        gt=0.0,
+        le=50.0,
+        description=(
+            "仿真栅格频率（Hz）：10–50Hz 到达的实车帧降采样到该频率后再写 CARLA，"
+            "50Hz tick 下每次栅格推进后 5 个 tick 中只有 1 个会改车辆位姿"
+        ),
     )
-
-    host: str = "0.0.0.0"
-    port: int = Field(8080, ge=1024, le=65535)
-    jwt_secret: SecretStr = Field(
-        default=SecretStr("CHANGE_ME_IN_PRODUCTION"),
-        description="JWT 签名密钥，生产环境必须通过环境变量覆盖",
+    overlay_enabled: bool = Field(
+        True, description="是否将实车感知结果叠加绘制到 CARLA 世界（每 3 个栅格一次）"
     )
-    jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = Field(1440, ge=1, le=10080)
-    admin_username: str = Field("admin", description="内置管理员账号（POST /auth/token）")
-    admin_password: SecretStr = Field(
-        default=SecretStr("admin"),
-        description="内置管理员口令（dev 默认 admin，prod 必须通过 API_ADMIN_PASSWORD 覆盖）",
+    lights_enabled: bool = Field(
+        True, description="是否同步实车灯光（刹车/左转/右转/近光）到虚拟车辆"
     )
-    cors_allow_origins: list[str] = Field(default=["*"])
-    rate_limit_per_minute: int = Field(1000, ge=1)
-    rate_limit_enabled: bool = Field(
-        True, description="是否启用按客户端 IP 的 API 限流（V2.6.0，消费 rate_limit_per_minute）"
-    )
-    login_max_failed_attempts: int = Field(
-        5, ge=1, description="同 IP 连续登录失败达到该次数后进入指数退避（V2.6.0）"
-    )
-    login_backoff_base_seconds: float = Field(
-        2.0, gt=0.0, le=60.0, description="登录退避首次时长（秒），按 2 的幂增长"
-    )
-    login_backoff_max_seconds: float = Field(
-        60.0, gt=0.0, le=3600.0, description="登录退避时长上限（秒）"
-    )
-    # ── V2.7.0 P1-6：JWT 吊销与滑动续期（仅 STATE_ENABLED=true 时生效）──
-    jwt_revocation_enabled: bool = Field(
-        True, description="写入 jti 并在中间件校验吊销名单（需状态库，P1-6）"
-    )
-    jwt_refresh_enabled: bool = Field(
-        True, description="开放 POST /auth/refresh 滑动续期（需状态库，P1-6）"
-    )
-    stream_base_url: str = Field(
-        "webrtc://localhost:8080", description="仿真画面 WebRTC 视频流基础地址（设计文档 §12.2）"
-    )
-    max_concurrent_instances: int = Field(2, ge=1, le=16, description="单 GPU 最大并发实例数")
 
 
 class ResourceSettings(BaseSettings):
-    """资源管理配置。"""
+    """资源管理配置（V3.0.0：单世界串行后仅保留实例寿命与巡检周期）。
+
+    实例超时回收由 ``platform_adapter.executor.SimulationExecutor`` 的看门狗
+    承担，GPU 池/实例配额/镜像仓库等语义已随 ``resource_manager`` 一并移除。
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="RESOURCE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    instance_max_lifetime_seconds: int = Field(7200, ge=60, description="实例最大运行时间（2小时，设计文档 §14.1）")
-    max_retry_count: int = Field(3, ge=0, le=10, description="实例异常重启最大次数（设计文档 §14.1）")
-    max_instances_per_user: int = Field(5, ge=1, description="单用户最大并发实例数（设计文档 §14.2 默认5个）")
-    max_instances_total: int = Field(50, ge=1, description="全局最大并发实例数")
-    health_check_interval_seconds: int = Field(10, ge=1)
-    gpu_memory_warning_threshold: float = Field(0.90, ge=0.0, le=1.0, description="显存告警阈值（设计文档 §15.4 >90%）")
-    docker_image: str = Field("carlasim/carla:0.9.16", description="CARLA Docker 镜像")
-    resources_dir: str = Field("resources", description="资源仓库根目录（设计文档 §10.4.1）")
-    gpu_allow_overload_downgrade: bool = Field(
-        False, description="GPU 过载时是否自动降低画质以提高并发数（设计文档 §10.3.1，默认关闭）"
+    instance_max_lifetime_seconds: int = Field(
+        7200, ge=60, description="实例最大运行时间（秒），看门狗兼作二次上限"
     )
+    health_check_interval_seconds: int = Field(10, ge=1, description="实例健康巡检周期（秒）")
 
 
 class ExecutionSettings(BaseSettings):
@@ -398,64 +370,22 @@ class ExecutionSettings(BaseSettings):
     )
 
 
-class StateSettings(BaseSettings):
-    """状态持久化配置（V2.4.0：实例与场景绑定落 SQLite）。
+class ProbeSettings(BaseSettings):
+    """只读运维探针面配置（V3.0.0，``huntersim probes``）。
 
-    默认关闭，避免源码直跑/单测产生本地文件；部署编排（compose/.env.example）
-    默认开启。开启后实例创建/状态流转/销毁与场景下发均同步落盘，服务重启可恢复。
+    探针面只暴露 ``/health`` 与 ``/metrics``，不承载业务、不写数据库；真实的
+    CARLA/VIL/传感器/云端状态由管理面 ``/health`` 汇总后经 ``adapter_url``
+    拉取，因此只需知道管理面地址即可。
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="STATE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_prefix="PROBE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    enabled: bool = Field(False, description="是否启用状态持久化")
-    db_path: str = Field("data/state/hunter_sim.db", description="SQLite 数据库路径")
-    recover_instances: bool = Field(True, description="启动时恢复未终态实例")
-    restore_scenes: bool = Field(True, description="启动后按需恢复已持久化的场景定义")
-    busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时（秒）")
-    # ── V2.7.0 P1-10：场景快照写节流 ──
-    snapshot_write_interval_seconds: float = Field(
-        1.0,
-        ge=0.0,
-        description="同状态快照落库最小间隔（秒）；状态跃迁不受限必写（0 表示不节流，P1-10）",
-    )
-
-
-class PlatformSettings(BaseSettings):
-    """平台化配置（V2.5.0：多租户 / 服务账号 / 审计）。
-
-    - ``default_tenant``：旧 Token（无 tenant claim）与未声明租户的请求归属租户，
-      保证升级后既有客户端继续可用；
-    - ``max_instances_per_tenant``：租户级并发实例上限，与用户级、全局配额叠加生效；
-    - ``api_keys_enabled``：关闭后服务账号 API Key 一律拒绝（仅保留 JWT）；
-    - ``audit_enabled``：开启后审计事件写入状态库，可通过 ``GET /audit`` 查询。
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="PLATFORM_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
-
-    default_tenant: str = Field("default", description="默认租户 ID（旧 Token 兼容归属）")
-    max_instances_per_tenant: int = Field(20, ge=1, description="单租户最大并发实例数")
-    api_keys_enabled: bool = Field(True, description="是否启用服务账号 API Key 认证")
-    audit_enabled: bool = Field(True, description="是否将审计事件落库并可查询")
-    # ── V2.8.0 P2-13：多用户体系（需 STATE_ENABLED=true，否则仅内置管理员）──
-    users_enabled: bool = Field(
-        True,
-        description=(
-            "是否启用用户表登录（POST /auth/token 先查用户表，未命中回退内置管理员）；"
-            "需状态库，关闭后仅保留内置账号与 API Key（P2-13）"
-        ),
-    )
-    min_password_length: int = Field(
-        10, ge=6, le=128, description="用户口令最小长度（创建/改密校验，P2-13）"
-    )
-    password_hash_iterations: int = Field(
-        100_000,
-        ge=1_000,
-        le=2_000_000,
-        description="PBKDF2-HMAC-SHA256 迭代次数（慢哈希抗暴破；调低仅用于测试，P2-13）",
+    host: str = Field("127.0.0.1", description="探针面监听地址（仅内网）")
+    port: int = Field(8080, ge=1024, le=65535, description="探针面监听端口")
+    adapter_url: str = Field(
+        "http://127.0.0.1:8090", description="管理面基础地址（:8090），用于聚合 /health"
     )
 
 
@@ -512,32 +442,16 @@ class CloudSettings(BaseSettings):
     )
 
 
-class GuiSettings(BaseSettings):
-    """Windows 桌面仿真客户端配置（V2.2.0）。
-
-    仅影响 CarlaSceneX 风格桌面客户端的默认外观与启动参数；CARLA 连接参数复用
-    `CarlaSettings`，数据回传参数复用 `CloudSettings`。
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="GUI_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
-
-    theme: str = Field("dark", pattern="^(dark|light)$", description="界面主题")
-    default_map: str = Field("Town03", description="启动默认地图")
-    stream_fps: float = Field(30.0, gt=0.0, le=60.0, description="实时画面目标帧率（Hz）")
-    scenario_runner_path: Optional[str] = Field(
-        None, description="scenario_runner.py 绝对路径（None 时走 PATH / 当前目录）"
-    )
-
-
 class HunterSimSettings(BaseSettings):
     """HunterSim 全局聚合配置。
 
     配置文件优先级：真实环境变量 > `.env` > 代码默认值；`.env` 需位于服务进程
-    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/API_/RESOURCE_/EXECUTION_/STATE_/
-    PLATFORM_/HUNTER_CORE_/GUI_）同样读取该 `.env`，`extra="ignore"` 保证同一份
-    文件中其他前缀的键不会触发校验错误。
+    工作目录。各前缀分组（CARLA_/KAFKA_/VIL_/RESOURCE_/EXECUTION_/HUNTER_CORE_/
+    ADAPTER_/PROBE_）同样读取该 `.env`，`extra="ignore"` 保证同一份文件中其他
+    前缀的键不会触发校验错误。
+
+    V3.0.0 起 ``adapter`` 随全局配置一并组装：管理面（:8090）与探针面（:8080）
+    共用同一份配置对象，避免两处各自加载 ``ADAPTER_*`` 得出不同结论。
     """
 
     model_config = SettingsConfigDict(
@@ -562,13 +476,11 @@ class HunterSimSettings(BaseSettings):
     carla: CarlaSettings = Field(default_factory=CarlaSettings)
     kafka: KafkaSettings = Field(default_factory=KafkaSettings)
     vil: VILSettings = Field(default_factory=VILSettings)
-    api: APISettings = Field(default_factory=APISettings)
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
-    state: StateSettings = Field(default_factory=StateSettings)
-    platform: PlatformSettings = Field(default_factory=PlatformSettings)
     cloud: CloudSettings = Field(default_factory=CloudSettings)
-    gui: GuiSettings = Field(default_factory=GuiSettings)
+    adapter: AdapterSettings = Field(default_factory=AdapterSettings)
+    probe: ProbeSettings = Field(default_factory=ProbeSettings)
 
     @field_validator("log_level")
     @classmethod

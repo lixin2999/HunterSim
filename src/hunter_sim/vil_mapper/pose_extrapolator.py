@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 from hunter_sim.common.models import Transform, VehicleState
 from hunter_sim.common.utils import get_logger, normalize_angle_rad
@@ -103,6 +104,7 @@ class PoseExtrapolator:
         transform: Transform,
         speed_ms: float,
         yaw_rate_rad_s: float,
+        dt: Optional[float] = None,
     ) -> Transform:
         """简化的位姿外推（仅使用速度和角速度标量，匀速圆周模型）。
 
@@ -110,11 +112,14 @@ class PoseExtrapolator:
             transform: 当前位姿（弧度制）。
             speed_ms: 车速（m/s）。
             yaw_rate_rad_s: 偏航角速度（rad/s）。
+            dt: 外推时长（秒）；None 时使用构造时的外推窗口。
+                ``FrameAligner`` 按实际栅格偏差传入精确时长，
+                避免为了这一次外推而改写共享的外推窗口。
 
         Returns:
             外推后的 Transform。
         """
-        dt = self._extrapolation_dt
+        dt = self._extrapolation_dt if dt is None else dt
         if dt <= 0.0:
             return transform.model_copy()
 

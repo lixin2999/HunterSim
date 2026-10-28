@@ -1,27 +1,20 @@
-# HunterSim 开发/单机部署编排（V2.8.0）
+# HunterSim 开发/单机部署编排（V3.0.0）
 # 使用：
-#   cp .env.example .env          # 按需修改密钥与 CARLA 地址（仓库根目录）
+#   cp .env.example .env          # 按需修改 CARLA 地址与平台凭据（仓库根目录）
 #   docker compose -f docker/docker-compose.yml up -d
 # CARLA server 运行在宿主机（Windows：先启动 CarlaUE4.exe；Linux：可选 --profile carla）
-# 镜像内已安装 carla==0.9.16 Python SDK，REST 可直接下发场景并生成自车。
-# V2.4.0：多引擎并行需在 .env 置 EXECUTION_ENGINE_ENDPOINTS（如 carla-engine:2000,carla-engine-2:2000），
-# 且启动两个 carla 容器（--profile carla）；实例与场景绑定落 data/state/hunter_sim.db。
-# V2.5.0：平台化——多租户隔离、服务账号 API Key（X-API-Key）、场景库/批量任务/审计落库，
-# 平台参数见下方 PLATFORM_*（默认单租户 default，API Key 与审计默认开启）。
-# V2.6.0：安全治理 P0——按 IP 限流（API_RATE_LIMIT_*）、/auth/token 失败指数退避（API_LOGIN_*）、
-# cloud bag 上传有界队列（HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE）、/metrics 标准化 Prometheus 指标。
-# V2.7.0：稳定性与链路加固 P1——租约心跳/僵尸回收（EXECUTION_LEASE_*）、快照写节流
-# （STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS）、Kafka 消费自愈与 DLQ（KAFKA_ENABLE_SELF_HEAL/
-# KAFKA_REBUILD_AFTER_ERRORS/KAFKA_DLQ_TOPIC）、VIL 乱序闸门与自动环深（VIL_*）、JWT 吊销/续期
-# （API_JWT_REVOCATION_ENABLED/API_JWT_REFRESH_ENABLED，需 STATE_ENABLED=true）、structlog 统一
-# 日志与 request_id 贯穿（HUNTER_SIM_LOG_JSON/HUNTER_SIM_LOG_FILE）。
-# V2.8.0：架构演进 P2——多用户体系与慢哈希（PLATFORM_USERS_ENABLED 等）、地图亲和调度
-# （同地图优先复用空闲引擎）、本地 CARLA 进程自愈（CARLA_SUPERVISOR_*，仅回环端点）、
-# 部署预检 CLI（docker compose exec sim-service python -m hunter_sim.cli.main doctor）、
-# 监控栈 healthcheck 与 service_healthy 依赖条件（P2-16）。
+# 镜像内已安装 carla==0.9.16 Python SDK，控制面可直接下发场景并生成自车。
+#
+# V3.0.0 架构：仿真端只做「执行」，治理（用户/租户/场景库/批量/审计/OTA）全部归云端。
+#   sim-service   :8090  唯一业务入口（控制面 + VIL Bridge + 场景 + 传感器 + 录制）
+#   probes        :8080  只读探针面（/health + /metrics），同镜像不同子命令
+# 受支持形态 = 单副本 + 重启恢复 + 单世界串行：不再使用 EXECUTION_ENGINE_ENDPOINTS
+# 双引擎示例（端点库存留空即单引擎，取 CARLA_HOST:CARLA_RPC_PORT）。
+# ROS2 出口改为进程内 CarlaRosBridge（场景 sensors[].ros_enabled 开关），
+# 不再需要独立 ros2-bridge 容器。
 
 services:
-  # ── Kafka 消息队列 ──────────────────────────────────────────────────────────
+  # ── Kafka 消息队列（VIL 消费 + sensor_data 回传）────────────────────────────
   kafka:
     # bitnami/kafka 的旧 tag 已从 Docker Hub 免费目录下架（Nov 2024 迁移）；
     # 改用内容一致的 bitnamilegacy/kafka（KAFKA_CFG_* 环境变量与 healthcheck 均不变）。
@@ -47,7 +40,7 @@ services:
       start_period: 20s
 
   # ── CARLA 仿真引擎（可选，Linux + NVIDIA GPU 环境启用）──────────────────────
-  # 设计文档 §10.2.3/§15.3：每个 CARLA 实例运行在独立容器，NVIDIA Container Toolkit 分配 GPU
+  # 设计文档 §10.2.3/§15.3：单世界串行，一台引擎承载唯一场景。
   # 启用：docker-compose -f docker/docker-compose.yml --profile carla up -d
   carla-engine:
     profiles: ["carla"]
@@ -58,6 +51,7 @@ services:
     ports:
       - "2000:2000"   # RPC
       - "2001:2001"   # 数据流
+      - "8000:8000"   # Traffic Manager
     environment:
       NVIDIA_VISIBLE_DEVICES: all
     runtime: nvidia
@@ -66,42 +60,7 @@ services:
       - ../resources:/home/carla/carla/PythonAPI/hunter_assets/resources
     restart: unless-stopped
 
-  # ── 第二个 CARLA 引擎（可选，多引擎并行）────────────────────────────────
-  # 启用：先置 EXECUTION_ENGINE_ENDPOINTS=carla-engine:2000,carla-engine-2:2000，
-  # 再 docker compose -f docker/docker-compose.yml --profile carla up -d
-  # 容器内 RPC/数据流/TM 端口均为 2000/2001/8000，宿主机映射到 2100/2101/8100 避免冲突。
-  carla-engine-2:
-    profiles: ["carla"]
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.carla
-    image: hunter-carla:0.9.16
-    ports:
-      - "2100:2000"   # RPC
-      - "2101:2001"   # 数据流
-      - "8100:8000"   # Traffic Manager
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-    runtime: nvidia
-    volumes:
-      - ../resources:/home/carla/carla/PythonAPI/hunter_assets/resources
-    restart: unless-stopped
-
-  # ── CARLA ↔ ROS2 桥接（可选，profile ros；对齐 ROS2_TOPIC_MAP，V2.2.0）────────
-  # 启用：docker-compose -f docker/docker-compose.yml --profile ros up -d
-  ros2-bridge:
-    profiles: ["ros"]
-    image: carla-simulator/ros-bridge:humble
-    network_mode: host   # ROS2 DDS 发现依赖组播/主机网络
-    environment:
-      CARLA_HOST: host.docker.internal
-      CARLA_PORT: "2000"
-      CARLA_CLIENT_ID: "0"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-
-  # ── HunterSim 仿真服务 ──────────────────────────────────────────────────
+  # ── HunterSim 控制面（唯一业务入口，8090）──────────────────────────────────
   sim-service:
     build:
       context: ..
@@ -115,74 +74,79 @@ services:
         # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ PIP_TRUSTED_HOST=mirrors.aliyun.com
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:2.10.0
+    image: hunter-sim:3.0.0
+    command: ["carla-manager"]
     ports:
-      - "8080:8080"
+      - "8090:8090"
     environment:
       HUNTER_SIM_ENV: ${HUNTER_SIM_ENV:-dev}
       HUNTER_SIM_LOG_LEVEL: ${HUNTER_SIM_LOG_LEVEL:-INFO}
+      HUNTER_SIM_LOG_JSON: ${HUNTER_SIM_LOG_JSON:-false}
+      HUNTER_SIM_LOG_FILE: ${HUNTER_SIM_LOG_FILE:-}
+      # ── CARLA 引擎 ──
       CARLA_HOST: ${CARLA_HOST:-host.docker.internal}
       CARLA_RPC_PORT: ${CARLA_RPC_PORT:-2000}
       CARLA_STREAM_PORT: ${CARLA_STREAM_PORT:-2001}
-      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # 开发默认值仅满足长度校验；HUNTER_SIM_ENV=prod 时必须通过 .env 覆盖（启动闸门会拒绝默认值）
-      API_JWT_SECRET: ${API_JWT_SECRET:-dev-only-change-me-at-least-32-characters}
-      API_ADMIN_USERNAME: ${API_ADMIN_USERNAME:-admin}
-      API_ADMIN_PASSWORD: ${API_ADMIN_PASSWORD:-admin}
-      # CORS 允许来源（JSON 数组）；prod 启动闸门禁止 "*"
-      API_CORS_ALLOW_ORIGINS: '${API_CORS_ALLOW_ORIGINS:-["*"]}'
-      API_STREAM_BASE_URL: ${API_STREAM_BASE_URL:-webrtc://localhost:8080}
-      API_PORT: "8080"
-      # 执行面（V2.4.0）：端点库存留空 = 单引擎（CARLA_HOST:CARLA_RPC_PORT）
-      EXECUTION_ENGINE_ENDPOINTS: ${EXECUTION_ENGINE_ENDPOINTS:-}
-      EXECUTION_MAX_ENGINES: ${EXECUTION_MAX_ENGINES:-8}
-      EXECUTION_RESTORE_SCENE_ON_ASSEMBLE: ${EXECUTION_RESTORE_SCENE_ON_ASSEMBLE:-true}
-      # 状态持久化：实例/场景绑定落 SQLite，重启可恢复（data 卷持久化）
-      STATE_ENABLED: ${STATE_ENABLED:-true}
-      STATE_DB_PATH: ${STATE_DB_PATH:-data/state/hunter_sim.db}
-      STATE_RECOVER_INSTANCES: ${STATE_RECOVER_INSTANCES:-true}
-      STATE_RESTORE_SCENES: ${STATE_RESTORE_SCENES:-true}
-      # 平台化（V2.5.0）：多租户默认租户/租户配额/服务账号 API Key/审计落库
-      PLATFORM_DEFAULT_TENANT: ${PLATFORM_DEFAULT_TENANT:-default}
-      PLATFORM_MAX_INSTANCES_PER_TENANT: ${PLATFORM_MAX_INSTANCES_PER_TENANT:-20}
-      PLATFORM_API_KEYS_ENABLED: ${PLATFORM_API_KEYS_ENABLED:-true}
-      PLATFORM_AUDIT_ENABLED: ${PLATFORM_AUDIT_ENABLED:-true}
-      # 安全治理（V2.6.0）：按客户端 IP 限流 + /auth/token 失败指数退避
-      API_RATE_LIMIT_ENABLED: ${API_RATE_LIMIT_ENABLED:-true}
-      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-1000}
-      API_LOGIN_MAX_FAILED_ATTEMPTS: ${API_LOGIN_MAX_FAILED_ATTEMPTS:-5}
-      API_LOGIN_BACKOFF_BASE_SECONDS: ${API_LOGIN_BACKOFF_BASE_SECONDS:-2}
-      API_LOGIN_BACKOFF_MAX_SECONDS: ${API_LOGIN_BACKOFF_MAX_SECONDS:-60}
-      # HunterCore bag 上传有界队列（V2.6.0，队满丢最旧并计数）
-      HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
-      # 稳定性加固（V2.7.0）：引擎租约心跳 + 僵尸判定（心跳超 TTL 未续可被 admin 强制回收）
-      EXECUTION_LEASE_HEARTBEAT_ENABLED: ${EXECUTION_LEASE_HEARTBEAT_ENABLED:-true}
-      EXECUTION_LEASE_TTL_SECONDS: ${EXECUTION_LEASE_TTL_SECONDS:-120}
-      # 场景快照写节流（V2.7.0）：同状态最小落库间隔；状态跃迁必写
-      STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS: ${STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS:-1}
-      # Kafka 消费自愈与坏消息 DLQ（V2.7.0）
-      KAFKA_ENABLE_SELF_HEAL: ${KAFKA_ENABLE_SELF_HEAL:-true}
-      KAFKA_REBUILD_AFTER_ERRORS: ${KAFKA_REBUILD_AFTER_ERRORS:-10}
-      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-}
-      # VIL 链路强化（V2.7.0）：乱序/去重闸门 + 环深自动推导
-      VIL_ORDERING_GUARD_ENABLED: ${VIL_ORDERING_GUARD_ENABLED:-true}
-      VIL_AUTO_BUFFER_DEPTH: ${VIL_AUTO_BUFFER_DEPTH:-true}
-      # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
-      API_JWT_REVOCATION_ENABLED: ${API_JWT_REVOCATION_ENABLED:-true}
-      API_JWT_REFRESH_ENABLED: ${API_JWT_REFRESH_ENABLED:-true}
-      # 多用户体系（V2.8.0 P2-13）：/auth/users 由 admin 管理，口令按 PBKDF2 摘要入库
-      PLATFORM_USERS_ENABLED: ${PLATFORM_USERS_ENABLED:-true}
-      PLATFORM_MIN_PASSWORD_LENGTH: ${PLATFORM_MIN_PASSWORD_LENGTH:-10}
-      PLATFORM_PASSWORD_HASH_ITERATIONS: ${PLATFORM_PASSWORD_HASH_ITERATIONS:-100000}
-      # 本地 CARLA 进程自愈（V2.8.0 P2-15）：仅托管回环端点；容器内默认关闭，
+      CARLA_TIMEOUT_SECONDS: ${CARLA_TIMEOUT_SECONDS:-10.0}
+      # 本地 CARLA 进程自愈：仅托管回环端点；容器内默认关闭，
       # 引擎容器由 docker restart / K8s liveness 负责，避免跨层抢管进程
       CARLA_SUPERVISOR_ENABLED: ${CARLA_SUPERVISOR_ENABLED:-false}
       CARLA_SUPERVISOR_BINARY_PATH: ${CARLA_SUPERVISOR_BINARY_PATH:-}
       CARLA_SUPERVISOR_MAX_RESTARTS: ${CARLA_SUPERVISOR_MAX_RESTARTS:-3}
       CARLA_SUPERVISOR_RESTART_BACKOFF_SECONDS: ${CARLA_SUPERVISOR_RESTART_BACKOFF_SECONDS:-5}
-      # 统一日志（V2.7.0）：生产采集可置 JSON；容器环境文件轮转留空由 docker logs 托管
-      HUNTER_SIM_LOG_JSON: ${HUNTER_SIM_LOG_JSON:-false}
-      HUNTER_SIM_LOG_FILE: ${HUNTER_SIM_LOG_FILE:-}
+      # ── Kafka（VIL 遥测消费 + sensor_data 回传）──
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TELEMETRY_TOPIC: ${KAFKA_TELEMETRY_TOPIC:-carla.{sim_id}.vil_state}
+      KAFKA_SIM_ID: ${KAFKA_SIM_ID:-}
+      KAFKA_LEGACY_TELEMETRY_TOPIC: ${KAFKA_LEGACY_TELEMETRY_TOPIC:-}
+      KAFKA_ENABLE_SELF_HEAL: ${KAFKA_ENABLE_SELF_HEAL:-true}
+      KAFKA_REBUILD_AFTER_ERRORS: ${KAFKA_REBUILD_AFTER_ERRORS:-10}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-}
+      # ── VIL 链路对齐（V3.0.0：10Hz 栅格降采样 + 插值）──
+      VIL_TARGET_HZ: ${VIL_TARGET_HZ:-10.0}
+      VIL_ORDERING_GUARD_ENABLED: ${VIL_ORDERING_GUARD_ENABLED:-true}
+      VIL_AUTO_BUFFER_DEPTH: ${VIL_AUTO_BUFFER_DEPTH:-true}
+      VIL_TELEMETRY_FREQUENCY_HZ: ${VIL_TELEMETRY_FREQUENCY_HZ:-10.0}
+      VIL_MAX_DATA_LATENCY_MS: ${VIL_MAX_DATA_LATENCY_MS:-500}
+      VIL_OVERLAY_ENABLED: ${VIL_OVERLAY_ENABLED:-true}
+      VIL_LIGHTS_ENABLED: ${VIL_LIGHTS_ENABLED:-true}
+      # ── 资源与执行面（单世界串行：端点库存留空即单引擎）──
+      RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS: ${RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS:-7200}
+      RESOURCE_HEALTH_CHECK_INTERVAL_SECONDS: ${RESOURCE_HEALTH_CHECK_INTERVAL_SECONDS:-10}
+      EXECUTION_RESTORE_SCENE_ON_ASSEMBLE: ${EXECUTION_RESTORE_SCENE_ON_ASSEMBLE:-true}
+      EXECUTION_LEASE_HEARTBEAT_ENABLED: ${EXECUTION_LEASE_HEARTBEAT_ENABLED:-true}
+      EXECUTION_LEASE_TTL_SECONDS: ${EXECUTION_LEASE_TTL_SECONDS:-120}
+      # ── 控制面（8090）：实例注册表 / 产物 / 录制 / 画面 ──
+      ADAPTER_HOST: 0.0.0.0
+      ADAPTER_PORT: "8090"
+      ADAPTER_DB_PATH: ${ADAPTER_DB_PATH:-data/adapter/carla_instances.db}
+      ADAPTER_ARTIFACTS_DIR: ${ADAPTER_ARTIFACTS_DIR:-data/adapter/artifacts}
+      ADAPTER_RECORDINGS_DIR: ${ADAPTER_RECORDINGS_DIR:-data/adapter/recordings}
+      ADAPTER_RECORDING_RETENTION_HOURS: ${ADAPTER_RECORDING_RETENTION_HOURS:-24}
+      ADAPTER_ARTIFACT_BUCKET: ${ADAPTER_ARTIFACT_BUCKET:-hunter-scene-assets}
+      ADAPTER_WATCHDOG_FACTOR: ${ADAPTER_WATCHDOG_FACTOR:-3.0}
+      ADAPTER_WATCHDOG_GRACE_SECONDS: ${ADAPTER_WATCHDOG_GRACE_SECONDS:-120}
+      ADAPTER_PROGRESS_INTERVAL_SECONDS: ${ADAPTER_PROGRESS_INTERVAL_SECONDS:-0.5}
+      ADAPTER_BUSY_TIMEOUT_SECONDS: ${ADAPTER_BUSY_TIMEOUT_SECONDS:-5.0}
+      ADAPTER_STREAM_FPS: ${ADAPTER_STREAM_FPS:-10.0}
+      ADAPTER_SCREENSHOT_QUALITY: ${ADAPTER_SCREENSHOT_QUALITY:-75}
+      # MJPEG 推流横向降采样上限（像素，0 = 不降采样）；降低内网带宽占用
+      ADAPTER_STREAM_MAX_WIDTH: ${ADAPTER_STREAM_MAX_WIDTH:-640}
+      ADAPTER_DEFAULT_DURATION_SECONDS: ${ADAPTER_DEFAULT_DURATION_SECONDS:-60}
+      ADAPTER_MAX_SCENE_SECONDS: ${ADAPTER_MAX_SCENE_SECONDS:-7200}
+      # ── HunterCore 平台接入（默认关闭，凭据仅经 .env / Secret 注入）──
+      HUNTER_CORE_ENABLED: ${HUNTER_CORE_ENABLED:-false}
+      HUNTER_CORE_KAFKA_BOOTSTRAP: ${HUNTER_CORE_KAFKA_BOOTSTRAP:-kafka:9092}
+      HUNTER_CORE_SECURITY_PROTOCOL: ${HUNTER_CORE_SECURITY_PROTOCOL:-SASL_SSL}
+      HUNTER_CORE_SASL_MECHANISM: ${HUNTER_CORE_SASL_MECHANISM:-SCRAM-SHA-512}
+      HUNTER_CORE_SASL_USERNAME: ${HUNTER_CORE_SASL_USERNAME:-}
+      HUNTER_CORE_SASL_PASSWORD: ${HUNTER_CORE_SASL_PASSWORD:-}
+      HUNTER_CORE_SIM_ID: ${HUNTER_CORE_SIM_ID:-}
+      HUNTER_CORE_GATEWAY_URL: ${HUNTER_CORE_GATEWAY_URL:-http://192.168.31.35:8080}
+      HUNTER_CORE_JWT_TOKEN: ${HUNTER_CORE_JWT_TOKEN:-}
+      HUNTER_CORE_ROSBAG_BUCKET: ${HUNTER_CORE_ROSBAG_BUCKET:-hunter-rosbag}
+      HUNTER_CORE_UPLOAD_TIMEOUT_S: ${HUNTER_CORE_UPLOAD_TIMEOUT_S:-60.0}
+      HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
     depends_on:
       kafka:
         condition: service_healthy
@@ -190,13 +154,30 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ../configs:/home/hunter/app/configs:ro
-      # 资源仓库（自定义地图上传与回放数据落盘，§10.4.1/§15.5）
+      # 资源仓库（自定义地图与传感器配置，§10.4.1）
       - ../resources:/home/hunter/app/resources
-      # 状态持久化（V2.4.0）：重启后实例与场景绑定可恢复
+      # 实例注册表 + 产物 + mcap 录制（重启恢复；录制按保留期清理）
       - ../data:/home/hunter/app/data
     restart: unless-stopped
 
-  # ── Prometheus 监控 ─────────────────────────────────────────────────────────
+  # ── 只读运维探针面（8080，无业务无鉴权）─────────────────────────────────────
+  probes:
+    image: hunter-sim:3.0.0
+    command: ["probes"]
+    ports:
+      - "8080:8080"
+    environment:
+      PROBE_HOST: 0.0.0.0
+      PROBE_PORT: "8080"
+      # 聚合控制面 /health 的真实状态（CARLA/VIL/传感器/云端）
+      PROBE_ADAPTER_URL: http://sim-service:8090
+      HUNTER_SIM_LOG_LEVEL: ${HUNTER_SIM_LOG_LEVEL:-INFO}
+    depends_on:
+      sim-service:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Prometheus 监控（抓取 sim-service:8090 业务指标 + probes:8080 探针指标）────────
   prometheus:
     image: prom/prometheus:v2.48.0
     ports:
@@ -209,7 +190,7 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
-    # V2.8.0 P2-16：就绪探针（busybox wget 镜像内置），供下游依赖条件判定
+    # 就绪探针（busybox wget 镜像内置），供下游依赖条件判定
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
       interval: 15s
@@ -217,7 +198,7 @@ services:
       retries: 4
       start_period: 20s
 
-  # ── Alertmanager 告警投递（审查项 S：prometheus.yml alerting 段的目标） ──────
+  # ── Alertmanager 告警投递（prometheus.yml alerting 段的目标）─────────────────
   alertmanager:
     image: prom/alertmanager:v0.26.0
     ports:
@@ -245,7 +226,7 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    # V2.8.0 P2-16：等 Prometheus 健康后再启动，避免数据源首连失败反复重试
+    # 等 Prometheus 健康后再启动，避免数据源首连失败反复重试
     depends_on:
       prometheus:
         condition: service_healthy

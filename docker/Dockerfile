@@ -1,9 +1,10 @@
-# HunterSim 仿真服务镜像（设计文档 §15.3 「仿真服务镜像」）
-# 基于 Python 3.12 slim，安装 hunter-sim 包及所有依赖
-# 注：文档示例基于 python:3.8-slim，但本项目代码使用 3.10+ 语法与 pydantic v2，
-#     为保持可构建性升级基础镜像；镜像结构（requirements + uvicorn 启动）与文档一致。
+# HunterSim 仿真服务镜像（V3.0.0，设计文档 §15.3 「仿真服务镜像」）
+# 基于 Python 3.12 slim，安装 hunter-sim 包及所有依赖。
+# 同一镜像两种启动形态（由 docker-compose / k8s 的 command 区分）：
+#   huntersim carla-manager  :8090   业务入口（单进程，控制面 + VIL + 场景 + 传感器）
+#   huntersim probes         :8080   只读探针面（/health + /metrics）
 # CARLA 引擎镜像另见 docker/Dockerfile.carla（§15.3）。
-# 使用：docker build -f docker/Dockerfile -t hunter-sim:2.10.0 .
+# 使用：docker build -f docker/Dockerfile -t hunter-sim:3.0.0 .
 #
 # CARLA Python SDK（V2.3.0）：服务端要「真跑起一个场景」必须能 import carla。
 # PyPI 自 0.9.14 起提供 manylinux wheel（cp310/cp311/cp312），默认随镜像安装，
@@ -72,19 +73,13 @@ ENV PATH="/home/hunter/.local/bin:${PATH}"
 # 复制配置文件
 COPY configs/ ./configs/
 
-# 暴露 API 端口
-EXPOSE 8080
+# 暴露控制面（8090）与只读探针面（8080）端口；未运行 `probes` 时 8080 空置
+EXPOSE 8090 8080
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:8080/api/v1/sim/health/live || exit 1
+# 健康检查（控制面 /health 为聚合健康；探针面见 docker-compose.yml 的 probes 服务）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:8090/health || exit 1
 
-# 启动命令
-ENTRYPOINT ["python", "-m", "uvicorn"]
-CMD ["hunter_sim.api.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8080", \
-     "--workers", "1", \
-     "--loop", "uvloop", \
-     "--http", "httptools", \
-     "--access-log", "--log-level", "info"]
+# 启动命令：单一业务入口（V3.0.0 起取消 --workers，单世界串行）
+ENTRYPOINT ["huntersim"]
+CMD ["carla-manager"]

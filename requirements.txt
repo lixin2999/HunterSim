@@ -6,22 +6,21 @@ fastapi>=0.100,<0.110
 uvicorn[standard]>=0.23,<0.30
 pydantic>=2.0,<3.0
 pydantic-settings>=2.0,<3.0
-python-jose[cryptography]>=3.3,<4.0
 numpy>=1.24,<2.0
 scipy>=1.11,<2.0
 kafka-python>=2.0,<3.0
-websockets>=11.0,<13.0
 httpx>=0.24,<0.28
-aiofiles>=23.0,<24.0
-python-multipart>=0.0.6,<0.1
 orjson>=3.9,<4.0
 structlog>=23.0,<24.0
 prometheus-client>=0.17,<0.27
 PyYAML>=6.0,<7.0
 defusedxml>=0.7,<1.0
 Jinja2>=3.1,<4.0
+# V3.0.0 传感器回传：mcap 录制（纯 Python，不依赖 ROS2 运行时）
+mcap>=1.1,<2.0
+mcap-ros2-support>=0.5,<0.7
 
-# ── 可选依赖（V2.2.0，按需经 extras 安装，惰性导入不阻断核心）────────────────
-# 桌面仿真客户端：pip install -e ".[gui]"    （PySide6>=6.6,<7.0）
+# ── 可选依赖（按需安装，惰性导入不阻断核心）──────────────────────────────────
 # HunterCore 数据接入：pip install -e ".[cloud]"（kafka-python / httpx，已含于默认依赖）
+# ROS2 话题桥接：需本机 ROS2 运行时（rclpy / sensor_msgs），缺失时自动降级不阻断
 # CARLA PythonAPI：需与服务器同版本（0.9.16），从 CARLA 安装目录 PythonAPI/lib 安装 carla wheel。

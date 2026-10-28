@@ -1,9 +1,9 @@
-"""部署预检 CLI 测试（V2.8.0 P2-16）。
+"""部署预检 CLI 测试（V3.0.0）。
 
 覆盖 ``huntersim doctor`` 的判定口径与退出码语义：
 哪些项算 fail（阻断上线）、哪些只 warn/skip、``--strict`` 如何把 warn 计失败，
-以及 ``--json`` 结构与 ``version``/无子命令的返回码。
-网络与磁盘探测全部打桩，不依赖真实 CARLA/nvidia-smi。
+以及 ``--json`` 结构与 ``version``/``probes``/无子命令的解析。
+网络与磁盘探测全部打桩，不依赖真实 CARLA/nvidia-smi/Kafka。
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import SecretStr
 
 from hunter_sim.cli import main as cli
 from hunter_sim.cli.main import (
@@ -22,11 +21,12 @@ from hunter_sim.cli.main import (
     EXIT_FAIL,
     EXIT_OK,
     CheckResult,
+    _check_adapter_db,
     _check_disk,
+    _check_kafka,
+    _check_mcap,
     _check_ports,
-    _check_secrets,
-    _check_state_store,
-    _check_users,
+    _check_recordings_dir,
     _counts,
     _render_text,
     build_parser,
@@ -34,36 +34,28 @@ from hunter_sim.cli.main import (
     run_doctor,
 )
 from hunter_sim.common.models import (
-    APISettings,
+    AdapterSettings,
     CarlaSettings,
     ExecutionSettings,
     HunterSimSettings,
-    PlatformSettings,
-    StateSettings,
+    KafkaSettings,
+    ProbeSettings,
 )
-
-_LONG_SECRET = "unit-test-secret-" + "x" * 32
 
 
 def _settings(
     *,
     env: str = "dev",
-    state_enabled: bool = False,
-    db_path: str = "data/state/hunter_sim.db",
-    users_enabled: bool = True,
-    min_password_length: int = 10,
-    jwt_secret: str = _LONG_SECRET,
-    admin_password: str = "S3cure-Admin-Pass",
+    db_path: str = "data/adapter/carla_instances.db",
+    recordings_dir: str = "data/adapter/recordings",
+    adapter_port: int = 8090,
+    probe_port: int = 8080,
     supervisor_enabled: bool = False,
     supervisor_binary_path: str = "",
+    bootstrap_servers: str = "localhost:9092",
 ) -> HunterSimSettings:
     return HunterSimSettings(
         env=env,
-        api=APISettings(
-            jwt_secret=SecretStr(jwt_secret),
-            admin_password=SecretStr(admin_password),
-            port=_free_port(),
-        ),
         carla=CarlaSettings(
             host="127.0.0.1",
             rpc_port=2000,
@@ -71,10 +63,11 @@ def _settings(
             supervisor_binary_path=supervisor_binary_path,
         ),
         execution=ExecutionSettings(engine_endpoints=""),
-        state=StateSettings(enabled=state_enabled, db_path=db_path),
-        platform=PlatformSettings(
-            users_enabled=users_enabled, min_password_length=min_password_length
+        kafka=KafkaSettings(bootstrap_servers=bootstrap_servers),
+        adapter=AdapterSettings(
+            db_path=db_path, recordings_dir=recordings_dir, port=adapter_port
         ),
+        probe=ProbeSettings(port=probe_port),
     )
 
 
@@ -102,7 +95,7 @@ def _gpu_passed() -> SimpleNamespace:
 
 @pytest.fixture(autouse=True)
 def _no_external_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """默认不发真实网络/子进程探测（CARLA 视为可达、GPU 环境视为通过）。"""
+    """默认不发真实网络/子进程探测（CARLA/Kafka 视为可达、GPU 环境视为通过）。"""
     monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: True)
     monkeypatch.setattr(cli, "check_environment", _gpu_passed)
 
@@ -112,14 +105,24 @@ def _by_name(results: list[CheckResult]) -> dict[str, CheckResult]:
 
 
 class TestDoctorChecks:
-    def test_happy_path_has_no_failure(self) -> None:
-        results = run_doctor(_settings(), base_path=".")
+    def test_happy_path_has_no_failure(self, tmp_path: Any) -> None:
+        settings = _settings(
+            db_path=str(tmp_path / "db" / "instances.db"),
+            recordings_dir=str(tmp_path / "rec"),
+            adapter_port=_free_port(),
+            probe_port=_free_port(),
+        )
+        results = run_doctor(settings, base_path=".")
         assert [item.name for item in results if item.status == "fail"] == []
         assert _by_name(results)["config"].status == "ok"
         assert _by_name(results)["python"].status == "ok"
+        assert _by_name(results)["adapter_db"].status == "ok"
+        assert _by_name(results)["recordings_dir"].status == "ok"
         assert _by_name(results)["carla_reachable"].status == "ok"
 
-    def test_carla_unreachable_fails_without_supervisor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_carla_unreachable_fails_without_supervisor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
         results = _by_name(run_doctor(_settings()))
 
@@ -138,7 +141,9 @@ class TestDoctorChecks:
         assert results["carla_reachable"].status == "warn"
         assert "自动拉起" in results["carla_reachable"].hint
 
-    def test_multi_engine_endpoints_are_all_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_multi_engine_endpoints_are_all_probed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         seen: list[tuple[str, int]] = []
 
         def spy(host: str, port: int, timeout: float = 1.5) -> bool:
@@ -150,7 +155,11 @@ class TestDoctorChecks:
         settings.execution.engine_endpoints = "10.0.0.1:2000,10.0.0.2:2100"
         results = run_doctor(settings)
 
-        assert seen == [("10.0.0.1", 2000), ("10.0.0.2", 2100)]
+        # Kafka 检查也会走 _tcp_open，这里只断言引擎端点的探测顺序
+        assert [item for item in seen if item[0].startswith("10.0.0.")] == [
+            ("10.0.0.1", 2000),
+            ("10.0.0.2", 2100),
+        ]
         assert [item.status for item in results if item.name == "carla_reachable"] == ["ok", "ok"]
 
     def test_config_load_failure_short_circuits(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,55 +171,66 @@ class TestDoctorChecks:
         assert results[0].status == "fail"
         assert "bad enum" in results[0].detail
 
-    def test_strict_promotes_warn_to_fail(self) -> None:
-        loose = _by_name(run_doctor(_settings(admin_password="admin")))
-        assert loose["admin_password"].status == "warn"
+    def test_strict_promotes_warn_to_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
+        loose = _by_name(run_doctor(_settings()))
+        assert loose["kafka"].status == "warn"
 
-        strict = _by_name(run_doctor(_settings(admin_password="admin"), strict=True))
-        assert strict["admin_password"].status == "fail"
-
-
-class TestSecretAndUserChecks:
-    def test_default_secret_is_warn_in_dev_and_fail_in_prod(self) -> None:
-        dev = _check_secrets(_settings(jwt_secret="CHANGE_ME_IN_PRODUCTION"))
-        assert _by_name(dev)["jwt_secret"].status == "warn"
-
-        prod = _check_secrets(_settings(env="prod", jwt_secret="CHANGE_ME_IN_PRODUCTION"))
-        assert _by_name(prod)["jwt_secret"].status == "fail"
-
-    def test_short_secret_flagged(self) -> None:
-        results = _by_name(_check_secrets(_settings(jwt_secret="too-short")))
-        assert results["jwt_secret"].status == "warn"
-        assert "32" in results["jwt_secret"].detail
-
-        prod = _by_name(_check_secrets(_settings(env="prod", jwt_secret="too-short")))
-        assert prod["jwt_secret"].status == "fail"
-
-    def test_custom_secrets_pass(self) -> None:
-        results = _by_name(_check_secrets(_settings()))
-        assert results["jwt_secret"].status == "ok"
-        assert results["admin_password"].status == "ok"
-
-    def test_weak_admin_password_advises_user_table(self) -> None:
-        results = _by_name(_check_secrets(_settings(admin_password="admin")))
-        assert "auth/users" in results["admin_password"].hint
-
-        shorter = _by_name(_check_secrets(_settings(admin_password="Ab1$", min_password_length=10)))
-        assert shorter["admin_password"].status == "warn"
-
-    def test_users_check_reflects_dependencies(self) -> None:
-        assert _check_users(_settings(users_enabled=False)).status == "skip"
-        assert _check_users(_settings()).status == "warn"  # 用户表开但状态库关
-        assert _check_users(_settings(state_enabled=True, db_path=":memory:")).status == "ok"
+        strict = _by_name(run_doctor(_settings(), strict=True))
+        assert strict["kafka"].status == "fail"
 
 
-class TestDiskStateAndPorts:
+class TestStorageChecks:
+    def test_adapter_db_writable(self, tmp_path: Any) -> None:
+        db_path = tmp_path / "adapter" / "instances.db"
+        result = _check_adapter_db(_settings(db_path=str(db_path)))
+
+        assert result.status == "ok"
+        assert db_path.exists()
+
+    def test_adapter_db_failure_is_fail_not_exception(self, tmp_path: Any) -> None:
+        blocker = tmp_path / "occupied"
+        blocker.mkdir()  # 把库路径指向目录 → 建库必然失败
+        result = _check_adapter_db(_settings(db_path=str(blocker)))
+
+        assert result.status == "fail"
+        assert "写权限" in result.hint
+
+    def test_recordings_dir_requires_free_space(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gb = 1024**3
+        target = tmp_path / "rec"
+        monkeypatch.setattr(
+            cli.shutil,
+            "disk_usage",
+            lambda path: SimpleNamespace(total=100 * gb, free=1 * gb),
+        )
+        result = _check_recordings_dir(_settings(recordings_dir=str(target)))
+
+        assert result.status == "fail"
+        assert "RETENTION_HOURS" in result.hint
+
+    def test_recordings_dir_unusable_reports_fail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(_: Any) -> Any:
+            raise OSError("volume not ready")
+
+        monkeypatch.setattr(cli.shutil, "disk_usage", boom)
+        result = _check_recordings_dir(_settings())
+
+        assert result.status == "fail"
+        assert "volume not ready" in result.detail
+
     def test_disk_thresholds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         gb = 1024**3
         cases = {1.0: "fail", 10.0: "warn", 500.0: "ok"}
         for free_gb, expected in cases.items():
             monkeypatch.setattr(
-                cli.shutil, "disk_usage", lambda path: SimpleNamespace(total=1 * gb, free=free_gb * gb)
+                cli.shutil,
+                "disk_usage",
+                lambda path: SimpleNamespace(total=1 * gb, free=free_gb * gb),
             )
             assert _check_disk(".").status == expected
 
@@ -223,62 +243,62 @@ class TestDiskStateAndPorts:
         assert result.status == "skip"
         assert "volume not ready" in result.detail
 
-    def test_state_store_skip_when_disabled(self) -> None:
-        result = _check_state_store(_settings(state_enabled=False))
-        assert result.status == "skip"
-        assert "STATE_ENABLED=false" in result.detail
 
-    def test_state_store_writable_reports_user_count(self, tmp_path: Any) -> None:
-        db_path = str(tmp_path / "state" / "hunter_sim.db")
-        result = _check_state_store(_settings(state_enabled=True, db_path=db_path))
+class TestMcapAndKafkaChecks:
+    def test_mcap_ok_when_dependencies_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli.importlib.util, "find_spec", lambda name: object())
+        assert _check_mcap().status == "ok"
 
-        assert result.status == "ok"
-        assert "users=0" in result.detail
-        assert (tmp_path / "state" / "hunter_sim.db").exists()
+    def test_mcap_missing_warns_and_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli.importlib.util, "find_spec", lambda name: None)
+        result = _check_mcap()
 
-    def test_state_store_failure_is_fail_not_exception(self, tmp_path: Any) -> None:
-        blocker = tmp_path / "occupied"
-        blocker.mkdir()  # 把库路径指向目录 → 建库必然失败
-        result = _check_state_store(_settings(state_enabled=True, db_path=str(blocker)))
+        assert result.status == "warn"
+        assert "no-op" in result.detail
 
-        assert result.status == "fail"
-        assert "写权限" in result.hint
+    def test_kafka_reachable(self) -> None:
+        assert _check_kafka(_settings()).status == "ok"
 
-    def test_api_port_free_busy_and_unreachable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        assert _check_ports(_settings())[0].status == "ok"
+    def test_kafka_unreachable_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
+        result = _check_kafka(_settings())
 
-        # 已被自己占用且可连通：判定为“疑似已在运行”，只 warn
+        assert result.status == "warn"
+        assert "KAFKA_BOOTSTRAP_SERVERS" in result.hint
+
+    def test_kafka_empty_bootstrap_is_skip(self) -> None:
+        assert _check_kafka(_settings(bootstrap_servers="")).status == "skip"
+
+    def test_kafka_bad_format_warns(self) -> None:
+        result = _check_kafka(_settings(bootstrap_servers="not-a-host-port"))
+        assert result.status == "warn"
+        assert "host:port" in result.hint
+
+
+class TestPortChecks:
+    def test_adapter_and_probe_ports_both_checked(self) -> None:
+        results = _check_ports(_settings(adapter_port=_free_port(), probe_port=_free_port()))
+        assert [item.name for item in results] == ["adapter_port", "probe_port"]
+        assert [item.status for item in results] == ["ok", "ok"]
+
+    def test_busy_port_is_warn_when_reachable(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
             held.bind(("127.0.0.1", 0))
             held.listen(1)
-            settings = _settings()
-            settings.api.port = int(held.getsockname()[1])
+            settings = _settings(adapter_port=int(held.getsockname()[1]))
             assert _check_ports(settings)[0].status == "warn"
 
-        # 端口被占但无法连接（残留绑定）→ fail
+    def test_busy_port_is_fail_when_unreachable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
             held.bind(("127.0.0.1", 0))
-            settings = _settings()
-            settings.api.port = int(held.getsockname()[1])
+            settings = _settings(adapter_port=int(held.getsockname()[1]))
             assert _check_ports(settings)[0].status == "fail"
 
 
 class TestGpuCheckIsDefensive:
     def test_gpu_env_collapsed_when_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        passed = SimpleNamespace(
-            passed=True,
-            os_ok=True,
-            gpu_driver_ok=True,
-            gpu_name="RTX 4080",
-            gpu_driver_version="550.00",
-            cuda_ok=True,
-            cuda_version="12.4",
-            gpu_memory_ok=True,
-            gpu_memory_gb=16.0,
-            errors=[],
-        )
-        monkeypatch.setattr(cli, "check_environment", lambda: passed)
+        monkeypatch.setattr(cli, "check_environment", lambda: _gpu_passed())
         results = cli._check_gpu()
 
         assert [item.name for item in results] == ["gpu_env"]
@@ -327,10 +347,11 @@ class TestRenderingAndExitCode:
         )
         assert counts == {"ok": 1, "warn": 1, "fail": 1, "skip": 1}
 
-    def test_render_text_shows_hint_and_summary(self) -> None:
-        text = _render_text([_check_users(_settings())])
+    def test_render_text_shows_hint_and_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
+        text = _render_text([_check_kafka(_settings())])
 
-        assert "users" in text
+        assert "kafka" in text
         assert "→" in text  # 非 ok 项带修复建议
         assert "Summary:" in text
 
@@ -338,8 +359,27 @@ class TestRenderingAndExitCode:
         args = build_parser().parse_args(["doctor"])
         assert (args.json, args.strict, args.path) == (False, False, ".")
 
-    def test_doctor_json_output_and_zero_exit(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+    def test_probes_parser_defaults(self) -> None:
+        args = build_parser().parse_args(["probes"])
+        assert args.command == "probes"
+        assert (args.host, args.port, args.adapter_url) == ("", 0, "")
+        assert args.handler is cli._cmd_probes
+
+    def test_serve_subcommand_is_gone(self) -> None:
+        """V3.0.0：``serve`` 改名 ``probes``，旧名不应再被接受。"""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["serve"])
+
+    def test_doctor_json_output_and_zero_exit(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Any
+    ) -> None:
+        settings = _settings(
+            db_path=str(tmp_path / "db" / "instances.db"),
+            recordings_dir=str(tmp_path / "rec"),
+            adapter_port=_free_port(),
+            probe_port=_free_port(),
+        )
+        monkeypatch.setattr(cli, "_load_settings", lambda: (settings, None))
 
         assert main(["doctor", "--json"]) == EXIT_OK
         payload = json.loads(capsys.readouterr().out)
@@ -349,34 +389,76 @@ class TestRenderingAndExitCode:
         assert payload["counts"]["fail"] == 0
         assert {"name", "status", "detail", "hint"} <= set(payload["checks"][0])
 
-    def test_doctor_exits_one_when_carla_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+    def test_doctor_exits_one_when_carla_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        monkeypatch.setattr(
+            cli,
+            "_load_settings",
+            lambda: (
+                _settings(
+                    db_path=str(tmp_path / "db" / "i.db"),
+                    recordings_dir=str(tmp_path / "rec"),
+                ),
+                None,
+            ),
+        )
         monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
 
         assert main(["doctor"]) == EXIT_FAIL
 
-    def test_doctor_strict_exits_one_on_warnings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_doctor_strict_exits_one_on_warnings(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
         monkeypatch.setattr(
-            cli, "_load_settings", lambda: (_settings(admin_password="admin"), None)
+            cli,
+            "_load_settings",
+            lambda: (
+                _settings(
+                    db_path=str(tmp_path / "db" / "i.db"),
+                    recordings_dir=str(tmp_path / "rec"),
+                    bootstrap_servers="127.0.0.1:1",
+                ),
+                None,
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_tcp_open",
+            lambda host, port, timeout=1.5: port != 1,  # Kafka 不可达 → warn
         )
 
         assert main(["doctor"]) == EXIT_OK  # warn 不阻断
         assert main(["doctor", "--strict"]) == EXIT_FAIL
 
-    def test_doctor_text_output_carries_version(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
-        monkeypatch.setattr(cli, "_version_text", lambda: "2.8.0")
+    def test_doctor_text_output_carries_version(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Any
+    ) -> None:
+        monkeypatch.setattr(
+            cli,
+            "_load_settings",
+            lambda: (
+                _settings(
+                    db_path=str(tmp_path / "db" / "i.db"),
+                    recordings_dir=str(tmp_path / "rec"),
+                    adapter_port=_free_port(),
+                    probe_port=_free_port(),
+                ),
+                None,
+            ),
+        )
+        monkeypatch.setattr(cli, "_version_text", lambda: "3.0.0")
 
         assert main(["doctor"]) == EXIT_OK
         out = capsys.readouterr().out
-        assert "HunterSim doctor (version=2.8.0)" in out
+        assert "HunterSim doctor (version=3.0.0)" in out
         assert "Summary:" in out
 
     def test_version_command(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-        monkeypatch.setattr(cli, "_version_text", lambda: "2.8.0")
+        monkeypatch.setattr(cli, "_version_text", lambda: "3.0.0")
 
         assert main(["version"]) == EXIT_OK
-        assert capsys.readouterr().out.strip() == "2.8.0"
+        assert capsys.readouterr().out.strip() == "3.0.0"
 
     def test_missing_subcommand_returns_bad_args(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert main([]) == EXIT_BAD_ARGS

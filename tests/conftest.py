@@ -21,7 +21,6 @@ if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
 from hunter_sim.common.models import (  # noqa: E402
-    APISettings,
     CarlaSettings,
     HunterSimSettings,
     KafkaSettings,
@@ -128,59 +127,8 @@ def ring_buffer() -> RingBuffer[int]:
     """测试用 RingBuffer，大小 5。"""
     return RingBuffer(max_size=5)
 
-# ─── FastAPI TestClient ───────────────────────────────────────────────────────
+# ─── FastAPI TestClient ──────────────────────────────────────────────────────
 
-
-@pytest.fixture(scope="module")
-def app():
-    """FastAPI 应用实例（module 级别复用）。
-
-    注入真实的 SimInstanceManager（基于内存 GPU 池，不依赖 CARLA），
-    以便实例管理路由可被完整测试。
-    """
-    from hunter_sim.api.main import create_app
-    from hunter_sim.resource_manager.gpu_resource_pool import GPUResourcePool
-    from hunter_sim.resource_manager.instance_manager import SimInstanceManager
-
-    settings = HunterSimSettings(
-        env="dev",
-        # V2.6.0：共享测试应用关闭 IP 限流并放宽登录退避阈值，
-        # 避免回归套件高频请求被 429 拦截（专项行为在各自测试中显式开启）
-        api=APISettings(rate_limit_enabled=False, login_max_failed_attempts=1_000_000),
-    )
-    application = create_app(settings)
-    gpu_pool = GPUResourcePool(gpu_count=2, total_memory_gb=64.0)
-    # 注入 quota_manager：配额释放收敛在 destroy_instance() 内统一执行（§14.2，见审查项 F）
-    application.state.instance_manager = SimInstanceManager(
-        settings=ResourceSettings(),
-        gpu_pool=gpu_pool,
-        quota_manager=application.state.quota_manager,
-    )
-    return application
-
-
-@pytest.fixture(scope="module")
-def client(app) -> Any:
-    """同步 HTTP 测试客户端。"""
-    from fastapi.testclient import TestClient
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture
-def auth_headers(test_settings: HunterSimSettings) -> dict[str, str]:
-    """生成测试 JWT header（管理员角色，创建/销毁实例需管理员权限，见 §14.2）。"""
-    from hunter_sim.api.deps import create_access_token
-
-    token = create_access_token("test_user", test_settings.api, extra_claims={"role": "admin"})
-    return {"Authorization": f"Bearer {token}"}
-
-
-@pytest.fixture
-def user_headers(test_settings: HunterSimSettings) -> dict[str, str]:
-    """生成普通用户 JWT header（无管理员角色，用于权限测试）。"""
-    from hunter_sim.api.deps import create_access_token
-
-    token = create_access_token("plain_user", test_settings.api, extra_claims={"role": "user"})
-    return {"Authorization": f"Bearer {token}"}
+# V3.0.0：8080 治理面（auth/instances/scenes 路由）已移除，共享 TestClient 与
+# JWT header fixture 随之删除；控制面端点测试改为在各自模块内注入 fake service
+# 后调 ``create_app``（见 tests/test_platform_adapter_app.py）。

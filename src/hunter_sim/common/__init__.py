@@ -16,7 +16,6 @@ from hunter_sim.common.exceptions import (
     ValidationError,
 )
 from hunter_sim.common.models import (
-    APISettings,
     CarlaSettings,
     DetectedObject,
     EvalGrade,
@@ -25,6 +24,7 @@ from hunter_sim.common.models import (
     InstanceStatus,
     KafkaSettings,
     PerceptionResult,
+    ProbeSettings,
     QualityLevel,
     ResourceSettings,
     RosTopicMapping,
@@ -60,7 +60,7 @@ __all__ = [
     "SimMode", "QualityLevel", "InstanceStatus", "SceneStatus", "SensorType", "EvalGrade",
     "Transform", "VehicleControlCommand", "VehicleState",
     "DetectedObject", "PerceptionResult", "HunterSESpec", "RosTopicMapping", "ROS2_TOPIC_MAP",
-    "CarlaSettings", "KafkaSettings", "VILSettings", "APISettings", "ResourceSettings",
+    "CarlaSettings", "KafkaSettings", "VILSettings", "ResourceSettings", "ProbeSettings",
     "HunterSimSettings",
     # utils
     "RingBuffer", "get_logger", "get_struct_logger",

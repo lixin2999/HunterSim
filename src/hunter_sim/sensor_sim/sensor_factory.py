@@ -74,6 +74,7 @@ class DepthCameraConfig(BaseModel):
         height: 图像高度。
         fov_deg: 视场角（度）。
         fps: 帧率（Hz）。
+        min_depth_m: 最小测距（米，D435 规格 0.2m）。
         max_depth_m: 最大测距（米）。
     """
 
@@ -81,6 +82,7 @@ class DepthCameraConfig(BaseModel):
     height: int = Field(720, ge=64, le=2160)
     fov_deg: float = Field(85.0, gt=0.0, le=180.0)
     fps: float = Field(30.0, gt=0.0, le=60.0)
+    min_depth_m: float = Field(0.2, gt=0.0)
     max_depth_m: float = Field(10.0, gt=0.0)
 
 
@@ -132,6 +134,7 @@ class SensorConfigBundle(BaseModel):
     """传感器全套配置集合。
 
     Attributes:
+        profile_name: 型号剖面名（``profiles.py`` / ``sensor_configs.json`` 中的键）。
         lidar: LiDAR 配置（None 表示不启用）。
         rgb_camera: RGB 相机配置。
         depth_camera: 深度相机配置。
@@ -142,6 +145,7 @@ class SensorConfigBundle(BaseModel):
         obstacle: 障碍物传感器配置。
     """
 
+    profile_name: str = ""
     lidar: Optional[LidarConfig] = None
     rgb_camera: Optional[RGBCameraConfig] = None
     depth_camera: Optional[DepthCameraConfig] = None
@@ -155,6 +159,7 @@ class SensorConfigBundle(BaseModel):
     def hunter_se_default(cls) -> "SensorConfigBundle":
         """返回 HUNTER SE 标准传感器配置（设计文档 §6.2.5 含三种事件传感器）。"""
         return cls(
+            profile_name="hunter_se_full",
             lidar=LidarConfig(),
             rgb_camera=RGBCameraConfig(),
             depth_camera=DepthCameraConfig(),

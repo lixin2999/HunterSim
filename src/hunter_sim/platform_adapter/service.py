@@ -14,10 +14,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional, cast
 
+from hunter_sim.common.metrics import INSTANCE_LIFECYCLE_TOTAL, STREAM_CLIENTS
 from hunter_sim.common.models import HunterSimSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.platform_adapter.config import AdapterSettings
@@ -30,11 +32,14 @@ from hunter_sim.platform_adapter.models import (
     SubmitScenarioRequest,
 )
 from hunter_sim.platform_adapter.store import InstanceStore
+from hunter_sim.sensor_sim.frame_hub import STREAM_RGB, Frame, FrameHub
 
 logger = get_logger(__name__)
 
 _DEFAULT_DURATION_S = 60.0
 _QUALITY_KEY = "quality"
+# MJPEG 无帧容忍时长（秒）：超过即结束响应，避免客户端无限等空流
+_STREAM_IDLE_TIMEOUT_S = 5.0
 
 
 class AdapterService:
@@ -45,6 +50,7 @@ class AdapterService:
         adapter_settings: 适配器配置（时长上限/产物目录等）。
         store: 实例注册表。
         executor: 串行执行器。
+        frame_hub_provider: 帧汇聚中心查询器（默认委托执行器；单测可注入）。
     """
 
     def __init__(
@@ -53,11 +59,13 @@ class AdapterService:
         adapter_settings: AdapterSettings,
         store: InstanceStore,
         executor: SimulationExecutor,
+        frame_hub_provider: Optional[Callable[[str], Optional[FrameHub]]] = None,
     ) -> None:
         self._settings = settings
         self._adapter = adapter_settings
         self._store = store
         self._executor = executor
+        self._frame_hub_provider = frame_hub_provider or _executor_frame_hub(executor)
 
     # ── 创建 / 下发 ─────────────────────────────────────────────────────────
 
@@ -112,6 +120,7 @@ class AdapterService:
             updated_at=time.time(),
         )
         self._store.insert(record)
+        INSTANCE_LIFECYCLE_TOTAL.labels(event="created").inc()
         self._executor.submit(record)
         logger.info(
             f"Adapter instance created: instance={record.instance_id}, "
@@ -173,7 +182,10 @@ class AdapterService:
 
     def stop(self, instance_id: str) -> Optional[InstanceRecord]:
         """停止实例并标记 canceled（幂等）。"""
-        return self._executor.cancel(instance_id, reason="canceled")
+        record = self._executor.cancel(instance_id, reason="canceled")
+        if record is not None:
+            INSTANCE_LIFECYCLE_TOTAL.labels(event="canceled").inc()
+        return record
 
     # ── 查询 ────────────────────────────────────────────────────────────────
 
@@ -193,6 +205,119 @@ class AdapterService:
     def mark_restarted_instances_failed(self) -> int:
         """启动恢复：把重启前未终结的实例标记为 failed。"""
         return self._store.mark_restarted_instances_failed("adapter restarted")
+
+    # ── 实时画面 ─────────────────────────────────────────────────────────────
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """管理面健康快照（供只读探针 ``huntersim probes`` 代理转发）。
+
+        只汇总本进程**真实掌握**的信息：无法采样的项显式置 ``None``，
+        避免探针与业务面各自探测导致结论不一致。
+
+        Returns:
+            含 ``carla_connected`` / ``active_instance`` / ``sensor`` / ``cloud``
+            等键的扁平字典（字段语义与探针 ``/health`` 一致）。
+        """
+        active = [
+            record for record in self._store.list_all() if record.status in ACTIVE_STATUSES
+        ]
+        current = active[0] if active else None
+        streams: dict[str, int] = {}
+        if current is not None:
+            hub = self._frame_hub_provider(current.instance_id)
+            if hub is not None:
+                streams = dict(hub.stats())
+        return {
+            "carla_connected": None if current is None else True,
+            "carla_probe_error": None,
+            "active_instance": None
+            if current is None
+            else {
+                "instance_id": current.instance_id,
+                "scene_id": current.scene_id,
+                "status": current.status,
+                "carla_status": current.carla_status,
+                "progress_percent": round(current.progress_percent, 3),
+            },
+            "vil_state": None,
+            "sensor": {
+                "recording": bool(current.recording_path) if current is not None else False,
+                "recording_bytes": int(current.recording_bytes) if current is not None else 0,
+                "streams": streams,
+            },
+            "cloud": {"enabled": bool(self._settings.cloud.enabled)},
+        }
+
+    def runtime_gauges(self) -> dict[str, Any]:
+        """采样运行时 Gauge 值（抓取 ``/metrics`` 时刷新）。"""
+        active = [
+            record for record in self._store.list_all() if record.status in ACTIVE_STATUSES
+        ]
+        return {
+            "active_instances": float(len(active)),
+            "carla_connected": bool(active),
+            "disk_usage_ratio": _disk_usage_ratio(self._adapter.recordings_dir),
+        }
+
+    def screenshot(self, instance_id: str) -> Optional[Frame]:
+        """取实例最新 RGB 帧（无活动场景/未挂相机时返回 None）。"""
+        hub = self._frame_hub_provider(instance_id)
+        if hub is None:
+            return None
+        return hub.latest(STREAM_RGB)
+
+    def stream_frames(
+        self, instance_id: str, fps: Optional[float] = None
+    ) -> Iterator[Frame]:
+        """持续产出最新 RGB 帧（客户端断开即终止）。
+
+        无相机时立即结束；无新帧时重发上一帧以维持 MJPEG 连接；
+        连续 ``_STREAM_IDLE_TIMEOUT_S`` 秒无任何帧则结束（由路由层拒绝空流）。
+
+        Args:
+            instance_id: 实例 ID。
+            fps: 推流帧率（None 时取 ``ADAPTER_STREAM_FPS``）。
+        """
+        rate = float(fps if fps is not None else self._adapter.stream_fps)
+        interval = 1.0 / max(0.5, rate)
+        last_frame: Optional[Frame] = None
+        last_seen_at = time.time()
+        STREAM_CLIENTS.inc()
+        try:
+            while True:
+                hub = self._frame_hub_provider(instance_id)
+                if hub is None:
+                    return
+                frame = hub.latest(STREAM_RGB)
+                if frame is not None:
+                    last_frame = frame
+                    last_seen_at = time.time()
+                elif time.time() - last_seen_at > _STREAM_IDLE_TIMEOUT_S:
+                    return
+                if last_frame is not None:
+                    yield last_frame
+                time.sleep(interval)
+        finally:
+            STREAM_CLIENTS.dec()
+
+
+def _disk_usage_ratio(path: str) -> Optional[float]:
+    """录制目录所在盘的占用率（目录不可用时返回 None，不产出样本）。"""
+    try:
+        usage = shutil.disk_usage(path or ".")
+    except OSError:
+        return None
+    return usage.used / usage.total if usage.total else None
+
+
+def _executor_frame_hub(
+    executor: Any,
+) -> Callable[[str], Optional[FrameHub]]:
+    """取执行器的帧汇聚中心查询器（测试替身可能未提供，降级为“无画面”）。"""
+    provider = getattr(executor, "frame_hub", None)
+    if callable(provider):
+        return cast(Callable[[str], Optional[FrameHub]], provider)
+    return lambda _instance_id: None
 
 
 def _same_scene_config(left: dict[str, Any], right: dict[str, Any]) -> bool:

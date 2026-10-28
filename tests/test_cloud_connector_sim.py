@@ -173,6 +173,7 @@ def test_all_six_message_types() -> None:
         "type": "sim_metrics", "timestamp": time.time(), "seq": 4, "payload": {"score": 85},
     })
     # 5. sensor_file (via _perform_upload)
+
     class _UploadResult:
         bucket = "b"
         object_key = "k"

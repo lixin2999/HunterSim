@@ -25,6 +25,7 @@ from hunter_sim.scene_runner.scene_config import (
     SceneEventTrigger,
     SceneEventType,
     ScenarioBehaviorType,
+    SensorSpec,
     SpawnPoint,
     TrafficParticipantConfig,
     TriggerType,
@@ -205,6 +206,7 @@ def map_scene_config(
         ),
         weather=_map_weather(_as_dict(platform_config.get("weather"))),
         traffic_participants=participants,
+        sensors=_map_sensors(platform_config.get("sensors")),
         scene_events=events,
         duration_seconds=duration,
         timeout_seconds=max(60.0, duration * 3.0),
@@ -323,6 +325,44 @@ def _map_trigger(section: dict[str, Any]) -> SceneEventTrigger:
     )
 
 
+def _map_sensors(raw: Any) -> list[SensorSpec]:
+    """平台 ``sensors`` 段 → 内部 ``SensorSpec`` 列表（V3.0.0）。
+
+    平台可下发两种形式：
+
+    - 省略 / 空值：默认挂 HUNTER SE 三件套（不改变旧场景行为）；
+    - 列表：每项至少含 ``profile``，可选 ``enabled`` / ``ros_enabled`` / ``record``。
+
+    未知剖面名不在此拦截，由 ``profiles.get_profile`` 回退默认剖面并记日志，
+    避免平台新剖面先于仿真端版本时阻断整场景。
+
+    Args:
+        raw: 平台 ``scene_config.sensors`` 原值。
+
+    Returns:
+        传感器规格列表（至少一项）。
+    """
+    items = _as_list(raw)
+    if not items:
+        return [SensorSpec()]
+    specs: list[SensorSpec] = []
+    for item in items:
+        section = _as_dict(item)
+        profile = str(section.get("profile") or "").strip()
+        if not profile:
+            # 分条声明但未指定剖面：跳过该条，不静默猜测型号
+            continue
+        specs.append(
+            SensorSpec(
+                profile=profile,
+                enabled=_as_bool(section.get("enabled"), True),
+                ros_enabled=_as_bool(section.get("ros_enabled"), False),
+                record=_as_bool(section.get("record"), True),
+            )
+        )
+    return specs or [SensorSpec()]
+
+
 def _map_weather(section: dict[str, Any]) -> WeatherConfig:
     """平台天气字段 → 内部天气字段。"""
     return WeatherConfig(
@@ -403,6 +443,21 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 def _as_dict(value: Any) -> dict[str, Any]:
     """安全转 dict。"""
     return value if isinstance(value, dict) else {}
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """安全转 bool（字符串/数字按常见写法解析，非法值回退默认）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off", ""}:
+            return False
+    return default
 
 
 def _as_list(value: Any) -> list[Any]:

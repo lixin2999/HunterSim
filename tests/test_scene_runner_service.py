@@ -11,11 +11,8 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from hunter_sim.common.models import SceneStatus
 from hunter_sim.scene_runner.event_detector import DetectedEvent
@@ -25,7 +22,6 @@ from hunter_sim.scene_runner.scene_config import (
     SpawnPoint,
 )
 from hunter_sim.scene_runner.scene_runner_service import SceneRunnerService
-from hunter_sim.scene_runner.scene_state_manager import SceneStateSnapshot
 
 
 # ── Mock 基础设施 ───────────────────────────────────────────────────────────────

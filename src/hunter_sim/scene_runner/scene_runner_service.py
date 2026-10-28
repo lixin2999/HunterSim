@@ -54,6 +54,14 @@ class SceneRunnerService:
         scene_id: 当前场景 ID（平台契约用）。
         status_interval_s: sim_status 周期上报间隔（秒，默认 1.0）。
         telemetry_interval_s: sim_telemetry 上报间隔（秒，默认 0.1）。
+        pose_driver: VIL 位姿驱动（每 tick 前调用）。
+        sample_sink: 轨迹采样回调（评估引擎消费）。
+        status_provider: 状态覆盖回调（VIL 数据中断→PAUSED）。
+        frame_hub: 传感器帧汇聚中心（控制面 MJPEG/截图取用）。
+        recorder: mcap 录制器（场景期间落盘传感器数据）。
+        ros_bridge: ROS2 桥接器（可选出口）。
+        screenshot_quality: 截图 JPEG 质量（Pillow 可用时生效）。
+        stream_max_width: 回传画面最大宽度（0 表示不降采样）。
     """
 
     def __init__(
@@ -70,6 +78,11 @@ class SceneRunnerService:
         pose_driver: Optional[Callable[[float], None]] = None,
         sample_sink: Optional[Callable[[dict[str, Any], float], None]] = None,
         status_provider: Optional[Callable[[], Optional[tuple[str, Optional[str]]]]] = None,
+        frame_hub: Optional[Any] = None,
+        recorder: Optional[Any] = None,
+        ros_bridge: Optional[Any] = None,
+        screenshot_quality: int = 75,
+        stream_max_width: int = 0,
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -82,6 +95,12 @@ class SceneRunnerService:
         self._pose_driver = pose_driver
         self._sample_sink = sample_sink
         self._status_provider = status_provider
+        # Sensor Emulator 出口（FrameHub → MJPEG/截图；McapRecorder → sensor_file）
+        self._frame_hub = frame_hub
+        self._recorder = recorder
+        self._ros_bridge = ros_bridge
+        self._screenshot_quality = screenshot_quality
+        self._stream_max_width = stream_max_width
 
         # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
         self._weather_manager = WeatherManager(world)
@@ -107,6 +126,11 @@ class SceneRunnerService:
     def weather_manager(self) -> WeatherManager:
         """天气管理器（供 API 层天气控制与渐变过渡）。"""
         return self._weather_manager
+
+    @property
+    def frame_hub(self) -> Any:
+        """传感器帧汇聚中心（未注入时为 None）。"""
+        return self._frame_hub
 
     @property
     def world(self) -> Any:
@@ -216,7 +240,16 @@ class SceneRunnerService:
             )
 
             if scenario is None:
-                scenario = BuiltinScenario(config, self._state_mgr, self._event_detector)
+                scenario = BuiltinScenario(
+                    config,
+                    self._state_mgr,
+                    self._event_detector,
+                    frame_hub=self._frame_hub,
+                    recorder=self._recorder,
+                    ros_bridge=self._ros_bridge,
+                    screenshot_quality=self._screenshot_quality,
+                    stream_max_width=self._stream_max_width,
+                )
             self._scenario = scenario
             self._scenario_cleaned = False
 

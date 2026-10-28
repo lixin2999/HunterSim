@@ -16,11 +16,17 @@ alerting:
         - targets: ["alertmanager:9093"]
 
 scrape_configs:
-  # HunterSim 仿真服务指标（免鉴权端点）
-  - job_name: "hunter-sim"
-    metrics_path: /api/v1/sim/metrics
+  # 业务面指标（V3.0.0：:8090 /metrics 导出 VIL / 传感器 / 录制 / 实例生命周期）
+  - job_name: "hunter-sim-service"
+    metrics_path: /metrics
     static_configs:
-      - targets: ["sim-service:8080"]
+      - targets: ["sim-service:8090"]
+
+  # 只读探针面指标（uptime / 上游可达性；无业务无鉴权）
+  - job_name: "hunter-sim"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["probes:8080"]
 
   # Prometheus 自监控
   - job_name: "prometheus"

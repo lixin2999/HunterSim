@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
-from hunter_sim.common.exceptions import CarlaSimulationError
+from hunter_sim.common.exceptions import CarlaSimulationError, SensorSimulationError
+from hunter_sim.common.models import SensorType
 from hunter_sim.common.utils import get_logger
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
 from hunter_sim.scene_runner.event_detector import EventDetector
@@ -26,10 +28,22 @@ from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
     SceneConfig,
     SceneEventType,
+    SensorSpec,
     SpawnPoint,
     TrafficParticipantConfig,
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
+from hunter_sim.sensor_sim.frame_hub import FrameHub, STREAM_RGB
+from hunter_sim.sensor_sim.image_codec import depth_bgra_to_meters, encode_rgb_frame
+from hunter_sim.sensor_sim.mcap_recorder import (
+    McapRecorder,
+    build_image_message,
+    build_imu_message,
+    build_pointcloud2_message,
+)
+from hunter_sim.sensor_sim.profiles import resolve_profiles
+from hunter_sim.sensor_sim.sensor_factory import SensorBlueprintFactory
+from hunter_sim.sensor_sim.sensor_mount import SensorMountManager
 
 logger = get_logger(__name__)
 
@@ -43,6 +57,25 @@ _FALLBACK_Z_M = 0.5
 
 _AUTOPILOT_TM_PORT = 8000
 
+# 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
+_SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
+    SensorType.LIDAR: "lidar",
+    SensorType.RGB_CAMERA: "rgb",
+    SensorType.DEPTH_CAMERA: "depth",
+    SensorType.IMU: "imu",
+}
+
+# 每点字节数（x/y/z/intensity 均为 float32）
+_LIDAR_POINT_BYTES = 16
+
+# 各流的坐标系 ID（与 ROS 话题约定一致）
+_FRAME_IDS: dict[str, str] = {
+    "lidar": "lidar_top",
+    "rgb": "camera_front",
+    "depth": "camera_depth",
+    "imu": "imu_link",
+}
+
 
 class BuiltinScenario(CustomScenarioBase):
     """由 SceneConfig 驱动的最小可用场景执行器。
@@ -53,6 +86,11 @@ class BuiltinScenario(CustomScenarioBase):
         event_detector: 事件检测器（由 SceneRunnerService 持有）。
         transform_factory: 生成位姿工厂，默认惰性导入 carla 构造 Transform；
             单元测试可注入桩实现以脱离 CARLA SDK。
+        frame_hub: 传感器帧汇聚中心（控制面 MJPEG/截图取用）；None 则不回传画面。
+        recorder: mcap 录制器；None 则不落盘。
+        ros_bridge: ROS2 桥接器；None 或不可用时不发布话题。
+        screenshot_quality: JPEG 质量（Pillow 可用时生效）。
+        stream_max_width: 回传画面最大宽度（0 表示不降采样）。
     """
 
     def __init__(
@@ -61,9 +99,21 @@ class BuiltinScenario(CustomScenarioBase):
         state_manager: SceneStateManager,
         event_detector: EventDetector,
         transform_factory: Optional[TransformFactory] = None,
+        frame_hub: Optional[FrameHub] = None,
+        recorder: Optional[McapRecorder] = None,
+        ros_bridge: Optional[Any] = None,
+        screenshot_quality: int = 75,
+        stream_max_width: int = 0,
     ) -> None:
         super().__init__(config, state_manager, event_detector)
         self._transform_factory = transform_factory
+        self._frame_hub = frame_hub
+        self._recorder = recorder
+        self._ros_bridge = ros_bridge
+        self._screenshot_quality = screenshot_quality
+        self._stream_max_width = stream_max_width
+        # 由 config.sensors 在挂载时确定（任一 spec 开启 ros 即发布）
+        self._ros_enabled = False
         self._ego: Any = None
         self._actors: list[Any] = []
         self._sensors: list[Any] = []
@@ -87,7 +137,7 @@ class BuiltinScenario(CustomScenarioBase):
     # ── CustomScenarioBase 实现 ───────────────────────────────────────────
 
     def setup(self, world: Any) -> None:
-        """生成自车、交通参与者与事件传感器。"""
+        """生成自车、交通参与者、事件传感器与仿真传感器。"""
         if self._ego is not None:
             # 同一 runner 重复下发场景：先回收上一场景 Actor，避免残影
             self.cleanup(world)
@@ -98,6 +148,7 @@ class BuiltinScenario(CustomScenarioBase):
         for participant in self._config.traffic_participants:
             self._spawn_participant(world, library, participant)
         self._attach_event_sensors(world, library)
+        self._attach_sim_sensors(world, library)
 
         logger.info(
             f"Builtin scenario '{self._config.scene_id}' ready: "
@@ -123,6 +174,9 @@ class BuiltinScenario(CustomScenarioBase):
                 stop = getattr(sensor, "stop", None)
                 if callable(stop):
                     stop()
+                destroy = getattr(sensor, "destroy", None)
+                if callable(destroy):
+                    destroy()
             except Exception as exc:  # noqa: BLE001  传感器可能已随世界销毁
                 logger.debug(f"Sensor stop failed: {exc}")
         self._sensors.clear()
@@ -255,6 +309,183 @@ class BuiltinScenario(CustomScenarioBase):
             logger.warning(f"Attach sensor '{sensor_id}' failed: {exc}")
             return
         self._sensors.append(sensor)
+
+    def _attach_sim_sensors(self, world: Any, library: Any) -> None:
+        """按 ``config.sensors`` 型号剖面挂载仿真传感器（V3.0.0）。
+
+        流程：剖面名合并 → 蓝图创建 → 按 HUNTER SE 安装位挂载 → 回调统一接入
+        ``FrameHub`` / ``McapRecorder`` / ROS2 桥接。单型传感器失败只降级该型，
+        不阻断场景（蓝图缺失常见于未部署 hunter_se 资产的环境）。
+
+        Args:
+            world: CARLA World。
+            library: BlueprintLibrary。
+        """
+        specs: list[SensorSpec] = [spec for spec in self._config.sensors if spec.enabled]
+        if not specs or self._ego is None:
+            return
+
+        bundle = resolve_profiles([spec.profile for spec in specs])
+        try:
+            blueprints = SensorBlueprintFactory(library).create_bundle(bundle)
+        except Exception as exc:  # noqa: BLE001  蓝图库异常不得阻断场景
+            logger.warning(f"Sim sensor blueprint creation failed: {exc}")
+            return
+        if not blueprints:
+            logger.warning("Sim sensors skipped: no available blueprint")
+            return
+
+        mount_manager = SensorMountManager(self._ego)
+        attached = 0
+        for sensor_type, blueprint in blueprints.items():
+            stream = _SIM_STREAM_BY_TYPE.get(sensor_type)
+            if stream is None:
+                # 事件类传感器由 _attach_event_sensors 负责（回调语义不同）
+                continue
+            try:
+                sensor = mount_manager.attach_sensor(sensor_type, blueprint, world)
+            except SensorSimulationError as exc:
+                logger.warning(f"Sim sensor '{sensor_type.value}' attach skipped: {exc}")
+                continue
+            self._listen_sensor(sensor, stream)
+            self._sensors.append(sensor)
+            attached += 1
+
+        if attached:
+            self._ros_enabled = any(spec.ros_enabled for spec in specs)
+            logger.info(
+                f"Sim sensors attached: {attached} (profile={bundle.profile_name}, "
+                f"record={self._recorder is not None}, ros={self._ros_enabled})"
+            )
+
+    def _listen_sensor(self, sensor: Any, stream: str) -> None:
+        """注册传感器回调（回调异常不得冒泡到 CARLA 线程）。"""
+        listen = getattr(sensor, "listen", None)
+        if not callable(listen):
+            return
+        listen(lambda data, _stream=stream: self._on_sensor_data(_stream, data))
+
+    def _on_sensor_data(self, stream: str, data: Any) -> None:
+        """传感器帧统一出口：编码 → FrameHub → McapRecorder → ROS2。"""
+        try:
+            self._dispatch_sensor_data(stream, data)
+        except Exception as exc:  # noqa: BLE001  单帧异常不得中断仿真
+            logger.debug(f"Sensor frame dispatch skipped ({stream}): {exc}")
+
+    def _dispatch_sensor_data(self, stream: str, data: Any) -> None:
+        """实际分发逻辑（拆分便于单测直接调用）。"""
+        ts = float(getattr(data, "timestamp", 0.0)) or time.time()
+        log_time_ns = int(ts * 1e9)
+        frame_id = _FRAME_IDS.get(stream, stream)
+
+        if stream == STREAM_RGB:
+            raw, width, height = self._raw_image(data)
+            encoded = encode_rgb_frame(
+                raw,
+                width,
+                height,
+                quality=self._screenshot_quality,
+                max_width=self._stream_max_width,
+            )
+            if self._frame_hub is not None:
+                self._frame_hub.push(
+                    stream,
+                    ts,
+                    encoded.payload,
+                    {
+                        "content_type": encoded.content_type,
+                        "format": encoded.format,
+                        "width": encoded.width,
+                        "height": encoded.height,
+                    },
+                )
+            if self._recorder is not None:
+                # 录制保留原始 BGRA（无损，便于离线重编码）
+                self._recorder.push_stream(
+                    stream,
+                    log_time_ns,
+                    build_image_message(raw, width, height, "bgra8", frame_id, log_time_ns),
+                )
+            self._publish_ros("rgb", data)
+            return
+
+        if stream == "depth":
+            raw, width, height = self._raw_image(data)
+            if self._recorder is not None:
+                meters = depth_bgra_to_meters(raw, width, height).tobytes()
+                self._recorder.push_stream(
+                    stream,
+                    log_time_ns,
+                    build_image_message(meters, width, height, "32FC1", frame_id, log_time_ns),
+                )
+            self._publish_ros("depth", data)
+            return
+
+        if stream == "lidar":
+            payload, points = self._lidar_xyz(points_bytes=bytes(getattr(data, "data", b"")))
+            if self._frame_hub is not None:
+                self._frame_hub.push(stream, ts, payload, {"points": points})
+            if self._recorder is not None and payload:
+                self._recorder.push_stream(
+                    stream,
+                    log_time_ns,
+                    build_pointcloud2_message(payload, points, frame_id, log_time_ns),
+                )
+            self._publish_ros("lidar", data)
+            return
+
+        if stream == "imu":
+            accel = tuple(float(v) for v in getattr(data, "accelerometer", (0.0, 0.0, 0.0)))
+            gyro = tuple(float(v) for v in getattr(data, "gyroscope", (0.0, 0.0, 0.0)))
+            if self._frame_hub is not None:
+                self._frame_hub.push(stream, ts, repr((accel, gyro)).encode("utf-8"), {})
+            if self._recorder is not None:
+                self._recorder.push_stream(
+                    stream,
+                    log_time_ns,
+                    build_imu_message(accel, gyro, frame_id, log_time_ns),  # type: ignore[arg-type]
+                )
+            self._publish_ros("imu", data)
+
+    def _publish_ros(self, stream: str, data: Any) -> None:
+        """可选 ROS2 话题发布（未启用/未初始化/无 rclpy 时静默跳过）。"""
+        if not self._ros_enabled or self._ros_bridge is None:
+            return
+        if not getattr(self._ros_bridge, "is_initialized", False):
+            return
+        publishers = {
+            "rgb": getattr(self._ros_bridge, "publish_rgb_image", None),
+            "depth": getattr(self._ros_bridge, "publish_depth_image", None),
+            "lidar": getattr(self._ros_bridge, "publish_lidar", None),
+            "imu": getattr(self._ros_bridge, "publish_imu", None),
+        }
+        publish = publishers.get(stream)
+        if not callable(publish):
+            return
+        try:
+            publish(data)
+        except Exception as exc:  # noqa: BLE001  ROS2 发布失败不影响仿真
+            logger.debug(f"ROS2 publish skipped ({stream}): {exc}")
+
+    @staticmethod
+    def _raw_image(data: Any) -> tuple[bytes, int, int]:
+        """取 CARLA 图像帧的原始字节与尺寸。"""
+        raw = bytes(getattr(data, "data", b"") or b"")
+        return raw, int(getattr(data, "width", 0)), int(getattr(data, "height", 0))
+
+    @staticmethod
+    def _lidar_xyz(points_bytes: bytes) -> tuple[bytes, int]:
+        """把 CARLA LiDAR（x,y,z,intensity float32 四元组）转为 PointCloud2 字节序。
+
+        CARLA 输出已是小端 float32×4，与 PointCloud2 的 x/y/z/intensity 布局一致，
+        因此仅做长度校验后直传，无需逐点重写。
+
+        Returns:
+            ``(payload, point_count)``；长度不合法时返回 ``(b"", 0)``。
+        """
+        if not points_bytes or len(points_bytes) % _LIDAR_POINT_BYTES != 0:
+            return b"", 0
+        return points_bytes, len(points_bytes) // _LIDAR_POINT_BYTES
 
     @staticmethod
     def _find_blueprint(library: Any, blueprint_id: str, prefix: str) -> Any:

@@ -4,6 +4,7 @@
 - 串行消费实例队列（同一时刻只运行一个场景，满足 CARLA 单世界约束）；
 - ``create``/``submit`` 立即返回，地图加载（10~30s）在后台线程完成；
 - 场景映射、VIL 运行时装配、看门狗与终态结果发布；
+- 传感器帧汇聚（FrameHub → MJPEG/截图）与 mcap 录制（→ sensor_file）；
 - 重启恢复：由 ``InstanceStore`` 在启动时把非终态实例标记为 failed。
 
 看门狗：``duration * 3 + 120s``（见 ``AdapterSettings.watchdog_timeout``）。
@@ -12,12 +13,15 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from hunter_sim.cloud.connector import CloudConnector
 from hunter_sim.common.exceptions import (
     CarlaSimulationError,
     ConfigurationError,
@@ -47,6 +51,8 @@ from hunter_sim.platform_adapter.store import InstanceStore
 from hunter_sim.platform_adapter.vil import VILRuntime
 from hunter_sim.scene_runner.scene_config import SceneConfig
 from hunter_sim.scene_runner.scene_state_manager import SceneStateSnapshot
+from hunter_sim.sensor_sim.frame_hub import FrameHub
+from hunter_sim.sensor_sim.mcap_recorder import McapRecorder, RecordStats
 
 logger = get_logger(__name__)
 
@@ -55,6 +61,10 @@ _SAMPLE_INTERVAL_S = 0.1
 _MAX_SAMPLES = 50_000
 # 进度落库最小间隔（秒）
 _PROGRESS_MIN_INTERVAL_S = 0.5
+# 录制文件保留清理周期（秒）：看门狗每轮顺带检查
+_RETENTION_SWEEP_INTERVAL_S = 300.0
+# 完成时等待录制上传排空的超时（秒）：不阻断终态落库，但给上传线程机会
+_UPLOAD_DRAIN_TIMEOUT_S = 10.0
 
 
 @dataclass
@@ -70,6 +80,9 @@ class _RunContext:
     last_progress_at: float = 0.0
     stop_reason: str = ""
     final_message: str = ""
+    frame_hub: Optional[FrameHub] = None
+    recorder: Optional[McapRecorder] = None
+    record_stats: Optional[RecordStats] = None
 
     def add_sample(self, ego: dict[str, Any], sim_time: float) -> None:
         """按 10Hz 采样自车状态（供评估引擎消费）。"""
@@ -124,6 +137,10 @@ class SimulationExecutor:
         self._watchdog: Optional[threading.Thread] = None
         self._shutdown = threading.Event()
         self._evaluator = EvaluationEngine()
+        # 传感器录制上传（复用 CloudConnector 的有界队列 + 后台线程）
+        self._connector_lock = threading.Lock()
+        self._connector: Optional[CloudConnector] = None
+        self._last_retention_sweep = 0.0
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
@@ -153,6 +170,7 @@ class SimulationExecutor:
             watchdog.join(timeout=5.0)
         self._worker = None
         self._watchdog = None
+        self._stop_connector()
         try:
             self._plane.release_all()
         except Exception as exc:  # noqa: BLE001
@@ -244,6 +262,15 @@ class SimulationExecutor:
         )
         return self._store.get(instance_id)
 
+    def frame_hub(self, instance_id: str) -> Optional[FrameHub]:
+        """当前运行的传感器帧汇聚中心（无活动场景返回 None）。
+
+        供控制面 MJPEG/截图端点取最新帧。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        return context.frame_hub if context is not None else None
+
     def _interrupt(self, instance_id: str, reason: str) -> None:
         """登记中断原因并停止当前运行器（不持锁调用 CARLA）。"""
         with self._lock:
@@ -330,9 +357,21 @@ class SimulationExecutor:
                 scene.duration_seconds
             )
 
+        # 传感器出口：FrameHub 总是创建（画面回传），录制器按 sensors[].record 打开，
+        # ROS2 桥接仅在 sensors[].ros_enabled 时惰性创建（rclpy 缺失时降级为 None）
+        context.frame_hub = FrameHub()
+        self._start_recording(context)
+
         vil: Optional[VILRuntime] = None
         try:
-            hooks: dict[str, Any] = {"sample_sink": context.add_sample}
+            hooks: dict[str, Any] = {
+                "sample_sink": context.add_sample,
+                "frame_hub": context.frame_hub,
+                "recorder": context.recorder,
+                "ros_bridge": self._ros_bridge_for(scene),
+                "screenshot_quality": self._adapter.screenshot_quality,
+                "stream_max_width": self._adapter.stream_max_width,
+            }
             if mode is SimMode.VIL:
                 vil = VILRuntime(
                     self._settings,
@@ -387,6 +426,7 @@ class SimulationExecutor:
             logger.warning(f"Instance {instance_id} assembly failed: {exc}")
             self._fail_instance(instance_id, f"execution_unavailable:{exc}")
         finally:
+            self._close_recording(context)
             if vil is not None:
                 vil.stop()
             try:
@@ -420,6 +460,9 @@ class SimulationExecutor:
                 break
             self._persist_progress(context)
             time.sleep(0.2)
+
+        # 录制收尾：成功/失败/取消/看门狗路径均到达此处（幂等）
+        context.record_stats = self._close_recording(context)
 
         if self._shutdown.is_set():
             return
@@ -474,6 +517,7 @@ class SimulationExecutor:
             result=result,
             watchdog_deadline=0,
         )
+        self._upload_recording(context)
         self._publish(record, evaluation, artifacts)
         logger.info(f"Instance completed: {instance_id}, passed={evaluation.passed}")
 
@@ -664,7 +708,156 @@ class SimulationExecutor:
                 self._fail_instance(instance_id, "watchdog_timeout")
                 with self._lock:
                     self._deadlines.pop(instance_id, None)
+            if now - self._last_retention_sweep >= _RETENTION_SWEEP_INTERVAL_S:
+                self._last_retention_sweep = now
+                try:
+                    self._sweep_recordings()
+                except Exception as exc:  # noqa: BLE001  清理失败不影响看门狗
+                    logger.warning(f"Recording retention sweep failed: {exc}")
             time.sleep(0.5)
+
+    # ── 传感器录制与上传 ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ros_bridge_for(scene: Any) -> Optional[Any]:
+        """按 ``sensors[].ros_enabled`` 惰性创建 ROS2 桥接器（默认关闭）。
+
+        ``rclpy`` 或桥接器构造失败时返回 None（场景照常运行，仅少一路出口）。
+        """
+        specs = [spec for spec in getattr(scene, "sensors", []) if spec.enabled]
+        if not any(spec.ros_enabled for spec in specs):
+            return None
+        try:
+            from hunter_sim.sensor_sim.carla_ros_bridge import CarlaRosBridge  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001  可选依赖缺失降级
+            logger.warning(f"ROS2 bridge unavailable: {type(exc).__name__}: {exc}")
+            return None
+        try:
+            return CarlaRosBridge()
+        except Exception as exc:  # noqa: BLE001  初始化失败不阻断场景
+            logger.warning(f"ROS2 bridge init failed: {type(exc).__name__}: {exc}")
+            return None
+
+    def _start_recording(self, context: _RunContext) -> None:
+        """按 ``scene.sensors[].record`` 打开 mcap 录制（不满足条件则不录制）。"""
+        enabled = [spec for spec in context.scene.sensors if spec.enabled]
+        if not any(spec.record for spec in enabled):
+            return
+        record = context.record
+        recorder = McapRecorder()
+        path = (
+            Path(self._adapter.recordings_dir)
+            / _safe_segment(record.instance_id)
+            / f"sensors_r{record.revision}.mcap"
+        )
+        if not recorder.open(path):
+            logger.warning(f"Sensor recording disabled for {record.instance_id} (degraded)")
+            return
+        context.recorder = recorder
+
+    def _close_recording(self, context: _RunContext) -> Optional[RecordStats]:
+        """结束录制并回写路径/字节数（幂等）。
+
+        Returns:
+            本次录制的统计（未录制或已关闭返回 None）。
+        """
+        recorder = context.recorder
+        if recorder is None:
+            return context.record_stats
+        context.recorder = None
+        stats = recorder.close()
+        context.record_stats = stats
+        if not stats.path:
+            return stats
+        try:
+            self._store.patch(
+                context.record.instance_id,
+                recording_path=stats.path,
+                recording_bytes=stats.size_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001  记录回写失败不影响终态
+            logger.debug(f"Recording metadata persist failed: {exc}")
+        logger.info(
+            f"Sensor recording closed: instance={context.record.instance_id}, "
+            f"frames={stats.frame_count}, size={stats.size_bytes}B"
+        )
+        return stats
+
+    def _upload_recording(self, context: _RunContext) -> None:
+        """把录制文件投递到上传队列（后台线程，不阻塞终态落库）。"""
+        stats = context.record_stats
+        if stats is None or not stats.path or stats.frame_count <= 0:
+            return
+        path = Path(stats.path)
+        if not path.is_file():
+            logger.warning(f"Recording file missing, skip upload: {path}")
+            return
+        connector = self._connector_for(context.record)
+        if connector is None:
+            logger.info("Cloud disabled, sensor recording kept locally only")
+            return
+        connector.upload_bag(
+            path,
+            data_type="rosbag",
+            stats=stats,
+            scene_id=context.record.scene_id,
+            vehicle_id=context.record.vehicle_id or None,
+        )
+
+    def _connector_for(self, record: InstanceRecord) -> Optional[CloudConnector]:
+        """取（并初始化）上传连接器；未启用云端或 producer 不可用时返回 None。
+
+        复用执行平面已连接的 ``SimDataProducer``，避免同一 sim_id 双生产者。
+        """
+        if not self._settings.cloud.enabled:
+            return None
+        producer = self._plane.producer_for_sim_id(record.sim_id)
+        if producer is None:
+            return None
+        with self._connector_lock:
+            if self._connector is None:
+                self._connector = CloudConnector(self._settings.cloud)
+            connector = self._connector
+        connector.attach_producer(producer, sim_id=record.sim_id)
+        return connector
+
+    def _stop_connector(self) -> None:
+        """停止上传线程（不等待未完成上传）。"""
+        with self._connector_lock:
+            connector, self._connector = self._connector, None
+        if connector is None:
+            return
+        try:
+            connector.wait_upload_idle(_UPLOAD_DRAIN_TIMEOUT_S)
+            connector.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Cloud connector stop failed: {exc}")
+
+    def _sweep_recordings(self) -> None:
+        """按保留期清理录制文件（看门狗周期调用，异常不外抛）。"""
+        retention = float(self._adapter.recording_retention_hours)
+        if retention <= 0:
+            return
+        root = Path(self._adapter.recordings_dir)
+        if not root.is_dir():
+            return
+        cutoff = time.time() - retention * 3600.0
+        removed = 0
+        for entry in root.iterdir():
+            try:
+                if not entry.is_dir():
+                    continue
+                newest = max(
+                    (child.stat().st_mtime for child in entry.rglob("*") if child.is_file()),
+                    default=entry.stat().st_mtime,
+                )
+                if newest < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    removed += 1
+            except OSError as exc:
+                logger.debug(f"Recording retention skip '{entry}': {exc}")
+        if removed:
+            logger.info(f"Recording retention removed {removed} directory(ies)")
 
     # ── 辅助 ─────────────────────────────────────────────────────────────────
 
@@ -682,6 +875,12 @@ class SimulationExecutor:
             carla_stream_port=carla.stream_port,
             carla_tm_port=carla.tm_port,
         )
+
+
+def _safe_segment(value: str) -> str:
+    """路径片段安全化（只保留字母数字与 ``._-``）。"""
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in value)
+    return cleaned or "unknown"
 
 
 def _quality_of(record: InstanceRecord) -> Optional[str]:

@@ -1389,3 +1389,96 @@ huntersim carla-manager --db-path data/adapter/carla_instances.db --log-level de
 - 产物预签名上传失败只保留本地文件与约定 `object_key`；需要可下载时需修复 JWT/MinIO 连通后重跑或手工补传。
 
 ---
+
+## V3.0.0 — 仿真端收敛与 VIL / 传感器链路补齐
+
+**发布日期**：2026-11-02
+**版本定位**：仿真端只做「执行」（跑 CARLA、用实车数据驱动虚拟自车、回传状态/事件/指标/传感器文件/画面），治理能力全部归云端；补齐 VIL 车辆状态同步与传感器录制–上传–通知全链。
+
+### 概览
+
+目标拓扑收敛为两个进程：
+
+```
+huntersim carla-manager  :8090   唯一业务入口（内网、无鉴权）
+huntersim probes         :8080   只读探针面（/health + /metrics）
+```
+
+数据面契约不变：消费 `carla.{sim_id}.vil_state`，发布 `carla.{sim_id}.sensor_data`（6 类 type）+ `.dlq`。
+
+### 破坏性变更
+
+| 项 | 变更 |
+|---|---|
+| 业务面 | `/api/v1/sim` 全部端点删除；8080 只保留 `/health`（+`/health/live`、`/health/ready`）与 `/metrics` |
+| 鉴权 | JWT / API Key / 用户 / 角色 / 限流 / 登录退避全部移除（安全边界改为网络隔离） |
+| 模块 | 删除 `gui/`、`replay_service/`、`api/`、`persistence/`、`resource_manager/` |
+| 配置前缀 | 删除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*`；新增 `PROBE_*`；`KAFKA_COMMAND_TOPIC` 删除 |
+| 依赖 | 删除 `python-jose[cryptography]` / `websockets` / `python-multipart` / `aiofiles`；新增 `mcap` / `mcap-ros2-support`；删除 `[gui]` extra |
+| CLI | `huntersim serve` → `huntersim probes`；`doctor` 删除 `state_store`/`users`/`jwt`，新增 `adapter_db`/`recordings_dir`/`mcap` |
+| 版本 | `2.13.0` → `3.0.0`（同时修正 README 与包版本漂移） |
+
+### 一、模块裁剪与替代
+
+- 新增 `probes/`：`create_probes_app()` 仅注册 `GET /health`、`/health/live`、`/health/ready`、`GET /metrics`。`/health` 通过 `PROBE_ADAPTER_URL` 拉取控制面快照并透传 `carla_connected` / `carla_probe_error` / `active_instance` / `vil_state` / `sensor` / `cloud` / `version`；上游不可达仍返回 **200 + `status=degraded`**，失败原因写 `upstream.error`（避免容器 liveness 反复杀进程）。
+- `common/models.py` 精简：删除 `APISettings` / `PlatformSettings` / `StateSettings` / `GuiSettings`；新增 `ProbeSettings`（`PROBE_` 前缀）；`ResourceSettings` 仅留 `instance_max_lifetime_seconds` / `health_check_interval_seconds`；`HunterSimSettings` 新增 `adapter` 字段（与 8090 共用同一份配置对象）。
+- 编排收敛：`docker/Dockerfile` 去 `--workers`，`ENTRYPOINT huntersim` + `CMD carla-manager`，`EXPOSE 8090 8080`；`docker-compose.yml` 为 `sim-service` + `probes` + `kafka` + `prometheus` + `alertmanager` + `grafana`（`carla-engine` 收进 `--profile carla`）；`docker-compose.windows.yml` 为 `carla-server` + `sim-service` + `kafka`；`k8s/deployment.yaml` 改为单 Pod 双容器（`sim-service` + `probes`）、`replicas: 1`；`Makefile` 为 `manager` / `probes` / `test` / `coverage` / `typecheck` / `lint`。
+
+### 二、VIL Bridge 补齐
+
+- 新增 `vil_mapper/frame_aligner.py`：把 10–50Hz 实车帧规约到固定 10Hz 栅格。`grid_index = floor(now × target_hz)` 同栅格去重（降采样）；跨 `now` 的左右帧线性插值（航向最短弧）→ `interpolated`；仅左帧且在 `max_extrapolation_ms` 内 → `extrapolated`；其余 → `nearest` 并记录 `skew_ms`。
+- `vil_mapper/vil_sync_service.py`：`apply_once()` 改走 `FrameAligner.next(now)`；新增舵角写入（`set_wheel_steer_angle` 前左/前右）、灯光同步（`StateVisualizer.apply_vehicle_lights`）、感知叠加（`PerceptionOverlay`，每 3 个栅格绘制一次）。CARLA 调用失败降级为 debug 日志，不影响 tick。
+- `cloud/vil_state_parser.py`：新增 `lights` 段解析（`left_turn`/`right_turn`/`low_beam`/`hazard`，顶层或 `chassis.lights`），缺省时不写入任何键（不改动已开灯光）；`chassis.steering_angle` 内部统一**弧度**，报文标注 `steering_unit="deg"` 时解析阶段换算。`VehicleState` 增加 `lights`。
+- `platform_adapter/vil.py`：装配 `FrameAligner` / `StateVisualizer` / `PerceptionOverlay`；`vil_config` 支持 `target_hz` / `overlay_enabled` / `lights_enabled` 覆盖；`status_override()` 在连续 `nearest` 且 `skew > 2×max_data_latency_ms` 时同样上报 `PAUSED(vil_data_interrupted)`。
+
+### 三、Sensor Emulator 落地
+
+- 新增 `sensor_sim/profiles.py`：`helios_16p`（16 线/150m/10Hz/FOV ±15°/σ=0.02m/131072 pts·s⁻¹）、`d435`（RGB 1280×720 HFOV 69° 30fps + Depth 1280×720 HFOV 87° 0.2–10m）、`ch10x`（IMU 100Hz/accel σ=0.01/gyro σ=0.001）、默认 `hunter_se_full`（三件套 + 三类事件传感器）。`configs/sensor_configs.json` 增 `profiles` 段，与代码双向对应（单测逐字段断言）。
+- `scene_runner/scene_config.py` 增 `SensorSpec{profile, enabled, ros_enabled, record}` 与 `SceneConfig.sensors`；`platform_adapter/scene_mapper.py` 增 `sensors` 映射（平台缺省 → 默认 `hunter_se_full`）。
+- 新增 `sensor_sim/frame_hub.py`：线程安全，`push/latest/stats`，stream ∈ `{rgb, depth, lidar, imu}`，只保留最新帧并维护 fps。
+- `scene_runner/builtin_scenario.py`：`_attach_sim_sensors()` 按剖面创建 bundle 并挂到自车（安装位取 `HunterSESpec` 偏移与 `sensor_configs.json.mount`），回调统一走 `data_converters` → `FrameHub.push` → 录制器，`ros_enabled` 时额外投递 ROS2；`cleanup()` 幂等销毁；blueprint 缺失只 warning 不阻断。
+- 新增 `sensor_sim/mcap_recorder.py`：纯 Python（`mcap` + `mcap_ros2.writer`），主题 `/carla/lidar_points`（PointCloud2）、`/carla/camera/color/image_raw`、`/carla/camera/depth/image_rect_raw`（Image）、`/carla/imu/data`（Imu）；`open/push_stream/close → RecordStats(start_time, end_time, frame_count, topics, size_bytes, path)`；依赖缺失或写失败降级 no-op + warning。`sensor_sim/data_recorder.py`（`ros2 bag record` 子进程包装）删除。
+- ROS2 出口：`CarlaRosBridge` 由 `SimulationExecutor._ros_bridge_for(scene)` 按 `sensors[].ros_enabled` 惰性装配（`rclpy` 或构造失败 → None + warning），修复“导出但从未实例化”的死代码问题。
+
+### 四、Monitor & Recorder
+
+- 新增 `GET /api/v1/instances/{id}/screenshot`（`image/jpeg`，无相机/无帧 → `409 camera_not_attached`，实例不存在 → `404`）与 `GET /api/v1/instances/{id}/stream.mjpg`（`multipart/x-mixed-replace; boundary=frame`，客户端断开即结束）。
+- `AdapterSettings` 新增 `stream_fps`(10.0) / `stream_max_width`(640) / `screenshot_quality`(75) / `recordings_dir` / `recording_retention_hours`(24)。
+- 录制→上传→通知全链：`SimulationExecutor` 按 `sensors[].record` 打开 `McapRecorder`（`recordings_dir/{instance_id}/sensors_r{revision}.mcap`）→ 运行期逐帧写入 → 终态（成功/失败/取消）close 得 `RecordStats` → `cloud.enabled` 时上传 → 成功后发布 `sensor_file`。
+- `sensor_file` 的 `start_time` / `end_time` / `frame_count` / `topics` / `size_bytes` 改为 `RecordStats` 真值，`file_format="mcap"`。
+- `InstanceRecord` 增 `recording_path` / `recording_bytes`，`GET /instances/{id}` 与 `/result` 可见；录制文件按 `ADAPTER_RECORDING_RETENTION_HOURS` 在 `_watchdog_loop` 周期清理。
+
+### 五、四条断链修复（对照）
+
+| 断链 | 状态 | 落地方式 |
+|---|---|---|
+| `sensor_file` 时间/帧数恒为 0 | **已修复** | `RecordStats` 真值回填 |
+| `CloudConnector.upload_bag()` 无调用点 | **已修复** | 场景结束链路上传并发布 `sensor_file` |
+| 无画面回传端点 | **已修复** | `/screenshot` + `/stream.mjpg`（MJPEG） |
+| `StateVisualizer` / `CarlaRosBridge` 导出未接线 | **已修复** | VIL 灯光同步 + 执行器 ROS2 桥接装配 |
+
+### 六、质量门禁（实测）
+
+- `pytest tests -q --cov=src/hunter_sim`：**1007 passed**，全仓行覆盖 **83.79%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 80 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增“无死代码”门禁 `tests/test_no_orphan_exports.py`：AST 扫描 `__init__.py` 的 `__all__`，断言本期接入符号（`StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge`）在生产代码有引用；历史欠账以只减不增的 allowlist 固定。
+- 新增控制面 VIL 全链集成测试 `tests/integration/test_vil_e2e_control_plane.py`（CARLA / Kafka / MinIO / VILRuntime 全替身）：`create → 断流 PAUSED → 恢复 → completed + sim_metrics + sensor_file`。
+- 补回执行面测试：`test_engine_pool_lease.py`(25) + `test_execution_plane_lifecycle.py`(35)，覆盖租约/心跳/地图亲和/装配取消/生产者生命周期。
+
+### 七、兼容性说明
+
+- **服务端**：平台只配置 `CARLA_MANAGEMENT_ENDPOINT` 即可（无变化）；新端点与 `sensors` 字段均为增量，旧报文仍可解析（`lights`/`steering_unit` 缺省时行为与旧版一致）。
+- **数据面**：Topic 名与 6 类 type 不变；唯一语义变化是 `sensor_file` 从“恒 0”变为真值，严格 Schema 校验方需放行。
+- **部署**：镜像 tag 改 `3.0.0`，`CMD` 为 `carla-manager`；compose 新增 `probes` 服务，需同步更新 Prometheus 抓取目标（业务指标从 `:8090/metrics`，探针自身从 `:8080/metrics`）。
+- **运维脚本**：凡引用 `/api/v1/sim`、`huntersim serve`、`API_JWT_SECRET` 的脚本必须改写（迁移对照见 `user_manual.md` §12）。
+
+### 八、待办 / 已知边界
+
+- 真实 CARLA 环境下的画面观感（灯光、转向灯、感知叠加节流）与 MJPEG 在平台前端的播放效果**未实测**（本期测试全部使用 CARLA/Kafka/MinIO 替身）。
+- `.mcap` 仅用 `mcap` Python reader 读回验证，尚未用 Foxglove/ROS2 工具在同一环境下复核。
+- ROS2 出口（`ros_enabled=true`）在装有 `rclpy` 的环境中**未实测**。
+- MinIO 实际上传与平台消费方对 `sensor_file.topics` 的解析**未联调**。
+- 单进程单世界仍是硬约束；需要并行只能部署多个控制面进程/端口并在平台侧分片（不共享注册表）。
+
+---

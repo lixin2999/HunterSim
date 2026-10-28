@@ -12,6 +12,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 from hunter_sim.common.models import QualityLevel, SimMode, SensorType, Transform
+from hunter_sim.sensor_sim.profiles import DEFAULT_PROFILE as DEFAULT_SENSOR_PROFILE
 
 
 class SpawnPoint(BaseModel):
@@ -63,6 +64,25 @@ class EgoVehicleConfig(BaseModel):
         description="挂载传感器列表",
     )
     initial_speed_ms: float = Field(0.0, ge=0.0, le=50.0)
+
+
+class SensorSpec(BaseModel):
+    """仿真传感器规格（V3.0.0：按型号剖面挂载）。
+
+    与 ``EgoVehicleConfig.sensors``（内部传感器类型枚举）区别：本段描述
+    **实车型号剖面**与数据出口开关，由 ``BuiltinScenario`` 解析后挂载。
+
+    Attributes:
+        profile: 型号剖面名（``helios_16p`` / ``d435`` / ``ch10x`` / ``hunter_se_full``）。
+        enabled: 是否挂载该剖面。
+        ros_enabled: 是否同时发布 ROS2 话题（需 rclpy，缺失时自动降级）。
+        record: 是否写入 mcap 录制文件。
+    """
+
+    profile: str = Field(DEFAULT_SENSOR_PROFILE, description="传感器型号剖面")
+    enabled: bool = True
+    ros_enabled: bool = False
+    record: bool = True
 
 
 class WeatherConfig(BaseModel):
@@ -194,6 +214,7 @@ class SceneConfig(BaseModel):
         ego_vehicle: 自车配置。
         weather: 天气配置。
         traffic_participants: 交通参与者列表。
+        sensors: 仿真传感器型号剖面列表（V3.0.0，默认挂 HUNTER SE 三件套）。
         scene_events: 场景评估事件定义列表。
         duration_seconds: 场景最大运行时长（秒）。
         timeout_seconds: 超时自动结束时间（秒）。
@@ -210,6 +231,7 @@ class SceneConfig(BaseModel):
     ego_vehicle: EgoVehicleConfig
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
     traffic_participants: list[TrafficParticipantConfig] = Field(default_factory=list)
+    sensors: list[SensorSpec] = Field(default_factory=lambda: [SensorSpec()])
     scene_events: list[SceneEventDefinition] = Field(default_factory=list)
     duration_seconds: float = Field(60.0, gt=0.0, le=7200.0)
     timeout_seconds: float = Field(7200.0, gt=0.0)

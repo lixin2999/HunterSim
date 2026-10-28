@@ -1,30 +1,39 @@
 """CARLA 管理面控制平面（HunterCore 侧 ``carla-manager``）。
 
-8 个端点（端口默认 8090，仅内网，无鉴权头 / 无 Ingress）：
+10 个端点（端口默认 8090，仅内网，无鉴权头 / 无 Ingress）：
 
-===============================  =================================================
-``POST   /api/v1/instances``     创建实例（立即返回，世界在后台加载）
-``GET    /api/v1/instances``     按 ``scene_id`` 查询（空查询返回空列表）
+==========================================  ======================================
+``POST   /api/v1/instances``                创建实例（立即返回，世界在后台加载）
+``GET    /api/v1/instances``                按 ``scene_id`` 查询（空查询返回空列表）
 ``POST   /api/v1/instances/{id}/scenario``  下发/重发场景配置
 ``GET    /api/v1/instances/{id}``           进度快照
 ``GET    /api/v1/instances/{id}/result``    终态结果
 ``POST   /api/v1/instances/{id}/pause``     暂停
 ``POST   /api/v1/instances/{id}/resume``    恢复
 ``POST   /api/v1/instances/{id}/stop``      停止并回收
-===============================  =================================================
+``GET    /api/v1/instances/{id}/screenshot`` 单帧截图（image/jpeg | image/png）
+``GET    /api/v1/instances/{id}/stream.mjpg`` MJPEG 实时画面
+==========================================  ======================================
 
 响应中的 ``status`` 使用平台词汇（pending/running/succeeded/failed/canceled），
 ``carla_status`` 保留 CARLA 原始状态（CREATED/LOADING/READY/RUNNING/PAUSED/...）。
+
+运维端点：``GET /health``（聚合快照，供 ``huntersim probes`` 代理）与
+``GET /metrics``（本进程 Prometheus 注册表）。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional, cast
+from typing import Any, AsyncIterator, Callable, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from prometheus_client import generate_latest
 
+from hunter_sim.common.metrics import observe_http_request, refresh_runtime_gauges
 from hunter_sim.common.models import HunterSimSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.execution.engine_pool import EnginePool, EngineEndpoint, parse_engine_endpoints
@@ -38,6 +47,7 @@ from hunter_sim.platform_adapter.models import (
 )
 from hunter_sim.platform_adapter.service import AdapterService
 from hunter_sim.platform_adapter.store import InstanceStore
+from hunter_sim.sensor_sim.frame_hub import FrameHub
 
 logger = get_logger(__name__)
 
@@ -97,6 +107,7 @@ def create_app(
     store: Optional[InstanceStore] = None,
     executor: Optional[SimulationExecutor] = None,
     service: Optional[AdapterService] = None,
+    frame_hub_provider: Optional[Callable[[str], Optional[FrameHub]]] = None,
 ) -> FastAPI:
     """构造控制平面应用。
 
@@ -104,6 +115,7 @@ def create_app(
         settings: 全局配置（None 时从环境加载）。
         adapter_settings: 适配器配置（None 时从 ``ADAPTER_*`` 环境加载）。
         plane/store/executor/service: 测试注入点；注入 ``service`` 时应用不接管生命周期。
+        frame_hub_provider: 帧汇聚中心查询器（测试注入用；默认委托执行器）。
     """
     owned: dict[str, Any] = {
         "store": None,
@@ -137,6 +149,7 @@ def create_app(
                 runtime_adapter,
                 runtime_store,
                 runtime_executor,
+                frame_hub_provider=frame_hub_provider,
             )
             runtime_executor.start()
             logger.info(
@@ -162,11 +175,42 @@ def create_app(
     )
 
     _register_routes(app)
+    app.add_middleware(_LatencyMiddleware)
     return app
 
 
+class _LatencyMiddleware:
+    """记录管理面请求延迟直方图（ASGI 中间件，低基数路径标签）。"""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        status_code = 500
+
+        async def _send(message: Any) -> None:
+            nonlocal status_code
+            if message.get("type") == "http.response.start":
+                status_code = int(message.get("status", 500))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        finally:
+            observe_http_request(
+                scope.get("method", "GET"),
+                scope.get("path", "/"),
+                status_code,
+                time.perf_counter() - started,
+            )
+
+
 def _register_routes(app: FastAPI) -> None:
-    """注册 8 个平台控制面端点与健康检查。"""
+    """注册 10 个平台控制面端点与运维端点（health/metrics）。"""
 
     def _service(request: Request) -> AdapterService:
         service = getattr(request.app.state, "adapter_service", None)
@@ -178,9 +222,37 @@ def _register_routes(app: FastAPI) -> None:
         return HTTPException(status_code=404, detail=f"instance not found: {instance_id}")
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        """健康探针（容器 liveness/readiness）。"""
-        return {"status": "ok"}
+    def health(request: Request) -> dict[str, Any]:
+        """聚合健康快照（容器 liveness/readiness 与 ``huntersim probes`` 上游）。"""
+        service = getattr(request.app.state, "adapter_service", None)
+        if service is None:
+            return {"status": "degraded", "carla_connected": None}
+        body: dict[str, Any] = {"status": "ok"}
+        snapshot = getattr(service, "health_snapshot", None)
+        if callable(snapshot):
+            try:
+                body.update(snapshot())
+            except Exception as exc:  # noqa: BLE001  健康检查不得因瞬时异常 500
+                logger.warning(f"Health snapshot failed: {exc}")
+                body["status"] = "degraded"
+        return body
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    def metrics(request: Request) -> PlainTextResponse:
+        """Prometheus 指标（抓取时刷新运行时 Gauge）。"""
+        service = getattr(request.app.state, "adapter_service", None)
+        gauges: dict[str, Any] = {}
+        sampler = getattr(service, "runtime_gauges", None)
+        if callable(sampler):
+            try:
+                gauges = sampler()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Runtime gauge sampling failed: {exc}")
+        refresh_runtime_gauges(**gauges)
+        return PlainTextResponse(
+            generate_latest().decode("utf-8"),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.post("/api/v1/instances")
     def create_instance(
@@ -239,6 +311,50 @@ def _register_routes(app: FastAPI) -> None:
     def stop_instance(instance_id: str, request: Request) -> dict[str, Any]:
         """停止实例并回收 CARLA 资源（幂等）。"""
         return _control(_service(request).stop(instance_id), instance_id)
+
+    @app.get("/api/v1/instances/{instance_id}/screenshot")
+    def screenshot(instance_id: str, request: Request) -> Response:
+        """当前 RGB 相机单帧截图（未挂相机→409，实例不存在→404）。"""
+        service = _service(request)
+        if service.get(instance_id) is None:
+            raise _not_found(instance_id)
+        frame = service.screenshot(instance_id)
+        if frame is None:
+            raise HTTPException(status_code=409, detail="camera_not_attached")
+        media_type = str(frame.meta.get("content_type") or "image/jpeg")
+        return Response(
+            content=frame.payload,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/instances/{instance_id}/stream.mjpg")
+    def stream_mjpeg(instance_id: str, request: Request) -> StreamingResponse:
+        """MJPEG 实时画面（``multipart/x-mixed-replace``，客户端断开即结束）。"""
+        service = _service(request)
+        if service.get(instance_id) is None:
+            raise _not_found(instance_id)
+        if service.screenshot(instance_id) is None:
+            raise HTTPException(status_code=409, detail="camera_not_attached")
+        return StreamingResponse(
+            _mjpeg_chunks(service.stream_frames(instance_id)),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store", "Connection": "close"},
+        )
+
+
+def _mjpeg_chunks(frames: Any) -> Any:
+    """把帧包装为 MJPEG 分片（Content-Type 跟随实际编码 JPEG/PNG）。"""
+    for frame in frames:
+        payload = frame.payload
+        content_type = str(frame.meta.get("content_type") or "image/jpeg")
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: " + content_type.encode("ascii") + b"\r\n"
+            b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
+            + payload
+            + b"\r\n"
+        )
 
 
 def _instance_view(record: InstanceRecord) -> dict[str, Any]:

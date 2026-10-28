@@ -336,7 +336,6 @@ class EvaluationEngine:
             import hashlib
             sha256 = hashlib.sha256(json_bytes).hexdigest()
             object_key = f"scenarios/simulations/{sim_id}/{scene_id}/eval.json"
-            seq_artifact = sim_data_producer.next_seq()
             sim_data_producer.publish_artifact(
                 name="eval.json",
                 bucket=eval_bucket,

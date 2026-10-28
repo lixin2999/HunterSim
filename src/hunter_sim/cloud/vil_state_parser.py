@@ -12,6 +12,7 @@
       "pose":        {x, y, z, roll, pitch, yaw},
       "twist":       {linear: [vx, vy, vz], angular: [wx, wy, wz]},
       "chassis":     {velocity, steering_angle, control_mode, vehicle_state, fault_code, ...},
+      "lights":      {left_turn, right_turn, low_beam, hazard},
       "perception":  {detected_objects, fps, latency_ms, objects: [...]},
       "planning":    {current_behavior, trajectory},
       "control":     {target_velocity, target_steer, target_throttle, target_brake},
@@ -21,10 +22,15 @@
 兼容性：同时接受旧 ``telemetry_clean`` 的扁平写法（``twist.vx`` /
 ``chassis.speed_m_s`` / ``chassis.steer``）以及被 ``payload`` 包裹的信封写法，
 便于平台侧灰度切换。
+
+单位约定（V3.0.0）：``chassis.steering_angle`` **内部统一弧度**；若报文显式标注
+``steering_unit="deg"``（可在顶层或 ``chassis`` 内）则解析时换算为弧度。
+``lights`` 段缺省时不写入任何键，仿真端不会因此变更车辆灯光。
 """
 
 from __future__ import annotations
 
+import math
 import time
 import zlib
 from typing import Any, Optional
@@ -39,6 +45,24 @@ from hunter_sim.vil_mapper.telemetry_buffer import TelemetryFrame
 
 # 感知目标 ID 为字符串时的稳定映射空间（CRC32 正值）
 _OBJECT_ID_MASK = 0x7FFFFFFF
+
+# 支持同步的灯光位（与 ``StateVisualizer.apply_vehicle_lights`` 对应）
+_LIGHT_KEYS = ("left_turn", "right_turn", "low_beam", "hazard")
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """安全转 bool（字符串/数字按常见写法解析）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on", "open"}:
+            return True
+        if lowered in {"false", "0", "no", "off", "closed", ""}:
+            return False
+    return default
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -113,6 +137,26 @@ def _as_object_id(raw: Any, index: int) -> int:
     if text.lstrip("-").isdigit():
         return int(text)
     return zlib.crc32(text.encode("utf-8")) & _OBJECT_ID_MASK
+
+
+def _lights_of(inner: dict[str, Any], chassis: dict[str, Any]) -> dict[str, bool]:
+    """提取灯光状态（顶层 ``lights`` 优先，其次 ``chassis.lights``）。
+
+    未上报或空字典时返回空字典，调用方据此跳过灯光同步（不改动已开灯光）。
+
+    Args:
+        inner: vil_state 内层报文。
+        chassis: ``inner["chassis"]``（归一化后的字典）。
+
+    Returns:
+        仅包含支持的灯光位（ ``_LIGHT_KEYS``）的布尔字典。
+    """
+    raw: Any = inner.get("lights")
+    if not isinstance(raw, dict):
+        raw = chassis.get("lights")
+    if not isinstance(raw, dict):
+        return {}
+    return {key: _as_bool(raw.get(key)) for key in _LIGHT_KEYS if key in raw}
 
 
 def _calibration_of(inner: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -212,6 +256,12 @@ def parse_vil_state(
     steering = _as_float(
         chassis.get("steering_angle", chassis.get("steer", chassis.get("steering")))
     )
+    # 单位约定（V3.0.0）：内部统一弧度；报文标注 deg 时在此换算，保证下游只需处理 rad
+    steering_unit = str(
+        inner.get("steering_unit") or chassis.get("steering_unit") or "rad"
+    ).strip().lower()
+    if steering_unit.startswith("deg"):
+        steering = math.radians(steering)
     # 实际执行量优先取 chassis，control 段（期望值）仅作兜底
     throttle = _as_float(
         chassis.get("throttle", control.get("throttle", control.get("target_throttle")))
@@ -235,6 +285,7 @@ def parse_vil_state(
         brake=brake,
         gear=int(_as_float(chassis.get("gear"), 1.0)),
         vehicle_speed=speed_m_s,
+        lights=_lights_of(inner, chassis),
     )
 
     perception: Optional[PerceptionResult] = None

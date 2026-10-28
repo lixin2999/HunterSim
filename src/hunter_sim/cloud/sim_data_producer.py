@@ -27,9 +27,7 @@ from hunter_sim.cloud.sim_data_mapper import (
     build_artifact,
     build_sensor_file,
     build_sim_event,
-    build_sim_metrics,
     build_sim_status,
-    build_sim_telemetry,
     SimStatusPayload,
 )
 from hunter_sim.common.metrics import (

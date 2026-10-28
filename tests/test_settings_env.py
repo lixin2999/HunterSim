@@ -2,7 +2,7 @@
 
 历史问题：`.env` 中写 `CARLA_HOST` 会因 `HunterSimSettings` 的 `extra=forbid`
 直接抛 ValidationError，且嵌套分组未配置 `env_file`，导致文档宣称的
-“环境变量 > .env > 默认值” 对 `CARLA_*/KAFKA_*/VIL_*/API_*/RESOURCE_*` 不成立。
+“环境变量 > .env > 默认值” 对 `CARLA_*/KAFKA_*/VIL_*/ADAPTER_*/PROBE_*` 不成立。
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ from hunter_sim.common.models import HunterSimSettings
 _ENV_KEYS = (
     "CARLA_HOST",
     "CARLA_RPC_PORT",
-    "API_PORT",
+    "ADAPTER_PORT",
+    "PROBE_PORT",
     "HUNTER_SIM_ENV",
 )
 
@@ -37,13 +38,15 @@ def test_dotenv_applies_to_nested_prefixes(tmp_path: Path) -> None:
     """`.env` 中的各前缀键应分别被对应分组读取。"""
     _write_env(
         tmp_path,
-        "HUNTER_SIM_ENV=staging\nCARLA_HOST=10.1.2.3\nCARLA_RPC_PORT=2100\nAPI_PORT=9090\n",
+        "HUNTER_SIM_ENV=staging\nCARLA_HOST=10.1.2.3\nCARLA_RPC_PORT=2100\n"
+        "ADAPTER_PORT=9091\nPROBE_PORT=9092\n",
     )
     settings = HunterSimSettings()
     assert settings.env == "staging"
     assert settings.carla.host == "10.1.2.3"
     assert settings.carla.rpc_port == 2100
-    assert settings.api.port == 9090
+    assert settings.adapter.port == 9091
+    assert settings.probe.port == 9092
 
 
 def test_env_var_overrides_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -67,17 +70,17 @@ def test_missing_dotenv_uses_defaults(tmp_path: Path) -> None:
     assert settings.carla.rpc_port == 2000
 
 
-def test_cloud_and_gui_dotenv_apply(tmp_path: Path) -> None:
-    """V2.2.0：HUNTER_CORE_* / GUI_* 前缀 `.env` 键分别被 cloud / gui 分组读取。"""
+def test_cloud_adapter_and_probe_dotenv_apply(tmp_path: Path) -> None:
+    """V3.0.0：HUNTER_CORE_* / ADAPTER_* / PROBE_* 前缀键分别被对应分组读取。"""
     _write_env(
         tmp_path,
         "HUNTER_CORE_ENABLED=true\n"
         "HUNTER_CORE_SIM_ID=SIM_X9\n"
         "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.31.35:9092\n"
         "HUNTER_CORE_JWT_TOKEN=abc.def.ghi\n"
-        "GUI_THEME=light\n"
-        "GUI_DEFAULT_MAP=Town05\n"
-        "GUI_STREAM_FPS=24\n",
+        "ADAPTER_STREAM_FPS=24\n"
+        "ADAPTER_RECORDINGS_DIR=data/rec\n"
+        "PROBE_PORT=8099\n",
     )
     settings = HunterSimSettings()
     assert settings.cloud.enabled is True
@@ -85,23 +88,32 @@ def test_cloud_and_gui_dotenv_apply(tmp_path: Path) -> None:
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
     assert settings.cloud.jwt_token is not None
     assert settings.cloud.jwt_token.get_secret_value() == "abc.def.ghi"
-    assert settings.gui.theme == "light"
-    assert settings.gui.default_map == "Town05"
-    assert settings.gui.stream_fps == 24.0
+    assert settings.adapter.stream_fps == 24.0
+    assert settings.adapter.recordings_dir == "data/rec"
+    assert settings.probe.port == 8099
 
 
-def test_cloud_defaults_are_noop(tmp_path: Path) -> None:
-    """未配置时 cloud 默认关闭、指向单机验证环境；gui 默认深色。"""
+def test_cloud_adapter_and_probe_defaults(tmp_path: Path) -> None:
+    """未配置时 cloud 默认关闭、指向单机验证环境；adapter/probe 默认 8090/8080。"""
     settings = HunterSimSettings()
     assert settings.cloud.enabled is False
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
     assert settings.cloud.sensor_data_topic_template == "carla.{sim_id}.sensor_data"
-    assert settings.gui.theme == "dark"
-    assert settings.gui.scenario_runner_path is None
+    assert settings.adapter.port == 8090
+    assert settings.adapter.stream_fps == 10.0
+    assert settings.probe.port == 8080
+    assert settings.probe.adapter_url == "http://127.0.0.1:8090"
+
+
+def test_removed_prefixes_are_gone() -> None:
+    """V3.0.0：8080 治理面与 GUI 配置块已删除，不得再出现在聚合配置中。"""
+    fields = set(HunterSimSettings.model_fields)
+    assert {"api", "state", "platform", "gui"}.isdisjoint(fields)
+    assert {"adapter", "probe", "carla", "kafka", "vil", "cloud", "resource"} <= fields
 
 
 def test_cloud_unknown_keys_ignored(tmp_path: Path) -> None:
     """HUNTER_CORE_ 前缀下的未知键不得触发校验错误。"""
-    _write_env(tmp_path, "HUNTER_CORE_TYPO_FIELD=1\nGUI_TYPO=2\n")
+    _write_env(tmp_path, "HUNTER_CORE_TYPO_FIELD=1\nADAPTER_TYPO=2\n")
     settings = HunterSimSettings()
     assert settings.cloud.enabled is False

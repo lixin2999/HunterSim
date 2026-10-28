@@ -14,6 +14,7 @@ from hunter_sim.vil_mapper.data_health_monitor import (
     DataHealthReport,
     DataHealthStatus,
 )
+from hunter_sim.vil_mapper.frame_aligner import AlignedFrame, AlignerStats, FrameAligner
 from hunter_sim.vil_mapper.pose_extrapolator import PoseExtrapolator
 from hunter_sim.vil_mapper.state_visualizer import PerceptionOverlay, StateVisualizer
 from hunter_sim.vil_mapper.telemetry_buffer import (
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from hunter_sim.cloud.vil_state_parser import parse_vil_state
 
 __all__ = [
+    "AlignedFrame", "AlignerStats", "FrameAligner",
     "CalibrationManager",
     "DataHealthMonitor", "DataHealthReport", "DataHealthStatus",
     "PoseExtrapolator",

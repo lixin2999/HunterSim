@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -18,6 +20,7 @@ from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.executor import SimulationExecutor
 from hunter_sim.platform_adapter.models import InstanceRecord
 from hunter_sim.platform_adapter.store import InstanceStore
+from hunter_sim.scene_runner.scene_config import SensorSpec
 from hunter_sim.scene_runner.scene_state_manager import SceneStateSnapshot
 
 TERMINAL = {"succeeded", "failed", "canceled"}
@@ -670,3 +673,42 @@ def _context(record: InstanceRecord, runner: _FakeRunner) -> Any:
     from hunter_sim.platform_adapter.executor import _RunContext  # noqa: PLC0415
 
     return _RunContext(record=record, scene=record.scene_config, runner=runner)
+
+
+class TestRosBridgeWiring:
+    """ROS2 出口按 ``sensors[].ros_enabled`` 惰性装配（V3.0.0 §3.6）。"""
+
+    def test_disabled_yields_none(self, executor: SimulationExecutor) -> None:
+        scene = SimpleNamespace(sensors=[SensorSpec()])
+
+        assert executor._ros_bridge_for(scene) is None  # noqa: SLF001
+
+    def test_enabled_sensor_creates_bridge(
+        self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Bridge:
+            pass
+
+        monkeypatch.setattr("hunter_sim.sensor_sim.carla_ros_bridge.CarlaRosBridge", _Bridge)
+        scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
+
+        assert isinstance(executor._ros_bridge_for(scene), _Bridge)  # noqa: SLF001
+
+    def test_init_failure_degrades_to_none(
+        self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _boom() -> Any:
+            raise RuntimeError("rclpy missing")
+
+        monkeypatch.setattr("hunter_sim.sensor_sim.carla_ros_bridge.CarlaRosBridge", _boom)
+        scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
+
+        assert executor._ros_bridge_for(scene) is None  # noqa: SLF001
+
+    def test_import_failure_degrades_to_none(
+        self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "hunter_sim.sensor_sim.carla_ros_bridge", None)
+        scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
+
+        assert executor._ros_bridge_for(scene) is None  # noqa: SLF001

@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Optional
-
-import pytest
+from typing import Any
 
 from hunter_sim.cloud.sim_data_producer import SimDataProducer
 from hunter_sim.common.models import CloudSettings
@@ -258,7 +256,6 @@ class TestBufferFallback:
         fake_fail = FakeKafkaProducer(fail_on_send=True)
         fake_ok = FakeKafkaProducer(fail_on_send=False)
         settings = _settings()
-        call_count = [0]
 
         def factory(s: CloudSettings, sid: str) -> FakeKafkaProducer:
             return fake_fail

@@ -8,8 +8,14 @@ spec:
     app: hunter-sim
     component: sim-service
   ports:
-    - name: http
+    # 唯一业务入口（控制面；含 /api/v1/instances/*、/screenshot、/stream.mjpg）
+    - name: adapter
       port: 80
+      targetPort: 8090
+      protocol: TCP
+    # 只读探针面（/health + /metrics），供 Prometheus 抓取
+    - name: probes
+      port: 8080
       targetPort: 8080
       protocol: TCP
   type: ClusterIP

@@ -15,6 +15,11 @@ class AdapterSettings(BaseSettings):
         db_path: 实例注册表 SQLite 路径（重启恢复/幂等）。
         artifacts_dir: 本地产物目录（上传前的暂存区）。
         artifact_bucket: 产物 Bucket（平台预签名下载约定）。
+        recordings_dir: 传感器录制目录（mcap 落盘 + 保留期清理）。
+        recording_retention_hours: 录制文件保留时长（小时），看门狗周期清理。
+        stream_fps: MJPEG 推流帧率（默认 10，与 VIL 栅格一致）。
+        stream_max_width: 回传画面最大宽度（0 表示不降采样）。
+        screenshot_quality: JPEG 质量（1-100，默认 75）。
         busy_timeout_seconds: SQLite 忙等待超时。
         watchdog_factor: 看门狗时长倍数（``duration * factor + grace``）。
         watchdog_grace_seconds: 看门狗基础宽限（秒）。
@@ -34,6 +39,18 @@ class AdapterSettings(BaseSettings):
     )
     artifacts_dir: str = Field("data/adapter/artifacts", description="本地产物暂存目录")
     artifact_bucket: str = Field("hunter-scene-assets", description="产物对象存储 Bucket")
+    # ── V3.0.0 Monitor & Recorder ──
+    recordings_dir: str = Field(
+        "data/adapter/recordings", description="传感器录制目录（mcap 落盘）"
+    )
+    recording_retention_hours: float = Field(
+        24.0, ge=0.0, le=720.0, description="录制文件保留时长（小时），0 表示不清理"
+    )
+    stream_fps: float = Field(10.0, gt=0.0, le=60.0, description="MJPEG 推流帧率（Hz）")
+    stream_max_width: int = Field(
+        640, ge=0, le=7680, description="回传画面最大宽度（0 表示不降采样）"
+    )
+    screenshot_quality: int = Field(75, ge=1, le=100, description="截图 JPEG 质量")
     busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时")
     watchdog_factor: float = Field(3.0, ge=1.0, le=10.0, description="看门狗时长倍数")
     watchdog_grace_seconds: float = Field(

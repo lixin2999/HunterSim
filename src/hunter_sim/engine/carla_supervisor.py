@@ -382,7 +382,8 @@ class CarlaProcessSupervisor:
                 _wait(process, 2.0)
         except Exception as exc:  # noqa: BLE001  终止失败仅记录，交由看门狗下轮处理
             logger.error(f"Failed to terminate CARLA process for {runtime.target.key}: {exc}")
-        CARLA_SUPERVISOR_EVENTS_TOTAL.labels(event=reason if reason in (EVENT_STOP, EVENT_RESTART) else EVENT_STOP).inc()
+        event = reason if reason in (EVENT_STOP, EVENT_RESTART) else EVENT_STOP
+        CARLA_SUPERVISOR_EVENTS_TOTAL.labels(event=event).inc()
         self._emit(runtime, reason, f"terminated, exit_code={_exit_code(process)}")
 
     def _build_command(self, target: ManagedTarget) -> list[str]:

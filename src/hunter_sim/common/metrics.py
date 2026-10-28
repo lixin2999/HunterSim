@@ -1,60 +1,62 @@
-"""Prometheus 指标统一定义（V2.6.0 P0-5）。
+"""Prometheus 指标统一定义（V3.0.0 收敛）。
 
 工程约定：
-- 全部指标注册在 ``prometheus_client`` 默认 REGISTRY，``/metrics`` 端点经
-  ``generate_latest()`` 一次性导出（``api/routers/health.py``）；
+- 全部指标注册在 ``prometheus_client`` 默认 REGISTRY；进程内 ``/metrics`` 端点经
+  ``generate_latest()`` 一次性导出（业务面 :8090 与只读探针 :8080 各持一份注册表）；
 - 命名统一 ``huntersim_`` 前缀，与 ``docker/alerts.yml`` 告警规则保持兼容；
 - 服务层/公共层只依赖本模块打点，不感知 API 层（避免反向依赖）；
-- Gauge 值在抓取时刻从 ``app.state`` 同步（``update_app_state_gauges``），
-  探测不可用时写入 NaN（NaN 不满足任何 ``>`` 阈值，不会误告警）。
+- Gauge 值在抓取时刻由 ``refresh_runtime_gauges`` 刷新；无采样源的指标保持初始
+  未设置状态（不产出样本，``absent`` 类告警可据 ``absent()`` 判定）。
 
-指标清单（V2.6.0 新增）：
-- huntersim_http_request_duration_seconds  HTTP 请求延迟直方图
-- huntersim_rate_limited_rejections_total  限流拒绝计数（P0-3）
-- huntersim_login_rejections_total         登录拒绝计数（凭据/退避，P0-3）
-- huntersim_instance_lifecycle_total       实例生命周期计数
+指标清单（仿真生命周期与云端回传）：
+- huntersim_http_request_duration_seconds  管理面 HTTP 请求延迟直方图
+- huntersim_instance_lifecycle_total       实例生命周期计数（created/canceled）
 - huntersim_carla_rpc_errors_total         CARLA RPC 探测失败计数
 - huntersim_kafka_consume_errors_total     Kafka 消费轮询错误计数
-- huntersim_cloud_upload_total             bag 上传结果计数（success/failed）
-- huntersim_cloud_upload_dropped_total     上传队列溢出丢弃计数（P0-4）
+- huntersim_kafka_consumer_rebuilds_total  Kafka 消费者自愈重建计数
+- huntersim_kafka_consumed_total           VIL 遥测消息消费计数
+- huntersim_kafka_consumer_lag             消费滞后估算 Gauge
+- huntersim_cloud_dlq_published_total      坏消息进 DLQ 计数
+- huntersim_cloud_upload_total             bag/mcap 上传结果计数（success/failed）
+- huntersim_cloud_upload_dropped_total     上传队列溢出丢弃计数
+- huntersim_carla_supervisor_events_total  托管 CARLA 进程事件计数
 
-指标清单（V2.7.0 P1 新增）：
-- huntersim_kafka_consumer_rebuilds_total  Kafka 消费者自愈重建计数（P1-8）
-- huntersim_cloud_dlq_published_total      坏消息进 DLQ 计数（P1-8）
-- huntersim_vil_message_dropped_total      VIL 乱序/重复消息丢弃计数（P1-9）
-- huntersim_vil_latency_seconds            VIL 端到端延迟直方图（P50/P95/P99，P1-9）
-- huntersim_execution_lease_reclaims_total 僵尸租约强制回收计数（P1-7）
-- huntersim_auth_token_events_total        Token 续期/吊销计数（P1-6）
+指标清单（VIL 链路）：
+- huntersim_vil_message_dropped_total      VIL 乱序/重复消息丢弃计数
+- huntersim_vil_latency_seconds            VIL 端到端延迟直方图（P50/P95/P99）
+- huntersim_vil_state_consumed_total       carla.{sim_id}.vil_state 消费计数
+- huntersim_vil_e2e_lag_ms                 VIL 端到端延迟（ms）Histogram
+- huntersim_vil_frames_downsampled_total   VIL 栅格推进计数（mode 见下）
+- huntersim_vil_align_skew_ms              VIL 栅格对齐误差（ms）Histogram
 
-指标清单（V2.8.0 P2 新增）：
-- huntersim_user_events_total              平台用户管理/登录计数（P2-13）
-- huntersim_scheduling_decisions_total     地图感知调度决策计数（P2-14）
-- huntersim_carla_supervisor_events_total  托管 CARLA 进程事件计数（P2-15）
-
-指标清单（V2.10.0 平台接入新增）：
+指标清单（平台接入 6 类消息）：
 - huntersim_sim_status_published_total     sim_status 消息发布计数
 - huntersim_sim_event_published_total      sim_event 消息发布计数
 - huntersim_sim_metrics_published_total    sim_metrics 消息发布计数
 - huntersim_sensor_file_published_total    sensor_file 消息发布计数
 - huntersim_sim_data_producer_errors_total SimDataProducer 发送/DLQ 错误计数
 - huntersim_sim_data_buffer_size           SimDataProducer 有界缓冲当前深度 Gauge
-- huntersim_vil_state_consumed_total       carla.{sim_id}.vil_state 消费计数
-- huntersim_vil_e2e_lag_ms                 VIL 端到端延迟（ms）Histogram
+- huntersim_sim_data_dropped_total         有界缓冲溢出丢弃计数
+
+指标清单（传感器模拟与画面回传，V3.0.0 新增）：
+- huntersim_sensor_frames_total            传感器帧计数（stream=rgb|depth|lidar|imu）
+- huntersim_sensor_record_bytes_total      mcap 写入累计字节数
+- huntersim_stream_clients                 MJPEG 在线客户端数 Gauge
 """
 
 from __future__ import annotations
 
-import math
 import re
 import time
 from typing import Any
 
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
-# 服务启动时间（uptime 指标基准；与 api/routers/health.py 原语义一致）
+# 服务启动时间（uptime 指标基准）
 SERVICE_START_TIME: float = time.time()
 
-_API_PREFIX = "/api/v1/sim"
+# 管理面路径前缀（:8090 的 /api/v1/instances/...）
+_API_PREFIX = "/api/v1"
 
 # 路径段中视为资源 ID 的形态：长度 ≥16 且含分隔符（uuid/实例 ID/任务 ID 等）
 _ID_SEGMENT_RE = re.compile(r"^[0-9A-Za-z_-]{16,}$")
@@ -91,17 +93,6 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "HTTP request latency in seconds.",
     labelnames=("method", "path", "status_class"),
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
-)
-
-RATE_LIMITED_REJECTIONS_TOTAL = Counter(
-    "huntersim_rate_limited_rejections_total",
-    "Requests rejected by the per-client rate limiter.",
-)
-
-LOGIN_REJECTIONS_TOTAL = Counter(
-    "huntersim_login_rejections_total",
-    "Token requests rejected (reason=credential|backoff).",
-    labelnames=("reason",),
 )
 
 # ─── 业务链路 ────────────────────────────────────────────────────────────────
@@ -169,32 +160,6 @@ VIL_LATENCY_SECONDS = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0, 5.0),
 )
 
-EXECUTION_LEASE_RECLAIMS_TOTAL = Counter(
-    "huntersim_execution_lease_reclaims_total",
-    "Zombie engine leases force-reclaimed by admin (stale heartbeat).",
-)
-
-AUTH_TOKEN_EVENTS_TOTAL = Counter(
-    "huntersim_auth_token_events_total",
-    "JWT token lifecycle events (event=refresh|revoke|revoked_hit).",
-    labelnames=("event",),
-)
-
-# ─── V2.8.0 P2：多用户 / 地图感知调度 / 引擎自愈 ────────────────────────────
-
-USER_EVENTS_TOTAL = Counter(
-    "huntersim_user_events_total",
-    "Platform user management events (event=create|update|delete|password_change|"
-    "password_change_denied|login|login_denied).",
-    labelnames=("event",),
-)
-
-SCHEDULING_DECISIONS_TOTAL = Counter(
-    "huntersim_scheduling_decisions_total",
-    "Engine endpoint scheduling outcomes (kind=affinity_reuse|fresh_endpoint|fallback).",
-    labelnames=("kind",),
-)
-
 CARLA_SUPERVISOR_EVENTS_TOTAL = Counter(
     "huntersim_carla_supervisor_events_total",
     "Managed CARLA process events (event=start|exit|restart|giveup|stop).",
@@ -252,48 +217,92 @@ VIL_E2E_LAG_MS = Histogram(
     buckets=(1, 5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000),
 )
 
-# ─── app.state 派生 Gauge（抓取时刻刷新）────────────────────────────────────
+# ─── V3.0.0：VIL 栅格对齐与传感器回传 ──────────────────────────────────────
 
+# 10Hz 栅格推进计数：mode=interpolated|extrapolated|nearest，
+# 三者之和即实际推进的栅格数（50Hz 输入下应稳定在 10/s）。
+VIL_FRAMES_DOWNSAMPLED_TOTAL = Counter(
+    "huntersim_vil_frames_downsampled_total",
+    "VIL frames applied per alignment mode (interpolated/extrapolated/nearest).",
+    labelnames=("mode",),
+)
+
+# 对齐误差（毫秒）：nearest 模式下的时间偏差，P95 用于判断时钟/插值质量
+VIL_ALIGN_SKEW_MS = Histogram(
+    "huntersim_vil_align_skew_ms",
+    "VIL frame alignment skew in milliseconds (grid time vs data time).",
+    buckets=(5, 10, 20, 30, 50, 60, 100, 150, 300, 500, 1000),
+)
+
+# 传感器帧计数：stream=rgb|depth|lidar|imu
+SENSOR_FRAMES_TOTAL = Counter(
+    "huntersim_sensor_frames_total",
+    "Sensor frames produced by the emulator (stream=rgb|depth|lidar|imu).",
+    labelnames=("stream",),
+)
+
+# 录制累计字节数（mcap 写入量，用于磁盘容量告警）
+SENSOR_RECORD_BYTES_TOTAL = Counter(
+    "huntersim_sensor_record_bytes_total",
+    "Bytes written by the mcap recorder.",
+)
+
+# MJPEG 在线客户端数（Gauge），用于带宽与连接泄漏观测
+STREAM_CLIENTS = Gauge(
+    "huntersim_stream_clients",
+    "Active MJPEG stream clients.",
+)
+
+# ─── 抓取时刻刷新的运行时 Gauge ──────────────────────────────────────────
+
+# (参数名, 指标名, 说明)：由 ``refresh_runtime_gauges`` 在 ``/metrics`` 抓取时刷新
 _GAUGE_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("active_instance_count", "huntersim_active_instances", "Number of active simulation instances."),
-    ("carla_rpc_latency_seconds", "huntersim_carla_rpc_latency_seconds", "CARLA RPC response time."),
+    ("active_instances", "huntersim_active_instances", "Number of active simulation instances."),
+    (
+        "carla_rpc_latency_seconds",
+        "huntersim_carla_rpc_latency_seconds",
+        "CARLA RPC response time.",
+    ),
     ("simulation_fps", "huntersim_simulation_fps", "Simulation average frame rate."),
     ("vil_latency_ms", "huntersim_vil_latency_ms", "VIL end-to-end latency in ms."),
     ("disk_usage_ratio", "huntersim_disk_usage_ratio", "Disk usage ratio (0-1)."),
 )
 
+_RUNTIME_GAUGES: dict[str, Gauge] = {
+    key: Gauge(name, help_text) for key, name, help_text in _GAUGE_SPECS
+}
+
 _UPTIME_GAUGE = Gauge("huntersim_uptime_seconds", "Service uptime in seconds.")
 _CARLA_CONNECTED_GAUGE = Gauge(
     "huntersim_carla_connected", "Whether CARLA connection is up (1/0)."
 )
-# Gauge 名 → Gauge 对象（抓取时缺值写 NaN，避免旧值滞留导致误判）
-_STATE_GAUGES: dict[str, Gauge] = {
-    name: Gauge(name, help_text) for _, name, help_text in _GAUGE_SPECS
-}
-# state 属性名 → Gauge 名
-_STATE_ATTR_TO_GAUGE: dict[str, str] = {state_key: name for state_key, name, _ in _GAUGE_SPECS}
 
 
-def update_app_state_gauges(state: Any) -> None:
-    """抓取时刻把 app.state 实时值刷入 Prometheus Gauge。
+def refresh_runtime_gauges(**values: float | bool | None) -> None:
+    """抓取时刻刷新运行时 Gauge（V3.0.0：不再依赖 ``app.state``）。
+
+    只写入本次采样到值的指标；传 ``None`` 或未知参数名的项保持上一次值不变
+    （进程启动后从未采样的指标不产出样本，可用 ``absent()`` 写告警）。
 
     Args:
-        state: ``FastAPI.app.state``（或任意具备同名属性的对象）。
+        **values: 指标参数名 → 采样值，支持 ``active_instances`` /
+            ``carla_rpc_latency_seconds`` / ``simulation_fps`` /
+            ``vil_latency_ms`` / ``disk_usage_ratio`` / ``carla_connected``。
     """
     _UPTIME_GAUGE.set(time.time() - SERVICE_START_TIME)
-    connected = getattr(state, "carla_connected", False)
-    _CARLA_CONNECTED_GAUGE.set(1 if connected else 0)
-    for attr, gauge_name in _STATE_ATTR_TO_GAUGE.items():
-        value: Any = getattr(state, attr, None)
-        gauge = _STATE_GAUGES[gauge_name]
+    for key, value in values.items():
         if value is None:
-            gauge.set(math.nan)
-        else:
+            continue
+        if key == "carla_connected":
+            _CARLA_CONNECTED_GAUGE.set(1 if value else 0)
+            continue
+        gauge = _RUNTIME_GAUGES.get(key)
+        if gauge is not None:
             gauge.set(float(value))
 
 
 def observe_http_request(method: str, path: str, status_code: int, elapsed_seconds: float) -> None:
-    """记录一次 HTTP 请求的延迟直方图样本（供请求日志中间件调用）。
+    """记录一次管理面 HTTP 请求的延迟直方图样本（供请求中间件调用）。
 
     Args:
         method: HTTP 方法。
@@ -315,6 +324,18 @@ def observe_vil_latency(latency_ms: float) -> None:
     """
     if latency_ms >= 0.0:
         VIL_LATENCY_SECONDS.observe(latency_ms / 1000.0)
+
+
+def observe_vil_alignment(mode: str, skew_ms: float) -> None:
+    """记录一次 VIL 栅格对齐结果（V3.0.0）。
+
+    Args:
+        mode: 对齐模式（``interpolated`` / ``extrapolated`` / ``nearest``）。
+        skew_ms: 栅格时间与实际数据时间的偏差（毫秒）。
+    """
+    VIL_FRAMES_DOWNSAMPLED_TOTAL.labels(mode=mode).inc()
+    if skew_ms >= 0.0:
+        VIL_ALIGN_SKEW_MS.observe(skew_ms)
 
 
 def observe_vil_e2e_lag(lag_ms: float) -> None:
@@ -368,23 +389,20 @@ def metric_exists(name: str) -> bool:
 
 
 __all__ = [
-    "AUTH_TOKEN_EVENTS_TOTAL",
     "CARLA_RPC_ERRORS_TOTAL",
     "CARLA_SUPERVISOR_EVENTS_TOTAL",
     "CLOUD_DLQ_PUBLISHED_TOTAL",
     "CLOUD_UPLOAD_DROPPED_TOTAL",
     "CLOUD_UPLOAD_TOTAL",
-    "EXECUTION_LEASE_RECLAIMS_TOTAL",
     "HTTP_REQUEST_DURATION_SECONDS",
     "INSTANCE_LIFECYCLE_TOTAL",
     "KAFKA_CONSUME_ERRORS_TOTAL",
     "KAFKA_CONSUMER_LAG",
     "KAFKA_CONSUMER_REBUILDS_TOTAL",
     "KAFKA_CONSUMED_TOTAL",
-    "LOGIN_REJECTIONS_TOTAL",
-    "RATE_LIMITED_REJECTIONS_TOTAL",
-    "SCHEDULING_DECISIONS_TOTAL",
+    "SENSOR_FRAMES_TOTAL",
     "SENSOR_FILE_PUBLISHED_TOTAL",
+    "SENSOR_RECORD_BYTES_TOTAL",
     "SERVICE_START_TIME",
     "SIM_DATA_BUFFER_SIZE",
     "SIM_DATA_DROPPED_TOTAL",
@@ -392,8 +410,10 @@ __all__ = [
     "SIM_EVENT_PUBLISHED_TOTAL",
     "SIM_METRICS_PUBLISHED_TOTAL",
     "SIM_STATUS_PUBLISHED_TOTAL",
-    "USER_EVENTS_TOTAL",
+    "STREAM_CLIENTS",
+    "VIL_ALIGN_SKEW_MS",
     "VIL_E2E_LAG_MS",
+    "VIL_FRAMES_DOWNSAMPLED_TOTAL",
     "VIL_LATENCY_SECONDS",
     "VIL_MESSAGE_DROPPED_TOTAL",
     "VIL_STATE_CONSUMED_TOTAL",
@@ -402,7 +422,8 @@ __all__ = [
     "metric_exists",
     "normalize_api_path",
     "observe_http_request",
+    "observe_vil_alignment",
     "observe_vil_e2e_lag",
     "observe_vil_latency",
-    "update_app_state_gauges",
+    "refresh_runtime_gauges",
 ]

@@ -1,13 +1,16 @@
-"""HunterSim 命令行工具入口（V2.8.0 P2-16）。
+"""HunterSim 命令行工具入口（V3.0.0）。
 
 当前提供：
-- ``huntersim doctor``：部署前自检（配置/密钥强度/端口/磁盘/CARLA SDK/GPU 环境/状态库），
-  一次跑完单机部署指南里的手工检查项，失败即非零退出，可直接用于 CI 与上线前门禁；
+- ``huntersim carla-manager``：启动唯一业务入口（控制面 :8090）；
+- ``huntersim probes``：启动只读运维探针面（:8080，仅 ``/health`` + ``/metrics``）；
+- ``huntersim doctor``：部署前自检（配置/端口/磁盘/CARLA SDK/GPU 环境/
+  实例库/录制目录/mcap/Kafka），一次跑完单机部署指南里的手工检查项，
+  失败即非零退出，可直接用于 CI 与上线前门禁；
 - ``huntersim version``：打印包版本（供脚本核对镜像 tag 与代码版本是否一致）。
 
 设计口径：
 - 只读检查，不修改任何状态，不启动服务；
-- 依赖缺失（如无 nvidia-smi、未装 CARLA SDK）记为 ``warn``/``skip``，
+- 依赖缺失（如无 nvidia-smi、未装 CARLA SDK、未装 mcap）记为 ``warn``/``skip``，
   只有会让服务起不来或跑不稳的问题才记 ``fail``；
 - 输出为人读表格 + 摘要行，``--json`` 供脚本消费。
 """
@@ -32,14 +35,11 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_BAD_ARGS = 2
 
-# 磁盘阈值（GB）：低于 warn 阈值可运行但易写满 bag；低于 fail 阈值直接拒绝
+# 磁盘阈值（GB）：低于 warn 阈值可运行但易写满录制文件；低于 fail 阈值直接拒绕
 _MIN_DISK_WARN_GB = 20.0
 _MIN_DISK_FAIL_GB = 5.0
-# 生产密钥最小长度（与 api/main.py 启动闸门一致）
-_MIN_PROD_SECRET_LEN = 32
-_INSECURE_SECRETS = frozenset(
-    {"CHANGE_ME_IN_PRODUCTION", "dev-only-change-me-at-least-32-characters"}
-)
+# 录制目录可用空间 fail 阈值（GB）：低于此值无法支撑一次完整场景录制
+_MIN_RECORDINGS_FREE_GB = 5.0
 
 _STATUS_ORDER = ("ok", "warn", "fail", "skip")
 
@@ -94,56 +94,6 @@ def _check_python() -> CheckResult:
     return _fail("python", f"Python {text} < 3.12", "使用 3.12+ 解释器（uv venv --python 3.12）")
 
 
-def _check_secrets(settings: HunterSimSettings) -> list[CheckResult]:
-    """密钥与口令强度（prod 与启动闸门同口径，dev 只提示）。"""
-    results: list[CheckResult] = []
-    secret = settings.api.jwt_secret.get_secret_value()
-    prod = settings.env == "prod"
-    if secret in _INSECURE_SECRETS:
-        results.append(
-            CheckResult(
-                name="jwt_secret",
-                status="fail" if prod else "warn",
-                detail="API_JWT_SECRET 使用内置默认值",
-                hint="生成随机密钥：python -c \"import secrets;print(secrets.token_urlsafe(48))\"",
-            )
-        )
-    elif len(secret) < _MIN_PROD_SECRET_LEN:
-        results.append(
-            CheckResult(
-                name="jwt_secret",
-                status="fail" if prod else "warn",
-                detail=f"API_JWT_SECRET 长度 {len(secret)} < {_MIN_PROD_SECRET_LEN}",
-                hint="prod 启动会被闸门拒绝，请替换为 ≥32 位随机密钥",
-            )
-        )
-    else:
-        results.append(_ok("jwt_secret", f"长度 {len(secret)}（已自定义）"))
-
-    admin_password = settings.api.admin_password.get_secret_value()
-    if admin_password == "admin":
-        results.append(
-            CheckResult(
-                name="admin_password",
-                status="fail" if prod else "warn",
-                detail="API_ADMIN_PASSWORD 仍为默认 'admin'",
-                hint="V2.8.0 建议改用用户表账号（POST /auth/users）并覆盖内置口令",
-            )
-        )
-    elif len(admin_password) < settings.platform.min_password_length:
-        results.append(
-            _warn(
-                "admin_password",
-                f"内置管理员口令长度 {len(admin_password)} < 平台策略 "
-                f"{settings.platform.min_password_length}",
-                "用户表口令会按 PLATFORM_MIN_PASSWORD_LENGTH 校验，建议同步加强",
-            )
-        )
-    else:
-        results.append(_ok("admin_password", "已自定义"))
-    return results
-
-
 def _port_available(host: str, port: int, timeout: float = 1.0) -> bool:
     """端口是否未被占用（可 bind）。host 为空表示通配监听。"""
     family = socket.AF_INET
@@ -157,22 +107,29 @@ def _port_available(host: str, port: int, timeout: float = 1.0) -> bool:
 
 
 def _check_ports(settings: HunterSimSettings) -> list[CheckResult]:
-    """API 端口与 CARLA 端口占用情况（API 端口被占=已有实例或端口冲突）。"""
+    """管理面（:8090）与探针面（:8080）端口占用情况。
+
+    端口已占用但可建立 TCP 连接→warn（疑似已有进程在跑）；无连接→fail。
+    """
     results: list[CheckResult] = []
-    api_port = settings.api.port
-    if _port_available("127.0.0.1", api_port):
-        results.append(_ok("api_port", f"{api_port} 空闲，可启动服务"))
-    else:
-        reachable = _tcp_open("127.0.0.1", api_port)
+    targets = (
+        ("adapter_port", settings.adapter.port, "ADAPTER_PORT"),
+        ("probe_port", settings.probe.port, "PROBE_PORT"),
+    )
+    for name, port, env_key in targets:
+        if _port_available("127.0.0.1", port):
+            results.append(_ok(name, f"{port} 空闲，可启动服务"))
+            continue
+        reachable = _tcp_open("127.0.0.1", port)
         results.append(
             CheckResult(
-                name="api_port",
+                name=name,
                 status="warn" if reachable else "fail",
                 detail=(
-                    f"127.0.0.1:{api_port} 已被占用"
+                    f"127.0.0.1:{port} 已被占用"
                     + ("（疑似 HunterSim 已在运行）" if reachable else "（无法建立连接）")
                 ),
-                hint="停掉旧实例，或改 API_PORT 后重启",
+                hint=f"停掉旧实例，或改 {env_key} 后重启",
             )
         )
     return results
@@ -254,34 +211,83 @@ def _check_disk(base_path: str = ".") -> CheckResult:
     return _ok("disk_space", f"剩余 {free_gb:.1f} GB")
 
 
-def _check_state_store(settings: HunterSimSettings) -> CheckResult:
-    """状态库可创建/可写（否则重启恢复与 API Key 会整体降级）。"""
-    if not settings.state.enabled:
-        return _skip(
-            "state_store",
-            "STATE_ENABLED=false（实例/场景绑定不落库，重启不恢复）",
-            "生产建议置 true 以获得重启恢复能力",
-        )
-    db_path = Path(settings.state.db_path)
+def _check_adapter_db(settings: HunterSimSettings) -> CheckResult:
+    """实例注册表（SQLite）可创建/可写（否则重启恢复与幂等失效）。"""
+    db_path = Path(settings.adapter.db_path)
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from hunter_sim.persistence.state_store import StateStore  # 局部导入：doctor 不拉重依赖
+        from hunter_sim.platform_adapter.store import InstanceStore  # 局部导入：doctor 不拉重依赖
 
-        store = StateStore(str(db_path), settings.state.busy_timeout_seconds)
+        store = InstanceStore(str(db_path), settings.adapter.busy_timeout_seconds)
         try:
-            users = store.count_users()
+            store.connect()
         finally:
             store.close()
-        return _ok(
-            "state_store",
-            f"{db_path.as_posix()} 可读写（users={users}）",
-        )
+        return _ok("adapter_db", f"{db_path.as_posix()} 可读写")
     except Exception as exc:  # noqa: BLE001  权限/锁/磁盘问题统一为 fail
         return _fail(
-            "state_store",
+            "adapter_db",
             f"{db_path.as_posix()} 初始化失败：{type(exc).__name__}: {exc}",
-            "检查目录写权限与磁盘空间；必要时改用绝对路径 STATE_DB_PATH",
+            "检查目录写权限与磁盘空间；必要时改用绝对路径 ADAPTER_DB_PATH",
         )
+
+
+def _check_recordings_dir(settings: HunterSimSettings) -> CheckResult:
+    """录制目录可写且剩余空间足够（mcap 写满会导致场景失败）。"""
+    target = Path(settings.adapter.recordings_dir)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(target)
+    except OSError as exc:
+        return _fail(
+            "recordings_dir",
+            f"{target.as_posix()} 不可用：{type(exc).__name__}: {exc}",
+            "检查目录写权限；必要时改用绝对路径 ADAPTER_RECORDINGS_DIR",
+        )
+    free_gb = usage.free / (1024**3)
+    if free_gb < _MIN_RECORDINGS_FREE_GB:
+        return _fail(
+            "recordings_dir",
+            f"{target.as_posix()} 剩余 {free_gb:.1f} GB < {_MIN_RECORDINGS_FREE_GB} GB",
+            "清理历史录制文件（ADAPTER_RECORDING_RETENTION_HOURS）后重试",
+        )
+    return _ok("recordings_dir", f"{target.as_posix()} 可写，剩余 {free_gb:.1f} GB")
+
+
+def _check_mcap() -> CheckResult:
+    """mcap 写入依赖（纯 Python，不依赖 ROS2 运行时）。"""
+    missing = [
+        name for name in ("mcap", "mcap_ros2") if importlib.util.find_spec(name) is None
+    ]
+    if not missing:
+        return _ok("mcap", "mcap / mcap_ros2 可导入，传感器录制可用")
+    return _warn(
+        "mcap",
+        f"缺少依赖：{', '.join(missing)}（录制降级为 no-op）",
+        "pip install 'mcap>=1.1' 'mcap-ros2-support>=0.5'",
+    )
+
+
+def _check_kafka(settings: HunterSimSettings) -> CheckResult:
+    """Kafka 连通性（VIL 数据面；不可达时 VIL 链路无输入）。"""
+    bootstrap = settings.kafka.bootstrap_servers
+    if not bootstrap:
+        return _skip("kafka", "KAFKA_BOOTSTRAP_SERVERS 未配置")
+    first = bootstrap.split(",")[0].strip()
+    host, _, port_text = first.rpartition(":")
+    if not host or not port_text.isdigit():
+        return _warn(
+            "kafka",
+            f"bootstrap 格式可疑：{bootstrap}",
+            "期望形如 host:port[,host:port]",
+        )
+    if _tcp_open(host, int(port_text)):
+        return _ok("kafka", f"{first} 可连通")
+    return _warn(
+        "kafka",
+        f"{first} 不可达（VIL 无输入，场景将停在等待数据）",
+        "先启动 Kafka（docker compose up kafka），或确认 KAFKA_BOOTSTRAP_SERVERS 为平台地址",
+    )
 
 
 def _check_gpu() -> list[CheckResult]:
@@ -325,23 +331,6 @@ def _check_gpu() -> list[CheckResult]:
     return results
 
 
-def _check_users(settings: HunterSimSettings) -> CheckResult:
-    """多用户体系可用性（V2.8.0 P2-13）。"""
-    if not settings.platform.users_enabled:
-        return _skip(
-            "users",
-            "PLATFORM_USERS_ENABLED=false（仅内置管理员可登录）",
-            "多用户场景请置 true 并启用 STATE_ENABLED",
-        )
-    if not settings.state.enabled:
-        return _warn(
-            "users",
-            "用户表依赖状态库，但 STATE_ENABLED=false",
-            "启用 STATE_ENABLED=true 后 /auth/users 才可用（否则返回 503）",
-        )
-    return _ok("users", "用户表登录已启用（/auth/users 由 admin 管理）")
-
-
 def run_doctor(
     settings: HunterSimSettings | None = None,
     *,
@@ -370,10 +359,11 @@ def run_doctor(
 
     results: list[CheckResult] = [_ok("config", f"配置加载成功（env={loaded.env}）")]
     results.append(_check_python())
-    results.extend(_check_secrets(loaded))
-    results.append(_check_users(loaded))
     results.append(_check_disk(base_path))
-    results.append(_check_state_store(loaded))
+    results.append(_check_adapter_db(loaded))
+    results.append(_check_recordings_dir(loaded))
+    results.append(_check_mcap())
+    results.append(_check_kafka(loaded))
     results.extend(_check_gpu())
     results.extend(_check_carla_endpoints(loaded))
     results.extend(_check_ports(loaded))
@@ -421,7 +411,7 @@ def _render_text(results: list[CheckResult]) -> str:
 def _version_text() -> str:
     """包版本（未安装时降级为 unknown）。"""
     try:
-        from importlib.metadata import PackageNotFoundError, version
+        from importlib.metadata import version
 
         return version("hunter-sim")
     except Exception:  # noqa: BLE001  源码直跑无包元数据
@@ -453,6 +443,35 @@ def _cmd_carla_manager(args: argparse.Namespace) -> int:
     app = create_app(adapter_settings=adapter)
     print(f"CARLA manager listening on http://{adapter.host}:{adapter.port}")
     uvicorn.run(app, host=adapter.host, port=adapter.port, log_level=args.log_level)
+    return EXIT_OK
+
+
+def _cmd_probes(args: argparse.Namespace) -> int:
+    """``huntersim probes`` 子命令：启动只读探针面（默认 8080）。"""
+    from hunter_sim.common.models import ProbeSettings
+    from hunter_sim.probes.app import create_probes_app
+
+    overrides: dict[str, Any] = {}
+    if args.host:
+        overrides["host"] = args.host
+    if args.port:
+        overrides["port"] = args.port
+    if args.adapter_url:
+        overrides["adapter_url"] = args.adapter_url
+    probe = ProbeSettings(**overrides)
+
+    import uvicorn  # noqa: PLC0415  仅服务类子命令需要（doctor 不拉 Web 依赖）
+
+    settings, error = _load_settings()
+    if settings is None:
+        print(f"配置加载失败，探针将以默认值启动：{error}", file=sys.stderr)
+        settings = HunterSimSettings.model_construct(probe=probe)
+    else:
+        settings = settings.model_copy(update={"probe": probe})
+
+    app = create_probes_app(settings)
+    print(f"HunterSim probes listening on http://{probe.host}:{probe.port}")
+    uvicorn.run(app, host=probe.host, port=probe.port, log_level=args.log_level)
     return EXIT_OK
 
 
@@ -493,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser(
         "doctor",
-        help="部署前自检：配置/密钥/端口/磁盘/GPU/CARLA/状态库",
+        help="部署前自检：配置/端口/磁盘/GPU/CARLA/实例库/录制目录/mcap/Kafka",
         description=(
             "一次跑完单机部署的手工检查项。默认只读、不修改任何状态；"
             "存在 fail 项时退出码为 1（--strict 时 warn 也计失败）。"
@@ -510,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     manager = subparsers.add_parser(
         "carla-manager",
-        help="启动 CARLA 管理面控制平面（HunterCore ↔ HunterSim，默认 8090）",
+        help="启动 CARLA 管理面控制平面（HunterCore -> HunterSim，默认 8090）",
         description=(
             "启动平台控制平面：创建/下发/查询/控制仿真实例。单世界串行执行；"
             "地图加载在后台完成，create/submit 立即返回。仅监听内网，不加鉴权头。"
@@ -526,6 +545,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="uvicorn 日志级别",
     )
     manager.set_defaults(handler=_cmd_carla_manager)
+
+    probes = subparsers.add_parser(
+        "probes",
+        help="启动只读探针面（/health + /metrics，默认 8080）",
+        description=(
+            "启动只读探针面：只暴露 /health（含管理面聚合状态）与 /metrics；"
+            "不承载业务、不写数据库、不依赖鉴权。"
+        ),
+    )
+    probes.add_argument("--host", default="", help="监听地址（默认取 PROBE_HOST）")
+    probes.add_argument("--port", type=int, default=0, help="监听端口（默认取 PROBE_PORT=8080）")
+    probes.add_argument(
+        "--adapter-url", default="", help="管理面基础地址（默认取 PROBE_ADAPTER_URL）"
+    )
+    probes.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="uvicorn 日志级别",
+    )
+    probes.set_defaults(handler=_cmd_probes)
 
     version_parser = subparsers.add_parser("version", help="打印包版本")
     version_parser.set_defaults(handler=_cmd_version)

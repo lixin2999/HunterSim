@@ -84,6 +84,24 @@ class CloudConnector:
         """当前实例的 SimDataProducer（启动后可用）。"""
         return self._producer
 
+    def attach_producer(self, producer: Optional[SimDataProducer], sim_id: str = "") -> None:
+        """复用外部已创建的 SimDataProducer（避免同一 sim_id 出现两个生产者）。
+
+        Args:
+            producer: 已连接的生产者（None 时忽略）。
+            sim_id: 当前实例的 sim_id（用于重建上传器的 vehicle_id）。
+        """
+        if producer is None:
+            return
+        resolved_id = sim_id or self._sim_id or self._settings.sim_id
+        self._sim_id = resolved_id
+        self._producer = producer
+        self.uploader = BagUploader(
+            self._settings, sim_id=resolved_id,
+            client_factory=getattr(self, "_client_factory", None),
+        )
+        self._started = True
+
     def start(self, sim_id: str = "") -> bool:
         """启动生产者与上传器；返回是否至少一条链路可用。
 
@@ -132,10 +150,10 @@ class CloudConnector:
         if self._producer is not None:
             self._producer.close()
         self._started = False
-    
+
     def publish_telemetry(self, message: dict[str, Any]) -> bool:
         """发布一条 sim_telemetry 消息（由调用方通过 build_sim_telemetry 构造）。
-    
+
         未启用/未启动时安全返回 False。距上次发布不足
         ``telemetry_proxy_interval_s`` 时跳过（返回 True 表示"已按节拍处理"）。
         """
@@ -147,13 +165,13 @@ class CloudConnector:
                 return True
             self._last_publish = now
         return self._producer.publish_telemetry(message)
-    
+
     def publish_status(self, message: dict[str, Any]) -> bool:
         """发布一条 sim_status 消息（由调用方通过 build_sim_status 构造）。"""
         if not self._started or self._producer is None:
             return False
         return self._producer.publish_status(message)
-    
+
     def publish_event(
         self,
         event_type: str,
@@ -165,7 +183,7 @@ class CloudConnector:
         data: Optional[dict[str, Any]] = None,
     ) -> bool:
         """发布一条 sim_event（由 SimDataProducer 自动构建消息体）。
-    
+
         未知 ``event_type`` 映射失败时记 WARN 并返回 False，绝不冒泡阻断仿真主循环。
         """
         if not self._started or self._producer is None:
@@ -183,13 +201,13 @@ class CloudConnector:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"事件发布失败（已忽略，不阻断仿真）：{type(exc).__name__}: {exc}")
             return False
-    
+
     def publish_metrics(self, message: dict[str, Any]) -> bool:
         """发布一条 sim_metrics 消息（场景终止后由 EvaluationEngine 调用）。"""
         if not self._started or self._producer is None:
             return False
         return self._producer.publish_metrics(message)
-    
+
     def publish_artifact(
         self,
         name: str,
@@ -214,12 +232,28 @@ class CloudConnector:
             scene_id=scene_id,
         )
 
-    def upload_bag(self, file_path: Path, data_type: str = "rosbag") -> None:
-        """将 bag 上传任务投递到后台有界队列（fire-and-forget，不阻塞调用线程）。
+    def upload_bag(
+        self,
+        file_path: Path,
+        data_type: str = "rosbag",
+        *,
+        stats: Optional[Any] = None,
+        scene_id: str = "",
+        vehicle_id: Optional[str] = None,
+    ) -> None:
+        """将 bag/mcap 上传任务投递到后台有界队列（fire-and-forget，不阻塞调用线程）。
 
         上传完成后自动发布 sensor_file 消息到 carla.{sim_id}.sensor_data。
         队列容量由 ``upload_queue_max_size`` 限定，避免 MinIO/网络长时故障
         时任务无界堆积在内存。队满时丢弃**最旧**待传任务为新任务腾位。
+
+        Args:
+            file_path: 待上传文件。
+            data_type: 数据类型（``rosbag`` / ``camera_raw`` 等）。
+            stats: 录制统计（``McapRecorder.close()`` 返回的 ``RecordStats``）；
+                提供时 ``sensor_file`` 的时长/帧数/主题/格式取真实值。
+            scene_id: 场景 ID（写入 sensor_file）。
+            vehicle_id: 孪生车 ID（写入 sensor_file）。
         """
         if not self._started:
             return
@@ -227,7 +261,13 @@ class CloudConnector:
         q = self._upload_q
         if q is None:
             return
-        job: tuple[Path, str] = (file_path, data_type)
+        job: tuple[Path, str, Optional[Any], str, Optional[str]] = (
+            file_path,
+            data_type,
+            stats,
+            scene_id,
+            vehicle_id,
+        )
         try:
             q.put_nowait(job)
             return
@@ -253,6 +293,27 @@ class CloudConnector:
             self._upload_dropped += 1
         CLOUD_UPLOAD_DROPPED_TOTAL.inc()
         logger.warning(f"bag 上传丢弃（{reason}）")
+
+    def wait_upload_idle(self, timeout: float = 10.0) -> bool:
+        """等待上传队列排空（仅用于关停/终态前的尽力等待）。
+
+        Args:
+            timeout: 最长等待秒数。
+
+        Returns:
+            True 表示已空闲（无待传任务且在途上传已结束）。
+        """
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            q = self._upload_q
+            if q is None or q.empty():
+                # 空闲标志：能立即拿到执行锁说明无在途上传
+                if self._upload_exec_lock.acquire(timeout=0.05):
+                    self._upload_exec_lock.release()
+                    return True
+                continue
+            time.sleep(0.05)
+        return False
 
     @property
     def upload_stats(self) -> dict[str, int]:
@@ -289,14 +350,21 @@ class CloudConnector:
                 continue
             if job is None:
                 break
-            path, dtype = job
-            self._perform_upload(path, dtype)
+            path, dtype, stats, scene_id, vehicle_id = job
+            self._perform_upload(path, dtype, stats, scene_id, vehicle_id)
 
-    def _perform_upload(self, file_path: Path, data_type: str) -> None:
+    def _perform_upload(
+        self,
+        file_path: Path,
+        data_type: str,
+        stats: Optional[Any] = None,
+        scene_id: str = "",
+        vehicle_id: Optional[str] = None,
+    ) -> None:
         """实际执行上传（在上传线程）；串行化保证任意时刻至多一次在途上传。
-    
-        上传成功后自动发布 sensor_file 消息。
-        异常收口为 WARN，绠不冒泡。
+
+        上传成功后自动发布 sensor_file 消息（字段取 ``stats`` 真值）。
+        异常收口为 WARN，绝不冒泡。
         """
         with self._upload_exec_lock:
             try:
@@ -313,7 +381,14 @@ class CloudConnector:
                         size_bytes=result.size_bytes,
                         sha256=result.sha256,
                         sensor_type=data_type,
-                        vehicle_id=None,
+                        start_time=float(getattr(stats, "start_time", 0.0) or 0.0),
+                        end_time=float(getattr(stats, "end_time", 0.0) or 0.0),
+                        frame_count=int(getattr(stats, "frame_count", 0) or 0),
+                        vehicle_id=vehicle_id,
+                        scene_id=scene_id,
+                        md5=getattr(result, "md5", "") or "",
+                        file_format="mcap" if stats is not None else "",
+                        topics=list(getattr(stats, "topics", ()) or ()),
                     )
             except Exception as exc:  # noqa: BLE001
                 with self._upload_counters_lock:

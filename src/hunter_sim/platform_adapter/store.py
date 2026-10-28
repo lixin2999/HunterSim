@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS instances (
     scene_config TEXT NOT NULL DEFAULT '{}',
     vil_config TEXT,
     result TEXT,
+    recording_path TEXT NOT NULL DEFAULT '',
+    recording_bytes INTEGER NOT NULL DEFAULT 0,
     revision INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -74,6 +76,8 @@ _UPDATABLE = (
     "scene_config",
     "vil_config",
     "result",
+    "recording_path",
+    "recording_bytes",
     "revision",
     "updated_at",
     "started_at",
@@ -114,6 +118,7 @@ class InstanceStore:
             conn.row_factory = sqlite3.Row
             conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
             conn.commit()
             self._conn = conn
             logger.info(f"Adapter instance store ready: {path}")
@@ -143,9 +148,9 @@ class InstanceStore:
                     instance_id, sim_id, scene_id, scene_name, mode, vehicle_id,
                     status, carla_status, message, progress_percent, current_time_s,
                     total_time_s, actors_count, collisions, lane_invasions, ego_state,
-                    scene_config, vil_config, result, revision, created_at, updated_at,
-                    started_at, finished_at, watchdog_deadline
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    scene_config, vil_config, result, recording_path, recording_bytes,
+                    revision, created_at, updated_at, started_at, finished_at, watchdog_deadline
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.instance_id,
@@ -167,6 +172,8 @@ class InstanceStore:
                     _dump(record.scene_config),
                     _dump(record.vil_config) if record.vil_config is not None else None,
                     _dump(record.result) if record.result is not None else None,
+                    record.recording_path,
+                    record.recording_bytes,
                     record.revision,
                     record.created_at,
                     record.updated_at,
@@ -307,6 +314,21 @@ class InstanceStore:
         return count
 
 
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("recording_path", "TEXT NOT NULL DEFAULT ''"),
+    ("recording_bytes", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """补建新增列（旧库就地升级，幂等）。"""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(instances)")}
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE instances ADD COLUMN {name} {ddl}")
+            logger.info(f"Adapter instance store migrated: added column '{name}'")
+
+
 def _dump(value: Any) -> str:
     """JSON 序列化（``default=str`` 兼容非原生类型）。"""
     return json.dumps(value, ensure_ascii=False, default=str)
@@ -347,6 +369,8 @@ def _row_to_record(row: sqlite3.Row) -> InstanceRecord:
         scene_config=_load_dict(row["scene_config"]),
         vil_config=_load_dict(vil_raw) if vil_raw else None,
         result=(json.loads(result_raw) if result_raw else None),
+        recording_path=str(row["recording_path"] or ""),
+        recording_bytes=int(row["recording_bytes"] or 0),
         revision=int(row["revision"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),

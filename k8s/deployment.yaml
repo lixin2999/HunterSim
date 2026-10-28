@@ -1,9 +1,13 @@
-# HunterSim K8s Deployment
+# HunterSim K8s Deployment（V3.0.0）
 # 命名空间：hunter-sim
 # 适用环境：Kubernetes 1.25+ with NVIDIA GPU Operator
-# V2.8.0：多用户体系（PLATFORM_USERS_*）；引擎自愈在 K8s 形态下由 carla-engine Pod 的
-# liveness 联动重启承担（不启用进程托管 CARLA_SUPERVISOR_ENABLED）；
-# 服务仍为单副本 + 重启恢复（SQLite 需 RWO 卷），多副本无状态化为长期项，见文档 §受支持形态。
+#
+# V3.0.0 形态：单副本 + 单世界串行 + 重启恢复（SQLite 需 RWO 卷）。
+# 同一 Pod 内两个容器、同镜像不同子命令：
+#   sim-service :8090  唯一业务入口（控制面 + VIL Bridge + 场景 + 传感器 + 录制）
+#   probes      :8080  只读探针面（/health + /metrics），供 kubelet 与 Prometheus 抓取
+# 治理面（用户/租户/场景库/批量/审计/OTA）已移除，统一由云端承担；
+# 引擎自愈由 carla-engine Pod 的 liveness 联动重启承担（不启用 CARLA_SUPERVISOR_ENABLED）。
 
 apiVersion: apps/v1
 kind: Deployment
@@ -15,6 +19,9 @@ metadata:
     component: sim-service
 spec:
   replicas: 1
+  # 单世界串行：新 Pod 起来前必须先停旧 Pod，避免两个进程抢同一个 CARLA 世界
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: hunter-sim
@@ -27,146 +34,53 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
-        prometheus.io/path: "/api/v1/sim/metrics"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
+        # ── 控制面（唯一业务入口）────────────────────────────────────────────
         - name: sim-service
-          image: hunter-sim:2.10.0
+          image: hunter-sim:3.0.0
           imagePullPolicy: IfNotPresent
+          command: ["huntersim"]
+          args: ["carla-manager"]
           ports:
-            - containerPort: 8080
-              name: http
+            - containerPort: 8090
+              name: adapter
               protocol: TCP
           env:
             - name: HUNTER_SIM_ENV
               value: "prod"
             - name: HUNTER_SIM_LOG_LEVEL
               value: "INFO"
+            - name: HUNTER_SIM_LOG_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: log_json
+            # ── CARLA 引擎 ──
             - name: CARLA_HOST
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: carla_host
             - name: CARLA_RPC_PORT
-              value: "2000"
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: carla_rpc_port
+            - name: CARLA_STREAM_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: carla_stream_port
+            - name: CARLA_SUPERVISOR_ENABLED
+              value: "false"
+            # ── Kafka（VIL 遥测消费 + sensor_data 回传）──
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: kafka_bootstrap_servers
-            - name: API_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: hunter-sim-secrets
-                  key: jwt_secret
-            # prod 启动闸门要求：管理员口令非默认 admin、CORS 不含 "*"
-            - name: API_ADMIN_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: hunter-sim-secrets
-                  key: admin_username
-            - name: API_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: hunter-sim-secrets
-                  key: admin_password
-            - name: API_CORS_ALLOW_ORIGINS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: cors_allow_origins
-            # 执行面（V2.4.0）：端点库存决定可并行实例数，端点耗尽时创建返回 503
-            - name: EXECUTION_ENGINE_ENDPOINTS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: execution_engine_endpoints
-            - name: EXECUTION_MAX_ENGINES
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: execution_max_engines
-            - name: EXECUTION_RESTORE_SCENE_ON_ASSEMBLE
-              value: "true"
-            # 状态持久化（V2.4.0）：实例/场景绑定落 SQLite，Pod 重建后恢复
-            - name: STATE_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: state_enabled
-            - name: STATE_DB_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: state_db_path
-            # 平台化（V2.5.0）：多租户/租户配额/API Key/审计
-            - name: PLATFORM_DEFAULT_TENANT
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: platform_default_tenant
-            - name: PLATFORM_MAX_INSTANCES_PER_TENANT
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: platform_max_instances_per_tenant
-            - name: PLATFORM_API_KEYS_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: platform_api_keys_enabled
-            - name: PLATFORM_AUDIT_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: platform_audit_enabled
-            # 安全治理（V2.6.0）：按 IP 限流 + /auth/token 失败指数退避
-            - name: API_RATE_LIMIT_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: api_rate_limit_enabled
-            - name: API_RATE_LIMIT_PER_MINUTE
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: api_rate_limit_per_minute
-            - name: API_LOGIN_MAX_FAILED_ATTEMPTS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: api_login_max_failed_attempts
-            - name: API_LOGIN_BACKOFF_BASE_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: api_login_backoff_base_seconds
-            - name: API_LOGIN_BACKOFF_MAX_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: api_login_backoff_max_seconds
-            # HunterCore bag 上传有界队列（V2.6.0，仅 HUNTER_CORE_ENABLED=true 时生效）
-            - name: HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE
-              value: "32"
-            # 稳定性加固（V2.7.0）：租约心跳 + 僵尸回收（GET /execution 看 stale；V2.9.0 起仅 stale 可强收，活跃租约 409）
-            - name: EXECUTION_LEASE_HEARTBEAT_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: execution_lease_heartbeat_enabled
-            - name: EXECUTION_LEASE_TTL_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: execution_lease_ttl_seconds
-            # 场景快照写节流（V2.7.0）：同状态最小落库间隔，降低 SQLite 单写者压力
-            - name: STATE_SNAPSHOT_WRITE_INTERVAL_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: hunter-sim-config
-                  key: state_snapshot_write_interval_seconds
-            # Kafka 消费自愈与 DLQ / VIL 乱序闸门与自动环深（V2.7.0）
             - name: KAFKA_ENABLE_SELF_HEAL
               valueFrom:
                 configMapKeyRef:
@@ -182,6 +96,12 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: kafka_dlq_topic
+            # ── VIL 链路对齐（10Hz 栅格降采样 + 插值 / 转向 / 灯光 / 感知叠加）──
+            - name: VIL_TARGET_HZ
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: vil_target_hz
             - name: VIL_ORDERING_GUARD_ENABLED
               valueFrom:
                 configMapKeyRef:
@@ -192,65 +112,141 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: vil_auto_buffer_depth
-            # JWT 吊销与滑动续期（V2.7.0，需 STATE_ENABLED=true）
-            - name: API_JWT_REVOCATION_ENABLED
+            - name: VIL_MAX_DATA_LATENCY_MS
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: api_jwt_revocation_enabled
-            - name: API_JWT_REFRESH_ENABLED
+                  key: vil_max_data_latency_ms
+            - name: VIL_OVERLAY_ENABLED
+              value: "true"
+            - name: VIL_LIGHTS_ENABLED
+              value: "true"
+            # ── 资源与执行面（单世界串行：端点库存留空即单引擎）──
+            - name: RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: api_jwt_refresh_enabled
-            # 统一日志（V2.7.0）：生产采集置 true（JSON 行 + request_id 贯穿）
-            - name: HUNTER_SIM_LOG_JSON
+                  key: resource_instance_max_lifetime_seconds
+            - name: RESOURCE_HEALTH_CHECK_INTERVAL_SECONDS
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: log_json
-            # 多用户体系（V2.8.0 P2-13）：/auth/users 由 admin 管理，口令 PBKDF2 摘要入库
-            - name: PLATFORM_USERS_ENABLED
+                  key: resource_health_check_interval_seconds
+            - name: EXECUTION_RESTORE_SCENE_ON_ASSEMBLE
+              value: "true"
+            - name: EXECUTION_LEASE_HEARTBEAT_ENABLED
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: platform_users_enabled
-            - name: PLATFORM_MIN_PASSWORD_LENGTH
+                  key: execution_lease_heartbeat_enabled
+            - name: EXECUTION_LEASE_TTL_SECONDS
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: platform_min_password_length
-            - name: PLATFORM_PASSWORD_HASH_ITERATIONS
+                  key: execution_lease_ttl_seconds
+            # ── 控制面（8090）：实例注册表 / 产物 / 录制 / 画面 ──
+            - name: ADAPTER_HOST
+              value: "0.0.0.0"
+            - name: ADAPTER_PORT
+              value: "8090"
+            - name: ADAPTER_DB_PATH
               valueFrom:
                 configMapKeyRef:
                   name: hunter-sim-config
-                  key: platform_password_hash_iterations
-            # 本地 CARLA 进程自愈（V2.8.0 P2-15）：集群形态置 false，
-            # 引擎 Pod 崩溃由 livenessProbe 联动重启；仅宿主机原生 CarlaUE4 需要置 true
-            - name: CARLA_SUPERVISOR_ENABLED
-              value: "false"
-            - name: CARLA_SUPERVISOR_BINARY_PATH
-              value: ""
+                  key: adapter_db_path
+            - name: ADAPTER_ARTIFACTS_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_artifacts_dir
+            - name: ADAPTER_RECORDINGS_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_recordings_dir
+            - name: ADAPTER_RECORDING_RETENTION_HOURS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_recording_retention_hours
+            - name: ADAPTER_STREAM_FPS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_stream_fps
+            - name: ADAPTER_STREAM_MAX_WIDTH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_stream_max_width
+            - name: ADAPTER_SCREENSHOT_QUALITY
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_screenshot_quality
+            - name: ADAPTER_ARTIFACT_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_artifact_bucket
+            - name: ADAPTER_MAX_SCENE_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_max_scene_seconds
+            # ── HunterCore 平台接入（凭据仅经 Secret 注入）──
+            - name: HUNTER_CORE_KAFKA_BOOTSTRAP
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_kafka_bootstrap
+            - name: HUNTER_CORE_SECURITY_PROTOCOL
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_security_protocol
+            - name: HUNTER_CORE_GATEWAY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_gateway_url
+            - name: HUNTER_CORE_ROSBAG_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_rosbag_bucket
+            - name: HUNTER_CORE_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: sasl_username
+                  optional: true
+            - name: HUNTER_CORE_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: sasl_password
+                  optional: true
+            - name: HUNTER_CORE_JWT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-sim-secrets
+                  key: jwt_token
+                  optional: true
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "500m"
+              memory: "1Gi"
+              cpu: "1000m"
             limits:
-              memory: "2Gi"
-              cpu: "2000m"
-          livenessProbe:
-            http:
-              path: /api/v1/sim/health/live
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
+              memory: "4Gi"
+              cpu: "4000m"
+          # 就绪判据走探针面聚合健康：CARLA 未连通也返回 200（degraded），
+          # 因此 /health/live 只代表进程活着，业务可用性由 /health/ready 与上层告警判定。
           readinessProbe:
             http:
-              path: /api/v1/sim/health/ready
-              port: 8080
-            initialDelaySeconds: 5
+              path: /health
+              port: 8090
+            initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
@@ -258,12 +254,57 @@ spec:
             - name: configs
               mountPath: /home/hunter/app/configs
               readOnly: true
-            # 共享存储 PVC（设计文档 §15.1：地图资源/车辆模型/场景配置/仿真记录）
+            # 共享存储 PVC（设计文档 §15.1：地图资源/车辆模型/场景配置）
             - name: shared-resources
               mountPath: /home/hunter/app/resources
-            # 状态持久化（V2.4.0）：SQLite 需独占块存储，不使用 NFS/RWX（WAL 锁不可靠）
-            - name: state-data
-              mountPath: /home/hunter/app/data/state
+            # 实例注册表 + 产物 + mcap 录制。SQLite 需独占块存储（RWO），
+            # 不使用 NFS/RWX（WAL 锁不可靠）；卷容量需覆盖录制保留期内的数据量。
+            - name: data
+              mountPath: /home/hunter/app/data
+
+        # ── 只读探针面（kubelet 存活/就绪 + Prometheus 抓取）─────────────────
+        - name: probes
+          image: hunter-sim:3.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["huntersim"]
+          args: ["probes"]
+          ports:
+            - containerPort: 8080
+              name: probes
+              protocol: TCP
+          env:
+            - name: PROBE_HOST
+              value: "0.0.0.0"
+            - name: PROBE_PORT
+              value: "8080"
+            # 同 Pod 内聚合控制面真实状态（CARLA/VIL/传感器/云端）
+            - name: PROBE_ADAPTER_URL
+              value: "http://127.0.0.1:8090"
+            - name: HUNTER_SIM_LOG_LEVEL
+              value: "WARNING"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            http:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            http:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: configs
           configMap:
@@ -271,14 +312,14 @@ spec:
         - name: shared-resources
           persistentVolumeClaim:
             claimName: hunter-sim-resources-pvc
-        - name: state-data
+        - name: data
           persistentVolumeClaim:
-            claimName: hunter-sim-state-pvc
+            claimName: hunter-sim-data-pvc
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 ---
 # 共享存储 PVC（设计文档 §15.1）
-# 审查项 S：ReadWriteMany 必须绑定支持 RWX 的 StorageClass（NFS/CephFS/Longhorn 等）。
+# ReadWriteMany 必须绑定支持 RWX 的 StorageClass（NFS/CephFS/Longhorn 等）。
 # 留空会回落集群默认 StorageClass，而默认类多为 RWO（云盘/hostpath），
 # 多 Pod 挂载时卡在 FailedMount。集群需预先创建同名 RWX StorageClass。
 apiVersion: v1
@@ -294,29 +335,29 @@ spec:
     requests:
       storage: 500Gi  # §15.2 推荐存储配置
 ---
-# 状态持久化卷（V2.4.0）：实例与场景绑定 SQLite。
+# 数据卷（V3.0.0）：实例注册表 SQLite + 产物暂存 + mcap 录制。
 # 必须 ReadWriteOnce（块存储/本地盘）；NFS 等 RWX 上的 SQLite WAL 锁不可靠，
 # 多副本同时挂载也会损坏数据库，因此保持 sim-service replicas=1。
+# 容量规划：单路三传感器录制约 1.5–3 GB/分钟（LiDAR 为主），
+# 默认保留 24 小时，按日均仿真时长与并发（单世界=1）估算后调整。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: hunter-sim-state-pvc
+  name: hunter-sim-data-pvc
   namespace: hunter-sim
 spec:
   accessModes:
     - ReadWriteOnce
-  # 留空回落集群默认 StorageClass；生产建议指定本地 SSD/云盘类
+  # 留空回落集群默认 StorageClass；生产建议指定本地 SSD/云盘类（录制为高写入）
   resources:
     requests:
-      storage: 10Gi
+      storage: 200Gi
 ---
 # CARLA 仿真引擎 GPU Pod（设计文档 §15.1/§10.2.3）
-# 需要 NVIDIA GPU Operator / Container Toolkit；每 Pod 分配 1 块 GPU，
-# 单 GPU 可承载 1-2 个实例（§10.3.2 并发限制由应用层 GPU 资源池调度）
-# V2.4.0：应用层已支持多引擎端点库存（EXECUTION_ENGINE_ENDPOINTS）。
-# 扩容时建议改为 StatefulSet（稳定 DNS：carla-engine-0.carla-engine-headless）+ Headless Service，
-# 并将每个 Pod 的 host:rpc 写入 EXECUTION_ENGINE_ENDPOINTS；仍禁止用普通 Deployment
-# 多副本 + 单一 ClusterIP，否则 load_world 会互相重置且请求会落到错误引擎。
+# 需要 NVIDIA GPU Operator / Container Toolkit；每 Pod 分配 1 块 GPU。
+# 受支持形态 = 单世界串行：一个引擎承载唯一场景。
+# 扩容需改 StatefulSet + Headless Service 逐条列出端点，禁止用普通 Deployment
+# 多副本 + 单一 ClusterIP（load_world 会互相重置且请求会落到错误引擎）。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -326,7 +367,7 @@ metadata:
     app: hunter-sim
     component: carla-engine
 spec:
-  replicas: 1   # 扩容需改 StatefulSet + Headless Service，并同步 EXECUTION_ENGINE_ENDPOINTS
+  replicas: 1
   selector:
     matchLabels:
       app: hunter-sim
@@ -363,7 +404,7 @@ spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 ---
-# CARLA 引擎集群内访问入口（审查项 S：供 CARLA_HOST=carla-engine-svc 使用，
+# CARLA 引擎集群内访问入口（供 CARLA_HOST=carla-engine-svc 使用，
 # 优于 configmap 中硬编码宿主机 IP 的双机分离模式）
 apiVersion: v1
 kind: Service

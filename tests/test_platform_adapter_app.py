@@ -68,6 +68,19 @@ class _FakeService:
     def stop(self, instance_id: str) -> Optional[InstanceRecord]:
         return self.get(instance_id)
 
+    def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "carla_connected": True,
+            "carla_probe_error": None,
+            "active_instance": {"instance_id": self.record.instance_id},
+            "vil_state": None,
+            "sensor": {"recording": False, "recording_bytes": 0, "streams": {}},
+            "cloud": {"enabled": False},
+        }
+
+    def runtime_gauges(self) -> dict[str, Any]:
+        return {"active_instances": 1.0, "carla_connected": True, "disk_usage_ratio": 0.25}
+
 
 @pytest.fixture
 def service() -> _FakeService:
@@ -84,7 +97,35 @@ class TestCreateAndQuery:
     def test_health(self, client: TestClient) -> None:
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        body = response.json()
+        assert body["status"] == "ok"
+        for key in (
+            "carla_connected",
+            "carla_probe_error",
+            "active_instance",
+            "vil_state",
+            "sensor",
+            "cloud",
+        ):
+            assert key in body, f"missing health field: {key}"
+        assert body["active_instance"]["instance_id"] == "inst-1"
+
+    def test_metrics_endpoint_exposes_registry(self, client: TestClient) -> None:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
+        assert "huntersim_active_instances" in response.text
+        assert "huntersim_http_request_duration_seconds" in response.text
+
+    def test_legacy_8080_business_paths_are_gone(self, client: TestClient) -> None:
+        """V3.0.0：8080 治理面（用户/实例库/场景库/审计）已移除。"""
+        for path in (
+            "/api/v1/sim/users",
+            "/api/v1/sim/scenes",
+            "/api/v1/sim/auth/login",
+            "/api/v1/sim/instances/inst-1/logs",
+        ):
+            assert client.get(path).status_code == 404
 
     def test_create_echoes_platform_sim_id(
         self, client: TestClient, service: _FakeService

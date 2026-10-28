@@ -1,7 +1,8 @@
-"""VIL 状态同步服务主类（PROMPT-ENG-002-C）。
+"""VIL 状态同步服务主类（PROMPT-ENG-002-C，V3.0.0 栅格对齐版）。
 
-实现同步循环：接收数据 → 坐标转换 → 延迟补偿 → 设置位姿 → world.tick()。
-提供 VILSyncService 类，协调数据消费者、坐标转换器、位姿外推器和车辆控制器。
+实现同步循环：取帧 → 栅格对齐 → 坐标转换 → 延迟补偿 → 设置位姿/速度/转向/灯光
+→ 感知叠加。提供 VILSyncService 类，协调数据消费者、帧对齐器、坐标转换器、
+位姿外推器、状态可视化器与车辆控制器。
 """
 
 from __future__ import annotations
@@ -17,13 +18,18 @@ from hunter_sim.common.models import Transform, VehicleState, VILSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.coordinate_converter import CoordinateTransformer
 from hunter_sim.vil_mapper.data_health_monitor import DataHealthMonitor, DataHealthStatus
+from hunter_sim.vil_mapper.frame_aligner import AlignedFrame, FrameAligner
 from hunter_sim.vil_mapper.pose_extrapolator import PoseExtrapolator
-from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer, TelemetryFrame
+from hunter_sim.vil_mapper.state_visualizer import PerceptionOverlay, StateVisualizer
+from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer
 
 logger = get_logger(__name__)
 
 # 断流减速斜率（m/s²）：3.0 接近常规舒适制动，避免瞬时停车
 _DECELERATION_MS2 = 3.0
+
+# 感知叠加绘制节流：每 N 个栅格画一次（10Hz 栅格下约 3.3Hz，降低 debug 绘制开销）
+_OVERLAY_GRID_INTERVAL = 3
 
 
 class VehicleActorProtocol(Protocol):
@@ -34,6 +40,10 @@ class VehicleActorProtocol(Protocol):
     def set_velocity(self, vector: Any) -> None: ...
 
     def set_angular_velocity(self, vector: Any) -> None: ...
+
+    def set_wheel_steer_angle(self, wheel_location: Any, steer_angle: float) -> None: ...
+
+    def set_light_state(self, light_state: Any) -> None: ...
 
     def get_velocity(self) -> Any: ...
 
@@ -74,11 +84,12 @@ class VILSyncService:
     调用方需在单独线程中运行 start_sync_loop()，并在停止时调用 stop()。
 
     同步流程：
-    1. 等待最新遥测帧（超时则使用外推）
+    1. 栅格对齐（10Hz 降采样 + 插值/外推，``FrameAligner``）
     2. 坐标转换（odom → CARLA）
     3. 位姿外推（延迟补偿）
-    4. 设置车辆位姿（vehicle.set_transform）
-    5. world.tick()
+    4. 设置车辆位姿/速度/舵角/灯光（vehicle.set_transform 等）
+    5. 感知叠加绘制（每 3 个栅格一次）
+    6. world.tick()
 
     Args:
         settings: VIL 参数配置。
@@ -89,6 +100,9 @@ class VILSyncService:
         vehicle_actor: CARLA Vehicle Actor（VIL 模式）。
         world: CARLA World 对象。
         ground_z_getter: 可选的路面高度获取函数 (x, y) -> z。
+        aligner: 帧对齐器；None 时按 ``settings`` 自建（V3.0.0）。
+        overlay: 感知叠加渲染器；None 表示不绘制感知框。
+        visualizer: 状态可视化器（灯光同步）；None 时灯光跳过。
     """
 
     def __init__(
@@ -101,6 +115,9 @@ class VILSyncService:
         vehicle_actor: VehicleActorProtocol,
         world: WorldProtocol,
         ground_z_getter: Optional[Any] = None,
+        aligner: Optional[FrameAligner] = None,
+        overlay: Optional[PerceptionOverlay] = None,
+        visualizer: Optional[StateVisualizer] = None,
     ) -> None:
         self._settings = settings
         self._buffer = buffer
@@ -110,6 +127,13 @@ class VILSyncService:
         self._vehicle = vehicle_actor
         self._world = world
         self._ground_z = ground_z_getter
+        self._aligner = aligner or FrameAligner(
+            buffer,
+            target_hz=settings.target_hz,
+            max_extrapolation_ms=settings.extrapolation_ms,
+        )
+        self._overlay = overlay
+        self._visualizer = visualizer
 
         self._running = threading.Event()
         self._lock = threading.Lock()
@@ -216,11 +240,15 @@ class VILSyncService:
         适配器把本方法挂到 ``SceneRunnerService`` 的每 tick 钩子上，避免出现
         第二个 ``world.tick()`` 导致帧同步错乱。
 
+        V3.0.0：取帧改为 ``FrameAligner.next()``，同一 10Hz 栅格内的后续 tick
+        返回 ``"skipped"``（不重复写位姿，实现降采样）；只有栅格推进的 tick
+        才真正改车辆状态。
+
         数据中断（超过 ``max_data_latency_ms``）或尚无首帧时执行减速/停车，
         不保持最后一帧位姿（方案要求"减速/停车"而非"冻结"）。
 
         Returns:
-            ``"applied"`` / ``"no_data"`` / ``"interrupted"``。
+            ``"applied"`` / ``"skipped"`` / ``"no_data"`` / ``"interrupted"``。
         """
         # 1. 健康检查
         report = self._health.check()
@@ -228,11 +256,15 @@ class VILSyncService:
             self._decelerate()
             return "interrupted"
 
-        # 2. 获取最新帧
-        frame: Optional[TelemetryFrame] = self._buffer.get_latest()
-        if frame is None:
-            self._decelerate()
-            return "no_data"
+        # 2. 栅格对齐（10Hz 降采样 + 插值/外推）
+        aligned: Optional[AlignedFrame] = self._aligner.next(time.time())
+        if aligned is None:
+            if self._buffer.is_empty:
+                self._decelerate()
+                return "no_data"
+            # 本 tick 未推进到新栅格（降采样），保持现有位姿不动
+            return "skipped"
+        frame = aligned.frame
 
         t_start = time.perf_counter()
 
@@ -249,7 +281,7 @@ class VILSyncService:
         if self._ground_z is not None:
             z_c = self._ground_z(x_c, y_c)
 
-        # 5. 位姿外推（延迟补偿，DEGRADED 状态时强制外推）
+        # 5. 位姿外推（延迟补偿，DEGRADED 状态或非插值帧时强制外推）
         carla_transform = Transform(
             x=x_c, y=y_c, z=z_c,
             pitch=pitch_c, yaw=yaw_c, roll=roll_c,
@@ -261,9 +293,14 @@ class VILSyncService:
                 carla_transform, speed, yaw_rate
             )
 
-        # 6. 设置 CARLA 车辆位姿与速度（VIL 模式，直接设置，设计文档 §4.4.1）
+        # 6. 设置 CARLA 车辆位姿/速度/舵角/灯光（VIL 模式，设计文档 §4.4.1）
         self._apply_carla_transform(carla_transform)
         self._apply_carla_velocity(frame.vehicle_state, carla_transform.yaw)
+        self._apply_steering(frame.vehicle_state)
+        self._apply_lights(frame.vehicle_state)
+
+        # 7. 感知叠加（节流绘制，异常不影响 tick）
+        self._draw_overlay(aligned)
 
         latency_ms = (time.perf_counter() - t_start) * 1000.0
         with self._lock:
@@ -271,6 +308,64 @@ class VILSyncService:
             if len(self._latency_samples) > 100:
                 self._latency_samples.pop(0)
         return "applied"
+
+    def _apply_steering(self, state: VehicleState) -> None:
+        """同步实车方向盘角度到虚拟车前轮转角（设计文档 §4.4.1）。
+
+        内部统一弧度制（``chassis.steering_angle``），CARLA
+        ``set_wheel_steer_angle`` 边界为度，因此此处换算。
+        无 carla SDK / 后端不支持时降级 debug，不中断同步循环。
+
+        Args:
+            state: 实车状态帧。
+        """
+        try:
+            import carla  # noqa: PLC0415
+
+            degrees = math.degrees(state.steering)
+            self._vehicle.set_wheel_steer_angle(carla.WheelLocation.FRONT_LEFT, degrees)
+            self._vehicle.set_wheel_steer_angle(carla.WheelLocation.FRONT_RIGHT, degrees)
+        except Exception as exc:  # noqa: BLE001  含无 carla 环境的 ImportError
+            logger.debug(f"apply steering skipped: {exc}")
+
+    def _apply_lights(self, state: VehicleState) -> None:
+        """同步实车灯光（刹车灯/转向灯/近光）到虚拟车（设计文档 §4.4.2）。
+
+        ``state.lights`` 为空（实车未上报）时不做任何变更，避免把已开灯光意外关掉。
+
+        Args:
+            state: 实车状态帧。
+        """
+        if self._visualizer is None or not self._settings.lights_enabled:
+            return
+        lights = state.lights
+        if not lights:
+            return
+        self._visualizer.apply_vehicle_lights(
+            self._vehicle,
+            brake=state.brake,
+            left_turn=bool(lights.get("left_turn", False)),
+            right_turn=bool(lights.get("right_turn", False)),
+            low_beam=bool(lights.get("low_beam", False)),
+        )
+
+    def _draw_overlay(self, aligned: AlignedFrame) -> None:
+        """绘制实车感知叠加框（每 ``_OVERLAY_GRID_INTERVAL`` 个栅格一次）。
+
+        Args:
+            aligned: 本栅格的对齐帧。
+        """
+        if self._overlay is None or not self._settings.overlay_enabled:
+            return
+        if aligned.grid_index % _OVERLAY_GRID_INTERVAL != 0:
+            return
+        perception = aligned.frame.perception
+        if perception is None:
+            return
+        try:
+            self._overlay.draw_perception_result(perception)
+        except Exception as exc:  # noqa: BLE001  绘制失败不得影响同步 tick
+            logger.debug(f"perception overlay skipped: {exc}")
 
     def _decelerate(self) -> None:
         """断流时按固定减速度逐步减速至停车（不保持最后位姿）。"""
