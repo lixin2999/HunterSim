@@ -23,6 +23,8 @@ _MIN_DRIVER_VERSION: tuple[int, int, int, int] = (510, 0, 0, 0)
 _MIN_CUDA_VERSION: tuple[int, int] = (11, 0)
 # 最低显存要求（GB）
 _MIN_GPU_MEMORY_GB: float = 4.0
+# nvidia-smi 表头中的 CUDA 版本字段，形如 "CUDA Version: 13.0"
+_CUDA_VERSION_PATTERN = re.compile(r"CUDA Version:\s*(\d+(?:\.\d+)*)")
 
 
 @dataclass
@@ -33,7 +35,7 @@ class EnvironmentCheckResult:
         os_ok: 操作系统是否为 Windows 10/11。
         gpu_driver_version: 检测到的 GPU 驱动版本字符串。
         gpu_driver_ok: 驱动版本是否满足最低要求。
-        cuda_version: 检测到的 CUDA 版本字符串。
+        cuda_version: 检测到的 CUDA 版本字符串（驱动最高支持版本）。
         cuda_ok: CUDA 版本是否满足最低要求。
         gpu_memory_gb: GPU 显存大小（GB）。
         gpu_memory_ok: 显存是否满足最低要求。
@@ -42,6 +44,7 @@ class EnvironmentCheckResult:
         python_ok: Python 版本是否 >= 3.12。
         passed: 总体是否通过所有检查。
         errors: 失败项说明列表。
+        gpu_compute_capability: GPU 计算能力（如 8.9），仅用于展示，不参与版本判定。
     """
 
     os_ok: bool
@@ -56,6 +59,18 @@ class EnvironmentCheckResult:
     python_ok: bool
     passed: bool
     errors: list[str]
+    gpu_compute_capability: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _GpuProbe:
+    """nvidia-smi 探测结果，查询失败的字段保持 None/0.0。"""
+
+    driver_version: Optional[str] = None
+    cuda_version: Optional[str] = None
+    compute_capability: Optional[str] = None
+    memory_gb: float = 0.0
+    gpu_name: Optional[str] = None
 
 
 def _parse_version(ver_str: str) -> tuple[int, ...]:
@@ -64,59 +79,84 @@ def _parse_version(ver_str: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts)
 
 
-def _check_nvidia_smi() -> tuple[Optional[str], Optional[str], float, Optional[str]]:
-    """通过 nvidia-smi 获取 GPU 驱动版本、CUDA 版本、显存和型号。
+def _run_nvidia_smi(args: list[str], timeout: int) -> Optional[str]:
+    """执行 nvidia-smi，返回 stdout；非零退出码返回 None。"""
+    completed = subprocess.run(
+        ["nvidia-smi", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def _parse_cuda_version(smi_output: str) -> Optional[str]:
+    """从 nvidia-smi 表头解析驱动支持的 CUDA 版本，形如 ``CUDA Version: 13.0``。"""
+    match = _CUDA_VERSION_PATTERN.search(smi_output)
+    return match.group(1) if match else None
+
+
+def _probe_gpu() -> _GpuProbe:
+    """通过 nvidia-smi 获取驱动版本、CUDA 版本、计算能力、显存和型号。
+
+    CUDA 版本取自 nvidia-smi 表头（驱动最高支持版本）；``compute_cap`` 是 GPU 计算能力
+    （Ada 架构 RTX 40 系为 8.9），与 CUDA 版本无关，不得混用同一字段判定。
 
     Returns:
-        (driver_version, cuda_version, memory_gb, gpu_name) 元组，查询失败时各项为 None/0.0。
+        _GpuProbe，查询失败的字段为 None/0.0。
     """
     try:
-        result = subprocess.run(
+        # 旧驱动可能不认识 compute_cap 列，整体查询失败时退化为基础字段
+        stdout = _run_nvidia_smi(
             [
-                "nvidia-smi",
-                "--query-gpu=driver_version,memory.total,name",
+                "--query-gpu=driver_version,memory.total,name,compute_cap",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True,
-            text=True,
             timeout=10,
         )
-        if result.returncode != 0:
+        if stdout is None:
+            stdout = _run_nvidia_smi(
+                [
+                    "--query-gpu=driver_version,memory.total,name",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=10,
+            )
+        if stdout is None:
             logger.warning("nvidia-smi returned non-zero exit code")
-            return None, None, 0.0, None
+            return _GpuProbe()
 
-        lines = result.stdout.strip().splitlines()
+        lines = stdout.strip().splitlines()
         if not lines:
-            return None, None, 0.0, None
+            return _GpuProbe()
 
         # 取第一块 GPU
         parts = [p.strip() for p in lines[0].split(",")]
-        driver_version: Optional[str] = parts[0] if len(parts) >= 1 else None
-        memory_mb: float = float(parts[1]) if len(parts) >= 2 else 0.0
-        gpu_name: Optional[str] = parts[2] if len(parts) >= 3 else None
+        driver_version: Optional[str] = parts[0] or None
+        memory_mb: float = float(parts[1]) if len(parts) >= 2 and parts[1] else 0.0
+        gpu_name: Optional[str] = parts[2] if len(parts) >= 3 and parts[2] else None
+        compute_capability: Optional[str] = parts[3] if len(parts) >= 4 and parts[3] else None
 
-        # 获取 CUDA 版本
-        cuda_result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        # CUDA 版本只在无参数的 nvidia-smi 表头里出现
+        header = _run_nvidia_smi([], timeout=5) or ""
+
+        return _GpuProbe(
+            driver_version=driver_version,
+            cuda_version=_parse_cuda_version(header),
+            compute_capability=compute_capability,
+            memory_gb=memory_mb / 1024.0,
+            gpu_name=gpu_name,
         )
-        cuda_version: Optional[str] = None
-        if cuda_result.returncode == 0 and cuda_result.stdout.strip():
-            cuda_version = cuda_result.stdout.strip().splitlines()[0]
-
-        return driver_version, cuda_version, memory_mb / 1024.0, gpu_name
 
     except FileNotFoundError:
         logger.warning("nvidia-smi not found in PATH")
-        return None, None, 0.0, None
+        return _GpuProbe()
     except subprocess.TimeoutExpired:
         logger.warning("nvidia-smi query timed out")
-        return None, None, 0.0, None
+        return _GpuProbe()
     except (ValueError, IndexError) as exc:
         logger.warning(f"Failed to parse nvidia-smi output: {exc}")
-        return None, None, 0.0, None
+        return _GpuProbe()
 
 
 def check_environment() -> EnvironmentCheckResult:
@@ -148,7 +188,10 @@ def check_environment() -> EnvironmentCheckResult:
         errors.append(f"Python >= 3.12 required, found: {python_version}")
 
     # GPU 检查
-    driver_version, cuda_version, gpu_memory_gb, gpu_name = _check_nvidia_smi()
+    probe = _probe_gpu()
+    driver_version = probe.driver_version
+    gpu_memory_gb = probe.memory_gb
+    gpu_name = probe.gpu_name
 
     gpu_driver_ok = True
     if driver_version:
@@ -164,11 +207,15 @@ def check_environment() -> EnvironmentCheckResult:
         gpu_driver_ok = False
 
     cuda_ok = True
-    if cuda_version:
-        cuda_tuple = _parse_version(cuda_version)
+    if probe.cuda_version:
+        cuda_tuple = _parse_version(probe.cuda_version)
         cuda_ok = cuda_tuple >= _MIN_CUDA_VERSION[:len(cuda_tuple)]
         if not cuda_ok:
-            errors.append(f"CUDA {cuda_version} < required {_MIN_CUDA_VERSION[0]}.{_MIN_CUDA_VERSION[1]}")
+            errors.append(f"CUDA {probe.cuda_version} < required {_MIN_CUDA_VERSION[0]}.{_MIN_CUDA_VERSION[1]}")
+    elif probe.compute_capability:
+        # 仅拿到计算能力（如 8.9）：能枚举出 GPU 即说明驱动自带 CUDA 运行时，
+        # 不能把计算能力与 CUDA 版本比较，否则 RTX 40 系会被误判为 CUDA < 11
+        logger.debug("CUDA version unavailable, compute capability=%s", probe.compute_capability)
     else:
         errors.append("Could not detect CUDA version")
         cuda_ok = False
@@ -183,7 +230,7 @@ def check_environment() -> EnvironmentCheckResult:
         os_ok=os_ok,
         gpu_driver_version=driver_version,
         gpu_driver_ok=gpu_driver_ok,
-        cuda_version=cuda_version,
+        cuda_version=probe.cuda_version,
         cuda_ok=cuda_ok,
         gpu_memory_gb=gpu_memory_gb,
         gpu_memory_ok=gpu_memory_ok,
@@ -192,6 +239,7 @@ def check_environment() -> EnvironmentCheckResult:
         python_ok=python_ok,
         passed=passed,
         errors=errors,
+        gpu_compute_capability=probe.compute_capability,
     )
 
 

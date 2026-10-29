@@ -89,6 +89,7 @@ def _gpu_passed() -> SimpleNamespace:
         cuda_version="12.4",
         gpu_memory_ok=True,
         gpu_memory_gb=16.0,
+        gpu_compute_capability="8.9",
         errors=[],
     )
 
@@ -315,6 +316,7 @@ class TestGpuCheckIsDefensive:
             cuda_version="",
             gpu_memory_ok=False,
             gpu_memory_gb=0.0,
+            gpu_compute_capability=None,
             errors=["no nvidia-smi"],
         )
         monkeypatch.setattr(cli, "check_environment", lambda: failed)
@@ -333,6 +335,31 @@ class TestGpuCheckIsDefensive:
 
         assert len(results) == 1
         assert results[0].status == "skip"
+
+    def test_cuda_detail_separates_compute_capability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 计算能力 8.9 不得被当作 CUDA 版本展示/判定（RTX 40 系误报 CUDA < 11）
+        partial = SimpleNamespace(
+            passed=False,
+            os_ok=True,
+            gpu_driver_ok=False,
+            gpu_name="NVIDIA GeForce RTX 4070",
+            gpu_driver_version="617.42",
+            cuda_ok=True,
+            cuda_version="13.0",
+            gpu_memory_ok=True,
+            gpu_memory_gb=12.0,
+            gpu_compute_capability="8.9",
+            errors=[],
+        )
+        monkeypatch.setattr(cli, "check_environment", lambda: partial)
+        results = {item.name: item for item in cli._check_gpu()}
+
+        assert results["cuda"].status == "ok"
+        assert "CUDA 13.0" in results["cuda"].detail
+        assert "计算能力 8.9" in results["cuda"].detail
+        assert results["cuda"].hint == ""
 
 
 class TestRenderingAndExitCode:

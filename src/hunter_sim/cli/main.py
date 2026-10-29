@@ -290,6 +290,20 @@ def _check_kafka(settings: HunterSimSettings) -> CheckResult:
     )
 
 
+def _describe_cuda(result: object) -> str:
+    """拼装 cuda 检查项描述。
+
+    ``cuda_version`` 是 nvidia-smi 表头里的驱动最高支持版本，``compute_cap`` 是 GPU 计算
+    能力（如 8.9），两者不是同一回事，展示时分开标注以免误读。
+    """
+    cuda_version = getattr(result, "cuda_version", None)
+    compute_cap = getattr(result, "gpu_compute_capability", None)
+    text = f"CUDA {cuda_version or '未检测到'}"
+    if compute_cap:
+        text += f"（驱动支持），计算能力 {compute_cap}"
+    return text
+
+
 def _check_gpu() -> list[CheckResult]:
     """GPU 环境（复用 CARLA 环境检查；无 nvidia-smi 时降级为 warn/skip）。"""
     try:
@@ -314,8 +328,8 @@ def _check_gpu() -> list[CheckResult]:
         CheckResult(
             name="cuda",
             status="ok" if result.cuda_ok else "warn",
-            detail=f"CUDA {result.cuda_version or '未检测到'}",
-            hint="" if result.cuda_ok else "安装/升级 CUDA（要求 ≥11.0）",
+            detail=_describe_cuda(result),
+            hint="" if result.cuda_ok else "安装/升级 NVIDIA 驱动（要求驱动支持 CUDA ≥11.0）",
         ),
         CheckResult(
             name="gpu_memory",

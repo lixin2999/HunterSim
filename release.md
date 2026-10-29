@@ -1661,3 +1661,45 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **k8s 形态需先建证书 Secret**：`k8s/deployment.yaml` 已把 `hunter-sim-tls` Secret 以 `optional` 方式挂到 `/home/hunter/app/certs`，并在 ConfigMap 预留三个路径键（默认空）。启用 mTLS 前需按 `k8s/secret.yaml` 注释创建 Secret 并把三个路径键指到挂载文件；Secret 缺失时只要路径留空，producer 行为与 V3.0.2 一致。
 
 ---
+
+## V3.0.4 — `huntersim doctor` CUDA 判定口径修复（误报「CUDA 8.9」）
+
+**发布日期**：2026-10-29
+**版本定位**：只修预检项的取值口径与提示文案，**不改变任何运行时行为与对外契约**：`EnvironmentCheckResult` 新增一个仅用于展示的字段（带默认值），其余字段语义不变。
+
+### 现场 / 根因
+
+| 级别 | 缺陷 | 根因 |
+|---|---|---|
+| 中 | `huntersim doctor` 在 RTX 40 系机器上报 `cuda warn CUDA 8.9`，并提示「安装/升级 CUDA（要求 ≥11.0）」，误导运维 | `engine/check_environment.py` 用 `nvidia-smi --query-gpu=compute_cap` 取 CUDA 版本。该字段返回的是**GPU 计算能力**（Ada 架构 RTX 4070 为 `8.9`），与 CUDA 版本无关；结果被当作版本号与 `_MIN_CUDA_VERSION=(11, 0)` 比较，必然判定「过低」 |
+| 低 | 同一行字串里分不清哪是 CUDA 版本、哪是算力 | 计算能力占用了 `cuda_version` 字段，没有独立的展示项 |
+
+### 修复内容
+
+- **`engine/check_environment.py`**：
+  - 新增 `_GpuProbe`（`driver_version` / `cuda_version` / `compute_capability` / `memory_gb` / `gpu_name`）承载探测结果，`_check_nvidia_smi()` 换为 `_probe_gpu()`。
+  - **CUDA 版本改从 `nvidia-smi` 表头解析**（`CUDA Version: 13.0`，`_parse_cuda_version` + `_CUDA_VERSION_PATTERN`），即驱动最高支持版本；`compute_cap` 只作为算力字段上报。
+  - `--query-gpu` 增加 `compute_cap` 列；旧驱动不认该列导致整体查询失败时，回退到 `driver_version,memory.total,name` 三列，算力留空。
+  - 判定逻辑：有 CUDA 版本则照旧与 ≥11.0 比较；**只有算力没有 CUDA 版本**时不再判失败（能枚举出 GPU 即说明驱动自带 CUDA 运行时）；两者都没有才记 `Could not detect CUDA version`。
+  - `EnvironmentCheckResult` 新增 `gpu_compute_capability: Optional[str] = None`（尾部带默认值，位置参数构造方式不受影响）。
+- **`cli/main.py`**：`cuda` 检查项改为 `CUDA 13.0（驱动支持），计算能力 8.9` 的形式（`_describe_cuda` 组装，缺字段自动省略），失败提示改为「安装/升级 NVIDIA 驱动（要求驱动支持 CUDA ≥11.0）」。
+
+### 验证
+
+- `pytest -q`：**1058 passed**（含新增 `tests/test_check_environment.py` 8 个用例与 `tests/test_doctor_cli.py` 1 个展示用例）。
+- `mypy src/hunter_sim tests/test_check_environment.py`（strict）：**Success: no issues found in 82 source files**。
+- `flake8 src/hunter_sim/engine/check_environment.py src/hunter_sim/cli/main.py tests/test_check_environment.py tests/test_doctor_cli.py`：**0 告警**。
+- 新增用例覆盖：表头解析 CUDA 版本、算力不被当作 CUDA 版本、旧驱动回退查询、`nvidia-smi` 缺失降级为空探测、RTX 4070 场景（`cuda_version=13.0` + `compute_capability=8.9`）不再产生 `CUDA ... < required` 错误、仅有算力时不判失败、无 GPU 时驱动与 CUDA 同时失败。
+
+### 兼容性说明
+
+- `doctor` 输出变化：`cuda` 行的数值从「计算能力」改为「驱动支持的 CUDA 版本」，并在有值时附带「计算能力 8.9」；原本因算力导致的 `warn` 在本机变为 `ok`，`--strict` 门禁不再被误报阻断。
+- `EnvironmentCheckResult.gpu_compute_capability` 带默认值 `None`，旧代码以关键字或位置参数构造均不受影响；仅 `doctor` 读取该字段（使用 `getattr` 容错，外部 stub 对象缺该属性也不会崩）。
+- 本版未新增/删除任何环境变量，未改动端口、接口或数据契约。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.0.3 → 3.0.4`，镜像 tag `hunter-sim:3.0.4`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步），`README.md` 与 `docs/单机部署指南.md`、`deployment_and_operations.md`、`user_manual.md` 版本号同步。升级步骤：`git pull` → `uv sync` → `huntersim doctor` 复跑确认 `cuda` 项取值。
+
+### 待办 / 已知边界
+
+- **未在带 GPU 的机器上实机复跑 `doctor`**：本次验证基于 `nvidia-smi` 输出的打桩断言（采集自现场报告的 `617.42 / RTX 4070 / 8.9`），需现场执行一次 `huntersim doctor` 确认 `cuda` 项显示为 `CUDA <版本>（驱动支持），计算能力 8.9` 且状态为 `ok`。
+- **CUDA 版本依赖 `nvidia-smi` 表头**：部分精简镜像/受限环境（如仅含 `nvidia-smi` 子集或 MIG 场景）可能不输出 `CUDA Version:`，此时该字段为空、按「仅有算力」处理（不报 warn），无法反映真实 CUDA 上限——如需严格判定，后续可改为查询 `nvcc --version` 或 CUDA runtime 库版本。
+
