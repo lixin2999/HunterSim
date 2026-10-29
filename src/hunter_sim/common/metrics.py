@@ -254,6 +254,13 @@ SENSOR_RECORD_BYTES_TOTAL = Counter(
     "Bytes written by the mcap recorder.",
 )
 
+# 录制生命周期事件：event=started|skipped_disabled|skipped_low_disk|stopped_low_disk
+RECORDING_EVENTS_TOTAL = Counter(
+    "huntersim_recording_events_total",
+    "Sensor recording lifecycle events (event=started|skipped_disabled|skipped_low_disk|stopped_low_disk).",
+    labelnames=("event",),
+)
+
 # MJPEG 在线客户端数（Gauge），用于带宽与连接泄漏观测
 STREAM_CLIENTS = Gauge(
     "huntersim_stream_clients",
@@ -407,6 +414,7 @@ __all__ = [
     "KAFKA_CONSUMER_LAG",
     "KAFKA_CONSUMER_REBUILDS_TOTAL",
     "KAFKA_CONSUMED_TOTAL",
+    "RECORDING_EVENTS_TOTAL",
     "SENSOR_FRAMES_DROPPED_TOTAL",
     "SENSOR_FRAMES_TOTAL",
     "SENSOR_FILE_PUBLISHED_TOTAL",

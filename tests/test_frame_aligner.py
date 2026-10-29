@@ -27,6 +27,7 @@ from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer, TelemetryFra
 def _frame(
     ts: float,
     *,
+    receive_time: float | None = None,
     x: float = 0.0,
     yaw: float = 0.0,
     speed: float = 0.0,
@@ -34,7 +35,7 @@ def _frame(
     gear: int = 1,
     lights: dict[str, bool] | None = None,
 ) -> TelemetryFrame:
-    """构造一帧遥测数据（仅填对齐器关心的字段）。"""
+    """构造一帧遥测数据（仅填对齐器关心的字段；``receive_time`` 可单独指定）。"""
     state = VehicleState(
         time_stamp=ts,
         transform=Transform(x=x, y=0.0, z=0.0, yaw=yaw),
@@ -47,7 +48,7 @@ def _frame(
     return TelemetryFrame(
         vehicle_id="veh-1",
         timestamp=ts,
-        receive_time=ts,
+        receive_time=ts if receive_time is None else receive_time,
         vehicle_state=state,
     )
 
@@ -280,3 +281,115 @@ def _mode_counter() -> object:
     from hunter_sim.common.metrics import VIL_FRAMES_DOWNSAMPLED_TOTAL  # noqa: PLC0415
 
     return VIL_FRAMES_DOWNSAMPLED_TOTAL
+
+
+# ── 时钟偏置补偿（V3.0.2 M4） ────────────────────────────────────────────────
+
+
+def _clock_shifted_buffer(base: float, shift: float, frames: int = 6) -> TelemetryBuffer:
+    """构造“实车时钟比仿真端快 ``shift`` 秒”的帧序列（每 100ms 一帧）。
+
+    注意：一次性预填时所有帧的 ``receive_time`` 都是同一瞬间，偏置估计样本
+    只有一个（不足 3 个不补偿），因此仅用于“不开启补偿”的对照用例。
+    """
+    buffer = TelemetryBuffer(max_frames=50)
+    for index in range(frames):
+        system_ts = base + index * 0.1
+        buffer.push(
+            _frame(system_ts + shift, receive_time=system_ts + 0.02, x=float(index))
+        )
+    return buffer
+
+
+class _Clock:
+    """可控本地时钟（替换 ``telemetry_buffer`` 的 ``time.time``，避免依赖真实时间）。"""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+
+class TestClockOffset:
+    """M4：实车/仿真端时钟不同步时的偏置估计与补偿。"""
+
+    def test_disabled_by_default(self) -> None:
+        base = _grid_base()
+        buffer = _clock_shifted_buffer(base, 5.0)
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=False)
+
+        aligner.next(base)
+
+        assert aligner.stats.clock_offset_ms == 0.0
+
+    def test_compensates_shifted_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """实车时钟快 5s：估计出 -5000ms 偏置后，对齐偏差回到百毫秒量级。"""
+        from hunter_sim.vil_mapper import telemetry_buffer as tb_module  # noqa: PLC0415
+
+        base = _grid_base()
+        clock = _Clock(base)
+        monkeypatch.setattr(tb_module, "time", clock)
+        buffer = TelemetryBuffer(max_frames=50)
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=True)
+
+        aligned = None
+        for index in range(6):
+            clock.now = base + index * 0.1  # 帧到达与本地时钟同步推进
+            buffer.push(_frame(clock.now + 5.0))
+            aligned = aligner.next(clock.now)
+
+        assert aligned is not None
+        assert aligner.stats.clock_offset_ms == pytest.approx(-5000.0, abs=120.0)
+        assert aligned.skew_ms < 200.0
+
+    def test_without_compensation_skew_stays_huge(self) -> None:
+        """对照：不开补偿时同一批帧的偏差接近整个时钟差，会退化为 nearest。"""
+        base = _grid_base()
+        buffer = _clock_shifted_buffer(base, 5.0)
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=False)
+
+        aligned = None
+        for index in range(6):
+            aligned = aligner.next(base + index * 0.1)
+
+        assert aligned is not None
+        assert aligned.mode == "nearest"
+        assert aligned.skew_ms > 4000.0
+
+    def test_insufficient_samples_stay_uncompensated(self) -> None:
+        """少于 3 个样本时不做补偿、也不写偏置（避免首帧抖动静默偏移栅格）。"""
+        base = _grid_base()
+        buffer = _buffer(_frame(base + 5.0, receive_time=base + 0.02))
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=True)
+
+        assert aligner.next(base) is not None
+        assert aligner.stats.clock_offset_ms == 0.0
+
+    def test_uncalibrated_timestamp_is_ignored(self) -> None:
+        """时间戳为 0（未校准）不参与偏置估计。"""
+        base = _grid_base()
+        buffer = _buffer(_frame(0.0, receive_time=base))
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=True)
+
+        aligner.next(base)
+
+        assert aligner.stats.clock_offset_ms == 0.0
+
+    def test_reset_clears_offset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from hunter_sim.vil_mapper import telemetry_buffer as tb_module  # noqa: PLC0415
+
+        base = _grid_base()
+        clock = _Clock(base)
+        monkeypatch.setattr(tb_module, "time", clock)
+        buffer = TelemetryBuffer(max_frames=50)
+        aligner = FrameAligner(buffer, target_hz=10.0, clock_offset_auto=True)
+        for index in range(6):
+            clock.now = base + index * 0.1
+            buffer.push(_frame(clock.now + 5.0))
+            aligner.next(clock.now)
+        assert aligner.stats.clock_offset_ms != 0.0
+
+        aligner.reset()
+
+        assert aligner.stats.clock_offset_ms == 0.0

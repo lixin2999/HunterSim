@@ -39,7 +39,7 @@ spec:
       containers:
         # ── 控制面（唯一业务入口）────────────────────────────────────────────
         - name: sim-service
-          image: hunter-sim:3.0.1
+          image: hunter-sim:3.0.2
           imagePullPolicy: IfNotPresent
           command: ["huntersim"]
           args: ["carla-manager"]
@@ -121,6 +121,11 @@ spec:
               value: "true"
             - name: VIL_LIGHTS_ENABLED
               value: "true"
+            - name: VIL_CLOCK_OFFSET_AUTO
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: vil_clock_offset_auto
             # ── 资源与执行面（单世界串行：端点库存留空即单引擎）──
             - name: RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS
               valueFrom:
@@ -169,6 +174,27 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: adapter_recording_retention_hours
+            # 录制三级闸门：总开关 → sensors[].record → 磁盘余量
+            - name: ADAPTER_RECORD_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_record_enabled
+            - name: ADAPTER_RECORD_MIN_FREE_GB
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_record_min_free_gb
+            - name: ADAPTER_UPLOAD_ON_FAILURE
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_upload_on_failure
+            - name: ADAPTER_ARTIFACT_RETENTION_HOURS
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: adapter_artifact_retention_hours
             - name: ADAPTER_STREAM_FPS
               valueFrom:
                 configMapKeyRef:
@@ -220,6 +246,16 @@ spec:
                 configMapKeyRef:
                   name: hunter-sim-config
                   key: hunter_core_rosbag_bucket
+            - name: HUNTER_CORE_UPLOAD_MAX_RETRIES
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_upload_max_retries
+            - name: HUNTER_CORE_UPLOAD_RETRY_BACKOFF_S
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_upload_retry_backoff_s
             - name: HUNTER_CORE_SASL_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -269,7 +305,7 @@ spec:
 
         # ── 只读探针面（kubelet 存活/就绪 + Prometheus 抓取）─────────────────
         - name: probes
-          image: hunter-sim:3.0.1
+          image: hunter-sim:3.0.2
           imagePullPolicy: IfNotPresent
           command: ["huntersim"]
           args: ["probes"]

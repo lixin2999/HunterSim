@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.0.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 章节）。
+- **当前版本**：`3.0.2`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 章节）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -170,12 +170,12 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 | `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) · `log_json`(false) · `log_file`(空) · `log_max_bytes` · `log_backup_count` |
 | `CARLA_` | CARLA 连接 | `host` · `rpc_port`(2000) · `stream_port`(2001) · `fixed_delta_seconds`(0.02 = 50Hz) · `timeout_seconds`(10) · `supervisor_*`（本地进程自愈，仅托管回环端点） |
 | `KAFKA_` | 数据总线 | `bootstrap_servers` · `telemetry_topic`(`carla.{sim_id}.vil_state`) · `sim_id` · `legacy_telemetry_topic` · `enable_self_heal`(true) · `rebuild_after_errors`(10) · `dlq_topic` |
-| `VIL_` | 虚实映射 | `target_hz`(10.0) · `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `warning_latency_ms`(50) · `buffer_max_frames`(10) · `ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true) · `overlay_enabled`(true) · `lights_enabled`(true) |
+| `VIL_` | 虚实映射 | `target_hz`(10.0) · `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `warning_latency_ms`(50) · `buffer_max_frames`(10) · `ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true) · `overlay_enabled`(true) · `lights_enabled`(true) · `clock_offset_auto`(false) |
 | `RESOURCE_` | 生命周期 | `instance_max_lifetime_seconds`(7200) · `health_check_interval_seconds`(10) |
 | `EXECUTION_` | 执行面 | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · `lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120) |
-| `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `recordings_dir` · `recording_retention_hours`(24) · `stream_fps`(10.0) · `stream_max_width`(640) · `screenshot_quality`(75) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
+| `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `artifact_retention_hours`(72) · `recordings_dir` · `recording_retention_hours`(24) · `record_enabled`(true) · `record_min_free_gb`(0.5) · `upload_on_failure`(false) · `stream_fps`(10.0) · `stream_max_width`(640) · `stream_max_clients`(8) · `screenshot_quality`(75) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
 | `PROBE_` | 探针面 | `host`(127.0.0.1) · `port`(8080) · `adapter_url`(`http://127.0.0.1:8090`) |
-| `HUNTER_CORE_` | 云端接入 | `enabled`(false) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) |
+| `HUNTER_CORE_` | 云端接入 | `enabled`(false) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
 
 > V3.0.0 起已移除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*` 前缀与 `EXECUTION_ENGINE_ENDPOINTS` 的双引擎示例（受支持形态 = 单世界串行，端点库存留空即单引擎）。
 
@@ -202,7 +202,7 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 }
 ```
 
-`ros_enabled=true` 时额外投递 ROS2 话题（需 `rclpy`，缺失自动降级为不出 ROS；桥接器装配后会调用 `initialize()` 建立发布者）；`record=true` 时写入 `ADAPTER_RECORDINGS_DIR` 下的 `.mcap`。
+`ros_enabled=true` 时额外投递 ROS2 话题（需 `rclpy`，缺失自动降级为不出 ROS；桥接器装配后会调用 `initialize()` 建立发布者）；`record=true` 时写入 `ADAPTER_RECORDINGS_DIR` 下的 `.mcap`。录制还受 `ADAPTER_RECORD_ENABLED`（总开关）与 `ADAPTER_RECORD_MIN_FREE_GB`（磁盘余量闸门）约束，运行期每 5s 复查、跌破阈值主动停录；`rgb`/`depth`/`lidar`/`imu` 四路均进入 `FrameHub`（`depth` 为 `32FC1` 米制字节）。
 
 传感器回调只做内存拷贝并入有界队列（上限 32 帧），编码/落盘/ROS 发布由 `hunter-sensor-encoder` 线程串行执行，避免把 CARLA `world.tick()` 线程拖出 50 Hz 预算；队满时丢帧并计入 `huntersim_sensor_frames_dropped_total{stream}`。mcap 写入连续失败 10 次即熔断（`RecordStats.write_errors` 上报），已写入部分仍会 `finish()` 落盘。
 
@@ -221,6 +221,8 @@ V3.0.0 新增指标：
 | `huntersim_sensor_frames_total{stream}` | Counter | 传感器帧计数（`rgb`/`depth`/`lidar`/`imu`） |
 | `huntersim_sensor_frames_dropped_total{stream}` | Counter | 编码队列满导致的丢帧计数（持续增长 → 磁盘/CPU 跟不上采集） |
 | `huntersim_sensor_record_bytes_total` | Counter | mcap 累计写入字节（磁盘容量告警依据） |
+| `huntersim_recording_events_total{event}` | Counter | 录制生命周期事件（`started`/`skipped_disabled`/`skipped_low_disk`/`stopped_low_disk`） |
+| `huntersim_cloud_upload_total{result}` | Counter | bag/mcap 上传终态（自动重试耗尽才计 `failed`） |
 | `huntersim_stream_clients` | Gauge | MJPEG 在线客户端数 |
 | `huntersim_probe_upstream_reachable` | Gauge | 探针到控制面的可达性 |
 

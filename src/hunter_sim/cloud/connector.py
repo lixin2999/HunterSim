@@ -16,6 +16,7 @@ API 服务层暴露统一发布接口：
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -68,6 +69,9 @@ class CloudConnector:
         self._upload_success = 0
         self._upload_failed = 0
         self._upload_dropped = 0
+        # 在途/排队上传的文件（供录制保留期清理避让，避免删掉正在上传的文件）
+        self._pending_lock = threading.Lock()
+        self._pending_paths: dict[str, Path] = {}
 
     @property
     def enabled(self) -> bool:
@@ -271,11 +275,13 @@ class CloudConnector:
             # 若执行时再读 self._producer 会把 A 的 sensor_file 发到 B 的 Topic
             self._producer,
         )
+        # 先登记再入队：消费线程可能在 put 成功瞬间就完成并注销
+        self._remember_pending(file_path)
         try:
             q.put_nowait(job)
             return
         except queue.Full:
-            pass
+            self._forget_pending(file_path)
         # 队满：丢弃最旧任务腾位，保证最新采集的 bag 优先上传
         dropped_job: Any = None
         try:
@@ -283,11 +289,13 @@ class CloudConnector:
         except queue.Empty:
             dropped_job = None
         if dropped_job is not None and isinstance(dropped_job, tuple):
+            self._forget_pending(dropped_job[0])
             self._count_drop(f"queue full, dropped oldest bag '{dropped_job[0]}'")
         try:
             q.put_nowait(job)
         except queue.Full:
             # 腾位失败（并发消费者已补位等极端情况）：丢弃新任务本身
+            self._forget_pending(file_path)
             self._count_drop(f"queue full, dropped new bag '{file_path}'")
 
     def _count_drop(self, reason: str) -> None:
@@ -296,6 +304,26 @@ class CloudConnector:
             self._upload_dropped += 1
         CLOUD_UPLOAD_DROPPED_TOTAL.inc()
         logger.warning(f"bag 上传丢弃（{reason}）")
+
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        """路径比对键（绝对路径 + 平台大小写），避免同一文件两种写法不算同一项。"""
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _remember_pending(self, path: Path) -> None:
+        """登记在途/排队上传文件。"""
+        with self._pending_lock:
+            self._pending_paths[self._path_key(path)] = path
+
+    def _forget_pending(self, path: Path) -> None:
+        """注销上传文件（完成/丢弃/异常均调用，幂等）。"""
+        with self._pending_lock:
+            self._pending_paths.pop(self._path_key(path), None)
+
+    def pending_upload_paths(self) -> set[Path]:
+        """当前排队或在途上传的文件（供保留期清理避让）。"""
+        with self._pending_lock:
+            return set(self._pending_paths.values())
 
     def wait_upload_idle(self, timeout: float = 10.0) -> bool:
         """等待上传队列排空（仅用于关停/终态前的尽力等待）。
@@ -381,9 +409,25 @@ class CloudConnector:
             producer: 投递任务时捕获的生产者（None 时回退到当前生产者）。
         """
         publisher = producer if producer is not None else self._producer
+        max_attempts = 1 + max(0, int(self._settings.upload_max_retries))
+        backoff_s = max(0.0, float(self._settings.upload_retry_backoff_s))
         with self._upload_exec_lock:
             try:
-                result = self.uploader.upload(file_path, data_type=data_type)
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        result = self.uploader.upload(file_path, data_type=data_type)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if attempt >= max_attempts:
+                            raise
+                        logger.warning(
+                            f"bag 上传失败（{attempt}/{max_attempts} 次），"
+                            f"{backoff_s}s 后重试：{type(exc).__name__}: {exc}"
+                        )
+                        if not self._wait_before_retry(backoff_s):
+                            raise
                 with self._upload_counters_lock:
                     self._upload_success += 1
                 CLOUD_UPLOAD_TOTAL.labels(result="success").inc()
@@ -410,3 +454,16 @@ class CloudConnector:
                     self._upload_failed += 1
                 CLOUD_UPLOAD_TOTAL.labels(result="failed").inc()
                 logger.warning(f"bag 上传失败（已忽略，不阻断仿真）：{type(exc).__name__}: {exc}")
+            finally:
+                # 无论成功/重试耗尽/停止，都要注销：否则保留期清理永远避让该目录
+                self._forget_pending(file_path)
+
+    def _wait_before_retry(self, backoff_s: float) -> bool:
+        """退避等待；返回 False 表示连接器已停止（不再重试）。"""
+        if backoff_s <= 0:
+            return True
+        stop = self._upload_stop
+        if stop is not None:
+            return not stop.wait(backoff_s)
+        time.sleep(backoff_s)
+        return True

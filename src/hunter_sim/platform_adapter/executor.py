@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import threading
@@ -26,6 +27,7 @@ from hunter_sim.common.exceptions import (
     CarlaSimulationError,
     ConfigurationError,
 )
+from hunter_sim.common.metrics import RECORDING_EVENTS_TOTAL
 from hunter_sim.common.models import HunterSimSettings, SimMode
 from hunter_sim.common.utils import get_logger
 from hunter_sim.eval_service.evaluation_engine import EvaluationEngine, SceneEvaluationResult
@@ -65,6 +67,8 @@ _PROGRESS_MIN_INTERVAL_S = 0.5
 _RETENTION_SWEEP_INTERVAL_S = 300.0
 # 完成时等待录制上传排空的超时（秒）：不阻断终态落库，但给上传线程机会
 _UPLOAD_DRAIN_TIMEOUT_S = 10.0
+# 录制期间磁盘剩余检查周期（秒）：低于阈值时中途停录，避免写满卷
+_DISK_CHECK_INTERVAL_S = 5.0
 
 
 @dataclass
@@ -83,6 +87,9 @@ class _RunContext:
     frame_hub: Optional[FrameHub] = None
     recorder: Optional[McapRecorder] = None
     record_stats: Optional[RecordStats] = None
+    # 运行期磁盘闸门：上次检查时刻与停录原因（low_disk 表示中途主动停录）
+    last_disk_check_at: float = 0.0
+    recording_stopped: str = ""
     ros_bridge: Optional[Any] = None
 
     def add_sample(self, ego: dict[str, Any], sim_time: float) -> None:
@@ -464,6 +471,7 @@ class SimulationExecutor:
             if not _runner_alive(runner):
                 break
             self._persist_progress(context)
+            self._enforce_disk_gate(context)
             time.sleep(0.2)
 
         # 录制收尾：成功/失败/取消/看门狗路径均到达此处（幂等）
@@ -484,13 +492,16 @@ class SimulationExecutor:
                 message="canceled",
                 finished_at=time.time(),
             )
+            self._maybe_upload_on_failure(context)
             return
         if reason == "watchdog_timeout":
             self._fail_instance(instance_id, "watchdog_timeout")
+            self._maybe_upload_on_failure(context)
             return
         snapshot = _safe_snapshot(runner)
         if snapshot is not None and snapshot.status.value == "failed":
             self._fail_instance(instance_id, snapshot.error_message or "scene_failed")
+            self._maybe_upload_on_failure(context)
             return
         self._complete_instance(context, snapshot)
 
@@ -719,6 +730,10 @@ class SimulationExecutor:
                     self._sweep_recordings()
                 except Exception as exc:  # noqa: BLE001  清理失败不影响看门狗
                     logger.warning(f"Recording retention sweep failed: {exc}")
+                try:
+                    self._sweep_artifacts()
+                except Exception as exc:  # noqa: BLE001  清理失败不影响看门狗
+                    logger.warning(f"Artifact retention sweep failed: {exc}")
             time.sleep(0.5)
 
     # ── 传感器录制与上传 ─────────────────────────────────────────────────────
@@ -759,21 +774,64 @@ class SimulationExecutor:
             logger.warning(f"ROS2 bridge shutdown failed: {type(exc).__name__}: {exc}")
 
     def _start_recording(self, context: _RunContext) -> None:
-        """按 ``scene.sensors[].record`` 打开 mcap 录制（不满足条件则不录制）。"""
+        """按总开关 + ``sensors[].record`` + 磁盘余量打开 mcap 录制。
+
+        三级闸门（任一条不满足则不录制，但不影响场景本身）：
+
+        1. ``ADAPTER_RECORD_ENABLED``：运维侧总开关（平台未显式关闭时也能停录）；
+        2. ``sensors[].record``：平台下发的逐传感器开关；
+        3. ``ADAPTER_RECORD_MIN_FREE_GB``：卷剩余空间低于阈值不开录（运行期另行监控）。
+        """
+        instance_id = context.record.instance_id
+        if not self._adapter.record_enabled:
+            RECORDING_EVENTS_TOTAL.labels(event="skipped_disabled").inc()
+            logger.info(f"Sensor recording disabled by ADAPTER_RECORD_ENABLED: {instance_id}")
+            return
         enabled = [spec for spec in context.scene.sensors if spec.enabled]
         if not any(spec.record for spec in enabled):
             return
         record = context.record
+        root = Path(self._adapter.recordings_dir)
+        free_gb = _free_disk_gb(root)
+        if not _has_recording_space(free_gb, self._adapter.record_min_free_gb):
+            RECORDING_EVENTS_TOTAL.labels(event="skipped_low_disk").inc()
+            logger.warning(
+                f"Sensor recording skipped (low disk {_disk_text(free_gb)} < "
+                f"{self._adapter.record_min_free_gb}GB): {instance_id}"
+            )
+            return
         recorder = McapRecorder()
-        path = (
-            Path(self._adapter.recordings_dir)
-            / _safe_segment(record.instance_id)
-            / f"sensors_r{record.revision}.mcap"
-        )
+        path = root / _safe_segment(record.instance_id) / f"sensors_r{record.revision}.mcap"
         if not recorder.open(path):
-            logger.warning(f"Sensor recording disabled for {record.instance_id} (degraded)")
+            logger.warning(f"Sensor recording disabled for {instance_id} (degraded)")
             return
         context.recorder = recorder
+        context.last_disk_check_at = time.time()
+        RECORDING_EVENTS_TOTAL.labels(event="started").inc()
+
+    def _enforce_disk_gate(self, context: _RunContext) -> None:
+        """运行期磁盘闸门：低于阈值时中途停录（已录部分照常收尾/上传）。
+
+        录制中磁盘写满会让 mcap 逐帧失败（虽有熔断，但已写分块可能损坏），
+        因此在看门狗之外另设每 ``_DISK_CHECK_INTERVAL_S`` 秒一次的余量检查。
+        """
+        min_free_gb = float(self._adapter.record_min_free_gb)
+        if context.recorder is None or min_free_gb <= 0:
+            return
+        now = time.time()
+        if now - context.last_disk_check_at < _DISK_CHECK_INTERVAL_S:
+            return
+        context.last_disk_check_at = now
+        free_gb = _free_disk_gb(Path(self._adapter.recordings_dir))
+        if _has_recording_space(free_gb, min_free_gb):
+            return
+        context.recording_stopped = "low_disk"
+        RECORDING_EVENTS_TOTAL.labels(event="stopped_low_disk").inc()
+        logger.warning(
+            f"Sensor recording stopped (low disk {_disk_text(free_gb)} < {min_free_gb}GB): "
+            f"{context.record.instance_id}"
+        )
+        self._close_recording(context)
 
     def _close_recording(self, context: _RunContext) -> Optional[RecordStats]:
         """结束录制并回写路径/字节数（幂等）。
@@ -800,6 +858,7 @@ class SimulationExecutor:
         logger.info(
             f"Sensor recording closed: instance={context.record.instance_id}, "
             f"frames={stats.frame_count}, size={stats.size_bytes}B"
+            + (f", stopped={context.recording_stopped}" if context.recording_stopped else "")
         )
         if stats.write_errors:
             logger.warning(
@@ -828,6 +887,16 @@ class SimulationExecutor:
             scene_id=context.record.scene_id,
             vehicle_id=context.record.vehicle_id or None,
         )
+
+    def _maybe_upload_on_failure(self, context: _RunContext) -> None:
+        """失败/取消/看门狗路径的可选上传（``ADAPTER_UPLOAD_ON_FAILURE``）。
+
+        默认只在正常完成时上传：失败路径的 mcap 往往是被中断的残片，上传会
+        污染平台的 ``sensor_file`` 列表；需要留证据时由运维打开开关。
+        """
+        if not self._adapter.upload_on_failure:
+            return
+        self._upload_recording(context)
 
     def _connector_for(self, record: InstanceRecord) -> Optional[CloudConnector]:
         """取（并初始化）上传连接器；未启用云端或 producer 不可用时返回 None。
@@ -859,7 +928,11 @@ class SimulationExecutor:
             logger.warning(f"Cloud connector stop failed: {exc}")
 
     def _sweep_recordings(self) -> None:
-        """按保留期清理录制文件（看门狗周期调用，异常不外抛）。"""
+        """按保留期清理录制文件（看门狗周期调用，异常不外抛）。
+
+        跳过仍在上传队列/正在上传的文件所在目录：否则长保留期下的旧录制在上传
+        中途被删除，上传线程会因 ``FileNotFoundError`` 静默失败并丢掉证据。
+        """
         retention = float(self._adapter.recording_retention_hours)
         if retention <= 0:
             return
@@ -867,22 +940,78 @@ class SimulationExecutor:
         if not root.is_dir():
             return
         cutoff = time.time() - retention * 3600.0
+        protected = self._pending_upload_dirs()
         removed = 0
         for entry in root.iterdir():
             try:
                 if not entry.is_dir():
                     continue
-                newest = max(
-                    (child.stat().st_mtime for child in entry.rglob("*") if child.is_file()),
-                    default=entry.stat().st_mtime,
-                )
-                if newest < cutoff:
-                    shutil.rmtree(entry, ignore_errors=True)
-                    removed += 1
+                if _norm_path(entry) in protected:
+                    logger.debug(f"Recording retention keeps in-flight upload: {entry}")
+                    continue
+                newest = _newest_mtime(entry)
+                if newest is None or newest >= cutoff:
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
             except OSError as exc:
                 logger.debug(f"Recording retention skip '{entry}': {exc}")
         if removed:
             logger.info(f"Recording retention removed {removed} directory(ies)")
+
+    def _sweep_artifacts(self) -> None:
+        """按保留期清理产物暂存目录（``<artifacts_dir>/<sim>/<scene>/``）。
+
+        产物在写入时已尽力直传对象存储，本地副本只用于排障；无保留期时旧实例
+        的目录会无限堆积（孤儿导出），按小时级保留期回收即可。
+        """
+        retention = float(self._adapter.artifact_retention_hours)
+        if retention <= 0:
+            return
+        root = Path(self._adapter.artifacts_dir)
+        if not root.is_dir():
+            return
+        cutoff = time.time() - retention * 3600.0
+        removed = 0
+        for sim_dir in root.iterdir():
+            if not sim_dir.is_dir():
+                continue
+            try:
+                scene_dirs = [entry for entry in sim_dir.iterdir() if entry.is_dir()]
+            except OSError as exc:
+                logger.debug(f"Artifact retention skip '{sim_dir}': {exc}")
+                continue
+            for scene_dir in scene_dirs:
+                try:
+                    newest = _newest_mtime(scene_dir)
+                    if newest is None or newest >= cutoff:
+                        continue
+                    shutil.rmtree(scene_dir, ignore_errors=True)
+                    removed += 1
+                except OSError as exc:
+                    logger.debug(f"Artifact retention skip '{scene_dir}': {exc}")
+            try:
+                sim_dir.rmdir()  # 仅在已空时成功，避免误删新实例目录
+            except OSError:
+                continue
+        if removed:
+            logger.info(f"Artifact retention removed {removed} directorie(s)")
+
+    def _pending_upload_dirs(self) -> set[str]:
+        """在途/排队上传文件所在目录（规范化路径），供保留期清理跳过。"""
+        with self._connector_lock:
+            connector = self._connector
+        if connector is None:
+            return set()
+        getter = getattr(connector, "pending_upload_paths", None)
+        if not callable(getter):
+            return set()
+        try:
+            paths = getter()
+        except Exception as exc:  # noqa: BLE001  取不到就退化为旧行为（不保护）
+            logger.debug(f"Pending upload paths unavailable: {exc}")
+            return set()
+        return {_norm_path(Path(path).parent) for path in paths}
 
     # ── 辅助 ─────────────────────────────────────────────────────────────────
 
@@ -900,6 +1029,64 @@ class SimulationExecutor:
             carla_stream_port=carla.stream_port,
             carla_tm_port=carla.tm_port,
         )
+
+
+def _free_disk_gb(path: Path) -> Optional[float]:
+    """目录所在卷的剩余空间（GB）；无法测量时返回 None。"""
+    try:
+        usage = shutil.disk_usage(_existing_path(path))
+    except OSError as exc:
+        logger.debug(f"Disk usage unavailable for '{path}': {exc}")
+        return None
+    return usage.free / (1024.0**3)
+
+
+def _existing_path(path: Path) -> Path:
+    """向上找到第一个已存在路径（目录尚未创建时仍可测量卷余量）。"""
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return Path(".")
+        current = parent
+    return current
+
+
+def _has_recording_space(free_gb: Optional[float], min_free_gb: float) -> bool:
+    """磁盘余量是否满足录制要求（无法测量时不拦截，避免误停录）。"""
+    if min_free_gb <= 0 or free_gb is None:
+        return True
+    return free_gb >= min_free_gb
+
+
+def _disk_text(free_gb: Optional[float]) -> str:
+    """磁盘余量的日志文本（未知时明确写 unknown）。"""
+    return "unknown" if free_gb is None else f"{free_gb:.2f}GB"
+
+
+def _newest_mtime(directory: Path) -> Optional[float]:
+    """目录内（递归）最新文件 mtime；无文件时回退目录自身；无法读取返回 None。"""
+    newest = 0.0
+    try:
+        for child in directory.rglob("*"):
+            try:
+                if child.is_file():
+                    newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+        if newest > 0:
+            return newest
+        return directory.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _norm_path(path: Path) -> str:
+    """路径规范化（绝对路径 + 平台大小写），用于清理时比对。"""
+    try:
+        return os.path.normcase(str(path.resolve()))
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(path)))
 
 
 def _safe_segment(value: str) -> str:

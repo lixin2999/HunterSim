@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import threading
 import time
@@ -15,9 +16,11 @@ from typing import Any, Optional
 
 import pytest
 
+from hunter_sim.common.metrics import RECORDING_EVENTS_TOTAL, counter_value
 from hunter_sim.common.models import HunterSimSettings, SceneStatus
+from hunter_sim.platform_adapter import executor as executor_module
 from hunter_sim.platform_adapter.config import AdapterSettings
-from hunter_sim.platform_adapter.executor import SimulationExecutor
+from hunter_sim.platform_adapter.executor import SimulationExecutor, _RunContext
 from hunter_sim.platform_adapter.models import InstanceRecord
 from hunter_sim.platform_adapter.store import InstanceStore
 from hunter_sim.scene_runner.scene_config import SensorSpec
@@ -763,3 +766,188 @@ class TestRosBridgeWiring:
         scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
 
         assert executor._ros_bridge_for(scene) is None  # noqa: SLF001
+
+
+# ── V3.0.2：录制闸门 / 失败上传 / 保留期清理 ─────────────────────────────────
+
+
+def _scene_with_sensors(*specs: SensorSpec) -> Any:
+    """构造只常 ``sensors`` 的场景视图（录制装配只需要该字段）。"""
+    return SimpleNamespace(sensors=list(specs) or [SensorSpec()])
+
+
+def _aged(path: Path, hours: float) -> None:
+    """把文件 mtime 调到 ``hours`` 小时前（触发保留期清理）。"""
+    stamp = time.time() - hours * 3600.0
+    os.utime(path, (stamp, stamp))
+
+
+class TestRecordingGates:
+    """H3：录制总开关 + 磁盘余量闸门（开录前与运行期）。"""
+
+    def test_disabled_by_switch(self, executor: SimulationExecutor, store: InstanceStore) -> None:
+        record = _new_record(store)
+        executor._adapter.record_enabled = False  # noqa: SLF001
+        context = _RunContext(record=record, scene=_scene_with_sensors())
+
+        executor._start_recording(context)  # noqa: SLF001
+
+        assert context.recorder is None
+        assert counter_value(RECORDING_EVENTS_TOTAL, event="skipped_disabled") >= 1
+
+    def test_low_disk_skips_start(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record = _new_record(store)
+        executor._adapter.record_min_free_gb = 1.0  # noqa: SLF001
+        monkeypatch.setattr(executor_module, "_free_disk_gb", lambda path: 0.1)
+        context = _RunContext(record=record, scene=_scene_with_sensors())
+
+        executor._start_recording(context)  # noqa: SLF001
+
+        assert context.recorder is None
+        assert counter_value(RECORDING_EVENTS_TOTAL, event="skipped_low_disk") >= 1
+
+    def test_recording_starts_when_space_available(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record = _new_record(store)
+        executor._adapter.recordings_dir = str(tmp_path / "recordings")  # noqa: SLF001
+        monkeypatch.setattr(executor_module, "_free_disk_gb", lambda path: 100.0)
+        context = _RunContext(record=record, scene=_scene_with_sensors())
+
+        executor._start_recording(context)  # noqa: SLF001
+        stats = executor._close_recording(context)  # noqa: SLF001
+
+        assert context.recorder is None
+        assert stats is not None and stats.path
+        assert store.get(record.instance_id).recording_path == stats.path
+
+    def test_running_low_disk_stops_recording(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record = _new_record(store)
+        executor._adapter.recordings_dir = str(tmp_path / "recordings")  # noqa: SLF001
+        executor._adapter.record_min_free_gb = 1.0  # noqa: SLF001
+        monkeypatch.setattr(executor_module, "_free_disk_gb", lambda path: 100.0)
+        context = _RunContext(record=record, scene=_scene_with_sensors())
+        executor._start_recording(context)  # noqa: SLF001
+        assert context.recorder is not None
+
+        # 运行期余量跌破阈值：中途停录，已录部分保留并可上传
+        monkeypatch.setattr(executor_module, "_free_disk_gb", lambda path: 0.01)
+        context.last_disk_check_at = 0.0
+        executor._enforce_disk_gate(context)  # noqa: SLF001
+
+        assert context.recording_stopped == "low_disk"
+        assert context.recorder is None
+        assert context.record_stats is not None
+        assert counter_value(RECORDING_EVENTS_TOTAL, event="stopped_low_disk") >= 1
+
+
+class TestFailureUpload:
+    """L4：失败/取消路径的可选上传（``ADAPTER_UPLOAD_ON_FAILURE``，默认关闭）。"""
+
+    def test_default_keeps_existing_trigger_points(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        context = _RunContext(record=_new_record(store), scene=_scene_with_sensors())
+        calls: list[Any] = []
+        monkeypatch.setattr(executor, "_upload_recording", lambda ctx: calls.append(ctx))
+
+        executor._maybe_upload_on_failure(context)  # noqa: SLF001
+
+        assert calls == []
+
+    def test_enabled_uploads_on_failure(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        context = _RunContext(record=_new_record(store), scene=_scene_with_sensors())
+        executor._adapter.upload_on_failure = True  # noqa: SLF001
+        calls: list[Any] = []
+        monkeypatch.setattr(executor, "_upload_recording", lambda ctx: calls.append(ctx))
+
+        executor._maybe_upload_on_failure(context)  # noqa: SLF001
+
+        assert calls == [context]
+
+
+class TestRetentionSweep:
+    """L5/L6：保留期清理（在途上传避让 + 产物孤儿目录回收）。"""
+
+    def test_sweep_removes_expired_recording(
+        self, executor: SimulationExecutor, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "recordings" / "inst-old" / "sensors_r1.mcap"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"x")
+        _aged(target, 48.0)
+        executor._adapter.recordings_dir = str(tmp_path / "recordings")  # noqa: SLF001
+
+        executor._sweep_recordings()  # noqa: SLF001
+
+        assert not target.parent.exists()
+
+    def test_sweep_skips_in_flight_upload(
+        self, executor: SimulationExecutor, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "recordings" / "inst-live" / "sensors_r1.mcap"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"x")
+        _aged(target, 48.0)
+        executor._adapter.recordings_dir = str(tmp_path / "recordings")  # noqa: SLF001
+        executor._connector = SimpleNamespace(  # noqa: SLF001
+            pending_upload_paths=lambda: {target}
+        )
+
+        executor._sweep_recordings()  # noqa: SLF001
+        assert target.is_file()  # 在途上传的文件不被删除
+
+        executor._connector = None  # noqa: SLF001
+        executor._sweep_recordings()  # noqa: SLF001
+        assert not target.parent.exists()
+
+    def test_sweep_removes_expired_artifacts(
+        self, executor: SimulationExecutor, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "artifacts" / "sim-a" / "scene-a"
+        root.mkdir(parents=True)
+        artifact = root / "eval.json"
+        artifact.write_text("{}")
+        _aged(artifact, 100.0)
+        executor._adapter.artifacts_dir = str(tmp_path / "artifacts")  # noqa: SLF001
+
+        executor._sweep_artifacts()  # noqa: SLF001
+
+        assert not root.exists()
+        assert not (tmp_path / "artifacts" / "sim-a").exists()
+
+    def test_sweep_keeps_fresh_artifacts(
+        self, executor: SimulationExecutor, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "artifacts" / "sim-b" / "scene-b"
+        root.mkdir(parents=True)
+        artifact = root / "eval.json"
+        artifact.write_text("{}")
+        executor._adapter.artifacts_dir = str(tmp_path / "artifacts")  # noqa: SLF001
+
+        executor._sweep_artifacts()  # noqa: SLF001
+
+        assert artifact.is_file()

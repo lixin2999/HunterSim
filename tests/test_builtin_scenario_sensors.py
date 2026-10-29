@@ -614,7 +614,12 @@ class TestIntegration:
             "/carla/imu/data",
         }
         assert stats.size_bytes > 0
-        assert hub.stats()["total"] == 3  # depth 只录制，不进 FrameHub
+        # rgb/depth/lidar/imu 四路都进 FrameHub（depth 为 32FC1 米制字节）
+        assert hub.stats()["total"] == 4
+        depth = hub.latest("depth")
+        assert depth is not None
+        assert depth.meta["encoding"] == "32FC1"
+        assert len(depth.payload) == depth.meta["width"] * depth.meta["height"] * 4
 
 
 class TestSensorSpec:

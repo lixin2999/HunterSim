@@ -74,7 +74,7 @@ services:
         # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ PIP_TRUSTED_HOST=mirrors.aliyun.com
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:3.0.1
+    image: hunter-sim:3.0.2
     command: ["carla-manager"]
     ports:
       - "8090:8090"
@@ -110,6 +110,8 @@ services:
       VIL_MAX_DATA_LATENCY_MS: ${VIL_MAX_DATA_LATENCY_MS:-500}
       VIL_OVERLAY_ENABLED: ${VIL_OVERLAY_ENABLED:-true}
       VIL_LIGHTS_ENABLED: ${VIL_LIGHTS_ENABLED:-true}
+      # 实车与仿真端时钟不同源时开启（默认 false：假设两端已同步，仅记录 skew）
+      VIL_CLOCK_OFFSET_AUTO: ${VIL_CLOCK_OFFSET_AUTO:-false}
       # ── 资源与执行面（单世界串行：端点库存留空即单引擎）──
       RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS: ${RESOURCE_INSTANCE_MAX_LIFETIME_SECONDS:-7200}
       RESOURCE_HEALTH_CHECK_INTERVAL_SECONDS: ${RESOURCE_HEALTH_CHECK_INTERVAL_SECONDS:-10}
@@ -123,6 +125,11 @@ services:
       ADAPTER_ARTIFACTS_DIR: ${ADAPTER_ARTIFACTS_DIR:-data/adapter/artifacts}
       ADAPTER_RECORDINGS_DIR: ${ADAPTER_RECORDINGS_DIR:-data/adapter/recordings}
       ADAPTER_RECORDING_RETENTION_HOURS: ${ADAPTER_RECORDING_RETENTION_HOURS:-24}
+      # 录制总开关 / 磁盘闸门（GB，0 = 不检查）/ 失败路径上传 / 产物暂存保留期（小时）
+      ADAPTER_RECORD_ENABLED: ${ADAPTER_RECORD_ENABLED:-true}
+      ADAPTER_RECORD_MIN_FREE_GB: ${ADAPTER_RECORD_MIN_FREE_GB:-0.5}
+      ADAPTER_UPLOAD_ON_FAILURE: ${ADAPTER_UPLOAD_ON_FAILURE:-false}
+      ADAPTER_ARTIFACT_RETENTION_HOURS: ${ADAPTER_ARTIFACT_RETENTION_HOURS:-72}
       ADAPTER_ARTIFACT_BUCKET: ${ADAPTER_ARTIFACT_BUCKET:-hunter-scene-assets}
       ADAPTER_WATCHDOG_FACTOR: ${ADAPTER_WATCHDOG_FACTOR:-3.0}
       ADAPTER_WATCHDOG_GRACE_SECONDS: ${ADAPTER_WATCHDOG_GRACE_SECONDS:-120}
@@ -149,6 +156,9 @@ services:
       HUNTER_CORE_ROSBAG_BUCKET: ${HUNTER_CORE_ROSBAG_BUCKET:-hunter-rosbag}
       HUNTER_CORE_UPLOAD_TIMEOUT_S: ${HUNTER_CORE_UPLOAD_TIMEOUT_S:-60.0}
       HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE: ${HUNTER_CORE_UPLOAD_QUEUE_MAX_SIZE:-32}
+      # 上传失败自动重试（0 = 不重试）与退避秒数
+      HUNTER_CORE_UPLOAD_MAX_RETRIES: ${HUNTER_CORE_UPLOAD_MAX_RETRIES:-2}
+      HUNTER_CORE_UPLOAD_RETRY_BACKOFF_S: ${HUNTER_CORE_UPLOAD_RETRY_BACKOFF_S:-1.0}
     depends_on:
       kafka:
         condition: service_healthy
@@ -164,7 +174,7 @@ services:
 
   # ── 只读运维探针面（8080，无业务无鉴权）─────────────────────────────────────
   probes:
-    image: hunter-sim:3.0.1
+    image: hunter-sim:3.0.2
     command: ["probes"]
     ports:
       - "8080:8080"

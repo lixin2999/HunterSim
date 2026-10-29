@@ -38,7 +38,7 @@ from hunter_sim.scene_runner.scene_config import (
     TrafficParticipantConfig,
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
-from hunter_sim.sensor_sim.frame_hub import FrameHub, STREAM_RGB
+from hunter_sim.sensor_sim.frame_hub import FrameHub, STREAM_DEPTH, STREAM_RGB
 from hunter_sim.sensor_sim.image_codec import depth_bgra_to_meters, encode_rgb_frame
 from hunter_sim.sensor_sim.mcap_recorder import (
     McapRecorder,
@@ -547,15 +547,29 @@ class BuiltinScenario(CustomScenarioBase):
             self._publish_ros("rgb", data)
             return
 
-        if stream == "depth":
+        if stream == STREAM_DEPTH:
             raw, width, height = self._raw_image(data)
-            if self._recorder is not None:
+            if self._frame_hub is not None or self._recorder is not None:
+                # 米制深度只算一次：FrameHub 暴露最新深度图（调试/上层取用），录制落 32FC1
                 meters = depth_bgra_to_meters(raw, width, height).tobytes()
-                self._recorder.push_stream(
-                    stream,
-                    log_time_ns,
-                    build_image_message(meters, width, height, "32FC1", frame_id, log_time_ns),
-                )
+                if self._frame_hub is not None:
+                    self._frame_hub.push(
+                        stream,
+                        ts,
+                        meters,
+                        {
+                            "encoding": "32FC1",
+                            "width": width,
+                            "height": height,
+                            "frame_id": frame_id,
+                        },
+                    )
+                if self._recorder is not None:
+                    self._recorder.push_stream(
+                        stream,
+                        log_time_ns,
+                        build_image_message(meters, width, height, "32FC1", frame_id, log_time_ns),
+                    )
             self._publish_ros("depth", data)
             return
 
@@ -713,7 +727,7 @@ def _frame_of(stream: str, data: Any) -> _SensorFrame:
         仅含基本类型的帧载荷。
     """
     ts = float(getattr(data, "timestamp", 0.0)) or time.time()
-    if stream in (STREAM_RGB, "depth"):
+    if stream in (STREAM_RGB, STREAM_DEPTH):
         raw, width, height = BuiltinScenario._raw_image(data)
         return _SensorFrame(stream=stream, ts=ts, payload=raw, width=width, height=height)
     if stream == "lidar":

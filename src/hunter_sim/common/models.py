@@ -318,6 +318,13 @@ class VILSettings(BaseSettings):
     lights_enabled: bool = Field(
         True, description="是否同步实车灯光（刹车/左转/右转/近光）到虚拟车辆"
     )
+    clock_offset_auto: bool = Field(
+        False,
+        description=(
+            "是否自动估计并补偿实车与仿真端时钟偏置；关闭时假设两端时钟已同步"
+            "（保持既有对齐行为，仅记录 skew）"
+        ),
+    )
 
 
 class ResourceSettings(BaseSettings):
@@ -439,6 +446,12 @@ class CloudSettings(BaseSettings):
     upload_timeout_s: float = Field(60.0, gt=0.0, description="预签名/直传 HTTP 超时（秒）")
     upload_queue_max_size: int = Field(
         32, ge=1, le=1024, description="bag 上传后台队列容量（有界防积压，满时丢最旧）"
+    )
+    upload_max_retries: int = Field(
+        2, ge=0, le=5, description="bag 上传失败后的自动重试次数（0 表示不重试）"
+    )
+    upload_retry_backoff_s: float = Field(
+        1.0, ge=0.0, le=30.0, description="bag 上传重试退避（秒），停止时立即中断"
     )
 
 

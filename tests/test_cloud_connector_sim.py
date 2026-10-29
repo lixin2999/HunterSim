@@ -53,6 +53,7 @@ def _settings(**overrides: object) -> CloudSettings:
         "sensor_data_topic_template": "carla.{sim_id}.sensor_data",
         "sensor_data_dlq_template": "carla.{sim_id}.sensor_data.dlq",
         "telemetry_proxy_interval_s": 0.0,  # 禁用节流方便测试
+        "upload_max_retries": 0,  # 默认不重试，避免失败用例变慢；重试用例单独覆盖
     }
     base.update(overrides)
     return CloudSettings(**base)  # type: ignore[arg-type]
@@ -291,4 +292,87 @@ def test_upload_job_captures_producer_at_enqueue() -> None:
     assert conn.wait_upload_idle(5.0) is True
     assert [m["value"]["sim_id"] for m in first.messages_of_type("sensor_file")] == ["sim-A"]
     assert second.messages_of_type("sensor_file") == []
+    conn.stop()
+
+
+# ── 测试：上传自动重试与在途文件登记（V3.0.2 L5） ──────────────────────────
+
+
+class _Result:
+    bucket = "b"
+    object_key = "k"
+    size_bytes = 3
+    sha256 = "h"
+
+
+def test_upload_retries_until_success() -> None:
+    """前两次抛异常、第三次成功：最终只计一次成功并发布 sensor_file。"""
+    rec = _RecordingProducer()
+    conn = CloudConnector(
+        _settings(upload_max_retries=2, upload_retry_backoff_s=0.0),
+        producer_factory=_factory(rec),
+    )
+    conn.start("sim-e2e-001")
+    attempts: list[int] = []
+
+    def _flaky(path: Path, data_type: str = "rosbag") -> _Result:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("transient network error")
+        return _Result()
+
+    conn.uploader.upload = _flaky  # type: ignore[method-assign]
+    conn._perform_upload(Path("retry.mcap"), "mcap")  # noqa: SLF001
+
+    assert len(attempts) == 3
+    assert conn.upload_stats == {"success": 1, "failed": 0, "dropped": 0}
+    assert len(rec.messages_of_type("sensor_file")) == 1
+    conn.stop()
+
+
+def test_upload_retry_exhausted_marks_failed() -> None:
+    """重试耗尽：按失败计数一次，不发布 sensor_file。"""
+    rec = _RecordingProducer()
+    conn = CloudConnector(
+        _settings(upload_max_retries=1, upload_retry_backoff_s=0.0),
+        producer_factory=_factory(rec),
+    )
+    conn.start("sim-e2e-001")
+    attempts: list[int] = []
+
+    def _boom(path: Path, data_type: str = "rosbag") -> _Result:
+        attempts.append(1)
+        raise RuntimeError("MinIO unreachable")
+
+    conn.uploader.upload = _boom  # type: ignore[method-assign]
+    conn._perform_upload(Path("bad.mcap"), "mcap")  # noqa: SLF001
+
+    assert len(attempts) == 2  # 1 次原始 + 1 次重试
+    assert conn.upload_stats == {"success": 0, "failed": 1, "dropped": 0}
+    assert rec.messages_of_type("sensor_file") == []
+    conn.stop()
+
+
+def test_pending_upload_paths_tracks_in_flight_upload() -> None:
+    """排队/在途上传可在任意时刻枚举（供保留期清理避让），完成后自动注销。"""
+    rec = _RecordingProducer()
+    conn = CloudConnector(_settings(), producer_factory=_factory(rec))
+    conn.start("sim-e2e-001")
+    gate = threading.Event()
+    running = threading.Event()
+    path = Path("pending.mcap")
+
+    def _upload(file_path: Path, data_type: str = "rosbag") -> _Result:
+        running.set()
+        gate.wait(5.0)
+        return _Result()
+
+    conn.uploader.upload = _upload  # type: ignore[method-assign]
+    conn.upload_bag(path, "mcap")
+    assert running.wait(5.0) is True
+    assert path in conn.pending_upload_paths()
+
+    gate.set()
+    assert conn.wait_upload_idle(5.0) is True
+    assert conn.pending_upload_paths() == set()
     conn.stop()

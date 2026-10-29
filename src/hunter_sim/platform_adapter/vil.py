@@ -82,6 +82,10 @@ class VILRuntime:
         lights_enabled = _optional_bool(self._vil_config.get("lights_enabled"))
         if lights_enabled is not None:
             overrides["lights_enabled"] = lights_enabled
+        # V3.0.2：时钟偏置自动补偿可由平台按会话覆盖（默认跟随全局配置）
+        clock_offset_auto = _optional_bool(self._vil_config.get("clock_offset_auto"))
+        if clock_offset_auto is not None:
+            overrides["clock_offset_auto"] = clock_offset_auto
         self._vil_settings: VILSettings = (
             settings.vil.model_copy(update=overrides) if overrides else settings.vil
         )
@@ -192,6 +196,9 @@ class VILRuntime:
             "max_data_latency_ms": self._vil_settings.max_data_latency_ms,
             "target_hz": self._vil_settings.target_hz,
             "align_skew_ms": self._last_skew_ms,
+            "clock_offset_ms": (
+                aligner_stats.clock_offset_ms if aligner_stats is not None else 0.0
+            ),
             "align_modes": (
                 {
                     "interpolated": aligner_stats.interpolated,
@@ -243,6 +250,7 @@ class VILRuntime:
             self._buffer,
             target_hz=self._vil_settings.target_hz,
             max_extrapolation_ms=self._vil_settings.extrapolation_ms,
+            clock_offset_auto=self._vil_settings.clock_offset_auto,
         )
         self._nearest_streak = 0
         self._last_skew_ms = 0.0

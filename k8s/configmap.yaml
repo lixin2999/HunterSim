@@ -26,6 +26,8 @@ data:
   vil_auto_buffer_depth: "true"
   # 超过该延迟即认定断流，实例置 PAUSED(vil_data_interrupted)
   vil_max_data_latency_ms: "500"
+  # 实车与仿真端时钟不同源时开启（默认 false：假设两端已同步，仅记录 skew）
+  vil_clock_offset_auto: "false"
   # ── 资源与执行面（单世界串行）──
   resource_instance_max_lifetime_seconds: "7200"
   resource_health_check_interval_seconds: "10"
@@ -37,6 +39,11 @@ data:
   adapter_artifacts_dir: "/home/hunter/app/data/adapter/artifacts"
   adapter_recordings_dir: "/home/hunter/app/data/adapter/recordings"
   adapter_recording_retention_hours: "24"
+  # 录制总开关 / 磁盘闸门（GB，0 = 不检查）/ 失败路径上传 / 产物暂存保留期（小时）
+  adapter_record_enabled: "true"
+  adapter_record_min_free_gb: "0.5"
+  adapter_upload_on_failure: "false"
+  adapter_artifact_retention_hours: "72"
   adapter_stream_fps: "10"
   # MJPEG 横向降采样上限（像素，0 = 不降采样）；降低内网带宽与前端解码开销
   adapter_stream_max_width: "640"
@@ -51,6 +58,9 @@ data:
   hunter_core_security_protocol: "SASL_SSL"
   hunter_core_gateway_url: "http://192.168.31.35:8080"
   hunter_core_rosbag_bucket: "hunter-rosbag"
+  # 上传失败自动重试（0 = 不重试）与退避秒数
+  hunter_core_upload_max_retries: "2"
+  hunter_core_upload_retry_backoff_s: "1.0"
   # ── 日志 ──
   # 生产采集建议置 "true"（JSON 行 + request_id 贯穿）
   log_json: "false"

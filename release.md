@@ -1545,3 +1545,69 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - 本次修复的 MJPEG 与 ROS2 行为仍使用替身验证，真实 CARLA + `rclpy` 环境与平台前端播放效果**未实测**。
 
 ---
+
+## V3.0.2 — 代码审查剩余 6 项缺陷修复（录制闸门 / 上传韧性 / 时钟偏置 / depth 入 Hub）
+
+**发布日期**：2026-10-29
+**版本定位**：收口 V3.0.0 代码审查报告中 V3.0.1 未处理、原本标为“需产品口径”与低优先级的 6 项（H3 / L4 / M4 / L1 / L5 / L6）。全部采用「可配置开关 + 保守默认」，**默认行为与 V3.0.1 完全一致**，不改变对外 REST / 数据面契约。
+
+### 现场 / 根因
+
+| 级别 | 缺陷 | 根因 |
+|---|---|---|
+| 高 | `record` 无总开关与空间闸门 | 平台未显式关闭时必录；磁盘满/卷耗尽只会逐帧写失败（叠加 mcap 熔断后表现为“录制静默变空”），无运行期保护 |
+| 低 | 失败/取消/看门狗超时路径不上传 mcap | 已录内容在失败场景直接落盘待保留期清理，无法用于事故复盘 |
+| 中 | VIL 时钟域假设未验证 | 实车与仿真端时钟不同源时 `skew` 恒大，栅格对齐偏差被误判为链路延迟；阈值告警失真 |
+| 低 | `depth` 未进 `FrameHub` | 深度只在录制/ROS 出口可见，控制面与调试工具无法取最新深度帧 |
+| 中 | 上传失败无重试 | 短暂网络抖动即判定失败，`sensor_file` 永久缺失，需人工重跑场景 |
+| 中 | 保留期清理与上传竞态 + 产物暂存无清理 | `_sweep_recordings` 只看目录 mtime，可能删除正在上传的 mcap 父目录；`artifacts/<sim>/<scene>/` 导出后长期堆积无上限 |
+
+### 修复内容
+
+- **录制三级闸门（`platform_adapter/executor.py`）**：`_start_recording()` 依次判定 `ADAPTER_RECORD_ENABLED` 总开关 → 场景 `sensors[].record` → `ADAPTER_RECORD_MIN_FREE_GB` 磁盘余量（`shutil.disk_usage` 测所在卷，目录未建时向上找已存在父目录，测量失败不拦截）；新增 `_enforce_disk_gate()` 在完成等待循环内每 5s 复查，跌破阈值置 `recording_stopped=low_disk` 并主动收尾（已录部分照常 close/上传）；生命周期事件计入 `huntersim_recording_events_total{event}`（`started` / `skipped_disabled` / `skipped_low_disk` / `stopped_low_disk`）。
+- **失败路径可选上传（`platform_adapter/executor.py`）**：`ADAPTER_UPLOAD_ON_FAILURE`（默认 `false`）开启后，`canceled` / `watchdog_timeout` / `failed` 三条路径也调用 `_upload_recording()`；默认沿用 V3.0.1 触发点，避免残片污染平台 `sensor_file` 列表。
+- **上传自动重试（`cloud/connector.py` / `common/models.py`）**：`_perform_upload` 改重试循环，`1 + HUNTER_CORE_UPLOAD_MAX_RETRIES` 次尝试，间隔 `HUNTER_CORE_UPLOAD_RETRY_BACKOFF_S` 且用 `_upload_stop.wait()` 退避（`stop()` 立即中断）；仅末次失败才计 `failed`。
+- **上传在途登记（`cloud/connector.py`）**：新增 `_pending_paths` + `pending_upload_paths()`，入队前登记、`_perform_upload` 的 `finally` 注销（成功/失败/停止都注销）；队满丢任务时同步注销。`_sweep_recordings()` 通过 `pending_upload_paths()` 跳过在途目录，消除保留期清理与上传的竞态。
+- **产物暂存保留期清理（`platform_adapter/executor.py`）**：新增 `_sweep_artifacts()`，`_watchdog_loop` 周期删除 `artifacts/<sim>/<scene>/` 下超过 `ADAPTER_ARTIFACT_RETENTION_HOURS`（默认 72）未更新的 scene 目录，随后尝试 `rmdir` 空的 sim 目录（非空自动跳过）；`_newest_mtime()` 读失败返回 None 时跳过删除。
+- **VIL 时钟偏置估计（`vil_mapper/frame_aligner.py` / `platform_adapter/vil.py`）**：`FrameAligner` 新增 `clock_offset_auto`，按 `receive_time - timestamp` 的 30 样本滑动窗口取**最小值**作为偏置（样本 < 3 或 |Δ| > 3600s 不补偿），`clock_time = now - offset` 参与栅格索引计算；`AlignerStats.clock_offset_ms` 随 `stats()` 暴露，控制面可由场景 `vil.clock_offset_auto` 覆盖全局默认值。默认关闭（`VIL_CLOCK_OFFSET_AUTO=false`），保持既有对齐行为。
+- **depth 进 FrameHub（`scene_runner/builtin_scenario.py`）**：深度分支把 `depth_bgra_to_meters()` 结果只算一次，同时推送 FrameHub（`encoding=32FC1` + `width`/`height`/`frame_id`）与 mcap（`build_image_message(..., "32FC1", ...)`），控制面可同源取最新深度帧。
+
+### 配置与指标变更（增量，默认值向后兼容）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `ADAPTER_RECORD_ENABLED` | `true` | 传感器录制总开关；`false` 时忽略场景 `sensors[].record` |
+| `ADAPTER_RECORD_MIN_FREE_GB` | `0.5` | 录制所需最小空闲磁盘（GB）：启动前不足则不录，运行期每 5s 复查跌破即停录；`0` = 不检查 |
+| `ADAPTER_UPLOAD_ON_FAILURE` | `false` | 失败/取消/看门狗超时路径是否也上传已录 mcap |
+| `ADAPTER_ARTIFACT_RETENTION_HOURS` | `72` | 产物暂存目录保留期（小时），看门狗周期清理；`0` = 不清理 |
+| `HUNTER_CORE_UPLOAD_MAX_RETRIES` | `2` | bag/mcap 上传失败后的自动重试次数；`0` = 不重试 |
+| `HUNTER_CORE_UPLOAD_RETRY_BACKOFF_S` | `1.0` | 重试退避秒数（`stop()` 时立即中断） |
+| `VIL_CLOCK_OFFSET_AUTO` | `false` | 是否自动估计并补偿实车与仿真端时钟偏置 |
+| `huntersim_recording_events_total{event}` | — | 新增 Counter：录制生命周期事件（`started` / `skipped_disabled` / `skipped_low_disk` / `stopped_low_disk`） |
+| `AlignerStats.clock_offset_ms` | `0.0` | 新增字段：当前估计的时钟偏置（毫秒，未开启补偿时恒 `0`） |
+
+`.env.example`、两套 compose、`k8s/configmap.yaml` + `k8s/deployment.yaml` 已同步上述全部新增项（`deployment.yaml` 用 `configMapKeyRef` 逐项引用小写 key）；场景级 `vil.clock_offset_auto` 可作为会话级覆盖。
+
+### 质量门禁（实测）
+
+- `pytest tests -q --cov=src/hunter_sim`：**1041 passed**，全仓行覆盖 **84%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 80 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增/改写测试：`test_platform_adapter_executor.py`（`TestRecordingGates` 总开关/低磁盘跳过启动/余量充足启动/运行期低磁盘停录，`TestFailureUpload` 默认不改变触发点与开关开启后上传，`TestRetentionSweep` 过期录制清理/在途上传避让/过期产物清理/新产物保留）、`test_cloud_connector_sim.py`（重试成功、重试耗尽计 failed、`pending_upload_paths` 在途跟踪）、`test_frame_aligner.py`（`TestClockOffset` 六个用例：默认关闭、补偿后 skew、不补偿对照、样本不足、未标定时间戳、`reset` 清除）、`test_builtin_scenario_sensors.py`（四路进 FrameHub 与 `depth` 的 `32FC1` 载荷校验）。
+
+### 兼容性说明
+
+- **录制**：`record` 默认仍为 `true`，`ADAPTER_RECORD_ENABLED` 默认 `true`，既有部署行为不变；仅新增低磁盘保护（`ADAPTER_RECORD_MIN_FREE_GB=0.5`）。若目标卷基线空闲本就低于 0.5GB，表现为“不录制”（`skipped_low_disk`），按实际调整或置 `0` 关闭检查。
+- **失败路径 mcap**：`ADAPTER_UPLOAD_ON_FAILURE` 默认 `false`，失败/取消场景仍不产生 `sensor_file`，与 V3.0.1 一致。
+- **时钟偏置**：`VIL_CLOCK_OFFSET_AUTO` 默认 `false`，对齐行为与 V3.0.1 完全一致；开启后 `stats()` 的 `skew_ms` 扣除估计偏置，`VIL_MAX_DATA_LATENCY_MS` 告警阈值按扣除后口径判定。
+- **清理语义**：录制目录清理新增“在途上传避让”，只会更保守；产物暂存新增保留期删除（默认 72h），如需永久保留置 `0`。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.0.1 → 3.0.2`，镜像 tag `hunter-sim:3.0.2`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。升级步骤：`git pull` → `uv sync` → `docker compose -f docker/docker-compose.yml build sim-service` → `up -d`；`.env` 可选择性新增上述 7 项（均有默认值，不填即保持 V3.0.1 行为）。
+
+### 待办 / 已知边界
+
+- 时钟偏置估计仅在受控时钟替身下验证（窗口最小值法），**未经实车时钟不同源的联调**；开启前建议先用 `clock_offset_ms` 观察收敛值。
+- `_sweep_artifacts()` 按“目录内最新文件 mtime”判定过期，长期未更新但仍在引用的产物目录会被清理；若有外部引用需求，需将 `ADAPTER_ARTIFACT_RETENTION_HOURS` 置 `0`。
+- 磁盘闸门以“卷余量”为准，不区分其他进程占用；多进程共用同一卷时阈值需按总占用上调。
+- 本次修复的 MJPEG 与 ROS2 行为仍使用替身验证，真实 CARLA + `rclpy` 环境与平台前端播放效果**未实测**；MinIO 实际重试链路（网络抖动）未做故障注入实测。
+
+---

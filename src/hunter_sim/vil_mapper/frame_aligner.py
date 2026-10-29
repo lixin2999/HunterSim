@@ -14,6 +14,11 @@
 4. 其余情况（首帧、超窗外、缓冲区无左帧、时钟回退）→ 取最近帧，
    ``mode="nearest"``，并把偏差记入 ``skew_ms``。
 
+时钟域：``now`` 是仿真端系统时间，``TelemetryFrame.timestamp`` 是实车上报时刻，
+两者可能不同步。开启 ``clock_offset_auto`` 时，用最近窗口内
+``receive_time - timestamp`` 的最小值作为偏置估计，把系统时间映射到实车时钟域
+（默认关闭，保持既有对齐行为）。
+
 指标：每次推进都会对 ``huntersim_vil_frames_downsampled_total{mode}`` 计数，
 并把 ``skew_ms`` 写入 ``huntersim_vil_align_skew_ms`` 直方图（P95 用于判质量）。
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -37,6 +43,10 @@ AlignMode = Literal["interpolated", "extrapolated", "nearest"]
 
 # 时间比较容差（秒）：小于该值视为同一时刻，避免除零与浮点抖动
 _TIME_EPS = 1e-6
+# 时钟偏置估计：样本窗口、最小样本数与可信范围（超过 1 小时的差值视为未校准）
+_OFFSET_WINDOW = 30
+_MIN_OFFSET_SAMPLES = 3
+_MAX_CLOCK_OFFSET_S = 3600.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,7 @@ class AlignerStats:
         extrapolated: 外推推进次数。
         interpolated: 插值推进次数。
         last_skew_ms: 最近一次对齐偏差（毫秒）。
+        clock_offset_ms: 当前时钟偏置估计（毫秒，未开启自动补偿时为 0）。
     """
 
     emitted: int = 0
@@ -75,6 +86,7 @@ class AlignerStats:
     extrapolated: int = 0
     interpolated: int = 0
     last_skew_ms: float = 0.0
+    clock_offset_ms: float = 0.0
 
 
 class FrameAligner:
@@ -85,6 +97,7 @@ class FrameAligner:
         target_hz: 栅格频率（Hz），默认 10，需 > 0。
         max_extrapolation_ms: 单侧外推的最大偏差（毫秒）。
         extrapolator: 位姿外推器；None 时按 ``max_extrapolation_ms`` 自建。
+        clock_offset_auto: 是否自动估计并补偿实车/仿真端时钟偏置（默认关闭）。
 
     Raises:
         ValueError: ``target_hz`` 非正时抛出。
@@ -96,6 +109,7 @@ class FrameAligner:
         target_hz: float = 10.0,
         max_extrapolation_ms: int = 150,
         extrapolator: Optional[PoseExtrapolator] = None,
+        clock_offset_auto: bool = False,
     ) -> None:
         if target_hz <= 0:
             raise ValueError("target_hz must be positive")
@@ -108,9 +122,15 @@ class FrameAligner:
         self._last_grid_index: Optional[int] = None
         self._last_now: Optional[float] = None
         self._stats = AlignerStats()
+        # 时钟偏置估计（仅 clock_offset_auto 时采样）
+        self._clock_offset_auto = bool(clock_offset_auto)
+        self._offset_samples: deque[float] = deque(maxlen=_OFFSET_WINDOW)
+        self._clock_offset_s = 0.0
+        self._last_offset_sample: Optional[tuple[float, float]] = None
         logger.info(
             f"FrameAligner initialized (target_hz={target_hz}, "
-            f"max_extrapolation_ms={max_extrapolation_ms})"
+            f"max_extrapolation_ms={max_extrapolation_ms}, "
+            f"clock_offset_auto={self._clock_offset_auto})"
         )
 
     @property
@@ -129,6 +149,7 @@ class FrameAligner:
                 extrapolated=self._stats.extrapolated,
                 interpolated=self._stats.interpolated,
                 last_skew_ms=self._stats.last_skew_ms,
+                clock_offset_ms=self._stats.clock_offset_ms,
             )
 
     def reset(self) -> None:
@@ -137,35 +158,42 @@ class FrameAligner:
             self._last_grid_index = None
             self._last_now = None
             self._stats = AlignerStats()
+            self._offset_samples.clear()
+            self._clock_offset_s = 0.0
+            self._last_offset_sample = None
         logger.info("FrameAligner reset")
 
     def next(self, now: float) -> Optional[AlignedFrame]:
         """推进到当前栅格，返回对齐帧（同一栅格内返回 ``None``）。
 
         Args:
-            now: 当前时刻（Unix 秒，需与 ``TelemetryFrame.timestamp`` 同一时钟域）。
+            now: 当前时刻（Unix 秒）。开启 ``clock_offset_auto`` 时由对齐器
+                自动换算到 ``TelemetryFrame.timestamp`` 的时钟域。
 
         Returns:
             对齐帧；本 tick 无需推进或缓冲区为空时返回 ``None``。
         """
+        frames = self._buffer.get_last_n(self._buffer.max_frames)
+        clock_now = self._compensate_clock(now, frames) if self._clock_offset_auto else now
         with self._lock:
             # 时钟回退保护：进程时钟被外部校正时不冻结栅格，直接重开一轮
-            if self._last_now is not None and now < self._last_now - 1.0:
+            if self._last_now is not None and clock_now < self._last_now - 1.0:
                 logger.warning(
-                    f"FrameAligner clock moved backwards ({now:.3f} < {self._last_now:.3f}), reset grid"
+                    f"FrameAligner clock moved backwards ({clock_now:.3f} < "
+                    f"{self._last_now:.3f}), reset grid"
                 )
                 self._last_grid_index = None
-            self._last_now = now
+            self._last_now = clock_now
 
-            grid_index = int(math.floor(now * self._target_hz))
+            grid_index = int(math.floor(clock_now * self._target_hz))
             if self._last_grid_index == grid_index:
                 self._stats.skipped += 1
                 return None
             # 先占位：即使本次取帧失败也不在同一栅格上反复重试
             self._last_grid_index = grid_index
+            self._stats.clock_offset_ms = self._clock_offset_s * 1000.0
 
         grid_time = grid_index / self._target_hz
-        frames = self._buffer.get_last_n(self._buffer.max_frames)
         if not frames:
             return None
 
@@ -186,6 +214,36 @@ class FrameAligner:
         return aligned
 
     # ── 内部实现 ─────────────────────────────────────────────────────────────
+
+    def _compensate_clock(self, now: float, frames: list[TelemetryFrame]) -> float:
+        """估计并补偿实车/仿真端时钟偏置，把系统时间映射到实车时钟域。
+
+        实现：每帧采样 ``receive_time - timestamp``（传输+处理延迟），取最近
+        ``_OFFSET_WINDOW`` 个样本的**最小值**作为偏置估计（最小延迟样本最能
+        代表两时钟的真实差值）；样本不足 ``_MIN_OFFSET_SAMPLES`` 或差值超过
+        ``_MAX_CLOCK_OFFSET_S``（未校准的时间戳）时不做补偿。
+        """
+        if not frames:
+            return now
+        latest = frames[-1]
+        if latest.timestamp <= 0 or latest.receive_time <= 0:
+            return now
+        key = (latest.timestamp, latest.receive_time)
+        delta = latest.receive_time - latest.timestamp
+        if not math.isfinite(delta) or abs(delta) > _MAX_CLOCK_OFFSET_S:
+            return now
+        with self._lock:
+            if self._last_offset_sample != key:
+                self._last_offset_sample = key
+                self._offset_samples.append(delta)
+                # 样本不足时不写偏置：首帧抖动不能悄悄搬动栅格
+                if len(self._offset_samples) >= _MIN_OFFSET_SAMPLES:
+                    self._clock_offset_s = min(self._offset_samples)
+            offset = self._clock_offset_s
+            enough = len(self._offset_samples) >= _MIN_OFFSET_SAMPLES
+        if not enough:
+            return now
+        return now - offset
 
     def _align(
         self, frames: list[TelemetryFrame], grid_time: float, grid_index: int

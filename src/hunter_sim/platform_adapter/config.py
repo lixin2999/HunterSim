@@ -17,6 +17,10 @@ class AdapterSettings(BaseSettings):
         artifact_bucket: 产物 Bucket（平台预签名下载约定）。
         recordings_dir: 传感器录制目录（mcap 落盘 + 保留期清理）。
         recording_retention_hours: 录制文件保留时长（小时），看门狗周期清理。
+        record_enabled: 录制总开关（false 时忽略 ``sensors[].record``）。
+        record_min_free_gb: 录制所需最小空闲磁盘（GB），运行期低于阈值自动停录。
+        upload_on_failure: 失败/取消路径是否也上传已录 mcap（默认仅成功路径）。
+        artifact_retention_hours: 产物暂存目录保留时长（小时），0 表示不清理。
         stream_fps: MJPEG 推流帧率（默认 10，与 VIL 栅格一致）。
         stream_max_width: 回传画面最大宽度（0 表示不降采样）。
         stream_max_clients: MJPEG 并发客户端上限（0 表示不限）。
@@ -46,6 +50,24 @@ class AdapterSettings(BaseSettings):
     )
     recording_retention_hours: float = Field(
         24.0, ge=0.0, le=720.0, description="录制文件保留时长（小时），0 表示不清理"
+    )
+    record_enabled: bool = Field(
+        True, description="传感器录制总开关（false 时忽略 sensors[].record）"
+    )
+    record_min_free_gb: float = Field(
+        0.5,
+        ge=0.0,
+        le=1024.0,
+        description="录制所需最小空闲磁盘（GB）；0 表示不检查，运行期低于阈值自动停录",
+    )
+    upload_on_failure: bool = Field(
+        False, description="失败/取消路径是否也上传已录 mcap（默认仅成功路径上传）"
+    )
+    artifact_retention_hours: float = Field(
+        72.0,
+        ge=0.0,
+        le=8760.0,
+        description="产物暂存目录保留时长（小时），看门狗周期清理；0 表示不清理",
     )
     stream_fps: float = Field(10.0, gt=0.0, le=60.0, description="MJPEG 推流帧率（Hz）")
     stream_max_width: int = Field(
