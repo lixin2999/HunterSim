@@ -1642,10 +1642,10 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 
 ### 质量门禁（实测）
 
-- `pytest tests -q --cov=src/hunter_sim`：**1048 passed**，全仓行覆盖 **84.24%**（门禁 `fail_under=80`）。
+- `pytest tests -q --cov=src/hunter_sim`：**1049 passed**，全仓行覆盖 **84.25%**（门禁 `fail_under=80`）。
 - `mypy src/hunter_sim`（strict）：**Success: no issues found in 81 source files**。
 - `flake8 src tests`：**0 告警**。
-- 新增测试（`tests/test_sim_data_producer.py`）：`TestSslKwargs`（非 SSL 协议不注入、仅 CA、CA+证书+私钥三件套、半配置报 `ValueError`、文件缺失报 `FileNotFoundError`）、`TestProducerMtlsWiring`（`SimDataProducer` 与 `TelemetryProducer` 均把 `ssl_cafile/ssl_certfile/ssl_keyfile` 透传给 `KafkaProducer`）。
+- 新增测试（`tests/test_sim_data_producer.py`）：`TestSslKwargs`（非 SSL 协议不注入、仅 CA、CA+证书+私钥三件套、半配置报 `ValueError`、文件缺失报 `FileNotFoundError`）、`TestProducerMtlsWiring`（`SimDataProducer` 与 `TelemetryProducer` 均把 `ssl_cafile/ssl_certfile/ssl_keyfile` 透传给 `KafkaProducer`）；`tests/test_settings_env.py` 新增环境变量映射用例（`HUNTER_CORE_CLIENT_CERT_PATH` / `HUNTER_CORE_CLIENT_KEY_PATH` / `HUNTER_CORE_CA_CERT_PATH` → `CloudSettings`）。
 
 ### 兼容性说明
 
@@ -1658,6 +1658,6 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **未与真实 HunterCore 9093 接入面联调验证**：本次仅以 `KafkaProducer` 参数替身断言参数透传正确，真实证书链、broker 侧 ACL 与用户名绑定仍需现场执行一次 `HUNTER_CORE_ENABLED=true` 的发布验证（观察 `huntersim_sim_status_published_total` 与平台 Topic）。
 - **主机名校验未开放**：kafka-python 默认 `ssl_check_hostname=True`，若用 IP 直连且 broker 证书只含 DNS SAN，握手会失败；当前未暴露 `ssl_check_hostname` 开关，需平台侧证书补 IP SAN（或后续按需增加配置项）。
 - **VIL 下行消费（`KafkaSettings`）仍无 SSL/CA/mTLS 配置**：`vil_data_consumer` 只透传 SASL 用户名口令，同样连不上 9093 双向 TLS 接入面，需另行补齐（本次未改动）。
-- **k8s 形态未接证书**：`k8s/configmap.yaml` 未新增两项（纯文件路径需配合 Secret 挂载才有意义），k8s 部署前需挂 Secret 并注入同名环境变量。
+- **k8s 形态需先建证书 Secret**：`k8s/deployment.yaml` 已把 `hunter-sim-tls` Secret 以 `optional` 方式挂到 `/home/hunter/app/certs`，并在 ConfigMap 预留三个路径键（默认空）。启用 mTLS 前需按 `k8s/secret.yaml` 注释创建 Secret 并把三个路径键指到挂载文件；Secret 缺失时只要路径留空，producer 行为与 V3.0.2 一致。
 
 ---

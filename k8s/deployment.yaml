@@ -268,6 +268,23 @@ spec:
                   name: hunter-sim-secrets
                   key: sasl_password
                   optional: true
+            # 9093 双向 TLS：证书由 hunter-sim-tls Secret 挂载为文件，路径在 ConfigMap 指定。
+            # 留空 = 不做客户端认证（单向 TLS/SCRAM）；启用时三个路径需全部指向挂载卷内文件。
+            - name: HUNTER_CORE_CA_CERT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_ca_cert_path
+            - name: HUNTER_CORE_CLIENT_CERT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_client_cert_path
+            - name: HUNTER_CORE_CLIENT_KEY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-sim-config
+                  key: hunter_core_client_key_path
             - name: HUNTER_CORE_JWT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -302,6 +319,11 @@ spec:
             # 不使用 NFS/RWX（WAL 锁不可靠）；卷容量需覆盖录制保留期内的数据量。
             - name: data
               mountPath: /home/hunter/app/data
+            # mTLS 客户端证书（CA / client-cert / client-key）。
+            # Secret 不存在时（optional）挂载为空目录，只要 ConfigMap 里的证书路径留空即不启用。
+            - name: tls-certs
+              mountPath: /home/hunter/app/certs
+              readOnly: true
 
         # ── 只读探针面（kubelet 存活/就绪 + Prometheus 抓取）─────────────────
         - name: probes
@@ -356,6 +378,11 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: hunter-sim-data-pvc
+        # 不存在时 Pod 仍可启动（optional）；启用 mTLS 前需先创建该 Secret。
+        - name: tls-certs
+          secret:
+            secretName: hunter-sim-tls
+            optional: true
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 ---

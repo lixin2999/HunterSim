@@ -61,6 +61,15 @@ data:
   # 上传失败自动重试（0 = 不重试）与退避秒数
   hunter_core_upload_max_retries: "2"
   hunter_core_upload_retry_backoff_s: "1.0"
+  # mTLS 证书路径（容器内绝对路径）。留空 = 不做客户端认证（单向 TLS/SCRAM，行为同 V3.0.2）。
+  # 启用双向 TLS（HunterCore 9093 的 ssl.client.auth=required）时，把接入包证书放进
+  # hunter-sim-tls Secret（见 secret.yaml 注释），并改为下面三个路径：
+  #   /home/hunter/app/certs/ca-cert.pem
+  #   /home/hunter/app/certs/client-cert.pem
+  #   /home/hunter/app/certs/client-key.pem
+  hunter_core_ca_cert_path: ""
+  hunter_core_client_cert_path: ""
+  hunter_core_client_key_path: ""
   # ── 日志 ──
   # 生产采集建议置 "true"（JSON 行 + request_id 贯穿）
   log_json: "false"

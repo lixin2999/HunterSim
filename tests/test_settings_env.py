@@ -93,6 +93,17 @@ def test_cloud_adapter_and_probe_dotenv_apply(tmp_path: Path) -> None:
     assert settings.probe.port == 8099
 
 
+def test_hunter_core_mtls_cert_env_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """V3.0.3：mTLS 客户端证书路径经 HUNTER_CORE_CLIENT_{CERT,KEY}_PATH 注入。"""
+    monkeypatch.setenv("HUNTER_CORE_CA_CERT_PATH", "/certs/ca-cert.pem")
+    monkeypatch.setenv("HUNTER_CORE_CLIENT_CERT_PATH", "/certs/client-cert.pem")
+    monkeypatch.setenv("HUNTER_CORE_CLIENT_KEY_PATH", "/certs/client-key.pem")
+    settings = HunterSimSettings()
+    assert settings.cloud.ca_cert_path == "/certs/ca-cert.pem"
+    assert settings.cloud.client_cert_path == "/certs/client-cert.pem"
+    assert settings.cloud.client_key_path == "/certs/client-key.pem"
+
+
 def test_cloud_adapter_and_probe_defaults(tmp_path: Path) -> None:
     """未配置时 cloud 默认关闭、指向单机验证环境；adapter/probe 默认 8090/8080。"""
     settings = HunterSimSettings()
