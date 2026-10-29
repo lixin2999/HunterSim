@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from hunter_sim.cloud.connector import CloudConnector
+from hunter_sim.cloud.sim_data_producer import SimDataProducer
 from hunter_sim.common.models import CloudSettings
 
 
@@ -221,4 +223,72 @@ def test_publish_metrics_via_connector() -> None:
     metrics = rec.messages_of_type("sim_metrics")
     assert len(metrics) == 1
     assert metrics[0]["value"]["payload"]["driving_score"] == 92.5
+    conn.stop()
+
+
+# ── 测试：上传任务携带投递时刻的 producer（M5 防串台） ──────────────────────
+
+
+def test_perform_upload_uses_given_producer() -> None:
+    """显式传入 producer 时优先于当前 producer（实例切换后不回退）。"""
+    current = _RecordingProducer()
+    captured = _RecordingProducer()
+    conn = CloudConnector(_settings(), producer_factory=_factory(current))
+    conn.start("sim-B")
+    captured_producer = SimDataProducer(
+        _settings(), sim_id="sim-A", producer_factory=_factory(captured)
+    )
+    assert captured_producer.connect() is True
+
+    class _Result:
+        bucket = "b"
+        object_key = "k"
+        size_bytes = 3
+        sha256 = "h"
+
+    conn.uploader.upload = lambda path, data_type="rosbag": _Result()  # type: ignore[method-assign]
+    conn._perform_upload(Path("A.mcap"), "mcap", producer=captured_producer)  # noqa: SLF001
+
+    assert [m["value"]["sim_id"] for m in captured.messages_of_type("sensor_file")] == [
+        "sim-A"
+    ]
+    assert current.messages_of_type("sensor_file") == []
+    conn.stop()
+
+
+def test_upload_job_captures_producer_at_enqueue() -> None:
+    """上传任务在投递时就固定 producer：实例切换后 sensor_file 仍发往原 sim 的 Topic。"""
+    first = _RecordingProducer()
+    second = _RecordingProducer()
+    conn = CloudConnector(_settings(), producer_factory=_factory(first))
+    conn.start("sim-A")
+    gate = threading.Event()
+    running = threading.Event()
+
+    class _Result:
+        bucket = "b"
+        object_key = "k"
+        size_bytes = 3
+        sha256 = "h"
+
+    def _upload(path: Path, data_type: str = "rosbag") -> _Result:
+        running.set()
+        gate.wait(5.0)
+        return _Result()
+
+    conn.uploader.upload = _upload  # type: ignore[method-assign]
+    conn.upload_bag(Path("A.mcap"), "mcap", scene_id="scene-A")
+    assert running.wait(5.0) is True  # 任务已投递并在上传线程执行中
+
+    # 模拟 A 结束、B 接管（单世界串行下下一个实例会重建 producer）
+    next_producer = SimDataProducer(
+        _settings(), sim_id="sim-B", producer_factory=_factory(second)
+    )
+    assert next_producer.connect() is True
+    conn._producer = next_producer  # noqa: SLF001
+    gate.set()
+
+    assert conn.wait_upload_idle(5.0) is True
+    assert [m["value"]["sim_id"] for m in first.messages_of_type("sensor_file")] == ["sim-A"]
+    assert second.messages_of_type("sensor_file") == []
     conn.stop()

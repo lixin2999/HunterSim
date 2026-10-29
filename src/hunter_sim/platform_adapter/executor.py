@@ -83,6 +83,7 @@ class _RunContext:
     frame_hub: Optional[FrameHub] = None
     recorder: Optional[McapRecorder] = None
     record_stats: Optional[RecordStats] = None
+    ros_bridge: Optional[Any] = None
 
     def add_sample(self, ego: dict[str, Any], sim_time: float) -> None:
         """按 10Hz 采样自车状态（供评估引擎消费）。"""
@@ -361,6 +362,9 @@ class SimulationExecutor:
         # ROS2 桥接仅在 sensors[].ros_enabled 时惰性创建（rclpy 缺失时降级为 None）
         context.frame_hub = FrameHub()
         self._start_recording(context)
+        # ROS2 桥接：构造后必须 initialize() 才会真正建 publisher，否则是静默死代码
+        ros_bridge = self._ros_bridge_for(scene)
+        context.ros_bridge = ros_bridge
 
         vil: Optional[VILRuntime] = None
         try:
@@ -368,7 +372,7 @@ class SimulationExecutor:
                 "sample_sink": context.add_sample,
                 "frame_hub": context.frame_hub,
                 "recorder": context.recorder,
-                "ros_bridge": self._ros_bridge_for(scene),
+                "ros_bridge": ros_bridge,
                 "screenshot_quality": self._adapter.screenshot_quality,
                 "stream_max_width": self._adapter.stream_max_width,
             }
@@ -427,6 +431,7 @@ class SimulationExecutor:
             self._fail_instance(instance_id, f"execution_unavailable:{exc}")
         finally:
             self._close_recording(context)
+            self._shutdown_ros_bridge(context)
             if vil is not None:
                 vil.stop()
             try:
@@ -720,9 +725,10 @@ class SimulationExecutor:
 
     @staticmethod
     def _ros_bridge_for(scene: Any) -> Optional[Any]:
-        """按 ``sensors[].ros_enabled`` 惰性创建 ROS2 桥接器（默认关闭）。
+        """按 ``sensors[].ros_enabled`` 惰性创建并初始化 ROS2 桥接器（默认关闭）。
 
-        ``rclpy`` 或桥接器构造失败时返回 None（场景照常运行，仅少一路出口）。
+        ``rclpy`` 或桥接器构造/初始化失败时返回 None（场景照常运行，仅少一路出口）。
+        未调用 ``initialize()`` 时 ``is_initialized`` 恒为 False，话题一条都不会发。
         """
         specs = [spec for spec in getattr(scene, "sensors", []) if spec.enabled]
         if not any(spec.ros_enabled for spec in specs):
@@ -733,10 +739,24 @@ class SimulationExecutor:
             logger.warning(f"ROS2 bridge unavailable: {type(exc).__name__}: {exc}")
             return None
         try:
-            return CarlaRosBridge()
+            bridge = CarlaRosBridge()
+            bridge.initialize()
         except Exception as exc:  # noqa: BLE001  初始化失败不阻断场景
-            logger.warning(f"ROS2 bridge init failed: {type(exc).__name__}: {exc}")
+            logger.warning(f"ROS2 bridge init failed, disabled: {type(exc).__name__}: {exc}")
             return None
+        return bridge
+
+    @staticmethod
+    def _shutdown_ros_bridge(context: _RunContext) -> None:
+        """释放本次运行的 ROS2 节点（幂等；未启用/已释放时不做事）。"""
+        bridge = context.ros_bridge
+        if bridge is None:
+            return
+        context.ros_bridge = None
+        try:
+            bridge.shutdown()
+        except Exception as exc:  # noqa: BLE001  释放失败不影响终态
+            logger.warning(f"ROS2 bridge shutdown failed: {type(exc).__name__}: {exc}")
 
     def _start_recording(self, context: _RunContext) -> None:
         """按 ``scene.sensors[].record`` 打开 mcap 录制（不满足条件则不录制）。"""
@@ -781,6 +801,11 @@ class SimulationExecutor:
             f"Sensor recording closed: instance={context.record.instance_id}, "
             f"frames={stats.frame_count}, size={stats.size_bytes}B"
         )
+        if stats.write_errors:
+            logger.warning(
+                f"Sensor recording truncated: instance={context.record.instance_id}, "
+                f"write_errors={stats.write_errors}, frames={stats.frame_count}"
+            )
         return stats
 
     def _upload_recording(self, context: _RunContext) -> None:

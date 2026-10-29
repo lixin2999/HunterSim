@@ -454,6 +454,7 @@ class TestDispatch:
         bad = types.SimpleNamespace(data=b"\x00\x01", width=640, height=480, timestamp=1.0)
         scenario._on_sensor_data(STREAM_RGB, bad)  # noqa: SLF001
 
+        assert scenario.drain_sensor_frames() is True
         assert hub.latest(STREAM_RGB) is None
 
     def test_callback_from_sensor_actor_reaches_hub(self) -> None:
@@ -468,7 +469,68 @@ class TestDispatch:
         )
         assert rgb_actor.emit(_image_data()) == 1
 
+        # 回调只入队，编码在 hunter-sensor-encoder 线程完成
+        assert scenario.drain_sensor_frames() is True
         assert hub.latest(STREAM_RGB) is not None
+
+    def test_callback_lands_in_recorder_via_worker_thread(self) -> None:
+        """回调只入队，编码/落盘在 worker 线程完成（tick 线程不被拖慢）。"""
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        recorder = _FakeRecorder()
+        scenario = _make_scenario(frame_hub=hub, recorder=recorder)
+        scenario.setup(_SensorWorld())
+
+        rgb_actor = next(
+            actor for actor in _sensor_actors(scenario) if actor.type_id == "sensor.camera.rgb"
+        )
+        rgb_actor.emit(_image_data())
+
+        # 已入队但尚未（必然）完成编码，随后 drain 确保最终落盘
+        assert scenario.drain_sensor_frames() is True
+        assert [stream for stream, _, _ in recorder.messages] == [STREAM_RGB]
+
+    def test_cleanup_flushes_pending_frames(self) -> None:
+        """cleanup 先排空编码队列再销毁传感器，未处理的帧不丢。"""
+        recorder = _FakeRecorder()
+        scenario = _make_scenario(recorder=recorder)
+        world = _SensorWorld()
+        scenario.setup(world)
+
+        imu_actor = next(
+            actor for actor in _sensor_actors(scenario) if actor.type_id == "sensor.other.imu"
+        )
+        imu_actor.emit(_imu_data())
+        scenario.cleanup(world)
+
+        assert [stream for stream, _, _ in recorder.messages] == [STREAM_IMU]
+        # 清理后回调不再入队（老传感器可能还会吐一帧）
+        imu_actor.emit(_imu_data())
+        assert len(recorder.messages) == 1
+
+    def test_full_queue_drops_frame_and_counts(self) -> None:
+        """队列满时丢帧并计数（不阻塞 tick 线程，不抛异常）。"""
+        from hunter_sim.common import metrics as metrics_module
+
+        scenario = _make_scenario()
+        # 不启动 worker，直接填满有界队列
+        scenario._frame_accepting = True  # noqa: SLF001
+        original = scenario._ensure_frame_worker  # noqa: SLF001
+        scenario._ensure_frame_worker = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+        try:
+            baseline = metrics_module.counter_value(
+                metrics_module.SENSOR_FRAMES_DROPPED_TOTAL, stream=STREAM_IMU
+            )
+            for _ in range(40):
+                scenario._on_sensor_data(STREAM_IMU, _imu_data())  # noqa: SLF001
+            dropped = metrics_module.counter_value(
+                metrics_module.SENSOR_FRAMES_DROPPED_TOTAL, stream=STREAM_IMU
+            )
+        finally:
+            scenario._ensure_frame_worker = original  # type: ignore[method-assign]  # noqa: SLF001
+        assert dropped == baseline + 8  # 队列上限 32，多出 8 帧被丢
+        assert scenario._frame_queue.qsize() == 32  # noqa: SLF001
 
 
 class TestRos:
@@ -541,6 +603,7 @@ class TestIntegration:
             }[actor.type_id]
             actor.emit(payload)
 
+        assert scenario.drain_sensor_frames() is True
         stats = recorder.close()
 
         assert stats.frame_count == 4

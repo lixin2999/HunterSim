@@ -351,6 +351,67 @@ class TestMessageBuilders:
         assert message.orientation.w == pytest.approx(1.0)
 
 
+def _writer_raising(exc: BaseException) -> object:
+    """构造一个总是抛异常的 ``writer.write_message`` 替身。"""
+
+    def _fail(*args: object, **kwargs: object) -> object:
+        raise exc
+
+    return _fail
+
+
+class TestWriteCircuitBreaker:
+    """连续写入失败熔断（M3）：磁盘满时不逐帧重试，但已写部分仍要 ``finish()`` 落盘。"""
+
+    def test_breaker_opens_after_threshold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = McapRecorder()
+        recorder.open(tmp_path / "run.mcap")
+        writer = recorder._writer  # noqa: SLF001  注入故障需要拿到底层 writer
+        monkeypatch.setattr(
+            writer, "write_message", _writer_raising(OSError("no space left on device"))
+        )
+
+        results = [_write_image(recorder, ts=(index + 1) * _NS) for index in range(10)]
+
+        assert results == [False] * 10
+        assert recorder.degraded is True
+        assert recorder.is_recording is False
+        # 熔断后 push 立即返回，不再触碰底层 writer
+        calls: list[object] = []
+        monkeypatch.setattr(
+            writer, "write_message", lambda *a, **k: calls.append(a)  # noqa: ARG005
+        )
+        assert _write_image(recorder, ts=11 * _NS) is False
+        assert calls == []
+
+        stats = recorder.close()
+
+        assert stats.write_errors == 10
+        assert stats.frame_count == 0
+        assert Path(stats.path).is_file()
+
+    def test_frames_written_before_breaker_are_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "run.mcap"
+        recorder = McapRecorder()
+        recorder.open(path)
+        assert _write_image(recorder, ts=_NS) is True
+        writer = recorder._writer  # noqa: SLF001
+        monkeypatch.setattr(writer, "write_message", _writer_raising(OSError("disk gone")))
+
+        for index in range(10):
+            assert _write_image(recorder, ts=(index + 2) * _NS) is False
+        stats = recorder.close()
+
+        # 熔断不丢已写入的帧：finish() 把分块刷盘，仍可被 reader 读回
+        assert stats.frame_count == 1
+        assert stats.write_errors == 10
+        assert len(_read_back(path)) == 1
+
+
 class TestSchemaTable:
     def test_stream_to_topic_is_complete(self) -> None:
         assert STREAM_TO_TOPIC == {

@@ -1482,3 +1482,66 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - 单进程单世界仍是硬约束；需要并行只能部署多个控制面进程/端口并在平台侧分片（不共享注册表）。
 
 ---
+
+## V3.0.1 — V3.0.0 代码审查缺陷修复
+
+**发布日期**：2026-10-29
+**版本定位**：按代码审查报告（功能遗漏 / 边界与异常 / 并发与性能）修复 V3.0.0 的三条高危与多条中低危缺陷，不改变对外数据契约。
+
+### 现场 / 根因
+
+| 级别 | 缺陷 | 根因 |
+|---|---|---|
+| 高 | ROS2 出口静默失效 | `_ros_bridge_for()` 只构造 `CarlaRosBridge()` 不调 `initialize()`，`is_initialized` 恒 False，所有 `publish_*` 被 `_publish_ros` 跳过 |
+| 高 | 传感器编码占用 CARLA tick 线程 | `sensor.listen()` 回调在 `world.tick()` 线程内同步做 BGRA→RGB、降采样、JPEG 编码与 mcap zstd 写盘，单帧 15–25 ms（帧预算 20 ms），50 Hz 被拖到 20–30 Hz |
+| 高（未修，见待办） | `record` 默认 True，无录制总开关/空间闸门 | 平台未显式关闭时必录；磁盘满只会逐帧写失败 |
+| 中 | Pillow 不在依赖 | `encode_jpeg` 惰性导入 PIL，缺包时恒回退 PNG，`ADAPTER_SCREENSHOT_QUALITY` 失效且带宽翻倍 |
+| 中 | MJPEG 占用 anyio 线程 | 同步生成器 + `time.sleep` 被 `iterate_in_threadpool` 包裹，每个客户端独占 1 个工作线程（默认线程池 40） |
+| 中 | mcap 写失败无熔断 | 磁盘满时逐帧重试 + 逐帧 warning，日志与 IO 二次放大 |
+| 中 | 上传任务跨实例串台 | 上传线程执行时读 `self._producer`，单世界串行下可能已被下一个实例替换，`sensor_file` 发到错误 sim 的 Topic |
+| 低 | `lights: {}` 不回退 | `isinstance({}, dict)` 为真，顶层空字典被当作“已上报”而不回退 `chassis.lights` |
+| 低 | 探针吞掉上游 degraded | 聚合状态只按上游可达性给 `ok`，上游自报 degraded 被掩盖 |
+
+### 修复内容
+
+- **ROS2 装配（`platform_adapter/executor.py`）**：`_ros_bridge_for()` 构造后立即 `initialize()`（失败 → None + warning）；`_RunContext` 新增 `ros_bridge`，`_run` 的 `finally` 调 `_shutdown_ros_bridge()` 幂等释放节点。
+- **传感器回调队列化（`scene_runner/builtin_scenario.py`）**：回调只做「拷贝为不可变载荷 `_SensorFrame` + 入有界队列（上限 32）」；新增 `hunter-sensor-encoder` 守护线程串行执行编码/落盘/ROS 发布，保帧序；队满丢帧并计入 `huntersim_sensor_frames_dropped_total{stream}`；新增 `drain_sensor_frames()`，`cleanup()` 先停收帧 → 排空队列 → 销毁传感器，收尾不丢已采集帧；线程停止后复位待处理计数，避免下一场景重放旧帧。
+- **Pillow 依赖**：`pyproject.toml` / `requirements.txt` 增 `Pillow>=10.0,<12.0`（缺失时仍降级 PNG，不阻断启动）。
+- **MJPEG 异步化（`platform_adapter/service.py` / `app.py` / `config.py`）**：`stream_frames` 改为异步生成器（`await asyncio.sleep`），路由改 `async def` 并用 `anext()` 预取首帧；新增 `StreamLimitExceeded` 与 `ADAPTER_STREAM_MAX_CLIENTS`（默认 8，0 = 不限），超限直接 `503 stream_limit_reached`（不再“先 200 再中途断流”）；`_mjpeg_chunks` 为异步生成器，`finally` 中 `aclose()` 上游保证名额立即释放。
+- **mcap 熔断（`sensor_sim/mcap_recorder.py`）**：连续写失败 10 次即熔断（`_broken`），后续 `push` 立即返回 False、日志只在前几条与每 100 条记一次；`RecordStats` 新增 `write_errors`；`close()` 在熔断路径下仍调 `finish()` 落盘已写分块并返回真值统计。
+- **上传任务捕获生产者（`cloud/connector.py`）**：`upload_bag()` 把投递时刻的 `self._producer` 随任务入队，`_perform_upload(..., producer=)` 优先使用任务自带生产者（None 才回退当前）。
+- **灯光回退（`cloud/vil_state_parser.py`）**：`lights` 顶层缺失**或为空字典**时回退 `chassis.lights`。
+- **探针状态聚合（`probes/app.py`）**：新增 `_derive_status()`，上游 `degraded` 原样透传；上游 `status=ok` 但 `carla_probe_error` 非空时降为 `degraded`。
+
+### 配置与指标变更（增量，默认值向后兼容）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `ADAPTER_STREAM_MAX_CLIENTS` | `8` | MJPEG 并发客户端上限，超限 `503`；`0` = 不限 |
+| `huntersim_sensor_frames_dropped_total{stream}` | — | 新增 Counter：编码队列满导致的丢帧计数 |
+| `RecordStats.write_errors` | `0` | 新增字段：mcap 写失败累计次数（熔断后仍可从 `close()` 读取） |
+
+`.env.example`、两套 compose、`k8s/configmap.yaml` + `k8s/deployment.yaml` 已同步 `ADAPTER_STREAM_MAX_CLIENTS`。
+
+### 质量门禁（实测）
+
+- `pytest tests -q --cov=src/hunter_sim`：**1022 passed**，全仓行覆盖 **83.96%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 80 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增/改写测试：`test_adapter_stream.py`（异步推流 + 客户端上限 `503` + 名额计数）、`test_builtin_scenario_sensors.py`（回调入队 / worker 落盘 / `cleanup` 排空 / 队满丢帧计数）、`test_platform_adapter_executor.py`（`initialize()` 必调、初始化失败降级、`shutdown()` 幂等）、`test_mcap_recorder.py`（熔断阈值、熔断后不再触底 writer、已写帧仍可读回）、`test_vil_state_parser_lights.py`（空 `lights` 回退）、`test_probes_app.py`（上游 degraded 透传 / 探针错误降级）、`test_cloud_connector_sim.py`（任务携带 enqueue 时刻 producer）。
+
+### 兼容性说明
+
+- 对外 REST/数据面契约不变；`stream.mjpg` 新增一种**成功建立前**的错误码 `503 stream_limit_reached`。
+- `RecordStats` 新增字段为向后兼容增量；`sensor_file` 报文结构未改。
+- 传感器帧进入 FrameHub / 录制 / ROS 的顺序与内容不变（单 worker 串行），变化仅是执行线程与丢弃策略（队满丢帧而非阻塞 tick）。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.0.0 → 3.0.1`，镜像 tag `hunter-sim:3.0.1`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。升级步骤：`git pull` → `uv sync`（新增 Pillow）→ `docker compose -f docker/docker-compose.yml build sim-service` → `up -d`；`.env` 可选择性新增 `ADAPTER_STREAM_MAX_CLIENTS`（缺省 8）。
+
+### 待办 / 已知边界
+
+- **`record` 默认值与录制总开关、运行期空间闸门未改**：属产品口径决策（默认是否录制 / 低磁盘时是否自动停止），需与平台侧确认后再落。
+- **失败/取消路径是否也应上传 mcap** 未定（当前维持既有触发点）。
+- 时钟域假设（CARLA sim 时间 vs 系统时间）未引入偏置估计；`depth` 未进 `FrameHub`；上传失败无自动重试、`_sweep_recordings` 与上传存在竞态窗口。
+- 本次修复的 MJPEG 与 ROS2 行为仍使用替身验证，真实 CARLA + `rclpy` 环境与平台前端播放效果**未实测**。
+
+---

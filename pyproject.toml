@@ -1,6 +1,6 @@
 [project]
 name = "hunter-sim"
-version = "3.0.0"
+version = "3.0.1"
 description = "HunterSim - VIL Virtual Simulation Platform for HUNTER SE Autonomous Driving"
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,6 +27,8 @@ dependencies = [
     # V3.0.0 传感器录制：纯 Python 写入 mcap（不依赖 ROS2 运行时）
     "mcap>=1.1,<2.0",
     "mcap-ros2-support>=0.5,<0.7",
+    # V3.0.0 画面回传：JPEG 编码 + 降采样（缺失时降级为纯 Python PNG）
+    "Pillow>=10.0,<12.0",
 ]
 
 [project.optional-dependencies]

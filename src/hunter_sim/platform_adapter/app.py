@@ -27,7 +27,7 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Callable, Optional, cast
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
@@ -45,9 +45,9 @@ from hunter_sim.platform_adapter.models import (
     InstanceRecord,
     SubmitScenarioRequest,
 )
-from hunter_sim.platform_adapter.service import AdapterService
+from hunter_sim.platform_adapter.service import AdapterService, StreamLimitExceeded
 from hunter_sim.platform_adapter.store import InstanceStore
-from hunter_sim.sensor_sim.frame_hub import FrameHub
+from hunter_sim.sensor_sim.frame_hub import Frame, FrameHub
 
 logger = get_logger(__name__)
 
@@ -329,32 +329,66 @@ def _register_routes(app: FastAPI) -> None:
         )
 
     @app.get("/api/v1/instances/{instance_id}/stream.mjpg")
-    def stream_mjpeg(instance_id: str, request: Request) -> StreamingResponse:
-        """MJPEG 实时画面（``multipart/x-mixed-replace``，客户端断开即结束）。"""
+    async def stream_mjpeg(instance_id: str, request: Request) -> StreamingResponse:
+        """MJPEG 实时画面（``multipart/x-mixed-replace``，客户端断开即结束）。
+
+        异步端点：等待用 ``asyncio.sleep``，不占用 anyio 工作线程。
+        并发客户端超 ``ADAPTER_STREAM_MAX_CLIENTS`` 时返回 503（而不是把控制面拖满）。
+        """
         service = _service(request)
         if service.get(instance_id) is None:
             raise _not_found(instance_id)
         if service.screenshot(instance_id) is None:
             raise HTTPException(status_code=409, detail="camera_not_attached")
+        frames = service.stream_frames(instance_id)
+        # 先拉首帧：名额超限（StreamLimitExceeded）只能在首次迭代抛出，
+        # 此时返回 503 比“先 200 再中途断流”对平台友好
+        try:
+            first = await anext(frames)
+        except StopAsyncIteration:
+            await frames.aclose()
+            raise HTTPException(status_code=409, detail="camera_not_attached") from None
+        except StreamLimitExceeded as exc:
+            raise HTTPException(status_code=503, detail="stream_limit_reached") from exc
         return StreamingResponse(
-            _mjpeg_chunks(service.stream_frames(instance_id)),
+            _mjpeg_chunks(frames, first),
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-store", "Connection": "close"},
         )
 
 
-def _mjpeg_chunks(frames: Any) -> Any:
-    """把帧包装为 MJPEG 分片（Content-Type 跟随实际编码 JPEG/PNG）。"""
-    for frame in frames:
-        payload = frame.payload
-        content_type = str(frame.meta.get("content_type") or "image/jpeg")
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: " + content_type.encode("ascii") + b"\r\n"
-            b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
-            + payload
-            + b"\r\n"
-        )
+async def _mjpeg_chunks(
+    frames: AsyncGenerator[Frame, None], first: Frame
+) -> AsyncGenerator[bytes, None]:
+    """把帧包装为 MJPEG 分片（Content-Type 跟随实际编码 JPEG/PNG）。
+
+    Args:
+        frames: 已占用推流名额的异步帧流。
+        first: 路由层预先拉取的首帧（避免重复等待）。
+
+    Yields:
+        单个 MJPEG 分片字节串。
+    """
+    try:
+        yield _mjpeg_chunk(first)
+        async for frame in frames:
+            yield _mjpeg_chunk(frame)
+    finally:
+        # 客户端断开时关闭上游生成器，保证推流名额立即释放
+        await frames.aclose()
+
+
+def _mjpeg_chunk(frame: Frame) -> bytes:
+    """单帧 MJPEG 分片（边界 + Content-Type/Length + 原始字节）。"""
+    payload = frame.payload
+    content_type = str(frame.meta.get("content_type") or "image/jpeg")
+    return (
+        b"--frame\r\n"
+        b"Content-Type: " + content_type.encode("ascii") + b"\r\n"
+        b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
+        + payload
+        + b"\r\n"
+    )
 
 
 def _instance_view(record: InstanceRecord) -> dict[str, Any]:

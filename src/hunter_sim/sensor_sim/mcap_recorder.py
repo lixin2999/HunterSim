@@ -48,6 +48,9 @@ STREAM_TO_TOPIC: dict[str, str] = {
     "imu": TOPIC_IMU,
 }
 
+# 写入失败熔断阈值：磁盘满/挂载点掉线时逐帧重试会放大 IO 与日志压力
+_MAX_WRITE_ERRORS = 10
+
 # ─── ROS2 msgdef（mcap_ros2 用其动态生成 CDR 编解码器） ──────────────────────
 
 _SEP = "=" * 80
@@ -135,6 +138,7 @@ class RecordStats:
         topics: 实际写入的主题名元组。
         size_bytes: 文件大小（字节）。
         path: 录制文件路径（为空表示未生成文件）。
+        write_errors: 写入失败次数（>0 表示文件被截断，后段数据丢失）。
     """
 
     start_time: float = 0.0
@@ -143,6 +147,7 @@ class RecordStats:
     topics: tuple[str, ...] = field(default_factory=tuple)
     size_bytes: int = 0
     path: str = ""
+    write_errors: int = 0
 
     @property
     def duration_s(self) -> float:
@@ -265,6 +270,8 @@ class McapRecorder:
         self._start_time = 0.0
         self._end_time = 0.0
         self._degraded = False
+        self._write_errors = 0
+        self._broken = False
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -311,6 +318,8 @@ class McapRecorder:
             self._start_time = 0.0
             self._end_time = 0.0
             self._degraded = False
+            self._write_errors = 0
+            self._broken = False
             logger.info(f"McapRecorder opened: {path}")
             return True
 
@@ -326,7 +335,7 @@ class McapRecorder:
             True 表示写入成功。
         """
         with self._lock:
-            if self._writer is None:
+            if self._writer is None or self._broken:
                 return False
             entry = TOPIC_SCHEMAS.get(topic)
             if entry is None:
@@ -336,7 +345,7 @@ class McapRecorder:
                 schema = self._schema_locked(topic, entry)
                 self._writer.write_message(topic, schema, message, log_time=log_time_ns)
             except Exception as exc:  # noqa: BLE001  单帧写入失败不影响整段录制
-                logger.warning(f"mcap 写入失败（topic={topic}）: {exc}")
+                self._record_write_error(topic, exc)
                 return False
 
             self._frame_count += 1
@@ -351,6 +360,32 @@ class McapRecorder:
             self._end_time = stamp
             return True
 
+    def _record_write_error(self, topic: str, exc: BaseException) -> None:
+        """记录一次写入失败；连续失败达上限则熔断（避免磁盘满时日志洪水）。
+
+        磁盘满/挂载点掉线时每一帧都会失败（默认剖面 170 msg/s），
+        若逐帧 WARNING 会二次放大写入压力，因此只在前几条与每 100 条记一次，
+        累计 ``_MAX_WRITE_ERRORS`` 次后直接关闭写入器（后续 push 立即返回 False）。
+
+        Args:
+            topic: 出错主题。
+            exc: 原始异常。
+        """
+        self._write_errors += 1
+        if self._write_errors in (1, _MAX_WRITE_ERRORS) or self._write_errors % 100 == 0:
+            logger.warning(
+                f"mcap 写入失败（topic={topic}, 累计 {self._write_errors} 次）: {exc}"
+            )
+        if self._write_errors < _MAX_WRITE_ERRORS:
+            return
+        # 保留 _writer 引用：close() 仍要 finish() 把已写入的分块落盘（能捞回多少算多少）
+        self._degraded = True
+        self._broken = True
+        logger.error(
+            f"mcap 写入连续失败 {self._write_errors} 次，已熔断（path={self._path}）："
+            "后续帧不再写入，已写入部分保留"
+        )
+
     def push_stream(self, stream: str, log_time_ns: int, message: Any) -> bool:
         """按流名写入（``rgb`` / ``depth`` / ``lidar`` / ``imu``）。"""
         topic = STREAM_TO_TOPIC.get(stream.strip().lower())
@@ -362,13 +397,15 @@ class McapRecorder:
     def close(self) -> RecordStats:
         """结束录制并返回统计（幂等）；未打开时返回空统计。"""
         with self._lock:
-            if self._writer is None:
+            # 熔断路径下不再写入新帧，但文件仍在（_path 非空）：仍要回收句柄并给出真值统计
+            if self._writer is None and self._path is None:
                 return RecordStats()
             path = self._path
-            try:
-                self._writer.finish()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"mcap finish 失败: {exc}")
+            if self._writer is not None:
+                try:
+                    self._writer.finish()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"mcap finish 失败: {exc}")
             try:
                 if self._handles is not None:
                     self._handles.close()
@@ -387,11 +424,13 @@ class McapRecorder:
                 topics=tuple(sorted(self._topics_written)),
                 size_bytes=size,
                 path=str(path) if path is not None else "",
+                write_errors=self._write_errors,
             )
             self._writer = None
             self._handles = None
             self._path = None
             self._schemas = {}
+            self._broken = False
             logger.info(
                 f"McapRecorder closed: {stats.path}, frames={stats.frame_count}, "
                 f"topics={len(stats.topics)}, size={stats.size_bytes}B"
@@ -402,9 +441,9 @@ class McapRecorder:
 
     @property
     def is_recording(self) -> bool:
-        """是否正在录制。"""
+        """是否正在录制（写入失败熔断后为 False）。"""
         with self._lock:
-            return self._writer is not None
+            return self._writer is not None and not self._broken
 
     @property
     def degraded(self) -> bool:

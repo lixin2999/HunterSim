@@ -152,7 +152,8 @@ def _lights_of(inner: dict[str, Any], chassis: dict[str, Any]) -> dict[str, bool
         仅包含支持的灯光位（ ``_LIGHT_KEYS``）的布尔字典。
     """
     raw: Any = inner.get("lights")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not raw:
+        # 顶层缺失**或为空字典**时回退 chassis.lights（空字典不掩盖内层真实灯光）
         raw = chassis.get("lights")
     if not isinstance(raw, dict):
         return {}

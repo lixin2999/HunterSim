@@ -16,10 +16,15 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.exceptions import CarlaSimulationError, SensorSimulationError
+from hunter_sim.common.metrics import SENSOR_FRAMES_DROPPED_TOTAL
 from hunter_sim.common.models import SensorType
 from hunter_sim.common.utils import get_logger
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
@@ -76,6 +81,39 @@ _FRAME_IDS: dict[str, str] = {
     "imu": "imu_link",
 }
 
+# 传感器帧编码队列容量：满载丢帧，绝不阻塞 CARLA tick
+_SENSOR_QUEUE_MAXSIZE = 32
+# 编码线程停止时等待排空/退出的超时（秒）
+_SENSOR_WORKER_JOIN_TIMEOUT_S = 1.0
+
+
+@dataclass(frozen=True)
+class _SensorFrame:
+    """CARLA 回调线程 → 编码线程的帧载荷。
+
+    只装已拷贝的基本类型（bytes / 尺寸 / 数值元组），不跨线程持有 CARLA 对象：
+    CARLA 的测量对象生命周期属于回调，不能假定在其他线程里仍然有效。
+    """
+
+    stream: str
+    ts: float
+    payload: bytes = b""
+    width: int = 0
+    height: int = 0
+    accel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    gyro: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    def as_measurement(self) -> Any:
+        """还原为 converter / ROS 桥可直接读取的轻量对象。"""
+        return SimpleNamespace(
+            data=self.payload,
+            width=self.width,
+            height=self.height,
+            timestamp=self.ts,
+            accelerometer=self.accel,
+            gyroscope=self.gyro,
+        )
+
 
 class BuiltinScenario(CustomScenarioBase):
     """由 SceneConfig 驱动的最小可用场景执行器。
@@ -114,6 +152,17 @@ class BuiltinScenario(CustomScenarioBase):
         self._stream_max_width = stream_max_width
         # 由 config.sensors 在挂载时确定（任一 spec 开启 ros 即发布）
         self._ros_enabled = False
+        # 传感器帧异步编码：CARLA tick 线程只做拷贝+入队
+        self._frame_queue: "queue.Queue[_SensorFrame]" = queue.Queue(
+            maxsize=_SENSOR_QUEUE_MAXSIZE
+        )
+        self._frame_worker: Optional[threading.Thread] = None
+        self._frame_worker_lock = threading.Lock()
+        self._frame_stop = threading.Event()
+        # 待处理帧计数（含已从队列取出但尚未编码完成的），供 drain 精确等待
+        self._frame_cond = threading.Condition()
+        self._frame_pending = 0
+        self._frame_accepting = True
         self._ego: Any = None
         self._actors: list[Any] = []
         self._sensors: list[Any] = []
@@ -142,6 +191,7 @@ class BuiltinScenario(CustomScenarioBase):
             # 同一 runner 重复下发场景：先回收上一场景 Actor，避免残影
             self.cleanup(world)
         self._cleaned = False
+        self._frame_accepting = True
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
@@ -168,6 +218,10 @@ class BuiltinScenario(CustomScenarioBase):
         if self._cleaned:
             return
         self._cleaned = True
+
+        # 先关回调入口并排空编码队列，再销毁传感器（避免后续帧写已关闭的录制器）
+        self._frame_accepting = False
+        self._stop_frame_worker()
 
         for sensor in self._sensors:
             try:
@@ -366,11 +420,95 @@ class BuiltinScenario(CustomScenarioBase):
         listen(lambda data, _stream=stream: self._on_sensor_data(_stream, data))
 
     def _on_sensor_data(self, stream: str, data: Any) -> None:
-        """传感器帧统一出口：编码 → FrameHub → McapRecorder → ROS2。"""
+        """传感器回调（CARLA tick 线程）：只做拷贝 + 入有界队列。
+
+        编码（BGRA→RGB / 降采样 / JPEG）与 mcap 写入（zstd + 全局锁）均在毫秒级，
+        放在 ``world.tick()`` 调用线程里会把 50Hz 循环拖慢，导致 VIL 时间轴错位；
+        因此交由 ``hunter-sensor-encoder`` 线程处理，队满时丢帧并计数。
+        """
+        if not self._frame_accepting:
+            return
         try:
-            self._dispatch_sensor_data(stream, data)
-        except Exception as exc:  # noqa: BLE001  单帧异常不得中断仿真
-            logger.debug(f"Sensor frame dispatch skipped ({stream}): {exc}")
+            frame = _frame_of(stream, data)
+        except Exception as exc:  # noqa: BLE001  单帧抽取异常不得冒泡到 CARLA
+            logger.debug(f"Sensor frame skipped ({stream}): {exc}")
+            return
+        self._ensure_frame_worker()
+        with self._frame_cond:
+            self._frame_pending += 1
+        try:
+            self._frame_queue.put_nowait(frame)
+        except queue.Full:
+            with self._frame_cond:
+                self._frame_pending -= 1
+            SENSOR_FRAMES_DROPPED_TOTAL.labels(stream=stream).inc()
+
+    def _ensure_frame_worker(self) -> None:
+        """惰性启动传感器编码线程（幂等）。"""
+        with self._frame_worker_lock:
+            if self._frame_worker is not None and self._frame_worker.is_alive():
+                return
+            self._frame_stop.clear()
+            self._frame_worker = threading.Thread(
+                target=self._frame_worker_loop,
+                name="hunter-sensor-encoder",
+                daemon=True,
+            )
+            self._frame_worker.start()
+            logger.debug("Sensor encoder thread started")
+
+    def _frame_worker_loop(self) -> None:
+        """消费队列执行编码/落盘/ROS 发布（单线程串行，保持帧序）。"""
+        while not self._frame_stop.is_set():
+            try:
+                frame = self._frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._dispatch_sensor_data(frame.stream, frame.as_measurement())
+            except Exception as exc:  # noqa: BLE001  单帧异常不得中断编码线程
+                logger.debug(f"Sensor frame dispatch skipped ({frame.stream}): {exc}")
+            finally:
+                with self._frame_cond:
+                    self._frame_pending -= 1
+                    self._frame_cond.notify_all()
+
+    def drain_sensor_frames(self, timeout: float = _SENSOR_WORKER_JOIN_TIMEOUT_S) -> bool:
+        """等待已入队的传感器帧处理完毕（收尾与单测使用）。
+
+        Args:
+            timeout: 最长等待秒数。
+
+        Returns:
+            True 表示全部帧已编码完成（含已出队但仍在处理的那一帧）。
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._frame_cond:
+            while self._frame_pending > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._frame_cond.wait(remaining)
+        return True
+
+    def _stop_frame_worker(self) -> None:
+        """排空队列后停止编码线程（幂等）。"""
+        with self._frame_worker_lock:
+            worker, self._frame_worker = self._frame_worker, None
+        if worker is None:
+            return
+        self.drain_sensor_frames()
+        self._frame_stop.set()
+        worker.join(timeout=_SENSOR_WORKER_JOIN_TIMEOUT_S)
+        # 丢弃残留帧并复位计数：避免下一场景的 worker 重放旧帧 / 计数漂移
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._frame_cond:
+            self._frame_pending = 0
+        logger.debug("Sensor encoder thread stopped")
 
     def _dispatch_sensor_data(self, stream: str, data: Any) -> None:
         """实际分发逻辑（拆分便于单测直接调用）。"""
@@ -562,6 +700,44 @@ class BuiltinScenario(CustomScenarioBase):
         if callable(try_spawn):
             return try_spawn(blueprint, transform)
         return world.spawn_actor(blueprint, transform)
+
+
+def _frame_of(stream: str, data: Any) -> _SensorFrame:
+    """把 CARLA 测量对象抽取为可跨线程的不可变载荷（数据在此一次性拷贝）。
+
+    Args:
+        stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu``）。
+        data: CARLA 传感器测量对象（或单测桩）。
+
+    Returns:
+        仅含基本类型的帧载荷。
+    """
+    ts = float(getattr(data, "timestamp", 0.0)) or time.time()
+    if stream in (STREAM_RGB, "depth"):
+        raw, width, height = BuiltinScenario._raw_image(data)
+        return _SensorFrame(stream=stream, ts=ts, payload=raw, width=width, height=height)
+    if stream == "lidar":
+        points = bytes(getattr(data, "data", b"") or b"")
+        return _SensorFrame(stream=stream, ts=ts, payload=points)
+    if stream == "imu":
+        return _SensorFrame(
+            stream=stream,
+            ts=ts,
+            accel=_vec3(getattr(data, "accelerometer", None)),
+            gyro=_vec3(getattr(data, "gyroscope", None)),
+        )
+    return _SensorFrame(stream=stream, ts=ts)
+
+
+def _vec3(value: Any) -> tuple[float, float, float]:
+    """把三元组量转为 ``tuple[float, float, float]``（非法输入回退零向量）。"""
+    try:
+        values = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 0.0)
+    if len(values) < 3:
+        return (0.0, 0.0, 0.0)
+    return (values[0], values[1], values[2])
 
 
 def _safe_find(library: Any, blueprint_id: str) -> Any:

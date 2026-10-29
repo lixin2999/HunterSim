@@ -40,6 +40,8 @@ data:
   adapter_stream_fps: "10"
   # MJPEG 横向降采样上限（像素，0 = 不降采样）；降低内网带宽与前端解码开销
   adapter_stream_max_width: "640"
+  # MJPEG 并发客户端上限（超限返回 503；0 = 不限）
+  adapter_stream_max_clients: "8"
   adapter_screenshot_quality: "75"
   adapter_artifact_bucket: "hunter-scene-assets"
   adapter_max_scene_seconds: "7200"

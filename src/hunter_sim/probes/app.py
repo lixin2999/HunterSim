@@ -72,6 +72,26 @@ def _fetch_upstream(adapter_url: str) -> tuple[dict[str, object] | None, str | N
     return payload if isinstance(payload, dict) else None, None
 
 
+def _derive_status(snapshot: dict[str, object] | None) -> str:
+    """由上游快照推导探针状态（不把上游的 degraded 当成 ok）。
+
+    Args:
+        snapshot: 管理面 ``/health`` 快照；不可达时为 None。
+
+    Returns:
+        ``ok`` / ``degraded`` 或上游自报的其他状态值。
+    """
+    if snapshot is None:
+        return "degraded"
+    status = str(snapshot.get("status") or "ok")
+    if status != "ok":
+        return status
+    # 上游可达但自报 CARLA 探测异常：同样是降级（否则 readiness 不会摘流量）
+    if snapshot.get("carla_probe_error"):
+        return "degraded"
+    return "ok"
+
+
 def _health_body(settings: HunterSimSettings) -> dict[str, object]:
     """构造探针健康响应体（上游可达时透传关键字段）。"""
     adapter_url = settings.probe.adapter_url
@@ -79,7 +99,7 @@ def _health_body(settings: HunterSimSettings) -> dict[str, object]:
     PROBE_UPSTREAM_REACHABLE.set(1 if snapshot is not None else 0)
 
     body: dict[str, object] = {
-        "status": "ok" if snapshot is not None else "degraded",
+        "status": _derive_status(snapshot),
         "version": _resolve_app_version(),
         "uptime_seconds": round(time.time() - SERVICE_START_TIME, 3),
         "upstream": {

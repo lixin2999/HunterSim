@@ -112,6 +112,16 @@ class TestLightsSection:
         frame = parse_vil_state(_message(lights={}))
         assert frame.vehicle_state.lights == {}
 
+    def test_empty_lights_dict_falls_back_to_chassis(self) -> None:
+        """``lights: {}`` 视为未上报，回退 ``chassis.lights``（不得把灯光置空）。"""
+        frame = parse_vil_state(
+            _message(
+                lights={},
+                chassis={"velocity": 5.0, "lights": {"hazard": True}},
+            )
+        )
+        assert frame.vehicle_state.lights == {"hazard": True}
+
 
 # ── 舵角单位 ──────────────────────────────────────────────────────────────────
 

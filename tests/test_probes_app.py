@@ -139,6 +139,28 @@ class TestHealthUpstream:
         assert body["sensor"]["recording"] is True
         assert body["cloud"]["enabled"] is True
 
+    def test_upstream_degraded_is_transparent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """上游自带 degraded 时不得覆盖为 ok（否则探针会误报健康）。"""
+        snapshot = {**self._snapshot(), "status": "degraded"}
+        _install_httpx(monkeypatch, response=_FakeResponse(snapshot))
+        with _client("http://127.0.0.1:8090/") as client:
+            body = client.get("/health").json()
+        assert body["status"] == "degraded"
+        assert body["upstream"]["reachable"] is True
+
+    def test_carla_probe_error_degrades_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """上游 status=ok 但探针报错时，聚合状态降为 degraded。"""
+        snapshot = {**self._snapshot(), "carla_probe_error": "timeout"}
+        _install_httpx(monkeypatch, response=_FakeResponse(snapshot))
+        with _client("http://127.0.0.1:8090/") as client:
+            body = client.get("/health").json()
+        assert body["status"] == "degraded"
+        assert body["carla_probe_error"] == "timeout"
+
 
 class TestProbesEndpoints:
     def test_health_live_always_ok(self) -> None:

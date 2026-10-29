@@ -261,12 +261,15 @@ class CloudConnector:
         q = self._upload_q
         if q is None:
             return
-        job: tuple[Path, str, Optional[Any], str, Optional[str]] = (
+        job: tuple[Path, str, Optional[Any], str, Optional[str], Any] = (
             file_path,
             data_type,
             stats,
             scene_id,
             vehicle_id,
+            # 捕获投递时刻的 producer：单世界串行下下一个实例可能已切换 sim_id，
+            # 若执行时再读 self._producer 会把 A 的 sensor_file 发到 B 的 Topic
+            self._producer,
         )
         try:
             q.put_nowait(job)
@@ -350,8 +353,10 @@ class CloudConnector:
                 continue
             if job is None:
                 break
-            path, dtype, stats, scene_id, vehicle_id = job
-            self._perform_upload(path, dtype, stats, scene_id, vehicle_id)
+            path, dtype, stats, scene_id, vehicle_id, producer = job
+            self._perform_upload(
+                path, dtype, stats, scene_id, vehicle_id, producer=producer
+            )
 
     def _perform_upload(
         self,
@@ -360,12 +365,22 @@ class CloudConnector:
         stats: Optional[Any] = None,
         scene_id: str = "",
         vehicle_id: Optional[str] = None,
+        producer: Optional[Any] = None,
     ) -> None:
         """实际执行上传（在上传线程）；串行化保证任意时刻至多一次在途上传。
 
         上传成功后自动发布 sensor_file 消息（字段取 ``stats`` 真值）。
         异常收口为 WARN，绝不冒泡。
+
+        Args:
+            file_path: 待上传文件。
+            data_type: 数据类型。
+            stats: 录制统计（写入 sensor_file）。
+            scene_id: 场景 ID。
+            vehicle_id: 孪生车 ID。
+            producer: 投递任务时捕获的生产者（None 时回退到当前生产者）。
         """
+        publisher = producer if producer is not None else self._producer
         with self._upload_exec_lock:
             try:
                 result = self.uploader.upload(file_path, data_type=data_type)
@@ -373,9 +388,9 @@ class CloudConnector:
                     self._upload_success += 1
                 CLOUD_UPLOAD_TOTAL.labels(result="success").inc()
                 logger.info(f"bag 上传完成：{file_path.name} → {result}")
-                # 自动发布 sensor_file 消息
-                if result is not None and self._producer is not None:
-                    self._producer.publish_sensor_file(
+                # 自动发布 sensor_file 消息（用任务自带的生产者，避免跨实例串台）
+                if result is not None and publisher is not None:
+                    publisher.publish_sensor_file(
                         bucket=result.bucket,
                         object_key=result.object_key,
                         size_bytes=result.size_bytes,

@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.0.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节）。
+- **当前版本**：`3.0.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 章节）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -202,7 +202,9 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 }
 ```
 
-`ros_enabled=true` 时额外投递 ROS2 话题（需 `rclpy`，缺失自动降级为不出 ROS）；`record=true` 时写入 `ADAPTER_RECORDINGS_DIR` 下的 `.mcap`。
+`ros_enabled=true` 时额外投递 ROS2 话题（需 `rclpy`，缺失自动降级为不出 ROS；桥接器装配后会调用 `initialize()` 建立发布者）；`record=true` 时写入 `ADAPTER_RECORDINGS_DIR` 下的 `.mcap`。
+
+传感器回调只做内存拷贝并入有界队列（上限 32 帧），编码/落盘/ROS 发布由 `hunter-sensor-encoder` 线程串行执行，避免把 CARLA `world.tick()` 线程拖出 50 Hz 预算；队满时丢帧并计入 `huntersim_sensor_frames_dropped_total{stream}`。mcap 写入连续失败 10 次即熔断（`RecordStats.write_errors` 上报），已写入部分仍会 `finish()` 落盘。
 
 ---
 
@@ -217,6 +219,7 @@ V3.0.0 新增指标：
 | `huntersim_vil_frames_downsampled_total{mode}` | Counter | 栅格推进计数（`interpolated`/`extrapolated`/`nearest`），总和应稳定 10/s |
 | `huntersim_vil_align_skew_ms` | Histogram | 栅格对齐误差，P95 < 60 ms 视为健康 |
 | `huntersim_sensor_frames_total{stream}` | Counter | 传感器帧计数（`rgb`/`depth`/`lidar`/`imu`） |
+| `huntersim_sensor_frames_dropped_total{stream}` | Counter | 编码队列满导致的丢帧计数（持续增长 → 磁盘/CPU 跟不上采集） |
 | `huntersim_sensor_record_bytes_total` | Counter | mcap 累计写入字节（磁盘容量告警依据） |
 | `huntersim_stream_clients` | Gauge | MJPEG 在线客户端数 |
 | `huntersim_probe_upstream_reachable` | Gauge | 探针到控制面的可达性 |

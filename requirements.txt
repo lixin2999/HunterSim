@@ -19,6 +19,8 @@ Jinja2>=3.1,<4.0
 # V3.0.0 传感器回传：mcap 录制（纯 Python，不依赖 ROS2 运行时）
 mcap>=1.1,<2.0
 mcap-ros2-support>=0.5,<0.7
+# V3.0.0 画面回传：JPEG 编码（缺失时降级为纯 Python PNG）
+Pillow>=10.0,<12.0
 
 # ── 可选依赖（按需安装，惰性导入不阻断核心）──────────────────────────────────
 # HunterCore 数据接入：pip install -e ".[cloud]"（kafka-python / httpx，已含于默认依赖）

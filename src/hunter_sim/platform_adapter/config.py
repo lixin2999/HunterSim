@@ -19,6 +19,7 @@ class AdapterSettings(BaseSettings):
         recording_retention_hours: 录制文件保留时长（小时），看门狗周期清理。
         stream_fps: MJPEG 推流帧率（默认 10，与 VIL 栅格一致）。
         stream_max_width: 回传画面最大宽度（0 表示不降采样）。
+        stream_max_clients: MJPEG 并发客户端上限（0 表示不限）。
         screenshot_quality: JPEG 质量（1-100，默认 75）。
         busy_timeout_seconds: SQLite 忙等待超时。
         watchdog_factor: 看门狗时长倍数（``duration * factor + grace``）。
@@ -49,6 +50,9 @@ class AdapterSettings(BaseSettings):
     stream_fps: float = Field(10.0, gt=0.0, le=60.0, description="MJPEG 推流帧率（Hz）")
     stream_max_width: int = Field(
         640, ge=0, le=7680, description="回传画面最大宽度（0 表示不降采样）"
+    )
+    stream_max_clients: int = Field(
+        8, ge=0, le=256, description="MJPEG 并发客户端上限（0 表示不限）"
     )
     screenshot_quality: int = Field(75, ge=1, le=100, description="截图 JPEG 质量")
     busy_timeout_seconds: float = Field(5.0, gt=0.0, le=60.0, description="SQLite 忙等待超时")

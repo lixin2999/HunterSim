@@ -687,12 +687,63 @@ class TestRosBridgeWiring:
         self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         class _Bridge:
-            pass
+            instances: list[_Bridge] = []
+
+            def __init__(self) -> None:
+                self.init_calls = 0
+                _Bridge.instances.append(self)
+
+            def initialize(self) -> None:
+                self.init_calls += 1
 
         monkeypatch.setattr("hunter_sim.sensor_sim.carla_ros_bridge.CarlaRosBridge", _Bridge)
         scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
 
-        assert isinstance(executor._ros_bridge_for(scene), _Bridge)  # noqa: SLF001
+        bridge = executor._ros_bridge_for(scene)  # noqa: SLF001
+
+        assert isinstance(bridge, _Bridge)
+        # 构造后必须 initialize()：否则 is_initialized 恒 False，话题静默不发
+        assert bridge.init_calls == 1  # type: ignore[union-attr]
+
+    def test_initialize_failure_degrades_to_none(
+        self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Bridge:
+            def initialize(self) -> None:
+                raise RuntimeError("rclpy init failed")
+
+        monkeypatch.setattr("hunter_sim.sensor_sim.carla_ros_bridge.CarlaRosBridge", _Bridge)
+        scene = SimpleNamespace(sensors=[SensorSpec(ros_enabled=True)])
+
+        assert executor._ros_bridge_for(scene) is None  # noqa: SLF001
+
+    def test_shutdown_releases_bridge_once(self) -> None:
+        class _Bridge:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            def shutdown(self) -> None:
+                self.shutdown_calls += 1
+
+        bridge = _Bridge()
+        context = SimpleNamespace(ros_bridge=bridge)
+
+        SimulationExecutor._shutdown_ros_bridge(context)  # noqa: SLF001
+        SimulationExecutor._shutdown_ros_bridge(context)  # noqa: SLF001
+
+        assert bridge.shutdown_calls == 1
+        assert context.ros_bridge is None
+
+    def test_shutdown_failure_does_not_raise(self) -> None:
+        class _Bridge:
+            def shutdown(self) -> None:
+                raise RuntimeError("rclpy already gone")
+
+        context = SimpleNamespace(ros_bridge=_Bridge())
+
+        SimulationExecutor._shutdown_ros_bridge(context)  # noqa: SLF001
+
+        assert context.ros_bridge is None
 
     def test_init_failure_degrades_to_none(
         self, executor: SimulationExecutor, monkeypatch: pytest.MonkeyPatch

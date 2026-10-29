@@ -74,7 +74,7 @@ services:
         # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ PIP_TRUSTED_HOST=mirrors.aliyun.com
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:3.0.0
+    image: hunter-sim:3.0.1
     command: ["carla-manager"]
     ports:
       - "8090:8090"
@@ -132,6 +132,8 @@ services:
       ADAPTER_SCREENSHOT_QUALITY: ${ADAPTER_SCREENSHOT_QUALITY:-75}
       # MJPEG 推流横向降采样上限（像素，0 = 不降采样）；降低内网带宽占用
       ADAPTER_STREAM_MAX_WIDTH: ${ADAPTER_STREAM_MAX_WIDTH:-640}
+      # MJPEG 并发客户端上限（超限返回 503；0 = 不限）
+      ADAPTER_STREAM_MAX_CLIENTS: ${ADAPTER_STREAM_MAX_CLIENTS:-8}
       ADAPTER_DEFAULT_DURATION_SECONDS: ${ADAPTER_DEFAULT_DURATION_SECONDS:-60}
       ADAPTER_MAX_SCENE_SECONDS: ${ADAPTER_MAX_SCENE_SECONDS:-7200}
       # ── HunterCore 平台接入（默认关闭，凭据仅经 .env / Secret 注入）──
@@ -162,7 +164,7 @@ services:
 
   # ── 只读运维探针面（8080，无业务无鉴权）─────────────────────────────────────
   probes:
-    image: hunter-sim:3.0.0
+    image: hunter-sim:3.0.1
     command: ["probes"]
     ports:
       - "8080:8080"

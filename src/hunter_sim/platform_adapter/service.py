@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
+import threading
 import time
 import uuid
-from typing import Any, Callable, Iterator, Optional, cast
+from typing import Any, AsyncGenerator, Callable, Optional, cast
 
 from hunter_sim.common.metrics import INSTANCE_LIFECYCLE_TOTAL, STREAM_CLIENTS
 from hunter_sim.common.models import HunterSimSettings
@@ -40,6 +42,14 @@ _DEFAULT_DURATION_S = 60.0
 _QUALITY_KEY = "quality"
 # MJPEG 无帧容忍时长（秒）：超过即结束响应，避免客户端无限等空流
 _STREAM_IDLE_TIMEOUT_S = 5.0
+
+
+class StreamLimitExceeded(RuntimeError):
+    """MJPEG 并发客户端数超过 ``ADAPTER_STREAM_MAX_CLIENTS``。"""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"stream clients limit reached: {limit}")
+        self.limit = limit
 
 
 class AdapterService:
@@ -66,6 +76,9 @@ class AdapterService:
         self._store = store
         self._executor = executor
         self._frame_hub_provider = frame_hub_provider or _executor_frame_hub(executor)
+        # MJPEG 并发客户端计数（与 Prometheus Gauge 同步增减）
+        self._stream_lock = threading.Lock()
+        self._stream_clients = 0
 
     # ── 创建 / 下发 ─────────────────────────────────────────────────────────
 
@@ -266,10 +279,20 @@ class AdapterService:
             return None
         return hub.latest(STREAM_RGB)
 
-    def stream_frames(
+    @property
+    def active_streams(self) -> int:
+        """当前在线的 MJPEG 客户端数（与 ``huntersim_stream_clients`` 同源）。"""
+        with self._stream_lock:
+            return self._stream_clients
+
+    async def stream_frames(
         self, instance_id: str, fps: Optional[float] = None
-    ) -> Iterator[Frame]:
+    ) -> AsyncGenerator[Frame, None]:
         """持续产出最新 RGB 帧（客户端断开即终止）。
+
+        异步生成器：帧读取本身非阻塞，等待用 ``asyncio.sleep``，因此不占用
+        anyio 工作线程（同步生成器 + ``time.sleep`` 会每个客户端独占 1 个线程，
+        推流客户端一多就把控制面其他同步端点拖死）。
 
         无相机时立即结束；无新帧时重发上一帧以维持 MJPEG 连接；
         连续 ``_STREAM_IDLE_TIMEOUT_S`` 秒无任何帧则结束（由路由层拒绝空流）。
@@ -277,12 +300,15 @@ class AdapterService:
         Args:
             instance_id: 实例 ID。
             fps: 推流帧率（None 时取 ``ADAPTER_STREAM_FPS``）。
+
+        Raises:
+            StreamLimitExceeded: 在线客户端数已达 ``stream_max_clients`` 上限。
         """
         rate = float(fps if fps is not None else self._adapter.stream_fps)
         interval = 1.0 / max(0.5, rate)
+        self._acquire_stream_slot()
         last_frame: Optional[Frame] = None
         last_seen_at = time.time()
-        STREAM_CLIENTS.inc()
         try:
             while True:
                 hub = self._frame_hub_provider(instance_id)
@@ -296,9 +322,25 @@ class AdapterService:
                     return
                 if last_frame is not None:
                     yield last_frame
-                time.sleep(interval)
+                await asyncio.sleep(interval)
         finally:
-            STREAM_CLIENTS.dec()
+            self._release_stream_slot()
+
+    def _acquire_stream_slot(self) -> None:
+        """占用一个推流名额（超限抛 ``StreamLimitExceeded``，由路由转 503）。"""
+        limit = int(self._adapter.stream_max_clients)
+        with self._stream_lock:
+            if limit > 0 and self._stream_clients >= limit:
+                raise StreamLimitExceeded(limit)
+            self._stream_clients += 1
+        STREAM_CLIENTS.inc()
+
+    def _release_stream_slot(self) -> None:
+        """释放推流名额（与 ``_acquire_stream_slot`` 成对调用）。"""
+        with self._stream_lock:
+            if self._stream_clients > 0:
+                self._stream_clients -= 1
+        STREAM_CLIENTS.dec()
 
 
 def _disk_usage_ratio(path: str) -> Optional[float]:

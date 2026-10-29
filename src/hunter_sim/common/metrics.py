@@ -241,6 +241,13 @@ SENSOR_FRAMES_TOTAL = Counter(
     labelnames=("stream",),
 )
 
+# 传感器帧丢弃计数：编码队列满时丢帧而不是阻塞 CARLA tick
+SENSOR_FRAMES_DROPPED_TOTAL = Counter(
+    "huntersim_sensor_frames_dropped_total",
+    "Sensor frames dropped because the encoder queue was full (stream=rgb|depth|lidar|imu).",
+    labelnames=("stream",),
+)
+
 # 录制累计字节数（mcap 写入量，用于磁盘容量告警）
 SENSOR_RECORD_BYTES_TOTAL = Counter(
     "huntersim_sensor_record_bytes_total",
@@ -400,6 +407,7 @@ __all__ = [
     "KAFKA_CONSUMER_LAG",
     "KAFKA_CONSUMER_REBUILDS_TOTAL",
     "KAFKA_CONSUMED_TOTAL",
+    "SENSOR_FRAMES_DROPPED_TOTAL",
     "SENSOR_FRAMES_TOTAL",
     "SENSOR_FILE_PUBLISHED_TOTAL",
     "SENSOR_RECORD_BYTES_TOTAL",

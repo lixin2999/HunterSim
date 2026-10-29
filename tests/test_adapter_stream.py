@@ -4,12 +4,13 @@
 - **端点层**（``platform_adapter/app.py``）：404/409/200 分支、JPEG/PNG 媒体类型、
   MJPEG 分片帧头（``--frame`` + Content-Type/Length）与流结束；
 - **编排层**（``platform_adapter/service.py``）：最新帧读取、无新帧时重发上一帧、
-  连续无帧超时结束、客户端断开后客户端计数归零。
+  连续无帧超时结束、客户端断开后客户端计数归零、并发客户端上限。
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional
+import types
+from typing import Any, AsyncIterator, Optional
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,7 +21,7 @@ from hunter_sim.platform_adapter import service as service_module
 from hunter_sim.platform_adapter.app import create_app
 from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.models import InstanceRecord
-from hunter_sim.platform_adapter.service import AdapterService
+from hunter_sim.platform_adapter.service import AdapterService, StreamLimitExceeded
 from hunter_sim.sensor_sim.frame_hub import STREAM_RGB, Frame, FrameHub
 
 _JPEG = b"\xff\xd8\xff\xe0jpeg-bytes"
@@ -53,9 +54,12 @@ class _StreamService:
     def screenshot(self, instance_id: str) -> Optional[Frame]:
         return self._frame
 
-    def stream_frames(self, instance_id: str, fps: Optional[float] = None) -> Iterator[Frame]:
+    async def stream_frames(
+        self, instance_id: str, fps: Optional[float] = None
+    ) -> AsyncIterator[Frame]:
         self.stream_calls += 1
-        yield from self._frames
+        for frame in self._frames:
+            yield frame
 
 
 def _client(service: Any) -> TestClient:
@@ -125,6 +129,22 @@ class TestStreamEndpoint:
                 body = b"".join(response.iter_raw())
         assert body.count(b"--frame\r\n") == 1
 
+    def test_stream_limit_is_503(self) -> None:
+        with _client(_LimitedStreamService(_frame())) as client:
+            response = client.get("/api/v1/instances/inst-1/stream.mjpg")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "stream_limit_reached"
+
+
+class _LimitedStreamService(_StreamService):
+    """端点层替身：推流名额已满。"""
+
+    async def stream_frames(
+        self, instance_id: str, fps: Optional[float] = None
+    ) -> AsyncIterator[Frame]:
+        raise StreamLimitExceeded(1)
+        yield _frame()  # pragma: no cover  仅为构成异步生成器
+
 
 class _StubHub:
     """帧源替身：按序吐出帧，耗尽后返回 None。"""
@@ -142,7 +162,7 @@ class _StubHub:
 
 
 class _FakeClock:
-    """可控时钟（避免真实 sleep 拖慢用例）。"""
+    """可控时钟（``time.time`` + ``asyncio.sleep`` 同步推进，避免真实等待）。"""
 
     def __init__(self) -> None:
         self.now = 1000.0
@@ -151,9 +171,15 @@ class _FakeClock:
     def time(self) -> float:
         return self.now
 
-    def sleep(self, seconds: float) -> None:
+    async def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+def _patch_clock(monkeypatch: pytest.MonkeyPatch, clock: _FakeClock) -> None:
+    """把 service 模块的 ``time`` / ``asyncio.sleep`` 换成虚拟时钟。"""
+    monkeypatch.setattr(service_module, "time", clock)
+    monkeypatch.setattr(service_module, "asyncio", types.SimpleNamespace(sleep=clock.sleep))
 
 
 def _service(hub: Optional[Any]) -> AdapterService:
@@ -179,14 +205,14 @@ class TestServiceFrameSource:
     def test_screenshot_without_scene_is_none(self) -> None:
         assert _service(None).screenshot("inst-1") is None
 
-    def test_stream_resends_last_frame_and_stops_on_idle(
+    async def test_stream_resends_last_frame_and_stops_on_idle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         clock = _FakeClock()
-        monkeypatch.setattr(service_module, "time", clock)
+        _patch_clock(monkeypatch, clock)
         hub = _StubHub([_frame()])
         baseline = counter_value(service_module.STREAM_CLIENTS)
-        frames = list(_service(hub).stream_frames("inst-1", fps=10.0))
+        frames = [frame async for frame in _service(hub).stream_frames("inst-1", fps=10.0)]
         # 首帧之后无新帧：重发上一帧直到空闲超时（5s / 0.1s = 50 次）
         assert len(frames) > 1
         assert all(item.payload == _JPEG for item in frames)
@@ -194,17 +220,36 @@ class TestServiceFrameSource:
         # 客户端计数在生成器结束后归零（断开即执行 finally）
         assert counter_value(service_module.STREAM_CLIENTS) == baseline
 
-    def test_stream_stops_immediately_without_hub(self) -> None:
-        assert list(_service(None).stream_frames("inst-1")) == []
+    async def test_stream_stops_immediately_without_hub(self) -> None:
+        assert [frame async for frame in _service(None).stream_frames("inst-1")] == []
 
-    def test_stream_client_gauge_decrements_on_early_close(
+    async def test_stream_client_gauge_decrements_on_early_close(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         clock = _FakeClock()
-        monkeypatch.setattr(service_module, "time", clock)
+        _patch_clock(monkeypatch, clock)
+        service = _service(_StubHub([_frame()]))
         baseline = counter_value(service_module.STREAM_CLIENTS)
-        generator = _service(_StubHub([_frame()])).stream_frames("inst-1")
-        next(generator)
+        generator = service.stream_frames("inst-1")
+        await anext(generator)
+        assert service.active_streams == 1
         assert counter_value(service_module.STREAM_CLIENTS) == baseline + 1
-        generator.close()
+        await generator.aclose()
+        assert service.active_streams == 0
+        assert counter_value(service_module.STREAM_CLIENTS) == baseline
+
+    async def test_stream_rejects_client_beyond_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _FakeClock()
+        _patch_clock(monkeypatch, clock)
+        service = _service(_StubHub([_frame(), _frame()]))
+        service._adapter.stream_max_clients = 1  # noqa: SLF001
+        baseline = counter_value(service_module.STREAM_CLIENTS)
+        first = service.stream_frames("inst-1", fps=10.0)
+        await anext(first)
+        with pytest.raises(StreamLimitExceeded) as excinfo:
+            await anext(service.stream_frames("inst-1", fps=10.0))
+        assert excinfo.value.limit == 1
+        await first.aclose()
         assert counter_value(service_module.STREAM_CLIENTS) == baseline
