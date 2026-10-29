@@ -1611,3 +1611,53 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - 本次修复的 MJPEG 与 ROS2 行为仍使用替身验证，真实 CARLA + `rclpy` 环境与平台前端播放效果**未实测**；MinIO 实际重试链路（网络抖动）未做故障注入实测。
 
 ---
+
+## V3.0.3 — HunterCore mTLS 客户端证书支持（9093 双向 TLS 接入）
+
+**发布日期**：2026-10-29
+**版本定位**：补齐 HunterCore 数据面接入的 mTLS 能力。仅新增可选配置项与参数透传，**未配置客户端证书时行为与 V3.0.2 完全一致**，不改变对外 REST / 数据面契约。
+
+### 现场 / 根因
+
+| 级别 | 缺陷 | 根因 |
+|---|---|---|
+| 高 | HunterCore 9093 接入面遥测 / sensor_file 全部静默丢失 | 平台侧 `infra/deploy/docker-compose.yml` 的 `KAFKA_CFG_SSL_CLIENT_AUTH` 默认 `required`（双向 TLS），而 HunterSim 的 producer 只透传 `ssl_cafile`（`sim_data_producer` / `telemetry_producer`），没有 `ssl_certfile` / `ssl_keyfile`。SCRAM 账号口令正确也过不了 TLS 握手，`connect()` 捕获异常后整体降级为 no-op（仅一条 warning），表现为“平台什么也没收到” |
+| 低 | 配置错误难定位 | 证书路径写错/只配一半时没有任何前置校验，只能从 kafka-python 抛出的模糊 SSL 错误反推 |
+
+### 修复内容
+
+- **新增 `cloud/kafka_security.py`**：`build_ssl_kwargs(settings)` 把 `CloudSettings` 的 CA / 客户端证书 / 私钥路径翻译为 kafka-python 的 `ssl_cafile` / `ssl_certfile` / `ssl_keyfile`；仅当 `security_protocol` 以 `SSL` 结尾（`SASL_SSL` / `SSL`）时生效。客户端证书与私钥**必须成对配置**，缺一抛 `ValueError`；三类文件均做存在性校验，缺失抛 `FileNotFoundError`（提前失败，由 `connect()` 捕获并降级为 no-op，日志给出明确原因）。
+- **`common/models.py`**：`CloudSettings` 新增 `client_cert_path` / `client_key_path`（环境变量 `HUNTER_CORE_CLIENT_CERT_PATH` / `HUNTER_CORE_CLIENT_KEY_PATH`），取值即接入包中的 `client-cert.pem` / `client-key.pem`。
+- **`cloud/sim_data_producer.py` / `cloud/telemetry_producer.py`**：`_build_kafka_producer()` 统一改为 `kwargs.update(build_ssl_kwargs(s))`，两端 SSL 参数不再各写一份，避免配置漂移。
+
+### 配置与指标变更（增量，默认值向后兼容）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `HUNTER_CORE_CLIENT_CERT_PATH` | 空 | mTLS 客户端证书路径（接入包 `client-cert.pem`）；空 = 不做客户端认证，行为同 V3.0.2 |
+| `HUNTER_CORE_CLIENT_KEY_PATH` | 空 | mTLS 客户端私钥路径（接入包 `client-key.pem`）；与证书必须成对 |
+| `HUNTER_CORE_CA_CERT_PATH` | 空 | 既有项，本次一并纳入存在性校验，并在两套 compose 中补上透传 |
+
+`.env.example` 与两套 compose（`docker-compose.yml` / `docker-compose.windows.yml`）已同步上述三项。容器内路径需在挂载卷内可见，推荐把接入包证书放到 `data/certs/`（`../data` 已挂载到 `/home/hunter/app/data`），即 `HUNTER_CORE_CLIENT_CERT_PATH=/home/hunter/app/data/certs/client-cert.pem`。
+
+### 质量门禁（实测）
+
+- `pytest tests -q --cov=src/hunter_sim`：**1048 passed**，全仓行覆盖 **84.24%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 81 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增测试（`tests/test_sim_data_producer.py`）：`TestSslKwargs`（非 SSL 协议不注入、仅 CA、CA+证书+私钥三件套、半配置报 `ValueError`、文件缺失报 `FileNotFoundError`）、`TestProducerMtlsWiring`（`SimDataProducer` 与 `TelemetryProducer` 均把 `ssl_cafile/ssl_certfile/ssl_keyfile` 透传给 `KafkaProducer`）。
+
+### 兼容性说明
+
+- 未设置 `HUNTER_CORE_CLIENT_CERT_PATH` / `HUNTER_CORE_CLIENT_KEY_PATH` 时 SSL 参数与 V3.0.2 一致（仅 `ssl_cafile` 可选），单向 TLS / SCRAM 环境不受影响。
+- 唯一行为变化：CA / 客户端证书路径**不存在**时，从“握手期才失败”提前为初始化阶段 `warning` 明确原因后降级 no-op。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.0.2 → 3.0.3`，镜像 tag `hunter-sim:3.0.3`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。升级步骤：`git pull` → `uv sync` → 放置接入包证书 → `.env` 配三项路径 → `docker compose -f docker/docker-compose.yml build sim-service` → `up -d`。
+
+### 待办 / 已知边界
+
+- **未与真实 HunterCore 9093 接入面联调验证**：本次仅以 `KafkaProducer` 参数替身断言参数透传正确，真实证书链、broker 侧 ACL 与用户名绑定仍需现场执行一次 `HUNTER_CORE_ENABLED=true` 的发布验证（观察 `huntersim_sim_status_published_total` 与平台 Topic）。
+- **主机名校验未开放**：kafka-python 默认 `ssl_check_hostname=True`，若用 IP 直连且 broker 证书只含 DNS SAN，握手会失败；当前未暴露 `ssl_check_hostname` 开关，需平台侧证书补 IP SAN（或后续按需增加配置项）。
+- **VIL 下行消费（`KafkaSettings`）仍无 SSL/CA/mTLS 配置**：`vil_data_consumer` 只透传 SASL 用户名口令，同样连不上 9093 双向 TLS 接入面，需另行补齐（本次未改动）。
+- **k8s 形态未接证书**：`k8s/configmap.yaml` 未新增两项（纯文件路径需配合 Secret 挂载才有意义），k8s 部署前需挂 Secret 并注入同名环境变量。
+
+---

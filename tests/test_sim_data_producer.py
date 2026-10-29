@@ -18,7 +18,11 @@ import json
 import threading
 from typing import Any
 
+import pytest
+
+from hunter_sim.cloud.kafka_security import build_ssl_kwargs
 from hunter_sim.cloud.sim_data_producer import SimDataProducer
+from hunter_sim.cloud.telemetry_producer import TelemetryProducer
 from hunter_sim.common.models import CloudSettings
 
 
@@ -314,6 +318,96 @@ class TestPublishStatusFromPayload:
         parsed = json.loads(value)
         assert parsed["type"] == "sim_status"
         assert parsed["payload"]["status"] == "COMPLETED"
+
+
+# ─── V3.0.3：mTLS 客户端证书（9093 强制 ssl.client.auth=required）─────────────
+
+
+def _cert_files(tmp_path: Any) -> tuple[str, str, str]:
+    """生成临时 CA / 客户端证书 / 客户端私钥文件，返回三者路径。"""
+    paths = []
+    for name in ("ca-cert.pem", "client-cert.pem", "client-key.pem"):
+        path = tmp_path / name
+        path.write_text("dummy", encoding="utf-8")
+        paths.append(str(path))
+    return paths[0], paths[1], paths[2]
+
+
+class TestSslKwargs:
+    def test_non_ssl_protocol_returns_empty(self, tmp_path: Any) -> None:
+        """非 SSL 协议不注入任何 ssl_* 参数（即使配了证书）。"""
+        ca, cert, key = _cert_files(tmp_path)
+        settings = _settings(
+            security_protocol="SASL_PLAINTEXT",
+            ca_cert_path=ca,
+            client_cert_path=cert,
+            client_key_path=key,
+        )
+        assert build_ssl_kwargs(settings) == {}
+
+    def test_ca_only(self, tmp_path: Any) -> None:
+        """只配 CA 时仅返回 ssl_cafile（向后兼容单向 TLS / SCRAM）。"""
+        ca, _, _ = _cert_files(tmp_path)
+        assert build_ssl_kwargs(_settings(ca_cert_path=ca)) == {"ssl_cafile": ca}
+
+    def test_mtls_pair(self, tmp_path: Any) -> None:
+        """CA + 客户端证书成对配置时三者全部注入。"""
+        ca, cert, key = _cert_files(tmp_path)
+        kwargs = build_ssl_kwargs(
+            _settings(ca_cert_path=ca, client_cert_path=cert, client_key_path=key)
+        )
+        assert kwargs == {"ssl_cafile": ca, "ssl_certfile": cert, "ssl_keyfile": key}
+
+    def test_partial_mtls_raises(self, tmp_path: Any) -> None:
+        """只配证书或只配私钥视为配置错误（提前暴露，不静默跳过握手）。"""
+        _, cert, _ = _cert_files(tmp_path)
+        with pytest.raises(ValueError, match="CLIENT_KEY_PATH"):
+            build_ssl_kwargs(_settings(client_cert_path=cert))
+
+    def test_missing_file_raises(self, tmp_path: Any) -> None:
+        """证书路径指向不存在的文件时提前失败，避免只看到模糊的 SSL 握手错误。"""
+        missing = tmp_path / "missing.pem"
+        with pytest.raises(FileNotFoundError, match="mTLS 客户端证书"):
+            build_ssl_kwargs(
+                _settings(client_cert_path=str(missing), client_key_path=str(missing))
+            )
+
+
+class TestProducerMtlsWiring:
+    """两个 producer 的 KafkaProducer 参数须一致带出 mTLS 客户端证书。"""
+
+    @staticmethod
+    def _patch_kafka_producer(monkeypatch: Any) -> dict[str, Any]:
+        pytest.importorskip("kafka")
+        captured: dict[str, Any] = {}
+
+        class _FakeKafkaProducer:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr("kafka.KafkaProducer", _FakeKafkaProducer)
+        return captured
+
+    def test_sim_data_producer(self, monkeypatch: Any, tmp_path: Any) -> None:
+        captured = self._patch_kafka_producer(monkeypatch)
+        ca, cert, key = _cert_files(tmp_path)
+        settings = _settings(
+            ca_cert_path=ca, client_cert_path=cert, client_key_path=key
+        )
+        SimDataProducer(settings, sim_id="sim-tls")._build_kafka_producer()
+        assert captured["ssl_cafile"] == ca
+        assert captured["ssl_certfile"] == cert
+        assert captured["ssl_keyfile"] == key
+
+    def test_telemetry_producer(self, monkeypatch: Any, tmp_path: Any) -> None:
+        captured = self._patch_kafka_producer(monkeypatch)
+        ca, cert, key = _cert_files(tmp_path)
+        settings = _settings(
+            ca_cert_path=ca, client_cert_path=cert, client_key_path=key
+        )
+        TelemetryProducer(settings, vehicle_id="v-1")._build_kafka_producer()
+        assert captured["ssl_certfile"] == cert
+        assert captured["ssl_keyfile"] == key
 
 
 # ─── V2.12.0：缓冲溢出可观测 + 重投异步失败不静默 ──────────────────────────

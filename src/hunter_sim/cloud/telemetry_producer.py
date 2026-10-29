@@ -16,6 +16,7 @@ import threading
 from collections import deque
 from typing import Any, Callable, Optional
 
+from hunter_sim.cloud.kafka_security import build_ssl_kwargs
 from hunter_sim.cloud.telemetry_mapper import build_event, build_health, build_telemetry
 from hunter_sim.common.models import CloudSettings, VehicleState
 from hunter_sim.common.utils import get_logger
@@ -105,8 +106,8 @@ class TelemetryProducer:
             kwargs["sasl_plain_username"] = s.sasl_username.get_secret_value()
         if s.sasl_password is not None:
             kwargs["sasl_plain_password"] = s.sasl_password.get_secret_value()
-        if s.security_protocol.upper().endswith("SSL") and s.ca_cert_path:
-            kwargs["ssl_cafile"] = s.ca_cert_path
+        # CA / mTLS 客户端证书（9093 接入面强制 ssl.client.auth=required）
+        kwargs.update(build_ssl_kwargs(s))
         return KafkaProducer(**kwargs)
 
     def close(self, timeout: float = 3.0) -> None:

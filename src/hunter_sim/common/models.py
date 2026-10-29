@@ -423,6 +423,12 @@ class CloudSettings(BaseSettings):
     sasl_username: Optional[SecretStr] = None
     sasl_password: Optional[SecretStr] = None
     ca_cert_path: Optional[str] = Field(None, description="SASL_SSL CA 证书路径（None 用系统信任链）")
+    client_cert_path: Optional[str] = Field(
+        None, description="mTLS 客户端证书路径（broker 强制 ssl.client.auth=required 时必填）"
+    )
+    client_key_path: Optional[str] = Field(
+        None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
+    )
     # ── sim_id 与 Topic 模板 ──
     sim_id: str = Field("", description="当前实例 sim_id（空=运行时由 instance_manager 分配）")
     sim_id_prefix: str = Field("sim", description="GUI 单实例模式 sim_id 前缀")

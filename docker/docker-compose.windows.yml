@@ -53,7 +53,7 @@ services:
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:3.0.2
+    image: hunter-sim:3.0.3
     command: ["carla-manager"]
     ports:
       - "8090:8090"
@@ -126,6 +126,11 @@ services:
       HUNTER_CORE_SASL_MECHANISM: ${HUNTER_CORE_SASL_MECHANISM:-SCRAM-SHA-512}
       HUNTER_CORE_SASL_USERNAME: ${HUNTER_CORE_SASL_USERNAME:-}
       HUNTER_CORE_SASL_PASSWORD: ${HUNTER_CORE_SASL_PASSWORD:-}
+      # TLS 证书（9093 强制双向 TLS）：路径需在容器内可见，
+      # 建议把接入包证书放到 data/certs/ 下（../data 已挂载到 /home/hunter/app/data）
+      HUNTER_CORE_CA_CERT_PATH: ${HUNTER_CORE_CA_CERT_PATH:-}
+      HUNTER_CORE_CLIENT_CERT_PATH: ${HUNTER_CORE_CLIENT_CERT_PATH:-}
+      HUNTER_CORE_CLIENT_KEY_PATH: ${HUNTER_CORE_CLIENT_KEY_PATH:-}
       HUNTER_CORE_SIM_ID: ${HUNTER_CORE_SIM_ID:-}
       HUNTER_CORE_GATEWAY_URL: ${HUNTER_CORE_GATEWAY_URL:-http://192.168.31.35:8080}
       HUNTER_CORE_JWT_TOKEN: ${HUNTER_CORE_JWT_TOKEN:-}

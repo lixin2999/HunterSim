@@ -3,6 +3,7 @@
 本层封装 CARLA 仿真向 HunterCore 数据采集分析平台回传的所有组件：
 
 - ``sim_data_producer``：发布 ``carla.{sim_id}.sensor_data``（6 类 type）；
+- ``kafka_security``：CA / mTLS 客户端证书 → kafka-python ``ssl_*`` 参数；
 - ``sim_data_mapper``：6 类消息构造函数（纯函数，可独立单测）；
 - ``vil_state_parser``：解析 ``carla.{sim_id}.vil_state`` 消息；
 - ``bag_uploader``：rosbag 经 data-collector 预签名直传 MinIO；
