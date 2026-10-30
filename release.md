@@ -1724,7 +1724,7 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
   - 流程：`doctor` 预检 → 依次拉起 `carla-manager`(:8090) 与 `probes`(:8080，可选) → 轮询 `/health` 就绪 → `webbrowser.open` 打开 `/viz` → 前台守护，`Ctrl+C` 统一回收子进程。
   - 参数：`--skip-doctor`（跳过预检）、`--strict`（warn 提为 fail）、`--force`（有 fail 项仍启动）、`--no-browser`（只打印地址）、`--no-probes`（不拉探针面）、`--path`（磁盘/状态库基准路径）、`--log-level`。
   - 幂等：目标端口已有同服务在跑时识别为「已运行」并复用，不重复拉起；子进程异常退出时按非零码返回并回收其余进程。
-- **`doctor` 新增 `platform` 检查项（`cli/main.py`）**：`HUNTER_CORE_ENABLED=false` 时 `skip`；开启时解析 `HUNTER_CORE_KAFKA_BOOTSTRAP` 并提示连通性结论，不可达给 `warn`（遥测/上传将降级），地址不可解析时同样 `warn` 并给出原因。
+- **`doctor` 新增 `platform` 检查项（`cli/main.py`）**：`HUNTER_CORE_ENABLED=false` 时 `skip`；开启时解析 `HUNTER_CORE_GATEWAY_URL` 并对 api-gateway 做 TCP 探测，不可达给 `warn`（遥测/上传将降级），地址不可解析时同样 `warn` 并给出原因（Kafka 连通性由独立的 `kafka` 项检查）。
 - **只读可视化客户端 `/viz`（`visualization/routes.py` + `assets/`）**：单页应用（无构建步骤），8 个端点全部 `include_in_schema=False`，不进 OpenAPI、不算第二套业务面：
 
   | 端点 | 作用 |
@@ -1788,5 +1788,73 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **SSE 未经反向代理实测**：心跳 15s 用于规避空闲断连，但 Nginx/网关的缓冲与超时配置未验证；断线时页面会降级为轮询，功能可用但实时性下降。
 - **事件列表为内存快照**：`detected_events` 随实例生命周期存在，实例终态回收后页面不再展示历史事件（历史事件需从产物 JSON / 平台侧获取）。
 - **ruff 全仓风格欠账未处理**：`make lint` 门禁仍是 flake8（0 告警）；`ruff check` 对历史代码仍报大量 UP/I 类风格问题，属独立清理任务，本版未纳入。
+
+---
+
+## V3.1.1 — `/viz` 让失败可见 + `huntersim up --demo` 冒烟场景
+
+**发布日期**：2026-10-30
+**版本定位**：V3.1.0 交付后的首个可用性补丁。只改「人怎么知道发生了什么」：页面把实例 `message`、参与者数与场景名/ID 写出来，终态实例不再无效拉流；`up` 新增 `--demo`，就绪后自动提交一个 SIL 冒烟场景。**无新增端点、无配置项变更、无数据面/平台契约变更**。
+
+### 现场 / 需求
+
+现场按 V3.1.0 执行 `huntersim up` 后打开 `/viz`，看到的现象：
+
+| 位置 | 现象 |
+|---|---|
+| 顶栏 | 控制面/日志正常，CARLA 灯未连接 |
+| 实例下拉 | 存在一个 `failed / FAILED` 实例，场景名显示为 `????` |
+| 画面 | 一直「暂无画面」，无报错文案 |
+| 传感器/事件 | 全空；日志面板仅 3 条启动日志 |
+| 服务端日志 | `screenshot` / `sensors/lidar` / `sensors/imu` / `stream.mjpg` 连续 `409` |
+
+用户诉求：「页面能看出为什么没画面」与「`up` 之后能马上看到东西」。
+
+### 根因（对照服务日志与代码）
+
+1. **`failed` 实例是重启前遗留的旧实例**：控制面重启时会把未结束实例收敛为 `failed(message=adapter restarted)`（既有 fail-fast 语义）。`status` 非活动后，`/stream.mjpg`、`/screenshot`、`/sensors/*` 一律 `409`——这是设计行为，但页面**既没有展示 `message`，也没有在终态停止拉流**，于是表现为「静默无画面 + 409 刷屏」。
+2. **本次 `up` 没有创建任何实例**：服务日志中无 `POST /api/v1/instances`，平台也没有下发场景；`up` 只负责起服务，页面自然没有活场景可看。此前缺少「不依赖平台也能立刻验证链路」的入口。
+3. **场景名 `????` 与 409 无关**：中文在提交端按 GBK 拼进 JSON（Windows 控制台/PowerShell 默认编码），服务端按 UTF-8 解码失败——属提交通道编码问题，非服务端缺陷。
+
+### 新增能力
+
+- **`huntersim up --demo`（`cli/main.py`）**：全部服务就绪后 `POST /api/v1/instances` 创建 SIL 冒烟场景，参数为 `mode=sil` / `map=Town03` / `ego_vehicle=hunter_se` / `sensors=[hunter_se_full]`（`record=false`，不占现场磁盘）/ `duration=120s`；请求体显式 `ensure_ascii=False` + UTF-8 编码，避免中文场景名退化为 `????`；创建超时 20s。
+  - 失败只提示不阻断：`[up] 就绪后附加动作失败（…），服务仍在运行`（CARLA 未起时冒烟场景会以 `failed` 结束，重跑 `--demo` 即可）。
+  - 输出提示实例 ID 与 `/viz` 地址，页面下拉选中后即可看画面/传感器/事件。
+- **`visualization/launcher.py` 新增就绪回调 `on_ready`**：`Launcher.run(..., on_ready=callable)`，在全部服务就绪（含复用已运行服务）后执行一次；异常只 `emit` 提示，不影响守护与 `Ctrl+C` 回收语义。
+
+### 修复与实现要点
+
+- **实例面板展示失败原因（`assets/app.js`）**：新增「原因」行直接渲染 `message`（`failed` 红、其余黄），状态行按 `failed`/`canceled` 高亮；场景显示为 `name（id）`；新增「参与者」数（`actors_count`）。`assets/style.css` 新增 `.kv dd.err/.warn` 与 `.kv dt.kv-label.err/.warn` 高亮规则（复用既有 `--err`/`--warn` 变量）。
+- **终态不再拉流**：`refreshDetail` 检测到实例进入终态时 `stopVideo()` 并在画面区写明「实例已结束（failed）：<原因>」；`startVideo` 对终态实例直接提示而不再发起 `stream.mjpg`/截图轮询，消除 `409` 持续刷屏。
+- **`up` 输出改为逐行刷新**：`Launcher` 默认 `emit` 换成 `flush=True` 的 `_print_line`，`_run_demo` 与 `_cmd_up` 进度输出同样刷新，并把 `sys.stdout` 设为 `line_buffering=True`（尽力而为）。此前 `huntersim up > up.log` 时父进程被块缓冲，现场看到的是「服务起来了但日志一片空白」。
+- **文档修正（`platform` 检查项口径）**：V3.1.0 章节与手册原写作「校验 `HUNTER_CORE_KAFKA_BOOTSTRAP`」，与实现不符——`_check_platform` 读的是 `settings.cloud.gateway_url`（`HUNTER_CORE_GATEWAY_URL`）并对 api-gateway 做 TCP 探测，Kafka 由独立的 `kafka` 项检查。`release.md` V3.1.0 章节、`user_manual.md` §2.2 已改正。
+
+### 配置与指标变更
+
+- **无新增配置项**：`--demo` 复用 `ADAPTER_HOST` / `ADAPTER_PORT` 与 `VIZ_AUTO_OPEN_BROWSER`；冒烟时长（120s）与创建超时（20s）为 `cli/main.py` 内常量。
+- 无新增/变更 Prometheus 指标。
+
+### 质量门禁（实测）
+
+- `pytest -q`：**1140 passed**，全仓行覆盖 **84.4%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 86 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增测试（`tests/test_viz_launcher.py` +14）：`on_ready` 就绪后执行一次 / 复用已运行服务时也执行 / 异常只提示不改退出码 / 必需服务未就绪时不执行；`up --demo` 仅登记回调（不在 `up` 内立即执行）、默认无回调；`_demo_payload` 字段口径；`_manager_base_url` 通配回落；`_create_demo_instance` 的 UTF-8 请求体与 `Content-Type`、`instance_id`/`sim_instance_id` 解析、时间戳场景 ID、HTTP 失败 / 响应不可解析 / 缺 `instance_id` 三类错误；`_run_demo` 输出实例 ID 与 `/viz` 地址。`node --check assets/app.js` 通过。
+- **启动冒烟（本机实测，无 CARLA）**：`huntersim up --skip-doctor --no-browser --no-probes --demo` 拉起后自动创建实例 `inst-3ca0…`：`POST /api/v1/instances` 返回 `200`，`scene_name` 为 `一键冒烟（SIL · Town03）`（中文未退化为 `????`）且无平台下发；因缺 `carla` 模块，实例按预期以 `failed(message=execution_unavailable:No CARLA client available…)` 结束——这正是页面「原因」行要展示的内容，`actors_count=1`、`total_time_s=120` 符合预期；`/viz/api/status` 返回 `version=3.1.1` / `instances.total=1,active=0` / `platform.enabled=false`。
+
+### 兼容性说明
+
+- **对外契约零改动**：平台 10 个 `/api/v1/*` 端点、`/health`、`/metrics`、MJPEG/截图出口与 Kafka Topic 均未变；`/viz*` 仍全部 `include_in_schema=False`。
+- **`up` 默认行为不变**：不加 `--demo` 时与本补丁前的编排完全一致；`on_ready` 是可选形参，既有调用方无需改动。
+- **页面仅增展示**：`instance-info` 新增「原因」「参与者」行，原有键值顺序保留，不影响任何脚本解析（API 未变）。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.1.0 → 3.1.1`，镜像 tag `hunter-sim:3.1.1`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md` 已同步。升级步骤：`git pull` → `uv sync` → `uv pip install -e .`（刷新安装元数据，否则 `/viz/api/status` 仍显示旧版本）→ `huntersim up --demo`。
+
+### 待办 / 已知边界
+
+- **未在带 CARLA 的现场机器复跑 `--demo` 端到端**：本机沙箱无 CARLA（`CarlaUE4.exe` 与工作区不在同一盘符），冒烟链路仅验证到「请求构造 + 响应解析 + 回调时序」；CARLA 就绪后 `--demo` 的首帧时延、`Town03` 默认出生点是否可用需现场确认。
+- **`????` 需现场按 UTF-8 复验**：页面/服务端已确认不破坏中文（请求体显式 UTF-8）；PowerShell 侧仍需 `[Console]::OutputEncoding = [Text.Encoding]::UTF8` + `Invoke-RestMethod -ContentType 'application/json; charset=utf-8'`，或用 `curl.exe --data-binary @file.json` 规避编码转换。
+- **旧实例的 `failed` 记录不会自动清理**：实例库保留历史实例，`/viz` 下拉仍能看到重启前的 `failed(adapter restarted)`；属审计需要，不视为缺陷。
+- **`--demo` 只建一个场景**：单世界串行语义下重复执行会排队/与运行中实例冲突（返回 `409`），提示后自行决定是否重试。
 
 

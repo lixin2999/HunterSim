@@ -6,11 +6,13 @@
 - 服务清单：控制面必启、探针面可选，地址取自配置；
 - 就绪等待：子进程提前退出即失败，必需服务不就绪返回 1，可选服务失败只提示；
 - 生命周期：任一同管子进程退出返回其退出码，Ctrl+C 统一 terminate（必要时 kill）；
-- CLI：``up`` 参数默认值、预检 fail 中止、``--force`` / ``--no-browser`` / ``--no-probes``。
+- 就绪回调：``on_ready`` 在服务全部就绪后执行一次，抛异常只提示；``up --demo`` 用它建冒烟场景；
+- CLI：``up`` 参数默认值、预检 fail 中止、``--force`` / ``--no-browser`` / ``--no-probes`` / ``--demo``。
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import urllib.error
 from typing import Any, Callable, Optional, Sequence
@@ -97,6 +99,22 @@ def _launcher(
 def _interrupt(_: float) -> None:
     """守护循环里的「Ctrl+C」。"""
     raise KeyboardInterrupt
+
+
+class _BytesResponse:
+    """``urllib`` 响应替身：只提供 ``read`` 与上下文管理。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_BytesResponse":
+        return self
+
+    def __exit__(self, *args: Any) -> bool:
+        return False
 
 
 class TestServiceSpec:
@@ -284,6 +302,56 @@ class TestRunLifecycle:
         assert any(_VIZ_URL in line for line in emitted)
 
 
+class TestRunOnReady:
+    """就绪回调：``up --demo`` 依赖它在就绪后提交冒烟场景。"""
+
+    def test_callback_runs_once_after_ready(self) -> None:
+        calls: list[str] = []
+        responses = iter([False, True])
+        launcher = _launcher(
+            popen=lambda argv: _Process(codes=[None]),
+            probe=lambda url: next(responses),
+            sleeper=_interrupt,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL, on_ready=lambda: calls.append("demo")) == 0
+        assert calls == ["demo"]
+
+    def test_callback_runs_when_service_is_reused(self) -> None:
+        calls: list[str] = []
+        launcher = _launcher(probe=lambda url: True, sleeper=_interrupt)
+
+        assert launcher.run([_manager()], _VIZ_URL, on_ready=lambda: calls.append("demo")) == 0
+        assert calls == ["demo"]
+
+    def test_callback_failure_is_reported_not_fatal(self) -> None:
+        emitted: list[str] = []
+        responses = iter([False, True])
+
+        def broken() -> None:
+            raise RuntimeError("CARLA 未就绪")
+
+        launcher = _launcher(
+            popen=lambda argv: _Process(codes=[None]),
+            probe=lambda url: next(responses),
+            sleeper=_interrupt,
+            emit=emitted.append,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL, on_ready=broken) == 0
+        assert any("就绪后附加动作失败" in line and "CARLA 未就绪" in line for line in emitted)
+
+    def test_callback_is_skipped_when_required_service_fails(self) -> None:
+        calls: list[str] = []
+
+        code = _launcher(probe=lambda url: False).run(
+            [_manager()], _VIZ_URL, on_ready=lambda: calls.append("demo")
+        )
+
+        assert code == 1
+        assert calls == []
+
+
 class _FakeLauncher:
     """拦截 ``Launcher`` 的替身，记录 ``up`` 传入的清单与参数。"""
 
@@ -296,11 +364,13 @@ class _FakeLauncher:
         *,
         open_browser: bool = True,
         ready_timeout_s: float = 0.0,
+        on_ready: Optional[Callable[[], None]] = None,
     ) -> int:
         type(self).recorded = {
             "specs": list(specs),
             "url": viz_url,
             "open_browser": open_browser,
+            "on_ready": on_ready,
         }
         return 0
 
@@ -319,6 +389,7 @@ class TestUpCommand:
             False,
             False,
         )
+        assert args.demo is False
 
     def test_aborts_when_doctor_fails(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -371,3 +442,116 @@ class TestUpCommand:
         assert checked == []
         assert [spec.name for spec in _FakeLauncher.recorded["specs"]] == ["carla-manager"]
         assert "已跳过预检" in capsys.readouterr().out
+
+    def test_demo_registers_ready_callback(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _FakeLauncher.recorded = {}
+        created: list[str] = []
+        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+        monkeypatch.setattr(cli, "_run_demo", lambda settings: created.append("demo"))
+        monkeypatch.setattr(launcher_module, "Launcher", _FakeLauncher)
+
+        assert main(["up", "--skip-doctor", "--demo", "--no-browser"]) == 0
+        on_ready = _FakeLauncher.recorded["on_ready"]
+        assert callable(on_ready)
+        assert created == []  # 仅登记回调，由 Launcher 在就绪后执行
+        on_ready()
+        assert created == ["demo"]
+        capsys.readouterr()
+
+    def test_default_up_has_no_ready_callback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _FakeLauncher.recorded = {}
+        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+        monkeypatch.setattr(launcher_module, "Launcher", _FakeLauncher)
+
+        assert main(["up", "--skip-doctor", "--no-browser"]) == 0
+        assert _FakeLauncher.recorded["on_ready"] is None
+
+
+class TestDemoScene:
+    """``up --demo`` 的请求构造与提交（不联真实控制面）。"""
+
+    def test_payload_matches_platform_contract(self) -> None:
+        payload = cli._demo_payload("demo-smoke-1", duration_s=30.0)
+        config = payload["scene_config"]
+
+        assert payload["scene_id"] == "demo-smoke-1"
+        assert payload["mode"] == "sil"
+        assert config["map"]["map_id"] == "Town03"
+        assert set(config["map"]["spawn_point"]) == {"x", "y", "z", "yaw"}
+        assert config["ego_vehicle"]["model"] == "hunter_se"
+        assert config["sensors"] == [
+            {"profile": "hunter_se_full", "enabled": True, "ros_enabled": False, "record": False}
+        ]
+        assert config["duration"] == 30.0
+
+    def test_manager_base_url_falls_back_to_loopback(self) -> None:
+        assert cli._manager_base_url(_settings(host="0.0.0.0")) == "http://127.0.0.1:8090"
+        assert cli._manager_base_url(_settings(adapter_port=18090, host="10.0.0.8")) == (
+            "http://10.0.0.8:18090"
+        )
+
+    def test_create_posts_utf8_json_and_returns_instance_id(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def opener(request: Any, timeout: float = 0.0) -> _BytesResponse:
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return _BytesResponse(b'{"instance_id": "inst-demo"}')
+
+        instance_id = cli._create_demo_instance(_settings(), opener=opener, scene_id="demo-smoke-1")
+
+        assert instance_id == "inst-demo"
+        request = captured["request"]
+        assert request.full_url == "http://127.0.0.1:8090/api/v1/instances"
+        assert request.get_method() == "POST"
+        headers = {key.lower(): value for key, value in request.header_items()}
+        assert headers["content-type"] == "application/json; charset=utf-8"
+        body = json.loads(request.data.decode("utf-8"))
+        assert body["scene_id"] == "demo-smoke-1"
+        # ensure_ascii=False + 显式 UTF-8：中文场景名不得退化为 “????”
+        assert "一键冒烟" in body["scene_name"]
+        assert captured["timeout"] == cli._DEMO_CREATE_TIMEOUT_S
+
+    def test_scene_id_defaults_to_timestamp(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def opener(request: Any, timeout: float = 0.0) -> _BytesResponse:
+            seen.update(json.loads(request.data.decode("utf-8")))
+            return _BytesResponse(b'{"sim_instance_id": "inst-sim"}')
+
+        assert cli._create_demo_instance(_settings(), opener=opener) == "inst-sim"
+        assert str(seen["scene_id"]).startswith("demo-smoke-")
+
+    def test_http_failure_raises_runtime_error(self) -> None:
+        def opener(request: Any, timeout: float = 0.0) -> _BytesResponse:
+            raise urllib.error.URLError("connection refused")
+
+        with pytest.raises(RuntimeError, match="创建冒烟场景失败"):
+            cli._create_demo_instance(_settings(), opener=opener)
+
+    def test_missing_instance_id_raises_runtime_error(self) -> None:
+        def opener(request: Any, timeout: float = 0.0) -> _BytesResponse:
+            return _BytesResponse(b'{"detail": "boom"}')
+
+        with pytest.raises(RuntimeError, match="缺少 instance_id"):
+            cli._create_demo_instance(_settings(), opener=opener)
+
+    def test_unparsable_response_raises_runtime_error(self) -> None:
+        def opener(request: Any, timeout: float = 0.0) -> _BytesResponse:
+            return _BytesResponse(b"not-json")
+
+        with pytest.raises(RuntimeError, match="响应不可解析"):
+            cli._create_demo_instance(_settings(), opener=opener)
+
+    def test_run_demo_prints_instance_and_viz_url(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_create_demo_instance", lambda settings: "inst-demo")
+
+        cli._run_demo(_settings())
+
+        out = capsys.readouterr().out
+        assert "inst-demo" in out
+        assert "http://127.0.0.1:8090/viz" in out

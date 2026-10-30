@@ -74,7 +74,7 @@ services:
         # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ PIP_TRUSTED_HOST=mirrors.aliyun.com
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:3.1.0
+    image: hunter-sim:3.1.1
     command: ["carla-manager"]
     ports:
       - "8090:8090"
@@ -179,7 +179,7 @@ services:
 
   # ── 只读运维探针面（8080，无业务无鉴权）─────────────────────────────────────
   probes:
-    image: hunter-sim:3.1.0
+    image: hunter-sim:3.1.1
     command: ["probes"]
     ports:
       - "8080:8080"

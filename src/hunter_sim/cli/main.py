@@ -1,7 +1,8 @@
-"""HunterSim 命令行工具入口（V3.1.0）。
+"""HunterSim 命令行工具入口（V3.1.1）。
 
 当前提供：
 - ``huntersim up``：一键启动仿真端（预检 → 控制面 → 探针面 → 打开可视化客户端）；
+  ``--demo`` 可在就绪后自动提交一个 SIL 冒烟场景，立即在页面上看到画面/传感器/事件；
 - ``huntersim carla-manager``：启动唯一业务入口（控制面 :8090）；
 - ``huntersim probes``：启动只读运维探针面（:8080，仅 ``/health`` + ``/metrics``）；
 - ``huntersim doctor``：部署前自检（配置/端口/磁盘/CARLA SDK/GPU 环境/
@@ -24,9 +25,12 @@ import json
 import shutil
 import socket
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 from hunter_sim.common.models import HunterSimSettings
@@ -42,6 +46,10 @@ _MIN_DISK_WARN_GB = 20.0
 _MIN_DISK_FAIL_GB = 5.0
 # 录制目录可用空间 fail 阈值（GB）：低于此值无法支撑一次完整场景录制
 _MIN_RECORDINGS_FREE_GB = 5.0
+
+# 一键冒烟场景：默认时长（秒）与创建超时（秒）
+_DEMO_DURATION_S = 120.0
+_DEMO_CREATE_TIMEOUT_S = 20.0
 
 _STATUS_ORDER = ("ok", "warn", "fail", "skip")
 
@@ -538,8 +546,118 @@ def _print_plan(specs: list[Any], viz: str, settings: HunterSimSettings) -> None
     print("")
 
 
+def _enable_line_buffering() -> None:
+    """标准输出改为行缓冲（现场 `huntersim up > 日志` 时进度仍实时可见）。
+
+    重定向到文件时 ``sys.stdout`` 是块缓冲，子进程启动信息会“压在缓冲区里”
+    直到退出才落盘，看起来像卡住。仅尽力而为：非 TTY 替身/已被替换的
+    流可能不支持 ``reconfigure``，失败不影响主流程。
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        reconfigure(line_buffering=True)
+    except (ValueError, OSError):
+        pass
+
+
+def _manager_base_url(settings: HunterSimSettings) -> str:
+    """控制面本机基础地址（通配监听回落 ``127.0.0.1``）。"""
+    host = (settings.adapter.host or "").strip()
+    if host in ("", "0.0.0.0", "::", "[::]"):
+        host = "127.0.0.1"
+    return f"http://{host}:{settings.adapter.port}"
+
+
+def _demo_payload(scene_id: str, *, duration_s: float = _DEMO_DURATION_S) -> dict[str, Any]:
+    """构造 ``--demo`` 的 SIL 冒烟场景请求体（字段口径与平台下发一致）。"""
+    return {
+        "scene_id": scene_id,
+        "scene_name": "一键冒烟（SIL · Town03）",
+        "mode": "sil",
+        "scene_config": {
+            "map": {
+                "map_id": "Town03",
+                "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.3, "yaw": 0.0},
+            },
+            "ego_vehicle": {"model": "hunter_se"},
+            # 冒烟不写录制文件，避免占满现场磁盘；需要录制时用平台/curl 下发
+            "sensors": [
+                {
+                    "profile": "hunter_se_full",
+                    "enabled": True,
+                    "ros_enabled": False,
+                    "record": False,
+                }
+            ],
+            "duration": duration_s,
+        },
+    }
+
+
+def _create_demo_instance(
+    settings: HunterSimSettings,
+    *,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    scene_id: str = "",
+    duration_s: float = _DEMO_DURATION_S,
+) -> str:
+    """创建一个 SIL 冒烟实例，返回实例 ID。
+
+    Args:
+        settings: 全局配置（取 ``adapter.host/port``）。
+        opener: HTTP 客户端（默认 ``urllib.request.urlopen``，单测可注入）。
+        scene_id: 场景 ID（空则按时间戳生成，ASCII 以免控制台编码丢失）。
+        duration_s: 场景时长（秒）。
+
+    Returns:
+        新建实例的 ``instance_id``。
+
+    Raises:
+        RuntimeError: HTTP 失败、响应非 JSON 或缺字段。
+    """
+    scene = scene_id or f"demo-smoke-{int(time.time())}"
+    url = f"{_manager_base_url(settings)}/api/v1/instances"
+    # 显式 UTF-8：Windows 控制台默认 GBK，否则中文场景名会变成“????”
+    body = json.dumps(_demo_payload(scene, duration_s=duration_s), ensure_ascii=False)
+    request = urllib.request.Request(
+        url,
+        data=body.encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with opener(request, timeout=_DEMO_CREATE_TIMEOUT_S) as response:  # noqa: S310  仅本机回环
+            raw = response.read()
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"创建冒烟场景失败（{url}）：{exc}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"创建冒烟场景响应不可解析：{exc}") from exc
+    instance_id = str(payload.get("instance_id") or payload.get("sim_instance_id") or "")
+    if not instance_id:
+        raise RuntimeError(f"创建冒烟场景响应缺少 instance_id：{payload}")
+    return instance_id
+
+
+def _run_demo(settings: HunterSimSettings) -> None:
+    """``up --demo``：就绪后提交冒烟场景并打印查看方式。"""
+    from hunter_sim.visualization.routes import viz_url
+
+    instance_id = _create_demo_instance(settings)
+    print(f"[up] 已创建冒烟场景：{instance_id}", flush=True)
+    print(f"[up] 在页面左上角下拉选中该实例即可看画面/传感器/事件：{viz_url(settings)}", flush=True)
+    print(
+        "[up] 若 CARLA 尚未就绪，实例会以 failed 结束并在页面「原因」显示原因；引擎拉起后重跑 --demo",
+        flush=True,
+    )
+
+
 def _cmd_up(args: argparse.Namespace) -> int:
     """``huntersim up`` 子命令：一键启动仿真端并打开可视化客户端。"""
+    _enable_line_buffering()
     from hunter_sim.visualization.launcher import Launcher, build_service_specs
     from hunter_sim.visualization.routes import viz_url
 
@@ -573,7 +691,8 @@ def _cmd_up(args: argparse.Namespace) -> int:
     open_browser = (not args.no_browser) and settings.viz.auto_open_browser
     if open_browser:
         print("启动完成后将自动打开浏览器；可用 --no-browser 关闭。")
-    return Launcher().run(specs, url, open_browser=open_browser)
+    on_ready = (lambda: _run_demo(settings)) if args.demo else None
+    return Launcher().run(specs, url, open_browser=open_browser, on_ready=on_ready)
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -625,6 +744,11 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--force", action="store_true", help="预检有 fail 项时仍继续启动")
     up.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     up.add_argument("--no-probes", action="store_true", help="不拉起只读探针面（:8080）")
+    up.add_argument(
+        "--demo",
+        action="store_true",
+        help="就绪后自动创建一个 SIL 冒烟场景（Town03 / hunter_se_full / 120s），页面立即有数据",
+    )
     up.add_argument("--path", default=".", help="预检磁盘与状态库的基准路径")
     up.add_argument(
         "--log-level",

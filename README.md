@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.1.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 章节，V3.1.0 新增一键启动与可视化客户端）。
+- **当前版本**：`3.1.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 章节，V3.1.0 新增一键启动与可视化客户端）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -25,6 +25,7 @@ huntersim carla-manager  :8090   唯一业务入口（内网、无鉴权）
 huntersim probes  :8080          只读探针面（/health + /metrics）
 
 huntersim up                     一键启动（V3.1.0：预检 → 两进程 → 打开可视化客户端）
+├── --demo                       就绪后自动建一个 SIL 冒烟场景（V3.1.1，无平台下发也能看到画面）
 └── 可视化客户端  visualization/  /viz 单页应用：画面(MJPEG) / 传感器(ROS) / 事件 / 日志（只读）
 ```
 
@@ -255,7 +256,7 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1126 passed`（单元 + 集成），全仓行覆盖 **84.40%**（门禁 ≥80%）。
+- **测试**：`1140 passed`（单元 + 集成），全仓行覆盖 **84.4%**（门禁 ≥80%）。
 - **类型**：`mypy src/hunter_sim`（strict）**86 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。

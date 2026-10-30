@@ -33,6 +33,7 @@
   var state = {
     instanceId: "",
     instanceStatus: "",
+    instanceMessage: "",
     carlaStatus: "",
     videoInstance: "",
     videoMode: "",
@@ -123,10 +124,10 @@
   function fillKv(target, rows) {
     target.textContent = "";
     rows.forEach(function (row) {
-      target.appendChild(el("dt", "", row[0]));
+      target.appendChild(el("dt", row[2] ? "kv-label " + row[2] : "", row[0]));
       var value = row[1];
       var empty = value === undefined || value === null || value === "";
-      target.appendChild(el("dd", "", empty ? "—" : value));
+      target.appendChild(el("dd", row[2] || "", empty ? "—" : value));
     });
   }
 
@@ -299,6 +300,7 @@
       return;
     }
     state.instanceStatus = record.status || "";
+    state.instanceMessage = record.message || "";
     state.carlaStatus = record.carla_status || "";
     updateControls();
   }
@@ -318,6 +320,7 @@
     }
     state.instanceId = instanceId || "";
     state.instanceStatus = "";
+    state.instanceMessage = "";
     state.carlaStatus = "";
     var select = $("instance-select");
     if (state.instanceId) {
@@ -383,19 +386,34 @@
     applyRecord(payload);
     var progress =
       typeof payload.progress_percent === "number" ? payload.progress_percent.toFixed(1) + "%" : "—";
-    fillKv($("instance-info"), [
+    // 失败/取消时必须把原因写在页面上：平台侧也是靠 message 判断故障类型
+    var statusText = (payload.status || "?") + " / " + (payload.carla_status || "?");
+    var statusKind = payload.status === "failed" ? "err" : payload.status === "canceled" ? "warn" : "";
+    var message = String(payload.message || "").trim();
+    var messageKind = payload.status === "failed" ? "err" : "warn";
+    var sceneLabel = payload.scene_name
+      ? payload.scene_name + "（" + (payload.scene_id || "—") + "）"
+      : payload.scene_id || "—";
+    var rows = [
       ["实例 ID", payload.instance_id],
-      ["场景", payload.scene_name || payload.scene_id],
+      ["场景", sceneLabel],
       ["模式", payload.mode],
-      ["车辆", payload.vehicle_id || "—"],
-      ["状态", (payload.status || "?") + " / " + (payload.carla_status || "?")],
+      ["车辆", payload.vehicle_id],
+      ["状态", statusText, statusKind],
+    ];
+    if (message) {
+      rows.push(["原因", message, messageKind]);
+    }
+    rows.push(
       ["进度", progress],
       ["仿真时间", num(payload.current_time_s, 1) + " / " + num(payload.total_time_s, 1) + " s"],
-      ["碰撞", payload.collisions],
-      ["车道侵入", payload.lane_invasions],
+      ["参与者", num(payload.actors_count, 0)],
+      ["碰撞", num(payload.collisions, 0)],
+      ["车道侵入", num(payload.lane_invasions, 0)],
       ["录制", payload.recording_path ? formatBytes(payload.recording_bytes) : "未录制"],
-      ["更新时间", payload.updated_at || "—"]
-    ]);
+      ["更新时间", payload.updated_at]
+    );
+    fillKv($("instance-info"), rows);
 
     var ego = payload.ego_state || {};
     var heading = ego.heading === undefined ? ego.yaw : ego.heading;
@@ -408,6 +426,14 @@
       ["转角", num(ego.steering, 3)],
       ["加速度", num(ego.acceleration)]
     ]);
+
+    // 实例刚进入终态：停掉拉流/截图轮询，只保留原因提示
+    if (TERMINAL.indexOf(payload.status || "") >= 0 && state.videoMode) {
+      stopVideo();
+      setNote("video-empty", "实例已结束（" + payload.status + "）" + (message ? "：" + message : ""));
+      setNote("stream-state", "无实时画面（实例已结束）");
+      setNote("video-meta", "未推流");
+    }
   }
 
   // ── 实时画面（MJPEG → 单帧轮询降级） ─────────────────────────────────────
@@ -419,6 +445,15 @@
     var img = $("video");
     var stage = img.parentElement;
     stage.classList.remove("live");
+    if (TERMINAL.indexOf(state.instanceStatus) >= 0) {
+      // 终态实例不会再有帧：直接说明原因，避免陷入 409 → 截图轮询循环
+      state.videoMode = "";
+      var reason = state.instanceMessage ? "：" + state.instanceMessage : "";
+      setNote("video-empty", "实例已结束（" + state.instanceStatus + "）" + reason);
+      setNote("stream-state", "无实时画面（实例已结束）");
+      setNote("video-meta", "未推流");
+      return;
+    }
     setNote("video-empty", "连接图像流…");
     setNote("video-meta", "MJPEG 连接中");
     setNote("stream-state", "图像流（MJPEG）");

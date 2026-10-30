@@ -148,6 +148,11 @@ def http_ok(url: str, timeout: float = 1.5) -> bool:
         return False
 
 
+def _print_line(text: str) -> None:
+    """默认输出：立即刷新（现场常把 up 重定向到文件，块缓冲会吞掉启动进度）。"""
+    print(text, flush=True)
+
+
 class Launcher:
     """子进程编排器（依赖全部可注入，便于单测）。
 
@@ -156,7 +161,7 @@ class Launcher:
         opener: 打开浏览器的函数（默认 ``webbrowser.open``）。
         probe: 就绪探测函数（默认 ``http_ok``）。
         sleeper: 等待函数（默认 ``time.sleep``）。
-        emit: 输出函数（默认 ``print``）。
+        emit: 输出函数（默认逐行刷新的 ``print``）。
     """
 
     def __init__(
@@ -166,7 +171,7 @@ class Launcher:
         opener: Callable[[str], Any] = webbrowser.open,
         probe: Callable[[str], bool] = http_ok,
         sleeper: Callable[[float], None] = time.sleep,
-        emit: Callable[[str], None] = print,
+        emit: Callable[[str], None] = _print_line,
     ) -> None:
         self._popen = popen
         self._opener = opener
@@ -183,6 +188,7 @@ class Launcher:
         *,
         open_browser: bool = True,
         ready_timeout_s: float = MANAGER_READY_TIMEOUT_S,
+        on_ready: Optional[Callable[[], None]] = None,
     ) -> int:
         """拉起服务、打开页面并守护运行。
 
@@ -191,6 +197,8 @@ class Launcher:
             viz_url: 可视化客户端地址。
             open_browser: 是否自动打开浏览器。
             ready_timeout_s: 单个服务的就绪超时（秒）。
+            on_ready: 全部服务就绪后的回调（如 ``--demo`` 创建冒烟场景）；
+                抛异常只提示，不阻断守护。
 
         Returns:
             进程退出码：0 表示被 Ctrl+C 正常中断；否则为子进程退出码或 1。
@@ -215,6 +223,9 @@ class Launcher:
                     return 1
                 self._emit(f"[up] {spec.name} 未就绪（非必需，继续启动可视化客户端）")
 
+            if on_ready is not None:
+                self._fire_ready(on_ready)
+
             if open_browser:
                 self._open(viz_url)
             else:
@@ -238,6 +249,13 @@ class Launcher:
                 return False
             self._sleeper(_READY_POLL_INTERVAL_S)
         return self._probe(spec.health_url())
+
+    def _fire_ready(self, on_ready: Callable[[], None]) -> None:
+        """执行就绪回调（Demo 等附加动作失败不得影响守护）。"""
+        try:
+            on_ready()
+        except Exception as exc:  # noqa: BLE001  up 的主职责是守护进程
+            self._emit(f"[up] 就绪后附加动作失败（{exc}），服务仍在运行")
 
     def _open(self, url: str) -> None:
         """打开浏览器（失败只提示，不影响服务运行）。"""
