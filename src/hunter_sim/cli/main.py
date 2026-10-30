@@ -1,15 +1,16 @@
-"""HunterSim 命令行工具入口（V3.0.0）。
+"""HunterSim 命令行工具入口（V3.1.0）。
 
 当前提供：
+- ``huntersim up``：一键启动仿真端（预检 → 控制面 → 探针面 → 打开可视化客户端）；
 - ``huntersim carla-manager``：启动唯一业务入口（控制面 :8090）；
 - ``huntersim probes``：启动只读运维探针面（:8080，仅 ``/health`` + ``/metrics``）；
 - ``huntersim doctor``：部署前自检（配置/端口/磁盘/CARLA SDK/GPU 环境/
-  实例库/录制目录/mcap/Kafka），一次跑完单机部署指南里的手工检查项，
+  实例库/录制目录/mcap/Kafka/平台），一次跑完单机部署指南里的手工检查项，
   失败即非零退出，可直接用于 CI 与上线前门禁；
 - ``huntersim version``：打印包版本（供脚本核对镜像 tag 与代码版本是否一致）。
 
 设计口径：
-- 只读检查，不修改任何状态，不启动服务；
+- ``doctor`` 只读检查，不修改任何状态，不启动服务；
 - 依赖缺失（如无 nvidia-smi、未装 CARLA SDK、未装 mcap）记为 ``warn``/``skip``，
   只有会让服务起不来或跑不稳的问题才记 ``fail``；
 - 输出为人读表格 + 摘要行，``--json`` 供脚本消费。
@@ -26,6 +27,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from hunter_sim.common.models import HunterSimSettings
 from hunter_sim.engine.check_environment import check_environment
@@ -268,6 +270,33 @@ def _check_mcap() -> CheckResult:
     )
 
 
+def _check_platform(settings: HunterSimSettings) -> CheckResult:
+    """平台连接（HunterCore 数据面）：未启用时 skip，启用时探测 api-gateway。
+
+    平台连接不阻断仿真：网关不可达时仅遥测/上传降级，本机场景照常执行，
+    因此记 ``warn`` 而非 ``fail``。
+    """
+    if not settings.cloud.enabled:
+        return _skip("platform", "HUNTER_CORE_ENABLED=false（未接入平台，仅本机联调）")
+    url = (settings.cloud.gateway_url or "").strip()
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not host:
+        return _warn(
+            "platform",
+            f"HUNTER_CORE_GATEWAY_URL 不可解析：{url or '<empty>'}",
+            "期望形如 http://host:port",
+        )
+    if _tcp_open(host, port):
+        return _ok("platform", f"{host}:{port} 可连通（api-gateway）")
+    return _warn(
+        "platform",
+        f"{host}:{port} 不可达（遥测/上传将降级）",
+        "确认网络与 HUNTER_CORE_GATEWAY_URL；本机联调可置 HUNTER_CORE_ENABLED=false",
+    )
+
+
 def _check_kafka(settings: HunterSimSettings) -> CheckResult:
     """Kafka 连通性（VIL 数据面；不可达时 VIL 链路无输入）。"""
     bootstrap = settings.kafka.bootstrap_servers
@@ -378,6 +407,7 @@ def run_doctor(
     results.append(_check_recordings_dir(loaded))
     results.append(_check_mcap())
     results.append(_check_kafka(loaded))
+    results.append(_check_platform(loaded))
     results.extend(_check_gpu())
     results.extend(_check_carla_endpoints(loaded))
     results.extend(_check_ports(loaded))
@@ -489,6 +519,63 @@ def _cmd_probes(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _print_plan(specs: list[Any], viz: str, settings: HunterSimSettings) -> None:
+    """打印启动计划（各模块地址与连接目标）。"""
+    carla = settings.carla
+    print("")
+    print("仿真端启动计划：")
+    for spec in specs:
+        role = "控制面（唯一业务入口）" if spec.required else "只读探针面"
+        print(f"  {spec.name:<14} {spec.url:<28} {role}")
+    print(f"  {'可视化客户端':<11} {viz:<28} 画面/传感器/事件/日志")
+    print(f"  {'CARLA 引擎':<12} {carla.host}:{carla.rpc_port}" + (
+        "（进程托管已启用，未就绪时由控制面自动拉起）"
+        if carla.supervisor_enabled and carla.supervisor_binary_path
+        else "（需先启动 CarlaUE4.exe）"
+    ))
+    platform = "未启用（本机联调）" if not settings.cloud.enabled else settings.cloud.gateway_url
+    print(f"  {'平台接入':<13} {platform}")
+    print("")
+
+
+def _cmd_up(args: argparse.Namespace) -> int:
+    """``huntersim up`` 子命令：一键启动仿真端并打开可视化客户端。"""
+    from hunter_sim.visualization.launcher import Launcher, build_service_specs
+    from hunter_sim.visualization.routes import viz_url
+
+    settings, error = _load_settings()
+    if settings is None:
+        print(f"配置加载失败：{error}", file=sys.stderr)
+        return EXIT_FAIL
+
+    if not args.skip_doctor:
+        results = run_doctor(settings, base_path=args.path, strict=args.strict)
+        print(f"HunterSim up (version={_version_text()})")
+        print(_render_text(results))
+        counts = _counts(results)
+        if counts["fail"] > 0 and not args.force:
+            print(
+                "预检存在 fail 项，已中止启动（确认无影响后可加 --force 继续）",
+                file=sys.stderr,
+            )
+            return EXIT_FAIL
+    else:
+        print(f"HunterSim up (version={_version_text()})（已跳过预检）")
+
+    specs = build_service_specs(
+        settings,
+        python=sys.executable,
+        log_level=args.log_level,
+        include_probes=not args.no_probes,
+    )
+    url = viz_url(settings)
+    _print_plan(specs, url, settings)
+    open_browser = (not args.no_browser) and settings.viz.auto_open_browser
+    if open_browser:
+        print("启动完成后将自动打开浏览器；可用 --no-browser 关闭。")
+    return Launcher().run(specs, url, open_browser=open_browser)
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """``huntersim doctor`` 子命令。"""
     settings, error = _load_settings()
@@ -523,6 +610,29 @@ def build_parser() -> argparse.ArgumentParser:
         description="HunterSim 运维命令行工具（部署预检与版本查询）",
     )
     subparsers = parser.add_subparsers(dest="command", required=False)
+
+    up = subparsers.add_parser(
+        "up",
+        help="一键启动仿真端（预检 + 控制面 + 探针面 + 可视化客户端）",
+        description=(
+            "一键启动：先跑 doctor 预检，失败即中止；然后拉起控制面（:8090）与"
+            "只读探针面（:8080），最后打开可视化客户端 http://<host>:8090/viz。"
+            "Ctrl+C 统一回收子进程。"
+        ),
+    )
+    up.add_argument("--skip-doctor", action="store_true", help="跳过启动前预检")
+    up.add_argument("--strict", action="store_true", help="预检把 warn 也视为失败")
+    up.add_argument("--force", action="store_true", help="预检有 fail 项时仍继续启动")
+    up.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    up.add_argument("--no-probes", action="store_true", help="不拉起只读探针面（:8080）")
+    up.add_argument("--path", default=".", help="预检磁盘与状态库的基准路径")
+    up.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="子服务 uvicorn 日志级别",
+    )
+    up.set_defaults(handler=_cmd_up)
 
     doctor = subparsers.add_parser(
         "doctor",

@@ -1703,3 +1703,90 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **未在带 GPU 的机器上实机复跑 `doctor`**：本次验证基于 `nvidia-smi` 输出的打桩断言（采集自现场报告的 `617.42 / RTX 4070 / 8.9`），需现场执行一次 `huntersim doctor` 确认 `cuda` 项显示为 `CUDA <版本>（驱动支持），计算能力 8.9` 且状态为 `ok`。
 - **CUDA 版本依赖 `nvidia-smi` 表头**：部分精简镜像/受限环境（如仅含 `nvidia-smi` 子集或 MIG 场景）可能不输出 `CUDA Version:`，此时该字段为空、按「仅有算力」处理（不报 warn），无法反映真实 CUDA 上限——如需严格判定，后续可改为查询 `nvcc --version` 或 CUDA runtime 库版本。
 
+---
+
+## V3.1.0 — 一键启动编排 + 只读可视化客户端（画面 / 传感器 / 事件 / 日志）
+
+**发布日期**：2026-10-30
+**版本定位**：把「起服务」与「看状态」两件运维动作收进同一条命令与同一个页面。新增 `huntersim up`（预检 → 两进程 → 打开可视化客户端 → Ctrl+C 统一回收）与 `/viz` 只读单页应用；**不新增 REST 业务面、不改平台 10 个端点契约、不改数据面 Topic**，可视化完全复用既有 MJPEG / 截图出口与进程内数据。
+
+### 现场 / 需求
+
+| 类型 | 诉求 | 现状缺口 |
+|---|---|---|
+| 运维 | 一条脚本拉起全套并看到各模块状态 | 需手工开两个终端起 `carla-manager` 与 `probes`，预检、端口占用、CARLA 可达性、平台连通性只能逐项自查 |
+| 观测 | 页面里同时看到画面、传感器、事件、日志 | 只有 `/docs`、`/health`、`/metrics` 与裸 MJPEG 地址；事件只在产物 JSON 里，日志只在终端 |
+| 排障 | 现场问题需要「日志全量 + 场景事件 + 传感器帧率」对照时间线 | 缺少带时间序号的进程内日志缓冲，`<img src=stream.mjpg>` 之外无法定位断流点 |
+
+### 新增能力
+
+- **一键启动 `huntersim up`（`cli/main.py` + `visualization/launcher.py`）**：
+  - 流程：`doctor` 预检 → 依次拉起 `carla-manager`(:8090) 与 `probes`(:8080，可选) → 轮询 `/health` 就绪 → `webbrowser.open` 打开 `/viz` → 前台守护，`Ctrl+C` 统一回收子进程。
+  - 参数：`--skip-doctor`（跳过预检）、`--strict`（warn 提为 fail）、`--force`（有 fail 项仍启动）、`--no-browser`（只打印地址）、`--no-probes`（不拉探针面）、`--path`（磁盘/状态库基准路径）、`--log-level`。
+  - 幂等：目标端口已有同服务在跑时识别为「已运行」并复用，不重复拉起；子进程异常退出时按非零码返回并回收其余进程。
+- **`doctor` 新增 `platform` 检查项（`cli/main.py`）**：`HUNTER_CORE_ENABLED=false` 时 `skip`；开启时解析 `HUNTER_CORE_KAFKA_BOOTSTRAP` 并提示连通性结论，不可达给 `warn`（遥测/上传将降级），地址不可解析时同样 `warn` 并给出原因。
+- **只读可视化客户端 `/viz`（`visualization/routes.py` + `assets/`）**：单页应用（无构建步骤），8 个端点全部 `include_in_schema=False`，不进 OpenAPI、不算第二套业务面：
+
+  | 端点 | 作用 |
+  |---|---|
+  | `GET /viz` | 单页应用页面 |
+  | `GET /viz/assets/{name}` | 静态资产（白名单外一律 404，防路径穿越） |
+  | `GET /viz/api/status` | 顶栏状态灯 + 模块连通性（控制面/CARLA/平台/ROS2/场景） |
+  | `GET /viz/api/instances/{id}/events` | 场景事件（碰撞/偏离/通过等）+ 按类型计数 |
+  | `GET /viz/api/instances/{id}/sensors` | 各传感器流的帧数/帧率/最新帧摘要 + ROS2 话题状态 |
+  | `GET /viz/api/instances/{id}/sensors/{stream}` | 单流预览：`rgb` 透传、`depth`→灰度 PNG、`lidar`→抽样点、`imu`→JSON |
+  | `GET /viz/api/logs` | 日志快照（`level` / `contains` / `since_seq` / `limit` 过滤） |
+  | `GET /viz/api/logs/stream` | 日志 SSE 实时推送（首屏回放历史，心跳 15s） |
+
+- **画面**：直接复用既有 `GET /api/v1/instances/{id}/stream.mjpg`（MJPEG）与 `/screenshot`，同源无跨域；`<img>` 报错或 6s 无新帧时自动降级为单帧截图轮询，避免「黑屏但连接正常」。
+- **传感器**：`rgb` 原字节透传（JPEG/PNG）；`depth`（32FC1，米制）经 numpy 归一化到 0~50m 映射灰度后缩放输出 PNG；`lidar`（float32 xyz）按 `VIZ_LIDAR_MAX_POINTS` 抽样后以 JSON 交给 Canvas 俯视散点；`imu` 的 `repr((accel,gyro))` 解析失败时回退原始文本。
+- **事件**：读 `EventDetector` 的 `detected_events`（经 `executor`/`service` 只读方法暴露），首列显示**仿真时间** `t=<sim_time>s`（`time_stamp` 为仿真秒，而非墙钟）。
+- **日志（全量）**：新增 `visualization/logbus.py`——root logger 旁路 `Handler` + 有界 `deque`（默认 2000 条）+ 订阅者投递；SSE 收到即推（断线或环境不支持 SSE 时降级为 `since_seq` 轮询 1.5s），页面最多保留 1500 行并可暂停滚动、按级别/关键字过滤。
+
+### 修复与实现要点
+
+- **`platform_adapter/executor.py`**：新增 `detected_events()`、`ros_status()` 只读访问器，事件与 ROS 话题状态不再需要绕过执行器直接摸内部字段。
+- **`platform_adapter/service.py`**：新增 `events()` / `sensor_frame()` / `sensors()` / `ros()` / `runtime_status()` 五个只读方法；`events()` 返回注解引入模块级别名 `EventItems = list[dict[str, Any]]`（类内已有同名方法 `list`，直接写 `list[...]` 会被遮蔽，mypy strict 报 `Function "AdapterService.list" is not valid as a type`）。
+- **`platform_adapter/app.py`**：lifespan 内装配 `LogBus` 并 `register_viz_routes()`；顺手收窄配置类型——`HunterSimSettings` 加载失败时显式 `raise RuntimeError`，而不是把 `None` 继续往下传（原先 mypy strict 报 3 处 `Optional` 实参错误）。
+- **`visualization/sensor_view.py`**：深度图渲染把 Pillow 降为**可选**——numpy 缺失时返回 `None`（端点 503 并提示「深度渲染不可用（需 numpy）」）；Pillow 缺失时走新增的 `_encode_gray_png()` 标准库兜底（`struct` + `zlib` 手写 IHDR/IDAT/IEND），保证 requirements 未装 Pillow 的环境仍能出图。
+- **打包**：`pyproject.toml` 新增 `[tool.setuptools.package-data]`，把 `assets/*.html|css|js` 纳入 wheel，容器/K8s 形态 `pip install .` 后页面不会 404。
+
+### 配置与指标变更（增量，默认值向后兼容）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `VIZ_ENABLED` | `true` | 是否注册 `/viz` 页面与 `/viz/api/*` 只读端点 |
+| `VIZ_AUTO_OPEN_BROWSER` | `true` | `huntersim up` 就绪后是否自动开浏览器（`--no-browser` 可临时覆盖） |
+| `VIZ_LOG_BUFFER_SIZE` | `2000` | 日志总线环形缓冲条数（进程内，重启即清空） |
+| `VIZ_LOG_HISTORY_LIMIT` | `500` | 首屏/重连最多回放的日志条数 |
+| `VIZ_EVENT_LIMIT` | `200` | 事件面板返回条数上限 |
+| `VIZ_LIDAR_MAX_POINTS` | `4000` | 激光雷达俯视抽样点数上限 |
+| `VIZ_DEPTH_MAX_WIDTH` | `480` | 深度图预览输出宽度上限（像素，0 = 不缩放） |
+
+`.env.example` 新增 `VIZ_*` 整块（7 项，含逐行中文注释）；`Makefile` 新增 `up-local` / `up-local-headless` / `viz` 三个目标。
+
+### 质量门禁（实测）
+
+- `pytest -q`：**1126 passed**，全仓行覆盖 **84.40%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 86 source files**。
+- `flake8 src tests`：**0 告警**。
+- **启动冒烟（本机实测，无 CARLA）**：`huntersim up --no-browser --no-probes --skip-doctor` 正常拉起控制面；`/viz` 与 `/viz/assets/style.css` 返回 `200`（`text/html` / `text/css` 均带 `charset=utf-8`），`/viz/api/status` 返回 `200` 且 `version=3.1.0` / `carla.connected=false` / `log.records=3`（启动日志已进旁路缓冲），`/viz/api/logs` 返回带 `seq` 的记录与 `counts`；未知资产与未知实例均为 `404`（`instance not found: nope`），平台端点 `/api/v1/instances` 正常返回。引擎未启动时顶栏 CARLA 灯为未连接属预期。
+- 新增测试：`tests/test_log_bus.py`（级别归一化、环形容量、`since_seq`/`level`/`contains`/`limit` 过滤、`counts`、格式化失败回退原模板、`attach`/`detach` 幂等、handler 吞异常不影响业务、订阅者异常不阻断 `publish`）、`tests/test_viz_api.py`（页面与资产白名单 404、**OpenAPI 不含 `/viz`**、状态汇总降级、事件计数、传感器流 404/409、lidar 抽样、imu 解析与原始回退、depth PNG 与 numpy 缺失 503、日志续传、SSE 首帧 history）、`tests/test_viz_launcher.py`（服务规格端口跟随配置、`0.0.0.0`→`127.0.0.1`、`/health` 就绪判定、复用已运行服务、必需未就绪返回 1、可选失败不阻断、`Ctrl+C` 回收、`terminate` 超时 `kill`、浏览器失败不致命、`up` 子命令 `--force`/`--no-probes` 透传）；`tests/test_doctor_cli.py` 新增 `TestPlatformCheck` 4 个用例。
+
+### 兼容性说明
+
+- **对外契约零改动**：平台 10 个 `/api/v1/*` 端点、`/health`、`/metrics`、MJPEG/截图出口与全部 Kafka Topic 均未变；`/viz*` 全部 `include_in_schema=False`，OpenAPI 与平台侧接口发现不受影响（`test_viz_is_not_in_openapi` 显式守护）。
+- **既有启动方式仍可用**：`huntersim carla-manager` / `huntersim probes` 分进程手工启动完全保留，`up` 只是在其上做编排；`VIZ_ENABLED=false` 可整体关闭可视化端点。
+- **Pillow 变为事实可选**：深度预览不再硬依赖 Pillow（缺失走标准库 PNG 编码），`numpy` 仍是深度渲染的必要条件（缺失时该端点返回 503 并在页面提示，不影响其余面板）。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.0.4 → 3.1.0`，镜像 tag `hunter-sim:3.1.0`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步），`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md` 已同步。升级步骤：`git pull` → `uv sync` → `huntersim up`（或维持原分进程启动）；`.env` 可选择性新增 `VIZ_*` 7 项（均有默认值）。
+
+### 待办 / 已知边界
+
+- **真实 CARLA + `rclpy` 环境未联调**：画面（MJPEG 降级链）、传感器帧渲染与 ROS2 话题状态均以替身对象验证；真实场景下的首帧时延、点云抽样规模与话题计数准确性需现场确认。
+- **`/viz` 在容器/K8s 形态的访问方式未实测**：两套 compose 与 `k8s/service.yaml` 只暴露 `8090` 业务端口，页面沿用同一端口因此无需新增映射；但若通过 Ingress/NodePort 暴露，按「8090 无鉴权」约定**仍只允许内网访问**，不得加公网入口。
+- **日志只覆盖本进程**：`LogBus` 是控制面进程内的旁路 handler，`probes` 进程与 CARLA 引擎侧日志不在其中；跨进程日志仍需 `HUNTER_SIM_LOG_FILE` 或容器日志采集。
+- **SSE 未经反向代理实测**：心跳 15s 用于规避空闲断连，但 Nginx/网关的缓冲与超时配置未验证；断线时页面会降级为轮询，功能可用但实时性下降。
+- **事件列表为内存快照**：`detected_events` 随实例生命周期存在，实例终态回收后页面不再展示历史事件（历史事件需从产物 JSON / 平台侧获取）。
+- **ruff 全仓风格欠账未处理**：`make lint` 门禁仍是 flake8（0 告警）；`ruff check` 对历史代码仍报大量 UP/I 类风格问题，属独立清理任务，本版未纳入。
+
+

@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.0.4`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 章节）。
+- **当前版本**：`3.1.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 章节，V3.1.0 新增一键启动与可视化客户端）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -23,6 +23,9 @@ huntersim carla-manager  :8090   唯一业务入口（内网、无鉴权）
 └── Monitor & Recorder            MJPEG/截图 + 产物 + Prometheus 指标
 
 huntersim probes  :8080          只读探针面（/health + /metrics）
+
+huntersim up                     一键启动（V3.1.0：预检 → 两进程 → 打开可视化客户端）
+└── 可视化客户端  visualization/  /viz 单页应用：画面(MJPEG) / 传感器(ROS) / 事件 / 日志（只读）
 ```
 
 **数据面契约不变**：
@@ -33,7 +36,7 @@ huntersim probes  :8080          只读探针面（/health + /metrics）
 | 发布 | `carla.{sim_id}.sensor_data` | 6 类 type：`sim_status` / `sim_telemetry` / `sim_event` / `sim_metrics` / `sensor_file` / `artifact` |
 | 死信 | `carla.{sim_id}.sensor_data.dlq` | 反序列化失败与坏消息 |
 
-**画面出口**：`GET /api/v1/instances/{id}/stream.mjpg`（MJPEG，默认 10fps）与 `/screenshot`（单帧 JPEG）。
+**画面出口**：`GET /api/v1/instances/{id}/stream.mjpg`（MJPEG，默认 10fps）与 `/screenshot`（单帧 JPEG）；可视化客户端 `http://127.0.0.1:8090/viz` 直接复用这两个出口，不新增第二套业务面。
 
 ---
 
@@ -51,8 +54,9 @@ huntersim probes  :8080          只读探针面（/health + /metrics）
 | `cloud/` | `SimDataProducer`（有界队列 + DLQ）、`sim_data_mapper`、`vil_state_parser`、`BagUploader` |
 | `eval_service/` | 轨迹/舒适/安全/覆盖率四维评估与 S/A/B/C/D 评级 |
 | `probes/` | 只读探针应用：`/health` 聚合管理面快照，`/metrics` 只导出本进程注册表 |
+| `visualization/` | 只读可视化客户端：`/viz` 页面 + `/viz/api/*`（状态/事件/传感器/日志 SSE）、`logbus` 日志旁路、`launcher` 一键启动编排 |
 | `common/` | pydantic 配置模型、异常体系、日志、Prometheus 指标 |
-| `cli/` | `huntersim carla-manager` / `probes` / `doctor` / `version` |
+| `cli/` | `huntersim carla-manager` / `probes` / `up` / `doctor` / `version` |
 
 ---
 
@@ -71,6 +75,7 @@ HunterSim/
 │   ├── cloud/              # sim_data_producer / sim_data_mapper / vil_state_parser / bag_uploader / connector
 │   ├── eval_service/       # 评估引擎与报告
 │   ├── probes/             # 只读探针面
+│   ├── visualization/      # 可视化客户端：logbus / sensor_view / routes / launcher + assets(index.html/app.js/style.css)
 │   ├── cli/                # 运维 CLI
 │   └── common/             # 配置 / 异常 / 日志 / 指标
 ├── configs/                # weather_profiles / sensor_configs / scene_templates / traffic_config
@@ -78,7 +83,7 @@ HunterSim/
 ├── k8s/                    # 单 Pod 双容器（sim-service + probes）+ CARLA GPU Pod + PVC
 ├── tests/                  # 单元 + 集成（覆盖率门禁 ≥80%）
 ├── docs/                   # 单机部署指南
-├── Makefile                # doctor / manager / probes / test / coverage / typecheck / lint / image / up
+├── Makefile                # doctor / up-local / manager / probes / test / coverage / typecheck / lint / image / up
 ├── pyproject.toml          # 依赖与工具配置（pytest / mypy / coverage / console script）
 └── .env.example            # 全部环境变量与默认值（逐项中文注释）
 ```
@@ -110,11 +115,19 @@ huntersim doctor --json --strict               # 脚本消费 / 上线门禁（w
 ```bash
 copy .env.example .env                        # Windows（Linux: cp）
 
+huntersim up                                  # 一键：预检 → 控制面 :8090 → 探针面 :8080 → 打开 /viz
+huntersim up --no-browser                     # 不起浏览器，只打印可视化地址
+huntersim up --skip-doctor --no-probes        # 跳过预检 / 不拉探针面
+```
+
+需要分进程排障时仍可手工起：
+
+```bash
 huntersim carla-manager                       # 控制面 :8090（唯一业务入口）
 huntersim probes                              # 只读探针面 :8080（另开终端）
 ```
 
-交互式文档：<http://127.0.0.1:8090/docs>。
+交互式文档：<http://127.0.0.1:8090/docs>；可视化客户端：<http://127.0.0.1:8090/viz>。
 
 > **8090 无鉴权**，只允许内网/本机访问，禁止加 Ingress/NodePort 或映射公网。CARLA 的 2000–2002 同理。
 
@@ -144,6 +157,7 @@ curl $BASE/api/v1/instances/<ID>/result
 # 4) 实时画面
 curl -o frame.jpg $BASE/api/v1/instances/<ID>/screenshot
 # 浏览器：<img src="http://127.0.0.1:8090/api/v1/instances/<ID>/stream.mjpg">
+# 可视化看板：http://127.0.0.1:8090/viz （画面 + 传感器 + 事件 + 日志）
 ```
 
 ### 4.5 容器化
@@ -175,6 +189,7 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 | `EXECUTION_` | 执行面 | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · `lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120) |
 | `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `artifact_retention_hours`(72) · `recordings_dir` · `recording_retention_hours`(24) · `record_enabled`(true) · `record_min_free_gb`(0.5) · `upload_on_failure`(false) · `stream_fps`(10.0) · `stream_max_width`(640) · `stream_max_clients`(8) · `screenshot_quality`(75) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
 | `PROBE_` | 探针面 | `host`(127.0.0.1) · `port`(8080) · `adapter_url`(`http://127.0.0.1:8090`) |
+| `VIZ_` | 可视化客户端 | `enabled`(true) · `auto_open_browser`(true) · `log_buffer_size`(2000) · `log_history_limit`(500) · `event_limit`(200) · `lidar_max_points`(4000) · `depth_max_width`(480) |
 | `HUNTER_CORE_` | 云端接入 | `enabled`(false) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
 
 > V3.0.0 起已移除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*` 前缀与 `EXECUTION_ENGINE_ENDPOINTS` 的双引擎示例（受支持形态 = 单世界串行，端点库存留空即单引擎）。
@@ -240,8 +255,8 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1007 passed`（单元 + 集成），全仓行覆盖 **83.79%**（门禁 ≥80%）。
-- **类型**：`mypy src/hunter_sim`（strict）**80 个源文件 0 错误**。
+- **测试**：`1126 passed`（单元 + 集成），全仓行覆盖 **84.40%**（门禁 ≥80%）。
+- **类型**：`mypy src/hunter_sim`（strict）**86 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。
 - CARLA / ROS2 / mcap 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）无引擎运行。

@@ -1,6 +1,6 @@
 [project]
 name = "hunter-sim"
-version = "3.0.4"
+version = "3.1.0"
 description = "HunterSim - VIL Virtual Simulation Platform for HUNTER SE Autonomous Driving"
 readme = "README.md"
 license = {text = "MIT"}
@@ -57,6 +57,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# 可视化客户端是纯静态单页应用（无构建步骤），需随包分发
+[tool.setuptools.package-data]
+"hunter_sim.visualization" = ["assets/*.html", "assets/*.css", "assets/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

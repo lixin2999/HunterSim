@@ -25,6 +25,7 @@ from hunter_sim.cli.main import (
     _check_disk,
     _check_kafka,
     _check_mcap,
+    _check_platform,
     _check_ports,
     _check_recordings_dir,
     _counts,
@@ -274,6 +275,47 @@ class TestMcapAndKafkaChecks:
         result = _check_kafka(_settings(bootstrap_servers="not-a-host-port"))
         assert result.status == "warn"
         assert "host:port" in result.hint
+
+
+class TestPlatformCheck:
+    """平台接入项：未启用即 skip，网关不可达只 warn（不阻断本机场景）。"""
+
+    def test_disabled_is_skip(self) -> None:
+        result = _check_platform(_settings())
+
+        assert result.status == "skip"
+        assert "HUNTER_CORE_ENABLED" in result.detail
+
+    def test_reachable_gateway_is_ok(self) -> None:
+        settings = _settings()
+        settings.cloud.enabled = True
+        settings.cloud.gateway_url = "http://10.0.0.5:8080"
+
+        result = _check_platform(settings)
+
+        assert result.status == "ok"
+        assert "10.0.0.5:8080" in result.detail
+
+    def test_unreachable_gateway_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
+        settings = _settings()
+        settings.cloud.enabled = True
+        settings.cloud.gateway_url = "http://10.0.0.5:8080"
+
+        result = _check_platform(settings)
+
+        assert result.status == "warn"
+        assert "遥测/上传将降级" in result.detail
+
+    def test_malformed_url_warns(self) -> None:
+        settings = _settings()
+        settings.cloud.enabled = True
+        settings.cloud.gateway_url = "not-a-url"
+
+        result = _check_platform(settings)
+
+        assert result.status == "warn"
+        assert "不可解析" in result.detail
 
 
 class TestPortChecks:

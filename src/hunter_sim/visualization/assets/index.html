@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HunterSim 仿真可视化</title>
+  <link rel="stylesheet" href="/viz/assets/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">HS</span>
+      <div>
+        <h1>HunterSim 仿真可视化</h1>
+        <p class="muted" id="version">加载中…</p>
+      </div>
+    </div>
+    <div class="badges" id="badges">
+      <span class="badge" id="badge-manager">控制面</span>
+      <span class="badge" id="badge-carla">CARLA</span>
+      <span class="badge" id="badge-platform">平台</span>
+      <span class="badge" id="badge-ros">ROS2</span>
+      <span class="badge" id="badge-scene">场景</span>
+    </div>
+    <div class="controls">
+      <select id="instance-select" title="选择仿真实例"></select>
+      <button id="btn-pause" class="ghost" type="button">暂停</button>
+      <button id="btn-resume" class="ghost" type="button">恢复</button>
+      <button id="btn-stop" class="danger" type="button">停止</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel video-panel">
+      <div class="panel-head">
+        <h2>可视化画面</h2>
+        <span class="muted" id="video-meta">未推流</span>
+      </div>
+      <div class="video-stage">
+        <img id="video" alt="仿真实时画面" />
+        <div class="empty" id="video-empty">暂无活动场景，等待平台下发实例…</div>
+      </div>
+      <div class="video-foot">
+        <span class="muted" id="stream-state">图像流（MJPEG）</span>
+        <label class="check"><input type="checkbox" id="toggle-depth" /> 深度图预览</label>
+      </div>
+    </section>
+
+    <aside class="panel side-panel">
+      <div class="panel-head"><h2>实例状态</h2></div>
+      <dl class="kv" id="instance-info"></dl>
+      <div class="panel-head"><h2>自车状态</h2></div>
+      <dl class="kv" id="ego-info"></dl>
+      <div class="panel-head"><h2>仿真端模块</h2></div>
+      <dl class="kv" id="module-info"></dl>
+    </aside>
+
+    <section class="panel sensor-panel">
+      <div class="panel-head">
+        <h2>传感器数据</h2>
+        <span class="muted" id="sensor-note">—</span>
+      </div>
+      <div class="table-wrap">
+        <table id="sensor-table">
+          <thead>
+            <tr><th>流</th><th>帧数</th><th>帧率</th><th>最新帧时间</th><th>数据陈旧度</th><th>大小</th><th>编码/尺寸</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="previews">
+        <div class="preview-block">
+          <h3>深度图（32FC1 → 归一化）</h3>
+          <img id="depth-preview" alt="深度图预览" />
+          <p class="muted small" id="depth-empty">未开启（勾选上方「深度图预览」）</p>
+        </div>
+        <div class="preview-block">
+          <h3>激光雷达俯视（XY 抽样）</h3>
+          <canvas id="lidar-canvas" width="360" height="240"></canvas>
+          <p class="muted small" id="lidar-empty">无点云数据</p>
+        </div>
+        <div class="preview-block">
+          <h3>IMU</h3>
+          <dl class="kv" id="imu-info"></dl>
+        </div>
+      </div>
+      <div class="panel-head">
+        <h2>ROS2 话题</h2>
+        <span class="muted" id="ros-note">—</span>
+      </div>
+      <div class="table-wrap">
+        <table id="ros-table">
+          <thead>
+            <tr><th>仿真话题</th><th>实车话题</th><th>消息类型</th><th>标称频率</th><th>已发布</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel event-panel">
+      <div class="panel-head">
+        <h2>场景事件</h2>
+        <span class="muted" id="event-summary">—</span>
+      </div>
+      <ul class="event-list" id="event-list"></ul>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="panel-head">
+        <h2>仿真日志</h2>
+        <div class="log-tools">
+          <select id="log-level" title="最低级别">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO</option>
+            <option value="WARNING">WARNING</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <input id="log-filter" type="search" placeholder="关键字过滤" />
+          <button id="log-pause" class="ghost" type="button">暂停</button>
+          <button id="log-clear" class="ghost" type="button">清空</button>
+          <label class="check"><input type="checkbox" id="log-autoscroll" checked /> 自动滚动</label>
+        </div>
+      </div>
+      <pre class="log-console" id="log-console"></pre>
+    </section>
+  </main>
+
+  <script src="/viz/assets/app.js"></script>
+</body>
+</html>

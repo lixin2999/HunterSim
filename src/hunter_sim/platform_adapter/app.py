@@ -20,6 +20,10 @@
 
 运维端点：``GET /health``（聚合快照，供 ``huntersim probes`` 代理）与
 ``GET /metrics``（本进程 Prometheus 注册表）。
+
+V3.1.0 追加可视化客户端（只读、独立前缀，不进 OpenAPI）：``GET /viz`` 页面、
+``GET /viz/api/status|logs|logs/stream`` 与 ``/viz/api/instances/{id}/events|sensors``；
+页面复用既有 ``/screenshot`` 与 ``/stream.mjpg`` 回传画面。
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from prometheus_client import generate_latest
 
 from hunter_sim.common.metrics import observe_http_request, refresh_runtime_gauges
-from hunter_sim.common.models import HunterSimSettings
+from hunter_sim.common.models import HunterSimSettings, VizSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.execution.engine_pool import EnginePool, EngineEndpoint, parse_engine_endpoints
 from hunter_sim.execution.plane import ExecutionPlane
@@ -48,6 +52,8 @@ from hunter_sim.platform_adapter.models import (
 from hunter_sim.platform_adapter.service import AdapterService, StreamLimitExceeded
 from hunter_sim.platform_adapter.store import InstanceStore
 from hunter_sim.sensor_sim.frame_hub import Frame, FrameHub
+from hunter_sim.visualization.logbus import LogBus
+from hunter_sim.visualization.routes import register_viz_routes
 
 logger = get_logger(__name__)
 
@@ -122,11 +128,42 @@ def create_app(
         "executor": None,
         "service": service,
     }
+    # 可视化客户端依赖：全局配置（状态面板）+ 进程内日志总线（日志面板）
+    resolved: dict[str, Any] = {
+        "settings": settings,
+        "viz": None,
+        "bus": None,
+    }
+
+    def _resolve_settings() -> Optional[HunterSimSettings]:
+        """取全局配置（已加载则复用；否则尝试加载，失败降级为 None）。"""
+        if resolved["settings"] is not None:
+            return cast(HunterSimSettings, resolved["settings"])
+        try:
+            resolved["settings"] = HunterSimSettings()
+        except Exception as exc:  # noqa: BLE001  可视化不得因配置异常阻断服务启动
+            logger.warning(f"Viz settings unavailable, using defaults: {exc}")
+            resolved["settings"] = None
+        return cast(Optional[HunterSimSettings], resolved["settings"])
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        runtime_settings = _resolve_settings()
+        viz = runtime_settings.viz if runtime_settings is not None else VizSettings()
+        bus = LogBus(max_records=viz.log_buffer_size)
+        if viz.enabled:
+            bus.attach()
+        resolved["viz"], resolved["bus"] = viz, bus
+        app.state.settings = runtime_settings
+        app.state.viz_settings = viz
+        app.state.log_bus = bus
+        app.state.started_at = time.time()
         if owned["service"] is None:
-            runtime_settings = settings or HunterSimSettings()
+            if runtime_settings is None:
+                # 可视化可以降级，但真正接管 CARLA 的执行链必须有配置
+                raise RuntimeError(
+                    "HunterSimSettings 加载失败，无法启动控制面；请检查 .env 配置"
+                )
             runtime_adapter = adapter_settings or AdapterSettings()
             runtime_store = store or InstanceStore(
                 runtime_adapter.db_path,
@@ -165,6 +202,8 @@ def create_app(
             if owned["store"] is not None:
                 owned["store"].close()
             owned["service"] = None
+            bus.detach()
+            app.state.log_bus = None
 
     app = FastAPI(
         title="HunterSim CARLA Manager",
@@ -175,6 +214,7 @@ def create_app(
     )
 
     _register_routes(app)
+    register_viz_routes(app)
     app.add_middleware(_LatencyMiddleware)
     return app
 

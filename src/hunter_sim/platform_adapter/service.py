@@ -16,13 +16,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import socket
 import threading
 import time
 import uuid
 from typing import Any, AsyncGenerator, Callable, Optional, cast
 
 from hunter_sim.common.metrics import INSTANCE_LIFECYCLE_TOTAL, STREAM_CLIENTS
-from hunter_sim.common.models import HunterSimSettings
+from hunter_sim.common.models import ROS2_TOPIC_MAP, HunterSimSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.executor import SimulationExecutor
@@ -34,7 +35,7 @@ from hunter_sim.platform_adapter.models import (
     SubmitScenarioRequest,
 )
 from hunter_sim.platform_adapter.store import InstanceStore
-from hunter_sim.sensor_sim.frame_hub import STREAM_RGB, Frame, FrameHub
+from hunter_sim.sensor_sim.frame_hub import KNOWN_STREAMS, STREAM_RGB, Frame, FrameHub
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,8 @@ _DEFAULT_DURATION_S = 60.0
 _QUALITY_KEY = "quality"
 # MJPEG 无帧容忍时长（秒）：超过即结束响应，避免客户端无限等空流
 _STREAM_IDLE_TIMEOUT_S = 5.0
+# 事件列表类型别名：类内已有同名方法 ``list``，直接写 ``list[...]`` 会被遮蔽
+EventItems = list[dict[str, Any]]
 
 
 class StreamLimitExceeded(RuntimeError):
@@ -279,6 +282,105 @@ class AdapterService:
             return None
         return hub.latest(STREAM_RGB)
 
+    # ── 可视化只读视图（/viz 面板数据源） ──────────────────────────────────────
+
+    def events(self, instance_id: str) -> EventItems:
+        """已检测到的场景事件（无事件/无运行器时为空列表）。"""
+        getter = getattr(self._executor, "detected_events", None)
+        if not callable(getter):
+            return []
+        try:
+            events = getter(instance_id)
+        except Exception as exc:  # noqa: BLE001  只读视图不得因运行器已释放而 500
+            logger.debug(f"Read detected events failed for {instance_id}: {exc}")
+            return []
+        return [dict(item) for item in events or [] if isinstance(item, dict)]
+
+    def sensor_frame(self, instance_id: str, stream: str) -> Optional[Frame]:
+        """取指定流的最新帧（未知流/无帧返回 None）。"""
+        hub = self._frame_hub_provider(instance_id)
+        if hub is None:
+            return None
+        return hub.latest(stream)
+
+    def sensors(self, instance_id: str) -> dict[str, Any]:
+        """传感器各流的累计帧数、实时帧率与最新帧摘要。
+
+        ``attached=False`` 表示当前实例没有活动运行器（未开始采集或已结束）。
+        """
+        hub = self._frame_hub_provider(instance_id)
+        if hub is None:
+            return {"attached": False, "counts": {}, "streams": {}}
+        now = time.time()
+        streams: dict[str, Any] = {}
+        for name in KNOWN_STREAMS:
+            frame = hub.latest(name)
+            streams[name] = {
+                "count": hub.count(name),
+                "fps": round(hub.fps(name), 2),
+                "frame": None
+                if frame is None
+                else {
+                    "seq": frame.seq,
+                    "ts": round(frame.ts, 3),
+                    "size": frame.size,
+                    "age_s": round(max(0.0, now - frame.ts), 3),
+                    "meta": dict(frame.meta),
+                },
+            }
+        counts = dict(hub.stats())
+        return {"attached": True, "counts": counts, "streams": streams}
+
+    def ros(self, instance_id: str) -> dict[str, Any]:
+        """ROS2 桥接状态（未启用时 ``enabled=False``，``topics`` 仍给出映射表）。"""
+        getter = getattr(self._executor, "ros_status", None)
+        status: dict[str, Any] = {"enabled": False, "topics": {}}
+        if callable(getter):
+            try:
+                raw = getter(instance_id)
+                if isinstance(raw, dict):
+                    status = {
+                        "enabled": bool(raw.get("enabled", False)),
+                        "topics": dict(raw.get("topics") or {}),
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Read ROS status failed for {instance_id}: {exc}")
+        status["mappings"] = [_topic_view(item, status["topics"]) for item in ROS2_TOPIC_MAP]
+        return status
+
+    def runtime_status(self) -> dict[str, Any]:
+        """仿真端运行态汇总（可视化客户端顶栏）。
+
+        只汇总本进程真实掌握的信息：CARLA 连通性用一次短超时 TCP 探测，
+        探测失败不影响返回（面板显示离线即可）。
+        """
+        records = self._store.list_all()
+        active = [record for record in records if record.status in ACTIVE_STATUSES]
+        current = active[0] if active else None
+        carla = self._settings.carla
+        sensor: dict[str, Any] = {"attached": False, "counts": {}, "streams": {}}
+        ros: dict[str, Any] = {"enabled": False, "topics": {}}
+        if current is not None:
+            sensor = self.sensors(current.instance_id)
+            ros = self.ros(current.instance_id)
+        return {
+            "instances": {"total": len(records), "active": len(active)},
+            "active_instance": None if current is None else current.to_view(),
+            "carla": {
+                "endpoint": f"{carla.host}:{carla.rpc_port}",
+                "connected": _tcp_open(carla.host, carla.rpc_port),
+            },
+            "platform": {
+                "enabled": bool(self._settings.cloud.enabled),
+                "gateway_url": self._settings.cloud.gateway_url
+                if self._settings.cloud.enabled
+                else "",
+                "kafka_bootstrap": self._settings.kafka.bootstrap_servers,
+            },
+            "sensor": sensor,
+            "ros": ros,
+        }
+
     @property
     def active_streams(self) -> int:
         """当前在线的 MJPEG 客户端数（与 ``huntersim_stream_clients`` 同源）。"""
@@ -350,6 +452,28 @@ def _disk_usage_ratio(path: str) -> Optional[float]:
     except OSError:
         return None
     return usage.used / usage.total if usage.total else None
+
+
+def _tcp_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    """TCP 端口可连通（可视化顶栏的 CARLA 在线指示，短超时避免拖慢轮询）。"""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _topic_view(mapping: Any, published: dict[str, Any]) -> dict[str, Any]:
+    """ROS 话题映射行（sim/real 话题名 + 消息类型 + 已发条数）。"""
+    topic = str(getattr(mapping, "sim_topic", ""))
+    count = published.get(topic, 0)
+    return {
+        "sim_topic": topic,
+        "real_topic": str(getattr(mapping, "real_topic", "")),
+        "msg_type": str(getattr(mapping, "msg_type", "")),
+        "frequency_hz": float(getattr(mapping, "frequency_hz", 0.0) or 0.0),
+        "published": int(count) if isinstance(count, (int, float)) else 0,
+    }
 
 
 def _executor_frame_hub(

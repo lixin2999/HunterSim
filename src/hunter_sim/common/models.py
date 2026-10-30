@@ -396,6 +396,40 @@ class ProbeSettings(BaseSettings):
     )
 
 
+class VizSettings(BaseSettings):
+    """可视化客户端配置（V3.1.0，管理面 ``/viz`` 页面）。
+
+    客户端是控制面的**只读附属视图**：不新建 REST 业务面，也不持有实例状态，
+    只读取控制面已有的帧汇聚中心、事件缓冲与进程内日志总线。因此这里的配置
+    项只影响展示体积（日志条数/点云抽样/深度图宽度），不影响仿真行为。
+
+    Attributes:
+        enabled: 是否注册 ``/viz`` 页面与 ``/viz/api/*`` 只读端点。
+        auto_open_browser: ``huntersim up`` 启动后是否自动打开浏览器。
+        log_buffer_size: 日志总线环形缓冲容量（条）。
+        log_history_limit: 页面首屏/断线重连最多回放的历史日志条数。
+        event_limit: 事件面板最多返回条数。
+        lidar_max_points: 点云预览抽样上限（点）。
+        depth_max_width: 深度图预览输出宽度（像素，0 表示不缩放）。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="VIZ_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = Field(True, description="是否启用 /viz 可视化客户端页面")
+    auto_open_browser: bool = Field(True, description="huntersim up 启动后自动打开浏览器")
+    log_buffer_size: int = Field(
+        2000, ge=100, le=20000, description="日志总线环形缓冲容量（条）"
+    )
+    log_history_limit: int = Field(
+        500, ge=1, le=5000, description="日志面板首屏回放条数上限"
+    )
+    event_limit: int = Field(200, ge=1, le=2000, description="事件面板最多返回条数")
+    lidar_max_points: int = Field(4000, ge=100, le=50000, description="点云预览抽样上限")
+    depth_max_width: int = Field(480, ge=0, le=4096, description="深度图预览宽度（0=原始尺寸）")
+
+
 class CloudSettings(BaseSettings):
     """HunterCore 数据采集分析平台接入配置（V2.10.0：平台契约重构）。
 
@@ -500,6 +534,7 @@ class HunterSimSettings(BaseSettings):
     cloud: CloudSettings = Field(default_factory=CloudSettings)
     adapter: AdapterSettings = Field(default_factory=AdapterSettings)
     probe: ProbeSettings = Field(default_factory=ProbeSettings)
+    viz: VizSettings = Field(default_factory=VizSettings)
 
     @field_validator("log_level")
     @classmethod

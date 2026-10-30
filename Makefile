@@ -1,10 +1,11 @@
-# HunterSim 一键入口（V3.0.0）
+# HunterSim 一键入口（V3.1.0）
 #
 # 面向“装好依赖 → 预检 → 起服务 → 验证”的日常闭环；Windows(cmd/PowerShell)
 # 与 Linux/macOS 通用：所有配方只调用 python / docker，不依赖 sh 专有语法。
 #
-#   make doctor     # 部署前自检（配置/端口/磁盘/GPU/CARLA/实例库/录制目录/mcap/Kafka）
-#   make manager    # 前台启动唯一业务入口（控制面 8090）
+#   make up-local   # 一键启动：预检 + 控制面(8090) + 探针面(8080) + 打开可视化客户端
+#   make doctor     # 部署前自检（配置/端口/磁盘/GPU/CARLA/实例库/录制目录/mcap/Kafka/平台）
+#   make manager    # 前台启动唯一业务入口（控制面 8090，可视化 /viz）
 #   make probes     # 前台启动只读探针面（/health + /metrics，8080）
 #   make test       # 单元测试 + 覆盖率门禁
 #   make typecheck  # mypy strict
@@ -16,14 +17,14 @@
 PYTHON ?= .venv/Scripts/python.exe
 PIP ?= $(PYTHON) -m pip
 COMPOSE_FILE ?= docker/docker-compose.yml
-IMAGE_TAG ?= hunter-sim:3.0.4
+IMAGE_TAG ?= hunter-sim:3.1.0
 UV_SYNC ?= uv sync
 
-.PHONY: help install sync dev-install doctor manager probes test coverage typecheck lint \
+.PHONY: help install sync dev-install doctor manager probes up-local up-local-headless viz test coverage typecheck lint \
         image up up-carla down logs clean
 
 help:
-	@echo HunterSim targets: install sync dev-install doctor manager probes test coverage typecheck image up up-carla down logs
+	@echo HunterSim targets: install sync dev-install doctor manager probes up-local viz test coverage typecheck image up up-carla down logs
 
 # ── 依赖 ────────────────────────────────────────────────────────────────────
 install:
@@ -44,6 +45,15 @@ manager:
 
 probes:
 	$(PYTHON) -m hunter_sim.cli.main probes
+
+up-local:
+	$(PYTHON) -m hunter_sim.cli.main up
+
+up-local-headless:
+	$(PYTHON) -m hunter_sim.cli.main up --no-browser
+
+viz:
+	@echo 可视化客户端：http://127.0.0.1:8090/viz（需先 make up-local / make manager）
 
 # ── 质量门禁（与 CI 同口径：mypy strict + 覆盖率 >=80%）──────────────────────
 test:

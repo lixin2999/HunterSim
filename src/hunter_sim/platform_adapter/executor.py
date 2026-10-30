@@ -279,6 +279,33 @@ class SimulationExecutor:
             context = self._contexts.get(instance_id)
         return context.frame_hub if context is not None else None
 
+    def detected_events(self, instance_id: str) -> list[dict[str, Any]]:
+        """当前运行已检测到的场景事件（碰撞/偏离/超速等）。
+
+        只读快照：事件由 ``EventDetector`` 有界缓冲持有，实例不在运行或运行器
+        尚未装配时返回空列表（可视化客户端据此渲染事件面板）。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        if context is None or context.runner is None:
+            return []
+        return [_event_to_dict(event) for event in _detected_events(context.runner)]
+
+    def ros_status(self, instance_id: str) -> dict[str, Any]:
+        """当前运行的 ROS2 桥接状态（未启用时 ``enabled=False``）。
+
+        Returns:
+            ``{enabled, topics:{topic: 已发布条数}}``；无活动场景返回禁用态。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        bridge = context.ros_bridge if context is not None else None
+        if bridge is None:
+            return {"enabled": False, "topics": {}}
+        counter = getattr(bridge, "message_counts", None)
+        counts = dict(counter) if isinstance(counter, dict) else {}
+        return {"enabled": bool(getattr(bridge, "is_initialized", False)), "topics": counts}
+
     def _interrupt(self, instance_id: str, reason: str) -> None:
         """登记中断原因并停止当前运行器（不持锁调用 CARLA）。"""
         with self._lock:
