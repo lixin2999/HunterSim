@@ -264,6 +264,23 @@ class KafkaSettings(BaseSettings):
     sim_id: str = Field("", description="当前 VIL 实例的 sim_id（用于渲染 Topic 名）")
     username: Optional[SecretStr] = None
     password: Optional[SecretStr] = None
+    # ── V3.1.2：消费侧接入安全（默认 PLAINTEXT，保持既有现场零改动）──
+    security_protocol: str = Field(
+        "PLAINTEXT",
+        description="Kafka 安全协议：PLAINTEXT / SASL_PLAINTEXT / SSL / SASL_SSL",
+    )
+    sasl_mechanism: str = Field(
+        "SCRAM-SHA-512", description="SASL 机制（仅 SASL_* 协议生效）"
+    )
+    ca_cert_path: Optional[str] = Field(
+        None, description="SASL_SSL/SSL 的 CA 证书路径（None 用系统信任链）"
+    )
+    client_cert_path: Optional[str] = Field(
+        None, description="mTLS 客户端证书路径（broker 强制 ssl.client.auth=required 时必填）"
+    )
+    client_key_path: Optional[str] = Field(
+        None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
+    )
     # ── V2.7.0 P1-8：消费自愈与坏消息 DLQ ──
     enable_self_heal: bool = Field(
         True, description="连续轮询错误达阈值后自动重建 KafkaConsumer（P1-8）"

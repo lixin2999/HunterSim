@@ -53,7 +53,7 @@ services:
         INSTALL_CARLA: ${INSTALL_CARLA:-true}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
-    image: hunter-sim:3.1.1
+    image: hunter-sim:3.1.2
     command: ["carla-manager"]
     ports:
       - "8090:8090"

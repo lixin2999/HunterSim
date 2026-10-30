@@ -1,4 +1,4 @@
-# HunterSim 一键入口（V3.1.1）
+# HunterSim 一键入口（V3.1.2）
 #
 # 面向“装好依赖 → 预检 → 起服务 → 验证”的日常闭环；Windows(cmd/PowerShell)
 # 与 Linux/macOS 通用：所有配方只调用 python / docker，不依赖 sh 专有语法。
@@ -17,7 +17,7 @@
 PYTHON ?= .venv/Scripts/python.exe
 PIP ?= $(PYTHON) -m pip
 COMPOSE_FILE ?= docker/docker-compose.yml
-IMAGE_TAG ?= hunter-sim:3.1.1
+IMAGE_TAG ?= hunter-sim:3.1.2
 UV_SYNC ?= uv sync
 
 .PHONY: help install sync dev-install doctor manager probes up-local up-local-headless viz test coverage typecheck lint \

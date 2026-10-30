@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.1.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 章节，V3.1.0 新增一键启动与可视化客户端）。
+- **当前版本**：`3.1.2`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 章节，V3.1.0 新增一键启动与可视化客户端）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -184,7 +184,7 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 |------|------|------------------|
 | `HUNTER_SIM_` | 全局 | `env`(dev) · `log_level`(INFO) · `log_json`(false) · `log_file`(空) · `log_max_bytes` · `log_backup_count` |
 | `CARLA_` | CARLA 连接 | `host` · `rpc_port`(2000) · `stream_port`(2001) · `fixed_delta_seconds`(0.02 = 50Hz) · `timeout_seconds`(10) · `supervisor_*`（本地进程自愈，仅托管回环端点） |
-| `KAFKA_` | 数据总线 | `bootstrap_servers` · `telemetry_topic`(`carla.{sim_id}.vil_state`) · `sim_id` · `legacy_telemetry_topic` · `enable_self_heal`(true) · `rebuild_after_errors`(10) · `dlq_topic` |
+| `KAFKA_` | 数据总线 | `bootstrap_servers` · `telemetry_topic`(`carla.{sim_id}.vil_state`) · `sim_id` · `legacy_telemetry_topic` · `enable_self_heal`(true) · `rebuild_after_errors`(10) · `dlq_topic` · `security_protocol`(PLAINTEXT) · `sasl_mechanism`(SCRAM-SHA-512) · `username`/`password` · `ca_cert_path`/`client_cert_path`/`client_key_path`（V3.1.2 消费侧 SASL/TLS） |
 | `VIL_` | 虚实映射 | `target_hz`(10.0) · `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `warning_latency_ms`(50) · `buffer_max_frames`(10) · `ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true) · `overlay_enabled`(true) · `lights_enabled`(true) · `clock_offset_auto`(false) |
 | `RESOURCE_` | 生命周期 | `instance_max_lifetime_seconds`(7200) · `health_check_interval_seconds`(10) |
 | `EXECUTION_` | 执行面 | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · `lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120) |
@@ -256,7 +256,7 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1140 passed`（单元 + 集成），全仓行覆盖 **84.4%**（门禁 ≥80%）。
+- **测试**：`1156 passed`（单元 + 集成），全仓行覆盖 **84.7%**（门禁 ≥80%）。
 - **类型**：`mypy src/hunter_sim`（strict）**86 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。

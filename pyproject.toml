@@ -1,6 +1,6 @@
 [project]
 name = "hunter-sim"
-version = "3.1.1"
+version = "3.1.2"
 description = "HunterSim - VIL Virtual Simulation Platform for HUNTER SE Autonomous Driving"
 readme = "README.md"
 license = {text = "MIT"}

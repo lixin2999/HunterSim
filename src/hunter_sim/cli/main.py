@@ -306,10 +306,27 @@ def _check_platform(settings: HunterSimSettings) -> CheckResult:
 
 
 def _check_kafka(settings: HunterSimSettings) -> CheckResult:
-    """Kafka 连通性（VIL 数据面；不可达时 VIL 链路无输入）。"""
+    """Kafka 连通性（VIL 数据面；不可达时 VIL 链路无输入）。
+
+    V3.1.2：先按消费端口径解析接入安全参数，配置类错误（协议拼写、SASL 缺账号、
+    mTLS 证书不成对/文件缺失）直接报 fail —— 这几类错误会让消费线程在构造期
+    就失败，比“TCP 通但收不到数据”更难定位。
+    """
+    from hunter_sim.cloud.kafka_security import build_consumer_security_kwargs  # noqa: PLC0415
+
     bootstrap = settings.kafka.bootstrap_servers
     if not bootstrap:
         return _skip("kafka", "KAFKA_BOOTSTRAP_SERVERS 未配置")
+    try:
+        security = build_consumer_security_kwargs(settings.kafka)
+    except (ValueError, FileNotFoundError) as exc:
+        return _fail(
+            "kafka",
+            f"消费端接入配置非法：{exc}",
+            "核对 KAFKA_SECURITY_PROTOCOL / KAFKA_SASL_MECHANISM / KAFKA_USERNAME"
+            " / KAFKA_*_CERT_PATH",
+        )
+    protocol = str(security["security_protocol"])
     first = bootstrap.split(",")[0].strip()
     host, _, port_text = first.rpartition(":")
     if not host or not port_text.isdigit():
@@ -319,7 +336,7 @@ def _check_kafka(settings: HunterSimSettings) -> CheckResult:
             "期望形如 host:port[,host:port]",
         )
     if _tcp_open(host, int(port_text)):
-        return _ok("kafka", f"{first} 可连通")
+        return _ok("kafka", f"{first} 可连通（{protocol}）")
     return _warn(
         "kafka",
         f"{first} 不可达（VIL 无输入，场景将停在等待数据）",

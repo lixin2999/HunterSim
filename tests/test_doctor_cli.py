@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import socket
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -54,7 +54,10 @@ def _settings(
     supervisor_enabled: bool = False,
     supervisor_binary_path: str = "",
     bootstrap_servers: str = "localhost:9092",
+    kafka_overrides: Optional[dict[str, Any]] = None,
 ) -> HunterSimSettings:
+    kafka_kwargs: dict[str, Any] = {"bootstrap_servers": bootstrap_servers}
+    kafka_kwargs.update(kafka_overrides or {})
     return HunterSimSettings(
         env=env,
         carla=CarlaSettings(
@@ -64,7 +67,7 @@ def _settings(
             supervisor_binary_path=supervisor_binary_path,
         ),
         execution=ExecutionSettings(engine_endpoints=""),
-        kafka=KafkaSettings(bootstrap_servers=bootstrap_servers),
+        kafka=KafkaSettings(**kafka_kwargs),
         adapter=AdapterSettings(
             db_path=db_path, recordings_dir=recordings_dir, port=adapter_port
         ),
@@ -275,6 +278,37 @@ class TestMcapAndKafkaChecks:
         result = _check_kafka(_settings(bootstrap_servers="not-a-host-port"))
         assert result.status == "warn"
         assert "host:port" in result.hint
+
+    def test_kafka_detail_shows_protocol(self) -> None:
+        """V3.1.2：可连通项带出实际安全协议，现场一眼分辨 PLAINTEXT/SASL_SSL。"""
+        result = _check_kafka(_settings())
+
+        assert result.status == "ok"
+        assert "PLAINTEXT" in result.detail
+
+    def test_kafka_sasl_without_username_fails(self) -> None:
+        """SASL 缺账号时消费线程构造即失败，doctor 提前判 fail。"""
+        result = _check_kafka(_settings(kafka_overrides={"security_protocol": "SASL_SSL"}))
+
+        assert result.status == "fail"
+        assert "KAFKA_USERNAME" in result.detail
+
+    def test_kafka_partial_mtls_fails(self, tmp_path: Any) -> None:
+        cert = tmp_path / "client.pem"
+        cert.write_text("x", encoding="utf-8")
+        result = _check_kafka(
+            _settings(
+                kafka_overrides={
+                    "security_protocol": "SASL_SSL",
+                    "username": "u",
+                    "password": "p",
+                    "client_cert_path": str(cert),
+                }
+            )
+        )
+
+        assert result.status == "fail"
+        assert "KAFKA_CLIENT_KEY_PATH" in result.detail
 
 
 class TestPlatformCheck:

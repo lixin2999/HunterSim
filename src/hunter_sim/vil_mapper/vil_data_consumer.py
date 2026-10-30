@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError as PydanticValidationError
 
+from hunter_sim.cloud.kafka_security import build_consumer_security_kwargs
 from hunter_sim.common.exceptions import KafkaConnectionError
 from hunter_sim.common.metrics import (
     CLOUD_DLQ_PUBLISHED_TOTAL,
@@ -73,6 +74,8 @@ class VILDataConsumer:
         self._sim_id = sim_id or settings.sim_id  # 优先用参数，次先 settings
         self._buffer = buffer
         self._producer_factory = producer_factory
+        # V3.1.2：接入安全参数在构造期解析，配置错误立即失败（不留空转线程）
+        self._security_kwargs = build_consumer_security_kwargs(settings)
         self._consumer: Any = None
         self._dlq_producer: Any = None
         self._thread: Optional[threading.Thread] = None
@@ -87,7 +90,9 @@ class VILDataConsumer:
         self._last_seq: Optional[int] = None
         logger.info(
             f"VILDataConsumer initialized: vehicle_id={vehicle_id}, sim_id={self._sim_id}, "
-            f"bootstrap={settings.bootstrap_servers}"
+            f"bootstrap={settings.bootstrap_servers}, "
+            f"protocol={self._security_kwargs['security_protocol']}, "
+            f"tls={'on' if 'ssl_cafile' in self._security_kwargs else 'off'}"
         )
 
     def start(self) -> None:
@@ -151,12 +156,9 @@ class VILDataConsumer:
             "enable_auto_commit": self._settings.enable_auto_commit,
             "value_deserializer": lambda v: v,
             "consumer_timeout_ms": 1000,
+            # V3.1.2：security_protocol / SASL 凭据 / TLS·mTLS 证书
+            **self._security_kwargs,
         }
-        if self._settings.username:
-            consumer_kwargs["sasl_username"] = self._settings.username.get_secret_value()
-            consumer_kwargs["sasl_password"] = (
-                self._settings.password.get_secret_value() if self._settings.password else ""
-            )
         return KafkaConsumer(*topics, **consumer_kwargs)
 
     def _rebuild_consumer(self) -> bool:
@@ -275,12 +277,9 @@ class VILDataConsumer:
 
                 producer_kwargs: dict[str, Any] = {
                     "bootstrap_servers": self._settings.bootstrap_servers.split(","),
+                    # V3.1.2：DLQ 生产者与消费者共用同一套接入安全参数
+                    **self._security_kwargs,
                 }
-                if self._settings.username:
-                    producer_kwargs["sasl_username"] = self._settings.username.get_secret_value()
-                    producer_kwargs["sasl_password"] = (
-                        self._settings.password.get_secret_value() if self._settings.password else ""
-                    )
                 self._dlq_producer = KafkaProducer(**producer_kwargs)
         except Exception as exc:  # noqa: BLE001  DLQ 不可用时降级为仅计数丢弃
             logger.warning(f"DLQ producer unavailable (bad messages will be counted-dropped): {exc}")

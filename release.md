@@ -1857,4 +1857,64 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **旧实例的 `failed` 记录不会自动清理**：实例库保留历史实例，`/viz` 下拉仍能看到重启前的 `failed(adapter restarted)`；属审计需要，不视为缺陷。
 - **`--demo` 只建一个场景**：单世界串行语义下重复执行会排队/与运行中实例冲突（返回 `409`），提示后自行决定是否重试。
 
+---
+
+## V3.1.2 — VIL 消费侧支持 SASL_SSL / mTLS 接入
+
+### 现场问题
+
+仿真端源码直跑、要与平台端打通做 VIL 全链路时，若平台 Kafka 只开放 9093 SASL_SSL 接入面（mTLS 强制 `ssl.client.auth=required`）：
+
+- `KAFKA_USERNAME/KAFKA_PASSWORD` 配了也**不生效**，日志里看不到任何认证信息；
+- 实例可以 `create` 成功、状态 `running`，但 `vil_state` 永远无数据，最终只能靠 `vil_data_interrupted` 判断“断流”；
+- 部分机器上消费线程持续重建（`huntersim_kafka_consumer_rebuilds_total` 增长），日志只有 `Kafka consumer rebuild failed`。
+
+### 根因
+
+1. **消费端从未传 `security_protocol`**：`VILDataConsumer._create_consumer` 的 kwargs 只有 `bootstrap_servers/group_id/auto_offset_reset/enable_auto_commit/value_deserializer/consumer_timeout_ms`。kafka-python 默认 `PLAINTEXT`，即使给了 SASL 账号也不会启用 SASL；TLS/证书参数更是完全没有入口（`cloud/kafka_security.py` 当时只服务发布侧）。
+2. **凭据键名非法**：旧代码写的是 `sasl_username` / `sasl_password`，而 kafka-python `KafkaConsumer` 的合法键是 `sasl_plain_username` / `sasl_plain_password`，且它对本类未识别键**直接抛** `KafkaConfigurationError`（不是忽略）——因此只要配了账号，消费者初始化就会失败。
+3. **配置错误暴露得太晚**：参数在消费线程里才拼装，线程异常只写日志，实例侧看不到“认证配置错了”，表现为“跑着但没数据”。
+
+### 修复内容
+
+- **`KafkaSettings` 新增 5 项接入安全配置**：`security_protocol`（默认 `PLAINTEXT`）、`sasl_mechanism`（默认 `SCRAM-SHA-512`）、`ca_cert_path`、`client_cert_path`、`client_key_path`。默认值与旧行为一致，现场不配即零改动。
+- **`cloud/kafka_security.py` 泛化**：
+  - `normalize_protocol()`：去空白 + 大写，非法取值（如 `SASL_TLS`）直接报错并列出可选值；
+  - `build_ssl_kwargs(settings, *, env_prefix="HUNTER_CORE")`：改为面向最小协议接口，发布侧（`HUNTER_CORE_*`）与消费侧（`KAFKA_*`）共用，错误信息按前缀定位（`KAFKA_CLIENT_KEY_PATH` / `HUNTER_CORE_CLIENT_KEY_PATH`）；
+  - 新增 `build_consumer_security_kwargs()`：输出协议 + SASL 凭据 + TLS 证书全套，`SCRAM/PLAIN` 机制缺账号即报错，证书/私钥不成对或文件缺失即报错，`PLAINTEXT` 下配了账号只告警不打包。
+- **`VILDataConsumer` 应用安全参数**：构造期解析并缓存 `_security_kwargs`（配置错误会让实例以 `execution_unavailable:*` 失败，而不是起一个空转线程）；`_create_consumer` 与坏消息 DLQ 的 `KafkaProducer` 共用同一套参数；初始化日志增加 `protocol=…, tls=on/off`。
+- **`huntersim doctor` 的 `kafka` 项**：先按消费端口径解析接入参数，协议拼写错误 / SASL 缺账号 / mTLS 不成对或证书缺失直接判 **fail**（附 `KAFKA_*` 变量提示）；可连通时 detail 带出实际协议（如 `127.0.0.1:9092 可连通（SASL_SSL）`）。
+
+### 配置变更（新增，均有默认值）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT` / `SASL_PLAINTEXT` / `SSL` / `SASL_SSL`，大小写不敏感 |
+| `KAFKA_SASL_MECHANISM` | `SCRAM-SHA-512` | 仅 `SASL_*` 协议生效；`PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512` 需账号 |
+| `KAFKA_USERNAME` / `KAFKA_PASSWORD` | 空 | SASL 凭据；`PLAINTEXT` 下不生效（doctor 与日志会提示） |
+| `KAFKA_CA_CERT_PATH` | 空 | CA 证书，留空用系统信任链 |
+| `KAFKA_CLIENT_CERT_PATH` / `KAFKA_CLIENT_KEY_PATH` | 空 | mTLS 必须成对配置 |
+
+无新增 Prometheus 指标；`KAFKA_SECURITY_PROTOCOL` 只影响连接参数，Topic 与消息契约不变。
+
+### 质量门禁（实测）
+
+- `pytest -q`：**1156 passed**（较 V3.1.1 +16），全仓行覆盖 **84.7%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 86 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增测试 16 条：`tests/test_vil_data_consumer.py::TestSecurityConfig`（13）覆盖默认 PLAINTEXT、协议大小写与非法值、`SASL_PLAINTEXT` 无证书、`SASL_SSL` + CA、纯 mTLS 三项、证书/私钥不成对、CA 文件缺失、SASL 缺账号、空账号视为未配置、PLAINTEXT 下账号被忽略、真实 `KafkaConsumer` kwargs 不含非法键 `sasl_username`、DLQ 生产者复用同一套参数；`tests/test_doctor_cli.py`（3）覆盖协议透出与两类配置错误判 fail。
+
+### 兼容性说明
+
+- **默认零改动**：不设 `KAFKA_SECURITY_PROTOCOL` 即为 `PLAINTEXT`，与本补丁前的实际连接参数一致（唯一差异是删除了会被 kafka-python 拒绝的 `sasl_username*` 键）。
+- **对外契约不变**：`/api/v1/*`、`/health`、`/metrics`、Topic 名与消息格式均未变。
+- **doctor 更严格**：SASL 缺账号、mTLS 不成对等配置错误由“可能 ok”变为 `fail`，属预期收紧（这类配置下 VIL 必然失败）。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.1.1 → 3.1.2`，镜像 tag `hunter-sim:3.1.2`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md` 已同步。升级步骤：`git pull` → `uv sync` → `uv pip install -e .`（刷新安装元数据）→ `huntersim doctor` 确认 `kafka` 项。
+
+### 待办 / 已知边界
+
+- **未在真实 SASL_SSL / mTLS 集群上联调**：本机无平台 Kafka，验证止于参数构建与 kwargs 接线（`KafkaConsumer`/`KafkaProducer` 均以桩对象断言）；实际握手、证书链、ACL 授权需在现场按 `KAFKA_SECURITY_PROTOCOL=SASL_SSL` + 三项证书路径复验。
+- **仅支持口令类 SASL**：`GSSAPI` / `OAUTHBEARER` 未提供凭据入口（会按机制名透传，但需要额外参数）。
+- **DLQ 写入仍是 best-effort**：DLQ 生产者创建失败或发送异常只计数丢弃，不阻塞消费主循环。
+
 

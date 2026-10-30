@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from hunter_sim.common.metrics import VIL_MESSAGE_DROPPED_TOTAL
 from hunter_sim.common.models import KafkaSettings, VILSettings
@@ -311,3 +314,148 @@ class TestV212Hardening:
         after = VIL_MESSAGE_DROPPED_TOTAL.labels(reason="sim_id_mismatch")._value.get()
         assert after - before == 1
         assert consumer._buffer.get_latest() is None
+
+
+# ── 测试：V3.1.2 消费侧接入安全（SASL / TLS / mTLS）─────────────────────────────
+
+
+def _cert_files(tmp_path: Path) -> tuple[str, str, str]:
+    """生成临时 CA / 客户端证书 / 客户端私钥文件，返回三者路径。"""
+    paths: list[str] = []
+    for name in ("ca-cert.pem", "client-cert.pem", "client-key.pem"):
+        path = tmp_path / name
+        path.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+        paths.append(str(path))
+    return paths[0], paths[1], paths[2]
+
+
+class TestSecurityConfig:
+    """消费端 security_protocol / SASL 凭据 / TLS 证书的构建与接线。"""
+
+    def test_default_is_plaintext(self) -> None:
+        """不配安全相关变量时保持旧行为（零改动）。"""
+        assert _make_consumer()._security_kwargs == {"security_protocol": "PLAINTEXT"}
+
+    def test_protocol_is_case_insensitive(self) -> None:
+        consumer = _make_consumer(
+            security_protocol=" sasl_plaintext ", username="u", password="p"
+        )
+        assert consumer._security_kwargs["security_protocol"] == "SASL_PLAINTEXT"
+
+    def test_sasl_plaintext_without_certs(self) -> None:
+        """SASL_PLAINTEXT 只带机制与凭据，不产生 ssl_* 参数。"""
+        consumer = _make_consumer(
+            security_protocol="SASL_PLAINTEXT",
+            sasl_mechanism="SCRAM-SHA-256",
+            username="u",
+            password="p",
+        )
+        assert consumer._security_kwargs == {
+            "security_protocol": "SASL_PLAINTEXT",
+            "sasl_mechanism": "SCRAM-SHA-256",
+            "sasl_plain_username": "u",
+            "sasl_plain_password": "p",
+        }
+
+    def test_sasl_ssl_with_ca(self, tmp_path: Path) -> None:
+        ca, _, _ = _cert_files(tmp_path)
+        consumer = _make_consumer(
+            security_protocol="SASL_SSL", username="u", password="p", ca_cert_path=ca
+        )
+        kwargs = consumer._security_kwargs
+        assert kwargs["security_protocol"] == "SASL_SSL"
+        assert kwargs["sasl_mechanism"] == "SCRAM-SHA-512"
+        assert kwargs["ssl_cafile"] == ca
+        assert "ssl_certfile" not in kwargs
+
+    def test_ssl_mtls_pair(self, tmp_path: Path) -> None:
+        """纯 mTLS（无 SASL）：只带证书三项。"""
+        ca, cert, key = _cert_files(tmp_path)
+        consumer = _make_consumer(
+            security_protocol="SSL",
+            ca_cert_path=ca,
+            client_cert_path=cert,
+            client_key_path=key,
+        )
+        assert consumer._security_kwargs == {
+            "security_protocol": "SSL",
+            "ssl_cafile": ca,
+            "ssl_certfile": cert,
+            "ssl_keyfile": key,
+        }
+
+    def test_partial_mtls_raises(self, tmp_path: Path) -> None:
+        _, cert, _ = _cert_files(tmp_path)
+        with pytest.raises(ValueError, match="KAFKA_CLIENT_KEY_PATH"):
+            _make_consumer(
+                security_protocol="SASL_SSL",
+                username="u",
+                password="p",
+                client_cert_path=cert,
+            )
+
+    def test_missing_ca_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError, match="CA 证书"):
+            _make_consumer(
+                security_protocol="SASL_SSL",
+                username="u",
+                password="p",
+                ca_cert_path=str(tmp_path / "missing.pem"),
+            )
+
+    def test_invalid_protocol_raises(self) -> None:
+        with pytest.raises(ValueError, match="不支持的 Kafka 安全协议"):
+            _make_consumer(security_protocol="SASL_TLS")
+
+    def test_sasl_without_username_raises(self) -> None:
+        """密码类机制缺账号是必然失败，构造期就报错而不是空转。"""
+        with pytest.raises(ValueError, match="KAFKA_USERNAME"):
+            _make_consumer(security_protocol="SASL_SSL")
+
+    def test_credentials_ignored_when_plaintext(self) -> None:
+        """PLAINTEXT 下账号不会被打包（kafka-python 不启用 SASL），但不报错。"""
+        kwargs = _make_consumer(username="u", password="p")._security_kwargs
+        assert kwargs == {"security_protocol": "PLAINTEXT"}
+
+    def test_empty_username_treated_as_unset(self) -> None:
+        """`KAFKA_USERNAME=` 空串视为未配置（.env 模板默认值不应触发告警）。"""
+        kwargs = _make_consumer(username="", password="")._security_kwargs
+        assert kwargs == {"security_protocol": "PLAINTEXT"}
+
+    def test_consumer_kwargs_carry_security(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """真实 KafkaConsumer 参数里不能出现旧键名 sasl_username（会直接抛错）。"""
+        kafka = pytest.importorskip("kafka")
+        captured: dict[str, Any] = {}
+
+        class _FakeConsumer:
+            def __init__(self, *topics: str, **kwargs: Any) -> None:
+                captured["topics"] = topics
+                captured.update(kwargs)
+
+        monkeypatch.setattr(kafka, "KafkaConsumer", _FakeConsumer)
+        consumer = _make_consumer(security_protocol="SASL_SSL", username="u", password="p")
+        assert consumer._create_consumer(["carla.sim-test-001.vil_state"]) is not None
+        assert captured["security_protocol"] == "SASL_SSL"
+        assert captured["sasl_plain_username"] == "u"
+        assert captured["sasl_plain_password"] == "p"
+        assert "sasl_username" not in captured
+
+    def test_dlq_producer_reuses_security(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """坏消息转发同样要带接入参数，否则 ACL 集群上 DLQ 写不进去。"""
+        kafka = pytest.importorskip("kafka")
+        captured: dict[str, Any] = {}
+
+        class _FakeProducer:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(kafka, "KafkaProducer", _FakeProducer)
+        consumer = _make_consumer(
+            security_protocol="SASL_SSL",
+            username="u",
+            password="p",
+            dlq_topic="carla.vil_state.dlq",
+        )
+        assert consumer._get_dlq_producer() is not None
+        assert captured["security_protocol"] == "SASL_SSL"
+        assert captured["sasl_plain_username"] == "u"

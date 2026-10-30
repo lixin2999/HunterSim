@@ -39,7 +39,7 @@ spec:
       containers:
         # ── 控制面（唯一业务入口）────────────────────────────────────────────
         - name: sim-service
-          image: hunter-sim:3.1.1
+          image: hunter-sim:3.1.2
           imagePullPolicy: IfNotPresent
           command: ["huntersim"]
           args: ["carla-manager"]
@@ -327,7 +327,7 @@ spec:
 
         # ── 只读探针面（kubelet 存活/就绪 + Prometheus 抓取）─────────────────
         - name: probes
-          image: hunter-sim:3.1.1
+          image: hunter-sim:3.1.2
           imagePullPolicy: IfNotPresent
           command: ["huntersim"]
           args: ["probes"]
