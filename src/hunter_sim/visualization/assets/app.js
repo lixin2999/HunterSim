@@ -35,6 +35,8 @@
     instanceStatus: "",
     instanceMessage: "",
     carlaStatus: "",
+    // 终态实例是否已做过一次收尾加载（传感器/事件面板需要落最终值，之后轮询即停）
+    terminalSynced: false,
     videoInstance: "",
     videoMode: "",
     videoTimer: 0,
@@ -314,6 +316,12 @@
     $("btn-stop").disabled = !has;
   }
 
+  // 终态实例（succeeded/failed/canceled）不会再产生新帧：帧类轮询必须短路，
+  // 否则 /sensors/lidar 、/sensors/imu 会持续返回 409 并刷满服务端日志
+  function isTerminalInstance() {
+    return TERMINAL.indexOf(state.instanceStatus) >= 0;
+  }
+
   function selectInstance(instanceId) {
     if (instanceId === state.instanceId) {
       return;
@@ -322,6 +330,7 @@
     state.instanceStatus = "";
     state.instanceMessage = "";
     state.carlaStatus = "";
+    state.terminalSynced = false;
     var select = $("instance-select");
     if (state.instanceId) {
       select.value = state.instanceId;
@@ -433,6 +442,12 @@
       setNote("video-empty", "实例已结束（" + payload.status + "）" + (message ? "：" + message : ""));
       setNote("stream-state", "无实时画面（实例已结束）");
       setNote("video-meta", "未推流");
+    }
+    // 终态后补一次收尾加载：传感器帧数/事件列表落到最终值，此后定时轮询由 isTerminalInstance 短路
+    if (TERMINAL.indexOf(payload.status || "") >= 0 && !state.terminalSynced) {
+      state.terminalSynced = true;
+      refreshSensors();
+      refreshEvents();
     }
   }
 
@@ -637,7 +652,7 @@
   // ── 预览：深度图 / 点云 / IMU ────────────────────────────────────────────
 
   async function refreshPreviews() {
-    if (!state.instanceId) {
+    if (!state.instanceId || isTerminalInstance()) {
       return;
     }
     var target = state.instanceId;
@@ -986,9 +1001,21 @@
     setInterval(refreshStatus, POLL_MS.status);
     setInterval(refreshInstances, POLL_MS.instances);
     setInterval(refreshDetail, POLL_MS.detail);
-    setInterval(refreshSensors, POLL_MS.sensors);
-    setInterval(refreshEvents, POLL_MS.events);
-    setInterval(refreshPreviews, POLL_MS.preview);
+    setInterval(function () {
+      if (!isTerminalInstance()) {
+        refreshSensors();
+      }
+    }, POLL_MS.sensors);
+    setInterval(function () {
+      if (!isTerminalInstance()) {
+        refreshEvents();
+      }
+    }, POLL_MS.events);
+    setInterval(function () {
+      if (!isTerminalInstance()) {
+        refreshPreviews();
+      }
+    }, POLL_MS.preview);
   }
 
   document.addEventListener("DOMContentLoaded", bootstrap);

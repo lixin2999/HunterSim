@@ -1917,4 +1917,59 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **仅支持口令类 SASL**：`GSSAPI` / `OAUTHBEARER` 未提供凭据入口（会按机制名透传，但需要额外参数）。
 - **DLQ 写入仍是 best-effort**：DLQ 生产者创建失败或发送异常只计数丢弃，不阻塞消费主循环。
 
+---
+
+## V3.1.3 — `/viz` 终态实例停止帧类轮询（消除持续 `409`）
+
+**发布日期**：2026-11-02
+**版本定位**：V3.1.1「终态不再拉流」的收尾补丁。V3.1.1 只停了 `stream.mjpg` / `screenshot`，传感器帧统计、事件列表、点云与 IMU 预览三类定时轮询仍在按 1.5–2s 打向已结束的实例，服务端 access log 被 `409` 刷满。**无新增端点、无配置项变更、无平台/数据面契约变更**。
+
+### 现场
+
+`huntersim up`（Windows 宿主源码直跑）后打开 `/viz`：
+
+- 预检全绿（`carla_reachable ok 127.0.0.1:2000`），面板显示「实例 1 个（活动 0）」；
+- 下拉选中 `inst-d408ba35…`：`failed / FAILED`，原因 `execution_unavailable:No CARLA client available for engine 'host.docker.internal:2000'`，场景名 `?????(smoke-001)`，**更新时间 2026-10-30**（早于本次启动 3 天）；
+- 本次启动日志里**没有任何 `POST /api/v1/instances`**，只有 GET；
+- 控制台每 1.5–2s 成对刷出 `GET /viz/api/instances/{id}/sensors/lidar … 409` 与 `…/sensors/imu … 409`，开头还有一条 `stream.mjpg` / `screenshot` 的 409。
+
+### 根因
+
+1. **`409` 刷屏（本版修复）**：`assets/app.js` 的 `bootstrap()` 把 `refreshSensors` / `refreshEvents` / `refreshPreviews` 直接挂到 `setInterval`，只有 `startVideo` / `pollScreenshot` 路径带 `TERMINAL` 判断。实例进入终态后已无帧，`/viz/api/instances/{id}/sensors/{stream}` 按设计返回 `409 sensor_frame_unavailable`（`visualization/routes.py`），于是页面按 `POLL_MS.preview=1500ms` 无限要 409。`/sensors`（帧统计）与 `/events` 返回 `200` 空快照，不报错但同样是无用轮询。
+2. **页面上的 `failed` 是历史记录，不是本次失败**：实例库 `data/adapter/carla_instances.db` 按审计语义保留历史实例，无活动实例时下拉回落列表首项，于是三天前的失败原因被当成当前故障展示。
+3. **`host.docker.internal:2000` 的来源（未改代码，只补文档）**：端点 host 取自 `CARLA_HOST`（`platform_adapter/executor.py::_plane_instance` → `execution/plane.py::ExecutionPlane._endpoint_of`），`build_execution_plane` 的 `resolve()` 在 `carla.Client(host, port)` / `MapManager` 构造失败时返回 `None`，`ensure_runner` 据此抛 `ExecutionUnavailable`。`host.docker.internal` 是 Docker Desktop 只注入给**容器**的 DNS 别名，Windows 宿主直跑 Python 时解析不到——即那次运行用的是容器形态的 `.env`。当前主机直跑配置（`127.0.0.1:2000`）已正确，无需改代码。
+
+### 修复内容
+
+- **`assets/app.js` 新增 `isTerminalInstance()`**：以既有 `TERMINAL = [succeeded, failed, canceled]` 判定当前实例是否已结束。
+- **三类定时轮询短路**：`bootstrap()` 中 `refreshSensors` / `refreshEvents` / `refreshPreviews` 的 `setInterval` 回调改为先判 `isTerminalInstance()`；`refreshPreviews` 自身入口同样加 `|| isTerminalInstance()` 守卫（覆盖 `selectInstance` 之外的调用路径）。
+- **终态收尾加载**：新增 `state.terminalSynced`（`selectInstance` 切换实例时复位），`refreshDetail` 首次观测到实例进入终态时主动调用一次 `refreshSensors()` + `refreshEvents()`，保证传感器帧数与事件列表落到最终值——只是此后不再周期性要。
+- **文档**：`README.md` §4.4 补 Windows 中文 `scene_name` 的 UTF-8 提交写法；`docs/单机部署指南.md` 排障表新增「`No CARLA client available for engine 'host.docker.internal:2000'`」与「持续 `409`」两行；`user_manual.md` 可视化「终态实例」条目、`deployment_and_operations.md` §4.6 / §5.7 与 §7 升级说明同步口径。
+
+### 配置与指标变更
+
+无新增/删除环境变量，无默认值变更，无 Prometheus 指标变化。
+
+### 质量门禁（实测）
+
+- `pytest -q`：**1157 passed**（较 V3.1.2 +1），全仓行覆盖 **84.67%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 86 source files**。
+- `flake8 src tests`：**0 告警**。
+- `node --check src/hunter_sim/visualization/assets/app.js`：通过。
+- 新增测试（`tests/test_viz_api.py::TestPageAndAssets::test_terminal_instance_stops_frame_polling`）：以源码接线方式锁定 `isTerminalInstance` 定义、`refreshPreviews` 入口守卫、三个 `setInterval` 均走短路、以及 `state.terminalSynced` 收尾加载存在（前端无 JS 测试框架，沿用本仓库既有的静态资源直出断言方式）。
+
+### 兼容性说明
+
+- **纯前端行为**：只改 `/viz` 只读页面内部逻辑，平台 10 个 `/api/v1/*` 端点、`/health`、`/metrics`、MJPEG/截图出口、Kafka Topic 与消息契约均未变。
+- **服务端 `409` 语义不变**：`/viz/api/instances/{id}/sensors/{stream}` 对无帧实例仍返回 `409 sensor_frame_unavailable`（其它调用方依赖该状态码），本版只让页面不再去要。
+- **在跑实例零感知**：守卫仅在 `status ∈ {succeeded, failed, canceled}` 时生效，`pending`/`running` 的轮询节奏与 V3.1.1 完全一致。
+- **旧 `failed` 记录不清理**：审计语义保留；需干净列表时停服务后删 `data/adapter/carla_instances.db`。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.1.2 → 3.1.3`，镜像 tag `hunter-sim:3.1.3`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md`、`.env.example` 已同步。升级步骤：`git pull` → `uv sync` → `uv pip install -e .`（刷新安装元数据）→ **Ctrl+F5 强刷 `/viz`**（前端资源无缓存版本号）。
+
+### 待办 / 已知边界
+
+- **未在浏览器里实测终态页面的轮询停止**：本机沙箱无 CARLA、无活实例，验证止于源码接线断言与 `node --check`。现场确认方式：选中一个 `failed` 实例后观察服务端 access log，`sensors/lidar`、`sensors/imu` 应只在切换实例时各出现一次 `409`，之后不再按 1.5s 周期刷出。
+- **`????` 场景名仍未做现场 UTF-8 复验**（承接 V3.1.1 待办）：服务端链路已确认不丢字（`--demo` 请求体显式 UTF-8、SQLite TEXT 与 JSON 响应均 UTF-8、静态资源带 `charset=utf-8`，且 `tests/test_platform_adapter_app.py` / `test_platform_adapter_store.py` 以中文 `scene_name` 覆盖往返），丢字发生在提交端把中文按控制台代码页交给 `curl` / `Invoke-RestMethod` 的那一步，服务端无法还原。本版只补文档写法，未加运行期拦截或告警。
+- **无活动实例时下拉仍选中历史 `failed` 首项**：`refreshInstances` 的 `running → pending → 首项` 优先级本身正确，但库里只剩历史实例时易被误读为当前故障；建议后续在页面顶部对「所选实例并非本次运行创建」给出提示。
+
 

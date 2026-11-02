@@ -130,6 +130,24 @@ class TestPageAndAssets:
         assert client.get("/viz/assets/secret.txt").status_code == 404
         assert client.get("/viz/assets/..%2F..%2Fpyproject.toml").status_code == 404
 
+    def test_terminal_instance_stops_frame_polling(self, client: TestClient) -> None:
+        """终态实例必须短路帧类轮询（V3.1.3）。
+
+        回归背景：实例进入 succeeded/failed/canceled 后不再产生新帧，但
+        ``/sensors/lidar``、``/sensors/imu`` 仍按 1.5s 被轮询并持续返回 409，
+        长驻运行会刷满服务端日志。这里以源码接线方式锁定守卫存在。
+        """
+        script = client.get("/viz/assets/app.js").text
+
+        assert "function isTerminalInstance()" in script
+        # 预览（激光点云 / IMU / 深度）本身带终态短路
+        assert "if (!state.instanceId || isTerminalInstance())" in script
+        # 传感器帧统计与事件列表的定时轮询也必须走同一短路（不能直挂 setInterval）
+        for name in ("refreshSensors", "refreshEvents", "refreshPreviews"):
+            assert f"setInterval(function () {{\n      if (!isTerminalInstance()) {{\n        {name}();" in script
+        # 终态后仍需一次收尾加载，否则传感器/事件面板停在旧值
+        assert "state.terminalSynced = true" in script
+
     def test_viz_is_not_in_openapi(self, client: TestClient) -> None:
         """可视化端点不进入平台 OpenAPI 契约（单一控制面口径）。"""
         paths = client.get("/openapi.json").json()["paths"]

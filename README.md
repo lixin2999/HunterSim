@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.1.2`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 章节，V3.1.0 新增一键启动与可视化客户端）。
+- **当前版本**：`3.1.3`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 章节，V3.1.0 新增一键启动与可视化客户端）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -148,6 +148,9 @@ curl -X POST $BASE/api/v1/instances -H "Content-Type: application/json" -d '{
     "duration": 30
   }
 }'
+
+> **Windows 下带中文 `scene_name` 请看这里**：`cmd` / PowerShell 默认按控制台代码页（GBK）把 `-d` 的字符串交给 `curl`，非 ASCII 字符会在提交端就变成 `?`，落库后页面显示 `?????`（服务端不丢字，无法还原）。
+> 三种安全写法：① 直接用 `huntersim up --demo`（内部已显式 UTF-8）；② 把请求体存为 **UTF-8 文件**后 `curl.exe --data-binary @body.json`；③ PowerShell 先 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`，再 `Invoke-RestMethod -ContentType 'application/json; charset=utf-8'`。
 
 # 2) 轮询（pending → running → succeeded/failed/canceled）
 curl $BASE/api/v1/instances/<ID>
