@@ -45,6 +45,8 @@ _QUALITY_KEY = "quality"
 _STREAM_IDLE_TIMEOUT_S = 5.0
 # 事件列表类型别名：类内已有同名方法 ``list``，直接写 ``list[...]`` 会被遮蔽
 EventItems = list[dict[str, Any]]
+# 实例 ID 列表类型别名（同上：规避类内 ``list`` 方法遮蔽内置类型）
+InstanceIds = list[str]
 
 
 class StreamLimitExceeded(RuntimeError):
@@ -217,6 +219,17 @@ class AdapterService:
     def result(self, instance_id: str) -> Optional[InstanceRecord]:
         """查询结果（非终态也返回当前状态，由平台映射为 3003）。"""
         return self._store.get(instance_id)
+
+    def running_instance_ids(self) -> InstanceIds:
+        """当前进行中的实例 ID（节点心跳上报，供平台核对 ``running_count``）。
+
+        只有 ``pending``/``running`` 计入；终态实例不占用节点容量。
+        """
+        return [
+            record.instance_id
+            for record in self._store.list_all()
+            if record.status in ACTIVE_STATUSES
+        ]
 
     def mark_restarted_instances_failed(self) -> int:
         """启动恢复：把重启前未终结的实例标记为 failed。"""

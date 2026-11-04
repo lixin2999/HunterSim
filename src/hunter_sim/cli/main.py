@@ -305,6 +305,69 @@ def _check_platform(settings: HunterSimSettings) -> CheckResult:
     )
 
 
+def _check_sim_node(settings: HunterSimSettings) -> CheckResult:
+    """仿真节点接入（HunterCore node 模式）：配置完整性 + 回访可达性提示。
+
+    注册/心跳本身是出向请求，网关不可达只影响节点上下线（记 ``warn``）；
+    但 ``node_id``/服务令牌缺失会让注册必然失败，记 ``fail`` 以在 ``huntersim up``
+    的预检阶段直接拦住。
+    """
+    node = settings.sim_node
+    if not node.enabled:
+        return _skip(
+            "sim_node", "未启用（HUNTER_CORE_SIM_NODE_ENABLED=false）"
+        )
+
+    missing = []
+    if not node.node_id:
+        missing.append("HUNTER_CORE_SIM_NODE_ID")
+    if node.service_token is None or not node.service_token.get_secret_value().strip():
+        missing.append("HUNTER_CORE_SIM_NODE_SERVICE_TOKEN")
+    if missing:
+        return _fail(
+            "sim_node",
+            f"节点注册参数缺失：{', '.join(missing)}",
+            "按 HunterCore《HunterSim 接入清单》§2/§3 配置节点标识与服务令牌",
+        )
+
+    host = (settings.adapter.host or "").strip()
+    if host in ("", "127.0.0.1", "localhost", "::1", "[::1]"):
+        return _warn(
+            "sim_node",
+            f"ADAPTER_HOST={host or '<empty>'}，平台无法回访管理 API",
+            "node 模式需监听 0.0.0.0 或本机网卡 IP（ADAPTER_HOST=0.0.0.0）",
+        )
+
+    url = (node.base_url or settings.cloud.gateway_url or "").strip()
+    parts = urlsplit(url)
+    gateway_host = parts.hostname or ""
+    gateway_port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not gateway_host:
+        return _warn(
+            "sim_node",
+            f"平台地址不可解析：{url or '<empty>'}",
+            "期望形如 http://<平台地址>（可复用 HUNTER_CORE_GATEWAY_URL）",
+        )
+    if gateway_port == 8080:
+        # 坑 1：直连网关时平台看到的是网关容器地址，会登记出“在线但打不通”的节点
+        return _warn(
+            "sim_node",
+            f"平台地址 {url} 直连网关 8080，平台可能学到网关容器地址",
+            "节点注册建议走 web-portal 80/443（X-Real-IP 才是真实网卡地址），"
+            "或确认网关已透传 X-Real-IP 并设置平台 SIM_NODE_ALLOWED_NETWORKS",
+        )
+    if _tcp_open(gateway_host, gateway_port):
+        return _ok(
+            "sim_node",
+            f"node_id={node.node_id}，平台 {gateway_host}:{gateway_port} 可连通",
+        )
+    return _warn(
+        "sim_node",
+        f"平台 {gateway_host}:{gateway_port} 不可达（注册/心跳将重试）",
+        "确认网络与平台地址；平台不可达不影响本机场景执行",
+    )
+
+
 def _check_kafka(settings: HunterSimSettings) -> CheckResult:
     """Kafka 连通性（VIL 数据面；不可达时 VIL 链路无输入）。
 
@@ -433,6 +496,7 @@ def run_doctor(
     results.append(_check_mcap())
     results.append(_check_kafka(loaded))
     results.append(_check_platform(loaded))
+    results.append(_check_sim_node(loaded))
     results.extend(_check_gpu())
     results.extend(_check_carla_endpoints(loaded))
     results.extend(_check_ports(loaded))
@@ -560,6 +624,15 @@ def _print_plan(specs: list[Any], viz: str, settings: HunterSimSettings) -> None
     ))
     platform = "未启用（本机联调）" if not settings.cloud.enabled else settings.cloud.gateway_url
     print(f"  {'平台接入':<13} {platform}")
+    node = settings.sim_node
+    if node.enabled:
+        node_url = node.base_url or settings.cloud.gateway_url
+        print(
+            f"  {'仿真节点':<13} {node.node_id} → {node_url}"
+            f"（心跳 {node.heartbeat_interval_seconds:g}s）"
+        )
+    else:
+        print(f"  {'仿真节点':<13} 未启用（HUNTER_CORE_SIM_NODE_ENABLED=false）")
     print("")
 
 

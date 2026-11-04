@@ -70,6 +70,23 @@ data:
   hunter_core_ca_cert_path: ""
   hunter_core_client_cert_path: ""
   hunter_core_client_key_path: ""
+  # ── 仿真节点接入（HunterCore node 模式；默认关闭）──
+  # 需平台侧 SIM_DISPATCH_MODE=node 且 Pod 网络能直接路由到节点网段。
+  hunter_core_sim_node_enabled: "false"
+  hunter_core_sim_node_id: ""
+  # 平台地址（空 = 复用 hunter_core_gateway_url）；建议走 web-portal 80/443
+  hunter_core_sim_node_base_url: ""
+  hunter_core_sim_node_heartbeat_interval_seconds: "20.0"
+  hunter_core_sim_node_request_timeout_seconds: "5.0"
+  hunter_core_sim_node_capacity: "1"
+  # 可用地图清单（逗号分隔；留空 = 不做地图过滤）
+  hunter_core_sim_node_maps: ""
+  hunter_core_sim_node_carla_version: ""
+  hunter_core_sim_node_protocol: "http"
+  # 平台回访端口（空 = 复用 ADAPTER_PORT）
+  hunter_core_sim_node_manager_port: ""
+  hunter_core_sim_node_labels: "{}"
+  hunter_core_sim_node_runtime_hint: ""
   # ── 日志 ──
   # 生产采集建议置 "true"（JSON 行 + request_id 贯穿）
   log_json: "false"

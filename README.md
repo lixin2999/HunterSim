@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.1.3`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 章节，V3.1.0 新增一键启动与可视化客户端）。
+- **当前版本**：`3.2.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 章节，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -45,7 +45,7 @@ huntersim up                     一键启动（V3.1.0：预检 → 两进程 �
 
 | 模块 | 职责 |
 |------|------|
-| `platform_adapter/` | 控制平面骨架：10 个实例端点 + `/health` + `/metrics`、单世界串行队列、SQLite 实例注册表（重启恢复/幂等）、看门狗、VIL 运行时装配、评估与产物回传、mcap 录制与上传 |
+| `platform_adapter/` | 控制平面骨架：10 个实例端点 + `/health` + `/metrics`、单世界串行队列、SQLite 实例注册表（重启恢复/幂等）、看门狗、VIL 运行时装配、评估与产物回传、mcap 录制与上传；`sim_node` 负责 node 模式注册/心跳（IP 漂移自愈） |
 | `vil_mapper/` | 遥测环形缓冲、`FrameAligner`（10Hz 栅格 + 最短弧插值/外推）、位姿外推、坐标标定、灯光与转向写入、感知叠加、Kafka 消费自愈与 DLQ |
 | `scene_runner/` | 场景契约与校验、状态机、事件检测、内置场景（含传感器挂载）、ScenarioRunner 适配 |
 | `sensor_sim/` | 传感型号剖面（`profiles.py`）、蓝图工厂、安装位、数据转换、`FrameHub` 帧汇聚、`McapRecorder` 录制、ROS2 桥接（可选） |
@@ -66,7 +66,7 @@ huntersim up                     一键启动（V3.1.0：预检 → 两进程 �
 ```
 HunterSim/
 ├── src/hunter_sim/
-│   ├── platform_adapter/   # 控制面：app / service / executor / vil / store / mapper / models / config
+│   ├── platform_adapter/   # 控制面：app / service / executor / vil / store / mapper / models / config / sim_node
 │   ├── vil_mapper/         # VIL：frame_aligner / vil_sync_service / vil_data_consumer / telemetry_buffer / pose_extrapolator / calibration_manager / state_visualizer / perception_overlay
 │   ├── scene_runner/       # 场景：scene_config / validator / state_manager / event_detector / builtin_scenario
 │   ├── sensor_sim/         # 传感器：profiles / sensor_factory / sensor_mount / data_converters / frame_hub / mcap_recorder / carla_ros_bridge
@@ -177,6 +177,44 @@ Windows 单机（CARLA 也在 Docker 里）：`docker compose -f docker/docker-c
 
 Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引擎自愈由 carla-engine Pod liveness 承担）。
 
+### 4.6 作为「仿真节点」接入平台（node 模式）
+
+平台 `SIM_DISPATCH_MODE=node` 时，场景库下发不再依赖固定 IP：仿真机注册后，平台从
+入站请求头自学习本机地址，再按该地址直推本机 CARLA 管理 API（`:8090`）。IP 漂移由下一次
+心跳自愈，平台侧无需改配置。完整契约与排障见 HunterCore
+[`docs/HunterSim接入清单.md`](../HunterCore/docs/HunterSim接入清单.md)。
+
+```bash
+# 平台管理员：签发节点服务令牌（同一 node_id 必须固定同一 client_id；建议同值）
+curl -sS -X POST http://<平台地址>/api/v1/user/service-token \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer <管理员 JWT>" \
+  -d '{"client_id":"sim-node-01"}'
+# → data.access_token 填入 HUNTER_CORE_SIM_NODE_SERVICE_TOKEN
+```
+
+```dotenv
+# 仿真机 .env（启用后控制面启动即注册，之后每 20s 心跳）
+HUNTER_CORE_SIM_NODE_ENABLED=true
+HUNTER_CORE_SIM_NODE_ID=sim-node-01
+HUNTER_CORE_SIM_NODE_SERVICE_TOKEN=<服务令牌>
+HUNTER_CORE_SIM_NODE_BASE_URL=http://<平台 web-portal>   # 空则复用 HUNTER_CORE_GATEWAY_URL
+HUNTER_CORE_SIM_NODE_CAPACITY=1
+HUNTER_CORE_SIM_NODE_MAPS=Town01,Town03                  # 留空 = 不做地图过滤
+ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回访 :8090
+```
+
+要点：
+
+- **地址只能由平台自学习**：注册体只声明 `manager_port`/`protocol`/`maps`/`capacity`；
+  在请求体里塞 IP 会被平台 422 拒绝（设计如此）。
+- 节点走 **web-portal 80/443**，不要直连网关 `8080`：直连时平台学到的是网关容器地址，
+  会登记出「在线但永远打不通」的节点（`huntersim doctor` 会针对 8080 给出 warn）。
+- 平台主机需能入向访问本机 `:8090`（Windows 防火墙放行平台地址），WiFi 不得启用 AP 隔离。
+- 平台日志应出现 `sim_node_dispatch_target` 且 `base_url` 指向本机；本机 `/health` 的
+  `sim_node` 段可看到 `endpoint_ip`/`endpoint_source`/租约与最近一次错误。
+- 失败语义：`3001`（未注册/租约过期）由客户端自动回到注册分支；`401/403` 需检查服务令牌
+  是否过期/被撤销、角色是否在平台 `SIM_NODE_ROLES` 内。
+
 ---
 
 ## 5. 配置
@@ -195,6 +233,7 @@ Kubernetes：`kubectl apply -f k8s/`（单 Pod 双容器，`replicas: 1`，引�
 | `PROBE_` | 探针面 | `host`(127.0.0.1) · `port`(8080) · `adapter_url`(`http://127.0.0.1:8090`) |
 | `VIZ_` | 可视化客户端 | `enabled`(true) · `auto_open_browser`(true) · `log_buffer_size`(2000) · `log_history_limit`(500) · `event_limit`(200) · `lidar_max_points`(4000) · `depth_max_width`(480) |
 | `HUNTER_CORE_` | 云端接入 | `enabled`(false) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
+| `HUNTER_CORE_SIM_NODE_` | 仿真节点 | `enabled`(false) · `node_id` · `service_token` · `base_url`(空=复用 gateway_url) · `heartbeat_interval_seconds`(20，≤30) · `request_timeout_seconds`(5) · `capacity`(1) · `maps`(空=不过滤) · `carla_version` · `protocol`(http) · `manager_port`(空=ADAPTER_PORT) · `labels` · `runtime_hint` |
 
 > V3.0.0 起已移除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*` 前缀与 `EXECUTION_ENGINE_ENDPOINTS` 的双引擎示例（受支持形态 = 单世界串行，端点库存留空即单引擎）。
 

@@ -50,6 +50,7 @@ from hunter_sim.platform_adapter.models import (
     SubmitScenarioRequest,
 )
 from hunter_sim.platform_adapter.service import AdapterService, StreamLimitExceeded
+from hunter_sim.platform_adapter.sim_node import SimNodeClient
 from hunter_sim.platform_adapter.store import InstanceStore
 from hunter_sim.sensor_sim.frame_hub import Frame, FrameHub
 from hunter_sim.visualization.logbus import LogBus
@@ -114,6 +115,7 @@ def create_app(
     executor: Optional[SimulationExecutor] = None,
     service: Optional[AdapterService] = None,
     frame_hub_provider: Optional[Callable[[str], Optional[FrameHub]]] = None,
+    sim_node_client: Optional[SimNodeClient] = None,
 ) -> FastAPI:
     """构造控制平面应用。
 
@@ -122,11 +124,13 @@ def create_app(
         adapter_settings: 适配器配置（None 时从 ``ADAPTER_*`` 环境加载）。
         plane/store/executor/service: 测试注入点；注入 ``service`` 时应用不接管生命周期。
         frame_hub_provider: 帧汇聚中心查询器（测试注入用；默认委托执行器）。
+        sim_node_client: 仿真节点注册/心跳客户端（测试注入用；默认按配置构建）。
     """
     owned: dict[str, Any] = {
         "store": None,
         "executor": None,
         "service": service,
+        "sim_node": sim_node_client,
     }
     # 可视化客户端依赖：全局配置（状态面板）+ 进程内日志总线（日志面板）
     resolved: dict[str, Any] = {
@@ -193,15 +197,39 @@ def create_app(
                 f"CARLA adapter control plane ready on "
                 f"{runtime_adapter.host}:{runtime_adapter.port}"
             )
+        # 仿真节点控制面：仅当启用时向平台注册/心跳；失败只告警，不阻断本机仿真
+        if owned["sim_node"] is None and runtime_settings is not None:
+            if runtime_settings.sim_node.enabled and owned["service"] is not None:
+                running_provider = getattr(
+                    owned["service"], "running_instance_ids", None
+                )
+                owned["sim_node"] = SimNodeClient(
+                    runtime_settings.sim_node,
+                    base_url=(
+                        runtime_settings.sim_node.base_url
+                        or runtime_settings.cloud.gateway_url
+                    ),
+                    manager_port=runtime_settings.adapter.port,
+                    running_instance_ids=cast(
+                        Optional[Callable[[], list[str]]], running_provider
+                    ),
+                )
+        if owned["sim_node"] is not None:
+            owned["sim_node"].start()
         app.state.adapter_service = owned["service"]
+        app.state.sim_node_client = owned["sim_node"]
         try:
             yield
         finally:
+            if owned["sim_node"] is not None:
+                owned["sim_node"].stop()
             if owned["executor"] is not None:
                 owned["executor"].stop()
             if owned["store"] is not None:
                 owned["store"].close()
             owned["service"] = None
+            owned["sim_node"] = None
+            app.state.sim_node_client = None
             bus.detach()
             app.state.log_bus = None
 
@@ -275,6 +303,14 @@ def _register_routes(app: FastAPI) -> None:
             except Exception as exc:  # noqa: BLE001  健康检查不得因瞬时异常 500
                 logger.warning(f"Health snapshot failed: {exc}")
                 body["status"] = "degraded"
+        node = getattr(request.app.state, "sim_node_client", None)
+        if node is not None:
+            node_snapshot = getattr(node, "snapshot", None)
+            if callable(node_snapshot):
+                try:
+                    body["sim_node"] = node_snapshot()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"Sim node snapshot failed: {exc}")
         return body
 
     @app.get("/metrics", response_class=PlainTextResponse)

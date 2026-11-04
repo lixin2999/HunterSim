@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import enum
-from typing import Optional
+import ipaddress
+import re
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 全局配置需要统一组装管理面配置；``platform_adapter.config`` 只依赖 pydantic，
@@ -512,6 +514,92 @@ class CloudSettings(BaseSettings):
     )
 
 
+#: 仿真节点标识（与 HunterCore 契约 ``SimNodeIdPath`` 一致，禁止用 IP 命名）
+SIM_NODE_ID_PATTERN = r"^[a-z0-9][a-z0-9._-]{2,63}$"
+_SIM_NODE_ID_RE = re.compile(SIM_NODE_ID_PATTERN)
+
+
+class SimNodeSettings(BaseSettings):
+    """仿真节点控制面配置（HunterCore ``node`` 模式注册/心跳）。
+
+    仿真机作为「仿真节点」接入平台后，平台从入站请求头自学习本机地址，
+    再按该地址直推 CARLA 管理 API（:8090）；IP 漂移由下一次心跳自愈。
+
+    ``enabled=false``（默认）时控制面完全保持既有行为，不会向平台发起任何注册请求。
+
+    Attributes:
+        enabled: 是否启用节点注册/心跳（默认关闭，避免未接入平台的现场产生噪音）。
+        node_id: 节点永久标识（与 IP 无关，形如 ``sim-node-01``）；启用时必填。
+        base_url: 平台基础地址（空表示复用 ``HUNTER_CORE_GATEWAY_URL``）。
+        service_token: 平台签发的服务令牌（``service:{client_id}``，启用时必填）。
+        heartbeat_interval_seconds: 心跳周期（秒，必须 ≤30s：平台租约默认 90s）。
+        request_timeout_seconds: 注册/心跳单次 HTTP 超时（秒）。
+        capacity: 可并行实例上限（1-32，参与平台选节点排序）。
+        maps: 可用地图清单（逗号分隔；留空 = 不做地图过滤）。
+        carla_version: CARLA 版本（留空时尝试从已安装 SDK 推导）。
+        protocol: 平台回访本机管理 API 的协议（http/https）。
+        manager_port: 管理 API 端口（空表示复用 ``ADAPTER_PORT``）。
+        labels: 自定义标签（仅展示，如机房/显卡型号）。
+        runtime_hint: 节点自述地址（仅展示，绝不参与寻址）。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="HUNTER_CORE_SIM_NODE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(False, description="是否作为仿真节点接入平台（注册/心跳）")
+    node_id: str = Field(
+        "",
+        validation_alias=AliasChoices("HUNTER_CORE_SIM_NODE_ID", "node_id"),
+        description="节点永久标识（与 IP 无关，如 sim-node-01）",
+    )
+    base_url: str = Field(
+        "", description="平台基础地址（空表示复用 HUNTER_CORE_GATEWAY_URL）"
+    )
+    service_token: Optional[SecretStr] = Field(
+        None, description="平台签发的服务令牌（service:{client_id}）"
+    )
+    heartbeat_interval_seconds: float = Field(
+        20.0, ge=5.0, le=30.0, description="心跳周期（秒，平台要求 ≤30s）"
+    )
+    request_timeout_seconds: float = Field(
+        5.0, gt=0.0, le=60.0, description="注册/心跳 HTTP 超时（秒）"
+    )
+    capacity: int = Field(1, ge=1, le=32, description="可并行实例上限")
+    maps: str = Field("", description="可用地图清单（逗号分隔；空=不做地图过滤）")
+    carla_version: str = Field("", description="CARLA 版本（空=尝试从 SDK 推导）")
+    protocol: Literal["http", "https"] = Field("http", description="管理 API 协议")
+    manager_port: Optional[int] = Field(
+        None, ge=1, le=65535, description="管理 API 端口（空=复用 ADAPTER_PORT）"
+    )
+    labels: dict[str, str] = Field(
+        default_factory=dict, description="自定义标签（仅展示）"
+    )
+    runtime_hint: str = Field("", description="节点自述地址（仅展示，不参与寻址）")
+
+    @field_validator("node_id")
+    @classmethod
+    def validate_node_id(cls, value: str) -> str:
+        """节点标识必须符合平台契约（空串表示未配置，由启动检查拦截）。"""
+        text = (value or "").strip()
+        if text and not _SIM_NODE_ID_RE.match(text):
+            raise ValueError(
+                f"node_id 必须匹配 {SIM_NODE_ID_PATTERN}（小写字母/数字开头，"
+                "3–64 位，可含 . _ -；禁止用 IP 命名）"
+            )
+        if text:
+            try:
+                ipaddress.ip_address(text)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("node_id 不得使用 IP 地址（标识必须与地址解耦）")
+        return text
+
+
 class HunterSimSettings(BaseSettings):
     """HunterSim 全局聚合配置。
 
@@ -549,6 +637,7 @@ class HunterSimSettings(BaseSettings):
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     cloud: CloudSettings = Field(default_factory=CloudSettings)
+    sim_node: SimNodeSettings = Field(default_factory=SimNodeSettings)
     adapter: AdapterSettings = Field(default_factory=AdapterSettings)
     probe: ProbeSettings = Field(default_factory=ProbeSettings)
     viz: VizSettings = Field(default_factory=VizSettings)

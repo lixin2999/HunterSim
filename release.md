@@ -1972,4 +1972,64 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **`????` 场景名仍未做现场 UTF-8 复验**（承接 V3.1.1 待办）：服务端链路已确认不丢字（`--demo` 请求体显式 UTF-8、SQLite TEXT 与 JSON 响应均 UTF-8、静态资源带 `charset=utf-8`，且 `tests/test_platform_adapter_app.py` / `test_platform_adapter_store.py` 以中文 `scene_name` 覆盖往返），丢字发生在提交端把中文按控制台代码页交给 `curl` / `Invoke-RestMethod` 的那一步，服务端无法还原。本版只补文档写法，未加运行期拦截或告警。
 - **无活动实例时下拉仍选中历史 `failed` 首项**：`refreshInstances` 的 `running → pending → 首项` 优先级本身正确，但库里只剩历史实例时易被误读为当前故障；建议后续在页面顶部对「所选实例并非本次运行创建」给出提示。
 
+---
+
+## V3.2.0 — 仿真节点接入（HunterCore node 模式）
+
+**发布日期**：2026-11-03
+**版本定位**：让 HunterSim 可作为「仿真节点」注册到 HunterCore 平台。平台开启 `SIM_DISPATCH_MODE=node` 后，场景库下发不再依赖固定 IP：平台从入站请求头**自学习**仿真机地址，再按该地址直推本机 CARLA 管理 API（`:8090`）。**默认关闭**，不开启时与本补丁前完全一致（不发起任何平台请求）。
+
+### 背景
+
+平台原有 node 模式契约（`PUT /api/v1/scene/sim-nodes/{node_id}` 注册、`POST /api/v1/scene/sim-nodes/{node_id}/heartbeat` 心跳）已就绪，但 HunterSim 侧缺少注册/心跳客户端，仿真机无法进入平台的可调度节点列表。本版按 HunterCore `docs/HunterSim接入清单.md` 补齐仿真端实现。
+
+### 新增配置（前缀 `HUNTER_CORE_SIM_NODE_`）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ENABLED` | `false` | 总开关；关闭时不注册、不心跳、无后台线程 |
+| `ID` | 空 | 节点永久标识（`^[a-z0-9][a-z0-9._-]{2,63}$`，禁止 IP 形式）；启用时必填 |
+| `SERVICE_TOKEN` | 空 | 平台签发的服务令牌（`service:{client_id}`）；启用时必填 |
+| `BASE_URL` | 空 | 平台基础地址；空表示复用 `HUNTER_CORE_GATEWAY_URL` |
+| `HEARTBEAT_INTERVAL_SECONDS` | `20` | 心跳周期，范围 5–30s（平台租约默认 90s） |
+| `REQUEST_TIMEOUT_SECONDS` | `5` | 注册/心跳单次 HTTP 超时 |
+| `CAPACITY` | `1` | 可并行实例上限（1–32，参与平台选节点排序） |
+| `MAPS` | 空 | 可用地图清单（逗号分隔，上限 64；空 = 不做地图过滤） |
+| `CARLA_VERSION` | 空 | 登记展示用；空时尝试从已安装 `carla` SDK 元数据推导 |
+| `PROTOCOL` | `http` | 平台回访管理 API 的协议（`http`/`https`） |
+| `MANAGER_PORT` | 空 | 管理 API 端口；空表示复用 `ADAPTER_PORT`（默认 8090） |
+| `LABELS` | `{}` | 自定义标签（JSON 对象，仅展示） |
+| `RUNTIME_HINT` | 空 | 节点自述地址（仅展示，绝不参与寻址） |
+
+### 运行行为
+
+- **启动即注册，之后周期心跳**：`platform_adapter` 启动时构建 `SimNodeClient`，后台线程（`HunterSimNodeHeartbeat`）先 `PUT` 注册，随后按周期 `POST` 心跳；心跳携带当前 `pending`/`running` 实例 ID（上限 32）。
+- **地址只由平台自学习**：注册体仅包含 `capacity`/`protocol`/`manager_port`/`maps`/`carla_version`/`labels`/`runtime_hint`（平台 `extra="forbid"`，多字段即 422）；节点 IP 由平台从 `X-Real-IP`/`X-Forwarded-For`/TCP 对端学习。
+- **租约过期自愈**：心跳返回 `404` 或 `code=3001` 时记录 `sim_node_lease_expired`，下一轮自动回到注册分支；`401/403` 只告警并继续重试（提示检查令牌/角色）；网络与超时异常不杀死线程，也不影响本机场景执行。
+- **地址漂移可见**：平台回显的 `endpoint_ip` 变化时打印 `sim_node_endpoint_refreshed`（旧/新地址 + 来源）；与本机网卡不一致时打印 `sim_node_endpoint_mismatch`（代理/NAT 场景属预期）。
+- **健康与控制台**：`GET /health` 新增 `sim_node` 快照（`enabled`/`node_id`/`base_url`/`online`/`endpoint_ip`/`endpoint_source`/`manager_port`/`lease_seconds`/`running_count`/`last_error`/`last_ok_at`/`heartbeat_interval_seconds`）；`huntersim up` 启动计划新增「仿真节点」行。
+- **`huntersim doctor` 新增 `sim_node` 检查**：启用但缺 `node_id`/服务令牌 → `fail`；`ADAPTER_HOST` 为回环地址 → `warn`（平台无法回访）；平台地址直连网关 `8080` → `warn`（平台可能学到网关容器地址）；平台不可达 → `warn`（注册/心跳会重试）。
+
+### 质量门禁（实测）
+
+- `pytest -q`：**1174 passed**（较 V3.1.3 +17），全仓行覆盖 **84.38%**（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 87 source files**。
+- `flake8 src tests`：**0 告警**。
+- 新增测试 17 条（`tests/test_sim_node_client.py`）：覆盖注册请求体只含声明字段与 Bearer 鉴权头、心跳上报活动实例（过滤空值/截断 32 项/提供者异常降级为空）、`404`/`3001` 后下一轮自动重注册、配置不完整时不启动、`HUNTER_CORE_SIM_NODE_ID` 环境变量按文档生效、应用 lifespan 启停与 `/health` 快照、doctor 的 fail/warn/ok 判定；网络全部由 `httpx.MockTransport` 打桩。
+
+### 兼容性说明
+
+- **默认零改动**：`HUNTER_CORE_SIM_NODE_ENABLED=false` 时不创建客户端、不启动线程、不产生任何出向请求，既有行为与 V3.1.3 一致。
+- **对外契约只增不改**：10 个 `/api/v1/*` 实例端点、`/metrics`、VIL 数据面与 Kafka 消息格式均未变；`/health` 仅新增可选 `sim_node` 字段。
+- **注册体不含地址**：这是平台契约要求（地址由平台自学习），不是遗漏；手工把 IP 写进注册体属于错误用法。
+- **`node_id` 校验更严**：除平台正则外额外禁止 IP 形式，符合接入清单「标识必须与地址解耦」；已用 IP 作 `node_id` 的现场需改用固定名字（如 `sim-node-01`）。
+- **版本**：`pyproject.toml` / `/health` 应用版本 `3.1.3 → 3.2.0`，镜像 tag `hunter-sim:3.2.0`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`（§4.6 接入说明与配置表）、`user_manual.md`（§2.4 / §9.1）、`deployment_and_operations.md`（§3.8 / §5.8 / §7）、`docs/单机部署指南.md`、`.env.example`、`k8s/configmap.yaml`、`k8s/secret.yaml` 已同步。升级步骤：`git pull` → `uv sync` → `uv pip install -e .`（刷新安装元数据）→ 按需配置 `HUNTER_CORE_SIM_NODE_*` → `huntersim doctor` 确认 `sim_node` 项。
+
+### 待办 / 已知边界
+
+- **未与真实平台联调**：本机无 HunterCore 平台，验证止于 `httpx.MockTransport` 打桩与配置/生命周期断言；注册成功后的真实下发链路（平台 → 本机 `:8090`）需在现场按接入清单复验。
+- **直连网关 `8080` 仍是常见坑**：此时平台学到的是网关容器地址，会登记出「在线但永远打不通」的节点；应走 web-portal 80/443，或确认网关透传 `X-Real-IP` 并在平台配置 `SIM_NODE_ALLOWED_NETWORKS`。doctor 只能提示，无法代替现场网络验证。
+- **Windows 防火墙/AP 隔离**：平台主机需能入向访问本机 `:8090`，需放行平台地址；WiFi AP 隔离会表现为节点在线但下发超时，属环境问题而非客户端缺陷。
+- **无本地指标**：本版未新增 Prometheus 指标，节点状态以 `/health` 快照与结构化日志（`sim_node_registered` / `sim_node_endpoint_refreshed` / `sim_node_*_failed`）呈现。
+
 
