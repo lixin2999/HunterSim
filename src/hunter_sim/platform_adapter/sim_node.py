@@ -17,9 +17,11 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
 from urllib.parse import quote, urlsplit
 
 from hunter_sim.common.models import SimNodeSettings
@@ -224,6 +226,93 @@ class SimNodeClient:
                 "last_ok_at": _iso(self._last_ok_at),
                 "heartbeat_interval_seconds": self._settings.heartbeat_interval_seconds,
             }
+
+    # ── V2.0 三步接入 step1：接入包下载 ──────────────────────────────────
+
+    def download_bundle(
+        self,
+        dest_dir: Union[str, Path],
+        *,
+        extract: bool = True,
+        timeout: Optional[float] = None,
+    ) -> Optional[Path]:
+        """下载并（可选）解压节点接入包 ZIP（接入清单 §1.5 三步接入 step1）。
+
+        平台 ``GET /api/v1/scene/sim-nodes/{node_id}/bundle`` 返回一个 ZIP，内含
+        平台 CA + Kafka 客户端证书 + 平台访问证书 + ``kafka.properties`` + README。
+        口令不入包（沿用车辆侧纪律），需手工把一次性 SCRAM 口令填入
+        ``kafka.properties`` 的 ``sasl.password``（step2）。
+
+        Args:
+            dest_dir: 保存目录（不存在则创建）。
+            extract: 是否同时解压（默认解压）。
+            timeout: 请求超时（秒）；空则用 ``request_timeout_seconds`` 放宽至 30s。
+
+        Returns:
+            解压目录（``extract=True`` 且成功）或 zip 文件路径；失败返回 None。
+            任何网络/格式异常仅记日志，不抛出（与心跳一样不阻断本机）。
+        """
+        if not self._settings.node_id or not self._base_url:
+            logger.error(
+                "接入包下载失败：node_id 或平台地址未配置"
+                "（HUNTER_CORE_SIM_NODE_ID / HUNTER_CORE_GATEWAY_URL）"
+            )
+            return None
+        url = (
+            f"{self._base_url}{NODE_PATH}"
+            f"/{quote(self._settings.node_id, safe='')}/bundle"
+        )
+        effective_timeout = (
+            float(timeout)
+            if timeout is not None
+            else max(30.0, float(self._settings.request_timeout_seconds))
+        )
+        try:
+            response = self._client_or_create().request(
+                "GET", url, headers=self._headers(), timeout=effective_timeout
+            )
+        except Exception as exc:  # noqa: BLE001  网络/证书/超时统一降级为失败
+            logger.error(f"接入包下载失败（请求异常）：{type(exc).__name__}: {exc}")
+            return None
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= status_code < 300:
+            detail = str(getattr(response, "text", "") or "")[:256]
+            logger.error(
+                f"接入包下载失败：status={status_code}, node_id={self._settings.node_id}, "
+                f"resp={detail}"
+            )
+            return None
+        content = bytes(getattr(response, "content", b"") or b"")
+        if not content:
+            logger.error("接入包下载失败：响应体为空")
+            return None
+        dest = Path(dest_dir)
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            zip_path = dest / f"{self._settings.node_id}-bundle.zip"
+            zip_path.write_bytes(content)
+        except OSError as exc:
+            logger.error(f"接入包落盘失败：{type(exc).__name__}: {exc}")
+            return None
+        logger.info(
+            f"sim_node_bundle_downloaded: {zip_path} ({len(content)} 字节)"
+        )
+        if not extract:
+            return zip_path
+        extract_dir = dest / f"{self._settings.node_id}-bundle"
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+        except (zipfile.BadZipFile, OSError) as exc:
+            logger.error(
+                f"接入包解压失败（zip 已保留：{zip_path}）：{type(exc).__name__}: {exc}"
+            )
+            return zip_path
+        logger.info(
+            f"sim_node_bundle_extracted: {extract_dir}"
+            "（后续：把一次性 SCRAM 口令填入 kafka.properties，见接入清单 §1.5 step2）"
+        )
+        return extract_dir
 
     # ── 内部 ────────────────────────────────────────────────────────────────
 

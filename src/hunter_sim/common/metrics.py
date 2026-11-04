@@ -188,6 +188,13 @@ SENSOR_FILE_PUBLISHED_TOTAL = Counter(
     "sensor_file messages published after successful bag upload.",
 )
 
+# 节点级结果回传（V2.0，simulation.{node_id}.result）
+NODE_RESULT_PUBLISHED_TOTAL = Counter(
+    "huntersim_node_result_published_total",
+    "Instance terminal-result messages published to the node-level simulation result topic.",
+    labelnames=("node_id",),
+)
+
 SIM_DATA_PRODUCER_ERRORS_TOTAL = Counter(
     "huntersim_sim_data_producer_errors_total",
     "SimDataProducer send/DLQ/serialization errors.",
@@ -414,6 +421,7 @@ __all__ = [
     "KAFKA_CONSUMER_LAG",
     "KAFKA_CONSUMER_REBUILDS_TOTAL",
     "KAFKA_CONSUMED_TOTAL",
+    "NODE_RESULT_PUBLISHED_TOTAL",
     "RECORDING_EVENTS_TOTAL",
     "SENSOR_FRAMES_DROPPED_TOTAL",
     "SENSOR_FRAMES_TOTAL",

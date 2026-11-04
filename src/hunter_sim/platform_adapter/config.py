@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Optional
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +33,11 @@ class AdapterSettings(BaseSettings):
         progress_interval_seconds: 进度落库间隔（秒）。
         default_duration_seconds: 场景未提供 duration 时的默认时长。
         max_scene_seconds: 平台下发时长上限（超出直接失败，避免占满单世界）。
+        ssl_certfile: 管理 API TLS 服务端证书（V2.0 下发 mTLS；空=明文 http）。
+        ssl_keyfile: 管理 API TLS 服务端私钥（须与 ssl_certfile 成对）。
+        ssl_ca_certfile: 信任的平台 CA 证书（校验客户端 sim-platform-{node_id}）。
+        ssl_client_auth_required: 是否强制双向 TLS（要求平台回访携带客户端证书）。
+        ssl_allowed_client_cn: 允许的客户端证书 CN（默认由 node_id 推导，留空不校验）。
     """
 
     model_config = SettingsConfigDict(
@@ -91,6 +98,35 @@ class AdapterSettings(BaseSettings):
     max_scene_seconds: float = Field(
         7200.0, gt=0.0, description="平台下发场景时长上限（秒）"
     )
+    # ── V2.0 下发通道 mTLS（接入清单 §1.5 步骤 3；注册体 protocol 相应改 https）──
+    ssl_certfile: Optional[str] = Field(
+        None, description="管理 API TLS 服务端证书（空=明文 http，平台无需 TLS）"
+    )
+    ssl_keyfile: Optional[str] = Field(
+        None, description="管理 API TLS 服务端私钥（须与 ssl_certfile 成对）"
+    )
+    ssl_ca_certfile: Optional[str] = Field(
+        None, description="信任的平台 CA 证书路径（校验回访客户端证书）"
+    )
+    ssl_client_auth_required: bool = Field(
+        False, description="是否强制双向 TLS（true 时仅接受平台 sim-platform 客户端证书）"
+    )
+    ssl_allowed_client_cn: str = Field(
+        "", description="允许的客户端证书 CN（留空则不做 CN 白名单校验）"
+    )
+
+    @field_validator("ssl_certfile", "ssl_keyfile", "ssl_ca_certfile", mode="after")
+    @classmethod
+    def _blank_cert_is_none(cls, value: Optional[str]) -> Optional[str]:
+        """空白证书路径归一为 ``None``（``ADAPTER_SSL_*=`` 视为未启用 TLS）。"""
+        if value is None or not value.strip():
+            return None
+        return value.strip()
+
+    @property
+    def tls_enabled(self) -> bool:
+        """管理 API 是否以 TLS 提供服务（服务端证书与私钥成对配置时为真）。"""
+        return bool(self.ssl_certfile and self.ssl_keyfile)
 
     def watchdog_timeout(self, duration_seconds: float) -> float:
         """计算看门狗超时：``duration * factor + grace``。"""

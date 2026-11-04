@@ -316,13 +316,13 @@ class TestMcapAndKafkaChecks:
 
 
 class TestSimNodeCheck:
-    """仿真节点接入项：缺凭据必须 fail，且 hint 同时给出「补什么」与「怎么关掉」。
+    """仿真节点接入项：V3.2.2 默认打开但无凭据即静默跳过，缺凭据记 warn（不阻断 up）。
 
-    V3.2.1 现场确认：`.env.example` 预置 `HUNTER_CORE_SIM_NODE_ENABLED=true`（面向
-    平台联调机），新机器首跑就会撞上这条 fail，提示必须带上暂不接入的退路。
+    旧版（V3.2.1）缺服务令牌记 fail 并拦住 `huntersim up`；V3.2.2 翻转默认后，
+    新机器首跑不应被拦住，因此缺凭据降级为 warn，hint 仍给出「补什么」与「怎么关掉」。
     """
 
-    def test_missing_token_fails_with_disable_hint(self) -> None:
+    def test_missing_token_warns_with_disable_hint(self) -> None:
         settings = _settings()
         settings.sim_node.enabled = True
         settings.sim_node.node_id = "sim-node-01"
@@ -330,7 +330,7 @@ class TestSimNodeCheck:
 
         result = _check_sim_node(settings)
 
-        assert result.status == "fail"
+        assert result.status == "warn"
         assert "HUNTER_CORE_SIM_NODE_SERVICE_TOKEN" in result.detail
         assert "HUNTER_CORE_SIM_NODE_ENABLED=false" in result.hint
 
@@ -348,7 +348,10 @@ class TestPlatformCheck:
     """平台接入项：未启用即 skip，网关不可达只 warn（不阻断本机场景）。"""
 
     def test_disabled_is_skip(self) -> None:
-        result = _check_platform(_settings())
+        settings = _settings()
+        settings.cloud.enabled = False
+
+        result = _check_platform(settings)
 
         assert result.status == "skip"
         assert "HUNTER_CORE_ENABLED" in result.detail

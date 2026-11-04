@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.2.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 章节，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，并把模板接入开关的注释与文档口径统一为「默认开启、需补凭据」）。
+- **当前版本**：`3.2.2`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 章节，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -115,8 +115,8 @@ huntersim doctor --json --strict               # 脚本消费 / 上线门禁（w
 
 ```bash
 copy .env.example .env                        # Windows（Linux: cp）
-# 模板默认开启平台接入：先补 CARLA_HOST / 节点服务令牌 / 平台地址 / ADAPTER_HOST，
-# 否则 huntersim doctor 会在 sim_node 项报 fail（详见 §5 与《单机部署指南》§2）
+# V3.2.2 起为极简模板：接入开关代码默认已开、无凭据静默跳过，本机拷完模板可不改直接 up
+# （源码直跑先改 CARLA_HOST=127.0.0.1；接入平台时再补 node_id/服务令牌/平台地址/ADAPTER_HOST，详见 §5）
 
 huntersim up                                  # 一键：预检 → 控制面 :8090 → 探针面 :8080 → 打开 /viz
 huntersim up --no-browser                     # 不起浏览器，只打印可视化地址
@@ -207,7 +207,7 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 
 要点：
 
-- **模板已默认开启**：`.env.example` 把 `HUNTER_CORE_SIM_NODE_ENABLED` 预置为 `true`（代码字段默认仍为 `false`），因此 `HUNTER_CORE_SIM_NODE_ID` / `_SERVICE_TOKEN` 与平台地址属于**首启必填**；不接入平台请把开关改回 `false`。
+- **默认已开、无凭据静默跳过**（V3.2.2）：`HUNTER_CORE_SIM_NODE_ENABLED` 代码默认已翻转为 `true`，`.env.example` 不再预置开关。未配 `HUNTER_CORE_SIM_NODE_ID` / `_SERVICE_TOKEN` 与平台地址时不发起注册/心跳，`huntersim doctor` 记 **warn**（不拦住 `huntersim up`）；接入平台时补齐这几项即可，彻底关闭可显式置 `false`。
 - **地址只能由平台自学习**：注册体只声明 `manager_port`/`protocol`/`maps`/`capacity`；
   在请求体里塞 IP 会被平台 422 拒绝（设计如此）。
 - 节点走 **web-portal 80/443**，不要直连网关 `8080`：直连时平台学到的是网关容器地址，
@@ -235,12 +235,13 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 | `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `artifact_retention_hours`(72) · `recordings_dir` · `recording_retention_hours`(24) · `record_enabled`(true) · `record_min_free_gb`(0.5) · `upload_on_failure`(false) · `stream_fps`(10.0) · `stream_max_width`(640) · `stream_max_clients`(8) · `screenshot_quality`(75) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
 | `PROBE_` | 探针面 | `host`(127.0.0.1) · `port`(8080) · `adapter_url`(`http://127.0.0.1:8090`) |
 | `VIZ_` | 可视化客户端 | `enabled`(true) · `auto_open_browser`(true) · `log_buffer_size`(2000) · `log_history_limit`(500) · `event_limit`(200) · `lidar_max_points`(4000) · `depth_max_width`(480) |
-| `HUNTER_CORE_` | 云端接入 | `enabled`(false) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
-| `HUNTER_CORE_SIM_NODE_` | 仿真节点 | `enabled`(false) · `node_id` · `service_token` · `base_url`(空=复用 gateway_url) · `heartbeat_interval_seconds`(20，≤30) · `request_timeout_seconds`(5) · `capacity`(1) · `maps`(空=不过滤) · `carla_version` · `protocol`(http) · `manager_port`(空=ADAPTER_PORT) · `labels` · `runtime_hint` |
+| `HUNTER_CORE_` | 云端接入 | `enabled`(**true**，V3.2.2 翻转) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
+| `HUNTER_CORE_SIM_NODE_` | 仿真节点 | `enabled`(**true**，V3.2.2 翻转；无凭据静默跳过) · `node_id` · `service_token` · `base_url`(空=复用 gateway_url) · `result_enabled`(**true**，V2.0 节点级回传) · `heartbeat_interval_seconds`(20，≤30) · `request_timeout_seconds`(5) · `capacity`(1) · `maps`(空=不过滤) · `carla_version` · `protocol`(http) · `manager_port`(空=ADAPTER_PORT) · `labels` · `runtime_hint` |
+| `ADAPTER_SSL_` | 下发 mTLS | `certfile`/`keyfile`（成对则 carla-manager 启用 TLS） · `ca_certfile`（信任平台 CA 校验回访证书） · `client_auth_required`(false，置 true 强制双向 TLS) · `allowed_client_cn`（仅展示提示）（V3.2.2） |
 
 > V3.0.0 起已移除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*` 前缀与 `EXECUTION_ENGINE_ENDPOINTS` 的双引擎示例（受支持形态 = 单世界串行，端点库存留空即单引擎）。
 
-> 上表括号里是**代码字段默认值**；[`.env.example`](.env.example) 模板把 `HUNTER_CORE_ENABLED` 与 `HUNTER_CORE_SIM_NODE_ENABLED` 预置为 `true`（面向平台联调机，注释里已标「需补凭据」）。拷模板后的**首启必填项**：`CARLA_HOST=127.0.0.1`（源码直跑）、`HUNTER_CORE_SIM_NODE_SERVICE_TOKEN`、平台地址（`HUNTER_CORE_SIM_NODE_BASE_URL` 或 `HUNTER_CORE_GATEWAY_URL`）、node 模式的 `ADAPTER_HOST=0.0.0.0`。缺服务令牌时 `huntersim doctor` 报 `sim_node` **fail** 并拦住 `huntersim up`；数据面凭据（SASL 账号/口令、`jwt_token`）缺失只静默降级 no-op。纯本机联调请把两个开关改回 `false`。
+> 上表括号里是**代码字段默认值**（V3.2.2 起两个接入开关默认已翻转为 `true`）；`.env.example` 已收敛为极简模板、不再逐条预置。未配服务令牌/`node_id`/Kafka 凭据时，`huntersim doctor` 对 `sim_node` 只记 **warn**（不再 `fail`），遥测/上传/注册心跳/节点级回传静默降级为 no-op，本机**拷完模板一行不改就能直接 `huntersim up`**。接入平台时才需补：`CARLA_HOST=127.0.0.1`（源码直跑）、`HUNTER_CORE_SIM_NODE_ID`/`_SERVICE_TOKEN`、平台地址（`HUNTER_CORE_SIM_NODE_BASE_URL` 或 `HUNTER_CORE_GATEWAY_URL`）、node 模式的 `ADAPTER_HOST=0.0.0.0`。纯本机联调想让 `doctor` 完全干净：显式把两个开关置 `false`（转 `skip`）。
 
 ---
 

@@ -2112,3 +2112,55 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **`sensor_view.py` 的 `Image.Resampling.NEAREST` 分支无测试覆盖**：该 `resize` 守卫在当前代码路径下永不触发（上游已用 numpy 步长下采样），本轮只修类型，未新增用例；后续若确认冗余可整块删除。
 - **`Image.fromarray(..., mode=...)` 的 Pillow 13 前瞻问题（未改）**：装上 Pillow 11 后测试日志开始出现 `'mode' parameter is deprecated`（`sensor_view.py` 与 `image_codec.py` 共两处）。当前依赖上限 `Pillow<12.0` 不会被真的移除，且不产生功能差异，所以本轮不动；升级 Pillow 前需去掉 `mode` 参数。
 
+---
+
+## V3.2.2 — 平台接入默认打开 + V2.0 节点级回传通道 + 极简环境模板
+
+**发布日期**：2026-11-04
+**版本定位**：按 HunterCore《仿真端接入平台系统方案》§2.5 与《HunterSim 接入清单》§1.5 打通仿真端与平台的通信及数据，落地 V2.0「一键开通/三步接入」的仿真端侧能力，并按现场诉求**简化运行环境配置**：接入开关默认全开、无凭据即静默跳过、`.env.example` 收敛为极简模板。
+
+### 概览
+
+仿真端在 V3.2.0/V3.2.1 的 node 模式接入（注册/心跳 + 实例级 Kafka 回传）基础上，本版补齐 V2.0 的两处关键链路——**节点级结果回传通道**与**下发通道 mTLS**，并把「每次升级要改一大堆配置项」的痛点从根上解决：默认值内聚到代码、模板只留首启必改项。全程延续「依赖惰性导入 + 无凭据安全 no-op」的韧性纪律，**绝不阻断本机仿真**。
+
+### 新增能力
+
+- **节点级 Kafka 回传通道（方案 §2.5.4 / §8.1）**：新增 `cloud/node_result_producer.py`——`NodeResultProducer` 复用平台数据面凭据（`CloudSettings` 的 SASL/TLS），把**实例终态结果摘要**按节点聚合回传到 `simulation.{node_id}.result`（配套派生死信 `.dlq` 模板），由平台 `data-collector-simulation` 消费组消费，与实例级 `carla.{sim_id}.sensor_data` 并存、与真实车队 Topic 物理隔离。`build_node_result` 构造对齐方案 §5.4 结果视图的消息（`type=simulation_result`、key=sim_id、acks=all）。`common/metrics.py` 注册并导出 `huntersim_node_result_published_total{node_id}`。
+- **执行器终态挂载**：`platform_adapter/executor.py` 在四个终态路径（`_complete_instance` / `_fail_instance`（含看门狗超时与场景失败）/ `cancel`）挂载 `_publish_node_result`，惰性连接、全程 `try/except`，回传失败仅告警、不影响结果落库；非终态与配置不足时安全跳过。
+- **接入配置字段（`common/models.py`）**：`SimNodeSettings` 新增 `result_enabled`（默认开）、`result_topic_template`、`result_dlq_template` 与 `render_result_topic()` / `render_result_dlq_topic()`（`node_id` 为空返回空串，表示不可用）。
+- **下发通道 mTLS（接入清单 §1.5 step3）**：`platform_adapter/config.py` 的 `AdapterSettings` 新增 `ssl_certfile` / `ssl_keyfile` / `ssl_ca_certfile` / `ssl_client_auth_required` / `ssl_allowed_client_cn` 与 `tls_enabled` 属性（空白证书路径归一为 `None`）。`huntersim carla-manager` 在成对配置服务端证书/私钥时以 TLS 提供服务，配置 CA 即信任平台 CA 校验回访客户端证书，`ssl_client_auth_required=true` 时强制双向 TLS（`ssl_cert_reqs=required`，否则 `optional`）。
+- **三步接入 step1 —— 接入包下载**：`platform_adapter/sim_node.py` 的 `SimNodeClient.download_bundle()` 从平台 `GET /api/v1/scene/sim-nodes/{node_id}/bundle` 拉取 ZIP（内含平台 CA + 双证书 + `kafka.properties` + README）并落盘解压，网络/格式异常仅记日志返回 `None`（与心跳一样不阻断本机）。新增 `huntersim connect` 子命令封装 step1，并打印 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS、注册体转 `https`）的后续指引。
+
+### 配置简化（现场核心诉求）
+
+- **接入开关默认全开**：`CloudSettings.enabled` 与 `SimNodeSettings.enabled` 的代码默认由 `False` 翻转为 `True`；模板不再逐条写 `HUNTER_CORE_ENABLED=true` / `HUNTER_CORE_SIM_NODE_ENABLED=true`，升级改默认值时无需再同步改模板。
+- **无凭据即静默跳过**：未配 Kafka 凭据/服务令牌/`node_id` 时，遥测、上传、注册心跳、节点级结果回传一律安全降级为 no-op，本机场景照常执行。
+- **doctor 缺凭据 fail → warn**：`_check_sim_node` 在启用但缺 `node_id`/服务令牌时改记 `warn`（原为 `fail`），不再拦住 `huntersim up`；彻底关闭仍走 `HUNTER_CORE_SIM_NODE_ENABLED=false`（转 `skip`）。
+- **`.env.example` 收敛为极简模板**：从 251 行精简到约 64 行，只保留「本机首启可能要改」（`CARLA_HOST`/`CARLA_VERSION`/`HUNTER_SIM_LOG_LEVEL`）与「接入平台需补」两节；绝大多数调优项（看门狗、录制、MJPEG、VIL 对齐、上传重试、探针/可视化等）改由代码默认值承载，需要覆盖时按 `变量名=值` 追加即可（键名见 `common/models.py` 与 `user_manual.md`）。本机零配置可整份不改直接 `huntersim up`。
+
+### 兼容与迁移
+
+- 旧「服务令牌 + 自注册」路径（接入清单 §2–§4）保留可用；V2.0 一键开通（`POST /sim-nodes`、`/bundle`、`rotate-scram`/`retry-provision`/`deprovision`、下发 mTLS、`SIM_DISPATCH_MTLS_ENABLED`）在平台侧为 `contract_defined`，**后端与前端向导待实现**——仿真端能力已就绪，平台落地即可对接。
+- 纯本机联调无需任何凭据即可起（开关默认开但静默跳过）；已在用「显式关闭」的部署可继续显式置 `false`，行为不变。
+
+### 质量门禁
+
+- `mypy src/hunter_sim`（strict）：88 文件无问题；`flake8 src tests`：改动文件全绿；`pytest`：**1197 passed**（新增 `tests/test_sim_node_v2_onboarding.py` 覆盖结果消息/Topic 渲染/回传门控与降级/TLS 归一/bundle 下载/执行器终态挂载/doctor 降级；更新 `tests/test_settings_env.py`、`tests/test_doctor_cli.py`、`tests/test_sim_node_client.py` 以匹配「默认打开 + 缺凭据 warn + 极简模板」新口径）。
+
+### 版本与镜像
+
+- **版本**：`pyproject.toml` / `huntersim version` `3.2.1 → 3.2.2`，镜像 tag `hunter-sim:3.2.2`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`、`.env.example` 已同步。
+
+### 实机执行（现场待办）
+
+- `git pull` → `uv pip install -e .`（刷新安装元数据）→ `huntersim version` 应为 `3.2.2` → `huntersim doctor`：`sim_node` 缺凭据转为 `warn`（不再是 `fail`），本机 `huntersim up` 不再被拦住。
+- 接入平台（V2.0）：管理员一键开通后，仿真端执行 `huntersim connect`（step1 下载/解压接入包）→ 把一次性 SCRAM 口令填入包内 `kafka.properties`（step2）→ 用包内证书配 `ADAPTER_SSL_*` 并重启 `carla-manager` 启用 TLS/mTLS、把 `HUNTER_CORE_SIM_NODE_PROTOCOL` 改为 `https`（step3）。
+- `.env.example` 属仓库根目录、不在 wheel 内，**模板改动无需重建镜像**；mTLS/`connect` 属代码改动，容器部署需 `--force-recreate` 生效。
+
+### 待办 / 已知边界
+
+- **平台侧一键开通/`/bundle`/mTLS 下发尚未落地**：均为 `contract_defined`；后端实现前，`huntersim connect` 会因平台无该端点而返回失败并降级为日志告警，旧 §2–§4 路径仍可用。
+- **`ssl_allowed_client_cn` 仅登记不强制**：uvicorn/SSL 以 CA 链信任校验客户端证书，不做 CN 白名单过滤；因每个节点的 `sim-platform-{node_id}` 证书 CN 唯一，CA 信任已等效保证「只有平台签发证书可接入」，本版只把预期 CN 打印提示，未加自定义 ASGI 中间件做强 CN 校验。
+- **回传通道无凭据即 no-op**：`HUNTER_CORE_KAFKA_BOOTSTRAP`/SASL/证书留空时，实例级与节点级回传均降级为 no-op（本机场景与结果落库不受影响），符合「默认开、无凭据静默跳过」的选定口径。
+
+

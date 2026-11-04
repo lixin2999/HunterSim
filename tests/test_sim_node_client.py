@@ -282,10 +282,11 @@ class TestDoctor:
         result = _check_sim_node(settings)
         assert result.status == "skip"
 
-    def test_missing_token_is_fail(self) -> None:
+    def test_missing_token_is_warn(self) -> None:
+        # V3.2.2：默认打开但缺服务令牌时静默跳过，记 warn（不阻断 huntersim up）
         settings = HunterSimSettings(sim_node=_settings(service_token=None))
         result = _check_sim_node(settings)
-        assert result.status == "fail"
+        assert result.status == "warn"
         assert "SERVICE_TOKEN" in result.detail
 
     def test_loopback_listener_warns(

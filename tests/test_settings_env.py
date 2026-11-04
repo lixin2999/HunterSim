@@ -121,9 +121,10 @@ def test_hunter_core_mtls_cert_env_keys(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_cloud_adapter_and_probe_defaults(tmp_path: Path) -> None:
-    """未配置时 cloud 默认关闭、指向单机验证环境；adapter/probe 默认 8090/8080。"""
+    """未配置时 cloud/sim_node 默认打开（V3.2.2），adapter/probe 默认 8090/8080。"""
     settings = HunterSimSettings()
-    assert settings.cloud.enabled is False
+    assert settings.cloud.enabled is True
+    assert settings.sim_node.enabled is True
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
     assert settings.cloud.sensor_data_topic_template == "carla.{sim_id}.sensor_data"
     assert settings.adapter.port == 8090
@@ -143,7 +144,7 @@ def test_cloud_unknown_keys_ignored(tmp_path: Path) -> None:
     """HUNTER_CORE_ 前缀下的未知键不得触发校验错误。"""
     _write_env(tmp_path, "HUNTER_CORE_TYPO_FIELD=1\nADAPTER_TYPO=2\n")
     settings = HunterSimSettings()
-    assert settings.cloud.enabled is False
+    assert settings.cloud.enabled is True
 
 
 class TestBlankOptionalValues:
@@ -194,28 +195,41 @@ class TestBlankOptionalValues:
             HunterSimSettings()
 
     def test_shipped_env_template_loads(self, tmp_path: Path) -> None:
-        """守护模板本身：`.env.example` 拷贝为 `.env` 后必须能直接加载。"""
+        """守护模板本身：`.env.example` 拷贝为 `.env` 后必须能直接加载。
+
+        V3.2.2 极简模板面向“本机零配置”，平台字段留空（``KEY=``）不得中断加载；
+        接入开关靠代码默认（不再在模板里逐条写 ENABLED=true）。
+        """
         shutil.copy(_REPO_ROOT / ".env.example", tmp_path / ".env")
         settings = HunterSimSettings()
-        # 模板里留空的回访端口不得阻断加载，且真实值照常读出
+        # 留空的回访端口/节点标识不得阻断加载（本机零配置可直接起）
         assert settings.sim_node.manager_port is None
-        assert settings.sim_node.node_id == "sim-node-01"
-        # 模板面向平台联调机：两个接入开关预置为开启（代码字段默认仍是 False）
+        assert settings.sim_node.node_id == ""
+        assert settings.sim_node.service_token is None
+        # 接入开关靠代码默认，拷完模板即为开（无凭据时静默跳过）
         assert settings.cloud.enabled is True
         assert settings.sim_node.enabled is True
 
     def test_template_integration_switches_are_documented(self) -> None:
-        """模板口径守护：预置开启必须与注释同口径（防止取值与注释、文档背离）。
+        """模板口径守护（V3.2.2 极简版）：默认靠代码，模板不重列接入开关与调优项。
 
-        V3.2.1 现场确认：模板把 `HUNTER_CORE_ENABLED` / `HUNTER_CORE_SIM_NODE_ENABLED`
-        置为 `true`，而旧注释与文档写的是「默认关闭」，新机器拷完模板就会撞上
-        `sim_node` 缺服务令牌的 `fail`。现在两处必须同时成立。
+        旧版把两个 ENABLED 写死在模板里，默认值一变就要同步改模板；V3.2.2 改为：
+        默认值在代码，模板只保留本机首启项与平台凭据位，并显式说明“无凭据静默跳过”。
         """
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-        assert "HUNTER_CORE_ENABLED=true" in text
-        assert "HUNTER_CORE_SIM_NODE_ENABLED=true" in text
-        # 两个分节标题都要写明「默认开启，需补凭据」
-        assert text.count("本模板默认开启，需补凭据") == 2
-        # 文件头必须给出首启清单，且服务令牌标注为必填
-        assert "必须补齐" in text
-        assert "开启接入时必填" in text
+        # 不再把两个开关当默认值写死（靠代码默认；仅在“关闭”提示里以注释出现）
+        active_lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert not any(line.startswith("HUNTER_CORE_ENABLED=") for line in active_lines)
+        assert not any(
+            line.startswith("HUNTER_CORE_SIM_NODE_ENABLED=") for line in active_lines
+        )
+        # 必须说明默认全开 + 无凭据静默跳过，并保留三步接入入口
+        assert "默认全开" in text
+        assert "静默跳过" in text
+        assert "huntersim connect" in text
+        # 调优项不再罗列：模板行数应大幅少于旧版（极简契约）
+        assert len(text.splitlines()) < 90

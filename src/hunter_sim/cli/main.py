@@ -308,9 +308,9 @@ def _check_platform(settings: HunterSimSettings) -> CheckResult:
 def _check_sim_node(settings: HunterSimSettings) -> CheckResult:
     """仿真节点接入（HunterCore node 模式）：配置完整性 + 回访可达性提示。
 
-    注册/心跳本身是出向请求，网关不可达只影响节点上下线（记 ``warn``）；
-    但 ``node_id``/服务令牌缺失会让注册必然失败，记 ``fail`` 以在 ``huntersim up``
-    的预检阶段直接拦住。
+    V3.2.2 起接入默认打开但**无凭据即静默跳过**：注册/心跳是出向请求，缺少
+    ``node_id``/服务令牌时 ``SimNodeClient`` 只记一条日志便不启动心跳，绝不阻断本机
+    仿真；因此这里缺凭据记 ``warn``（而非 ``fail``），不拦住 ``huntersim up``。
     """
     node = settings.sim_node
     if not node.enabled:
@@ -324,11 +324,11 @@ def _check_sim_node(settings: HunterSimSettings) -> CheckResult:
     if node.service_token is None or not node.service_token.get_secret_value().strip():
         missing.append("HUNTER_CORE_SIM_NODE_SERVICE_TOKEN")
     if missing:
-        return _fail(
+        return _warn(
             "sim_node",
-            f"节点注册参数缺失：{', '.join(missing)}",
-            "模板默认开启接入：按 HunterCore《HunterSim 接入清单》§2/§3 配置节点标识"
-            "与服务令牌；暂不接入平台则置 HUNTER_CORE_SIM_NODE_ENABLED=false",
+            f"未配置接入凭据（{', '.join(missing)}），节点接入静默跳过",
+            "接入平台时按 HunterCore《HunterSim 接入清单》§1.5/§3 配置节点标识与凭据；"
+            "缺凭据不阻断本机仿真（如需彻底关闭置 HUNTER_CORE_SIM_NODE_ENABLED=false）",
         )
 
     host = (settings.adapter.host or "").strip()
@@ -560,7 +560,13 @@ def _cmd_version(_args: argparse.Namespace) -> int:
 
 
 def _cmd_carla_manager(args: argparse.Namespace) -> int:
-    """``huntersim carla-manager`` 子命令：启动平台控制平面（默认 8090）。"""
+    """``huntersim carla-manager`` 子命令：启动平台控制平面（默认 8090）。
+
+    V2.0 下发 mTLS（接入清单 §1.5 step3）：当 ``ADAPTER_SSL_CERTFILE``/
+    ``ADAPTER_SSL_KEYFILE`` 成对配置时以 TLS 提供服务；进一层配置
+    ``ADAPTER_SSL_CA_CERTFILE`` 则信任平台 CA 校验回访客户端证书，
+    ``ADAPTER_SSL_CLIENT_AUTH_REQUIRED=true`` 时强制双向 TLS。
+    """
     from hunter_sim.platform_adapter.app import create_app
     from hunter_sim.platform_adapter.config import AdapterSettings
 
@@ -576,8 +582,32 @@ def _cmd_carla_manager(args: argparse.Namespace) -> int:
     import uvicorn  # noqa: PLC0415  仅 carla-manager 需要（doctor 不拉 Web 依赖）
 
     app = create_app(adapter_settings=adapter)
-    print(f"CARLA manager listening on http://{adapter.host}:{adapter.port}")
-    uvicorn.run(app, host=adapter.host, port=adapter.port, log_level=args.log_level)
+    uvicorn_kwargs: dict[str, Any] = {
+        "host": adapter.host,
+        "port": adapter.port,
+        "log_level": args.log_level,
+    }
+    if adapter.tls_enabled:
+        uvicorn_kwargs["ssl_certfile"] = adapter.ssl_certfile
+        uvicorn_kwargs["ssl_keyfile"] = adapter.ssl_keyfile
+        mode = "TLS"
+        if adapter.ssl_ca_certfile:
+            uvicorn_kwargs["ssl_ca_certs"] = adapter.ssl_ca_certfile
+            if adapter.ssl_client_auth_required:
+                uvicorn_kwargs["ssl_cert_reqs"] = "required"
+                mode = "mTLS（强制平台客户端证书）"
+            else:
+                uvicorn_kwargs["ssl_cert_reqs"] = "optional"
+                mode = "mTLS（信任平台 CA，客户端证书可选）"
+            if adapter.ssl_allowed_client_cn:
+                print(
+                    f"下发 mTLS 预期客户端 CN：{adapter.ssl_allowed_client_cn}"
+                    "（CA 链信任已保证只有平台签发证书可接入）"
+                )
+        print(f"CARLA manager listening on https://{adapter.host}:{adapter.port} ({mode})")
+    else:
+        print(f"CARLA manager listening on http://{adapter.host}:{adapter.port}")
+    uvicorn.run(app, **uvicorn_kwargs)
     return EXIT_OK
 
 
@@ -607,6 +637,58 @@ def _cmd_probes(args: argparse.Namespace) -> int:
     app = create_probes_app(settings)
     print(f"HunterSim probes listening on http://{probe.host}:{probe.port}")
     uvicorn.run(app, host=probe.host, port=probe.port, log_level=args.log_level)
+    return EXIT_OK
+
+
+def _cmd_connect(args: argparse.Namespace) -> int:
+    """``huntersim connect`` 子命令：V2.0 三步接入 step1 —— 下载并解压节点接入包。
+
+    从平台 ``GET /api/v1/scene/sim-nodes/{node_id}/bundle`` 拉取 ZIP（内含平台
+    CA + 双证书 + ``kafka.properties`` + README），落盘到 ``--dest``（默认
+    ``./connect/{node_id}``）并解压。后续手工完成 step2/step3（见输出提示）。
+    """
+    from hunter_sim.platform_adapter.sim_node import SimNodeClient
+
+    settings, error = _load_settings()
+    if settings is None:
+        print(f"配置加载失败，无法接入：{error}", file=sys.stderr)
+        return EXIT_FAIL
+    node = settings.sim_node
+    if not node.node_id:
+        print(
+            "未配置 HUNTER_CORE_SIM_NODE_ID，无法定位接入包（请先按接入清单 §3 确定节点标识）",
+            file=sys.stderr,
+        )
+        return EXIT_FAIL
+    base_url = (node.base_url or settings.cloud.gateway_url or "").strip()
+    if not base_url:
+        print(
+            "平台地址为空（需配 HUNTER_CORE_SIM_NODE_BASE_URL 或 HUNTER_CORE_GATEWAY_URL）",
+            file=sys.stderr,
+        )
+        return EXIT_FAIL
+
+    client = SimNodeClient(
+        node,
+        base_url=base_url,
+        manager_port=settings.adapter.port,
+    )
+    dest = args.dest or f"./connect/{node.node_id}"
+    result = client.download_bundle(dest, extract=not args.no_extract)
+    if result is None:
+        print(
+            "接入包下载失败（检查服务令牌/平台地址/节点是否已一键开通），详见上方日志",
+            file=sys.stderr,
+        )
+        return EXIT_FAIL
+    print(f"[connect] 接入包已就绪：{result}")
+    print(
+        "[connect] 后续两步（接入清单 §1.5）：\n"
+        "  step2 把开通响应里的一次性 SCRAM 口令填入包内 kafka.properties 的 "
+        "sasl.password（口令不落库/不入包，丢失只能 rotate-scram）；\n"
+        "  step3 把包内平台 CA/证书配到 ADAPTER_SSL_*，重启 carla-manager 启用 TLS/mTLS，"
+        "并把注册体 protocol 改为 https（HUNTER_CORE_SIM_NODE_PROTOCOL=https）。"
+    )
     return EXIT_OK
 
 
@@ -909,6 +991,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     version_parser = subparsers.add_parser("version", help="打印包版本")
     version_parser.set_defaults(handler=_cmd_version)
+
+    connect = subparsers.add_parser(
+        "connect",
+        help="V2.0 三步接入 step1：从平台下载/解压节点接入包（bundle）",
+        description=(
+            "一键接入第一步：从平台 GET /sim-nodes/{node_id}/bundle 拉取接入包 ZIP"
+            "（平台 CA + 双证书 + kafka.properties + README）并解压到 --dest；"
+            "随后按提示手工完成 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS）。"
+        ),
+    )
+    connect.add_argument(
+        "--dest", default="", help="接入包保存目录（默认 ./connect/{node_id}）"
+    )
+    connect.add_argument(
+        "--no-extract", action="store_true", help="只下载 zip，不解压"
+    )
+    connect.set_defaults(handler=_cmd_connect)
     return parser
 
 

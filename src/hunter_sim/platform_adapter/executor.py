@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from hunter_sim.cloud.connector import CloudConnector
+from hunter_sim.cloud.node_result_producer import NodeResultProducer, build_node_result
 from hunter_sim.common.exceptions import (
     CarlaSimulationError,
     ConfigurationError,
@@ -149,6 +150,9 @@ class SimulationExecutor:
         self._connector_lock = threading.Lock()
         self._connector: Optional[CloudConnector] = None
         self._last_retention_sweep = 0.0
+        # 节点级结果回传（V2.0，simulation.{node_id}.result；惰性连接，全程 no-op 降级）
+        self._result_lock = threading.Lock()
+        self._result_producer: Optional[NodeResultProducer] = None
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
@@ -179,6 +183,7 @@ class SimulationExecutor:
         self._worker = None
         self._watchdog = None
         self._stop_connector()
+        self._stop_result_producer()
         try:
             self._plane.release_all()
         except Exception as exc:  # noqa: BLE001
@@ -268,6 +273,7 @@ class SimulationExecutor:
             message=reason,
             finished_at=time.time(),
         )
+        self._publish_node_result(instance_id)
         return self._store.get(instance_id)
 
     def frame_hub(self, instance_id: str) -> Optional[FrameHub]:
@@ -562,6 +568,7 @@ class SimulationExecutor:
         )
         self._upload_recording(context)
         self._publish(record, evaluation, artifacts)
+        self._publish_node_result(instance_id)
         logger.info(f"Instance completed: {instance_id}, passed={evaluation.passed}")
 
     def _fail_instance(self, instance_id: str, message: str) -> None:
@@ -578,6 +585,7 @@ class SimulationExecutor:
             watchdog_deadline=0,
         )
         logger.warning(f"Adapter instance failed: {instance_id}: {message}")
+        self._publish_node_result(instance_id)
 
     def _evaluate(
         self, context: _RunContext, completed: bool
@@ -678,6 +686,80 @@ class SimulationExecutor:
                 )
         except Exception as exc:  # noqa: BLE001  发布失败不阻断结果落库
             logger.warning(f"Publish metrics/artifacts failed: {type(exc).__name__}: {exc}")
+
+    # ── 节点级结果回传（V2.0）─────────────────────────────────────────
+
+    def _result_producer_for(self) -> Optional[NodeResultProducer]:
+        """取（并惰性连接）节点级结果回传生产者；不可用时返回 None。
+
+        配置不足（未启用/无 node_id/无凭据）时 ``connect()`` 自行降级，返回的
+        实例 ``available=False``，``publish`` 安全空转；绝不阻断主流程。
+        """
+        node = self._settings.sim_node
+        if not (node.result_enabled and node.enabled and node.node_id):
+            return None
+        with self._result_lock:
+            if self._result_producer is None:
+                producer = NodeResultProducer(self._settings.cloud, node)
+                producer.connect()
+                self._result_producer = producer
+            return self._result_producer
+
+    def _publish_node_result(self, instance_id: str) -> None:
+        """把实例终态结果摘要回传 ``simulation.{node_id}.result``（不阻断落库）。
+
+        在四个终态路径（完成/失败/取消/看门狗）末尾调用；异常仅告警，
+        避免回传通道影响本地仿真与结果持久化。
+        """
+        try:
+            record = self._store.get(instance_id)
+            if record is None or record.status not in TERMINAL_STATUSES:
+                return
+            producer = self._result_producer_for()
+            if producer is None or not producer.available:
+                return
+            result = record.result or {}
+            node = self._settings.sim_node
+            evaluation = result.get("evaluation") or {}
+            message = build_node_result(
+                node_id=node.node_id,
+                sim_id=record.sim_id,
+                scene_id=record.scene_id,
+                status=record.status,
+                success=bool(result.get("success", False)),
+                message=record.message,
+                success_criteria_result=result.get("success_criteria_result"),
+                metrics={
+                    "collisions": int(record.collisions or 0),
+                    "lane_invasions": int(record.lane_invasions or 0),
+                    "current_time_s": round(float(record.current_time_s or 0.0), 3),
+                    "total_time_s": round(float(record.total_time_s or 0.0), 3),
+                    "progress_percent": round(float(record.progress_percent or 0.0), 3),
+                    "grade": evaluation.get("grade", ""),
+                },
+                artifacts=result.get("artifacts") or [],
+                provider="carla",
+                provider_version=node.carla_version,
+                started_at=record.started_at,
+                finished_at=record.finished_at,
+            )
+            producer.publish(message)
+        except Exception as exc:  # noqa: BLE001  回传失败不得影响结果落库/主循环
+            logger.warning(
+                f"Node result publish failed for {instance_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _stop_result_producer(self) -> None:
+        """关闭节点级结果回传生产者（幂等）。"""
+        with self._result_lock:
+            producer, self._result_producer = self._result_producer, None
+        if producer is None:
+            return
+        try:
+            producer.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Node result producer close failed: {exc}")
 
     # ── 回调/看门狗 ─────────────────────────────────────────────────────────
 

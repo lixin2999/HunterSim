@@ -497,7 +497,13 @@ class CloudSettings(BaseSettings):
         env_prefix="HUNTER_CORE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    enabled: bool = Field(False, description="是否启用 HunterCore 数据回传")
+    enabled: bool = Field(
+        True,
+        description=(
+            "是否启用 HunterCore 数据回传（V3.2.2 起默认打开）；未配凭据时整体降级为 "
+            "no-op，不阻断本机仿真，纯本机联调可显式置 HUNTER_CORE_ENABLED=false 关闭"
+        ),
+    )
     # ── Kafka 数据面（发布 carla.{sim_id}.sensor_data）──
     kafka_bootstrap: str = Field("192.168.31.35:9092", description="Kafka broker（SASL_SSL）")
     security_protocol: str = Field("SASL_SSL", description="Kafka 安全协议")
@@ -554,10 +560,14 @@ class SimNodeSettings(BaseSettings):
     仿真机作为「仿真节点」接入平台后，平台从入站请求头自学习本机地址，
     再按该地址直推 CARLA 管理 API（:8090）；IP 漂移由下一次心跳自愈。
 
-    ``enabled=false``（默认）时控制面完全保持既有行为，不会向平台发起任何注册请求。
+    ``enabled=false`` 时控制面完全保持既有行为，不会向平台发起任何注册请求。
+
+    V3.2.2 起默认打开，但**无凭据即静默跳过**：``node_id``/服务令牌未配时
+    ``SimNodeClient`` 只记一条日志便不启动心跳，绝不阻断本机仿真；
+    ``huntersim doctor`` 对应项也从 fail 降级为 warn。
 
     Attributes:
-        enabled: 是否启用节点注册/心跳（默认关闭，避免未接入平台的现场产生噪音）。
+        enabled: 是否启用节点注册/心跳（V3.2.2 起默认打开）。
         node_id: 节点永久标识（与 IP 无关，形如 ``sim-node-01``）；启用时必填。
         base_url: 平台基础地址（空表示复用 ``HUNTER_CORE_GATEWAY_URL``）。
         service_token: 平台签发的服务令牌（``service:{client_id}``，启用时必填）。
@@ -570,6 +580,9 @@ class SimNodeSettings(BaseSettings):
         manager_port: 管理 API 端口（空表示复用 ``ADAPTER_PORT``）。
         labels: 自定义标签（仅展示，如机房/显卡型号）。
         runtime_hint: 节点自述地址（仅展示，绝不参与寻址）。
+        result_enabled: 是否向节点级 Topic 回传实例终态结果（V2.0 独立回传通道）。
+        result_topic_template: 节点级回传 Topic 模板（``{node_id}`` 运行时渲染）。
+        result_dlq_template: 节点级回传死信 Topic 模板。
     """
 
     model_config = SettingsConfigDict(
@@ -579,7 +592,13 @@ class SimNodeSettings(BaseSettings):
         extra="ignore",
     )
 
-    enabled: bool = Field(False, description="是否作为仿真节点接入平台（注册/心跳）")
+    enabled: bool = Field(
+        True,
+        description=(
+            "是否作为仿真节点接入平台（注册/心跳）；V3.2.2 起默认打开，"
+            "无 node_id/服务令牌时静默跳过（不启动心跳，不阻断本机仿真）"
+        ),
+    )
     node_id: str = Field(
         "",
         validation_alias=AliasChoices("HUNTER_CORE_SIM_NODE_ID", "node_id"),
@@ -608,6 +627,34 @@ class SimNodeSettings(BaseSettings):
         default_factory=dict, description="自定义标签（仅展示）"
     )
     runtime_hint: str = Field("", description="节点自述地址（仅展示，不参与寻址）")
+    # ── V2.0 节点级 Kafka 回传通道（方案 §2.5.4 / §8.1）──
+    result_enabled: bool = Field(
+        True,
+        description=(
+            "是否向节点级 Topic 回传实例终态结果（复用平台数据面凭据，"
+            "未配凭据/未启用时安全 no-op）"
+        ),
+    )
+    result_topic_template: str = Field(
+        "simulation.{node_id}.result",
+        description="节点级回传 Topic 模板（{node_id} 运行时渲染）",
+    )
+    result_dlq_template: str = Field(
+        "simulation.{node_id}.result.dlq",
+        description="节点级回传死信 Topic 模板",
+    )
+
+    def render_result_topic(self) -> str:
+        """渲染节点级回传 Topic 全名（node_id 为空时返回空串，表示不可用）。"""
+        if not self.node_id:
+            return ""
+        return self.result_topic_template.format(node_id=self.node_id)
+
+    def render_result_dlq_topic(self) -> str:
+        """渲染节点级回传死信 Topic 全名（node_id 为空时返回空串）。"""
+        if not self.node_id:
+            return ""
+        return self.result_dlq_template.format(node_id=self.node_id)
 
     @field_validator("node_id")
     @classmethod
