@@ -327,7 +327,8 @@ def _check_sim_node(settings: HunterSimSettings) -> CheckResult:
         return _fail(
             "sim_node",
             f"节点注册参数缺失：{', '.join(missing)}",
-            "按 HunterCore《HunterSim 接入清单》§2/§3 配置节点标识与服务令牌",
+            "模板默认开启接入：按 HunterCore《HunterSim 接入清单》§2/§3 配置节点标识"
+            "与服务令牌；暂不接入平台则置 HUNTER_CORE_SIM_NODE_ENABLED=false",
         )
 
     host = (settings.adapter.host or "").strip()
@@ -484,7 +485,8 @@ def run_doctor(
             _fail(
                 "config",
                 f"配置加载失败：{error}",
-                "检查 .env 中的环境变量类型/枚举值；参考 docs/单机部署指南.md §2.3",
+                "检查 .env 中的环境变量类型/枚举值（可选字段留空不算错误，V3.2.1 起按未配置处理）；"
+                "参考 deployment_and_operations.md §5.9 与 docs/单机部署指南.md §2",
             )
         ]
 

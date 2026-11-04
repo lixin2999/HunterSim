@@ -2032,4 +2032,83 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **Windows 防火墙/AP 隔离**：平台主机需能入向访问本机 `:8090`，需放行平台地址；WiFi AP 隔离会表现为节点在线但下发超时，属环境问题而非客户端缺陷。
 - **无本地指标**：本版未新增 Prometheus 指标，节点状态以 `/health` 快照与结构化日志（`sim_node_registered` / `sim_node_endpoint_refreshed` / `sim_node_*_failed`）呈现。
 
+---
+
+## V3.2.1 — 留空环境变量不再中断配置加载（`.env` 模板首启失败修复）
+
+**发布日期**：2026-11-04
+**版本定位**：修复 V3.2.0 引入 `HUNTER_CORE_SIM_NODE_MANAGER_PORT` 后暴露的**首启阻塞**问题：按文档 `copy .env.example .env` 后，模板里的留空项会让整份配置加载以 `ValidationError` 失败，`huntersim up` / `huntersim doctor` 直接起不来。同时把 `.env.example` 的**平台接入开关与注释/文档口径对齐**（保持预置开启，口径统一为「默认开启，需补凭据」）。纯缺陷修复 + 配置模板口径修正，不改接口契约与任何字段默认值。
+
+### 现场
+
+- Windows 源码部署（`D:\python\HunterSim`，`huntersim version` = 3.2.0）执行 `copy .env.example .env` 后：
+
+  ```text
+  huntersim up
+  配置加载失败：ValidationError: 1 validation error for SimNodeSettings
+  manager_port
+    Input should be a valid integer, unable to parse string as an integer
+    [type=int_parsing, input_value='', input_type=str]
+  ```
+
+- `huntersim doctor` 同样失败，只在 `config` 项记一条 `fail`，其余检查项全部未执行（`Summary: 0 ok, 0 warn, 1 fail, 0 skip`）。
+- 未改动任何配置值，用的是仓库自带的 `.env.example`——即**每台按文档起步的新机器都会命中**。
+
+### 根因
+
+- `.env.example` 中 `HUNTER_CORE_SIM_NODE_MANAGER_PORT=` 留空，注释与 README/user_manual 都写明「空 = 复用 `ADAPTER_PORT`」，即留空是**受支持的写法**。
+- `SimNodeSettings.manager_port` 声明为 `Optional[int]`（默认 `None`）。pydantic-settings 对标量字段会把环境值原样送入校验，空串 `""` 不是合法整数 → `int_parsing`；`Optional[int]` 只允许 `int | None`，空串**不会**被当作 `None`，于是异常冒泡到 CLI 的配置加载入口。
+- 同一缺陷面在 k8s 清单上同样存在：`k8s/configmap.yaml` 的 `hunter_core_sim_node_manager_port: ""` 会注入空值环境变量，Pod 启动即崩。
+- 同类隐患：留空的凭据/证书字段（`KAFKA_USERNAME=`、`HUNTER_CORE_JWT_TOKEN=`、`KAFKA_CA_CERT_PATH=` 等）虽不报错，但会解析成**空口令/空路径**对象而非「未配置」，与字段文档语义（`None` = 用系统信任链）不一致。
+
+### 修复内容（`common/models.py`）
+
+- 新增 `_blank_is_unset()` 前置校验器与三个可选字段类型别名 `OptionalInt` / `OptionalStr` / `OptionalSecret`：**空白值（`""` 或纯空格）归一为 `None`**，回落字段默认值；非空值完全按原有类型与范围校验。
+- 应用到全部声明为 Optional 的配置字段：`SimNodeSettings.manager_port` / `.service_token`；`CloudSettings.sasl_username` / `.sasl_password` / `.ca_cert_path` / `.client_cert_path` / `.client_key_path` / `.jwt_token`；`KafkaSettings.username` / `.password` / `.ca_cert_path` / `.client_cert_path` / `.client_key_path`。必填标量（如 `ADAPTER_PORT`）留空仍报错——那是真实的配置错误，不属本次归一范围。
+- 消费方无需改动：读取这些字段的代码（`platform_adapter/sim_node.py`、`cli/main.py`、`cloud/kafka_security.py`、`cloud/telemetry_producer.py`、`cloud/sim_data_producer.py`、`platform_adapter/artifacts.py`、`cloud/bag_uploader.py`）本来就以 `is None` / 真值判断分支，`None` 与空串走同一降级路径。
+- **预检提示给出可查路径**（`cli/main.py`）：`config` 失败时的 hint 补上「可选字段留空不算错误」，并把原本指向不存在的《单机部署指南》§2.3 改为实际章节（`deployment_and_operations.md` §5.9 与本指南 §2）。
+
+### 模板口径统一（`.env.example` 与四份文档）
+
+现场确认：模板把 `HUNTER_CORE_ENABLED` / `HUNTER_CORE_SIM_NODE_ENABLED` 预置为 `true`（面向平台联调机），而同一行注释与 README/user_manual 写的是「默认关闭」——两者必须挑一个口径。本版**保留 `true`**（不影响已接入节点的现场默认），把注释与文档改为「本模板默认开启，需补凭据」并突出首启必填项：
+
+- `.env.example`：标题行升 V3.2.1；文件头新增「首启必补清单」（`CARLA_HOST` / 节点服务令牌 / 平台地址 / `ADAPTER_HOST` / 数据面凭据，逐项写明漏填后果）；两个接入分节标题改为「本模板默认开启，需补凭据」并补上「暂不接入请置 `false`」的退路；`_SERVICE_TOKEN` / `_NODE_ID` 标为「开启接入时必填」；在 `HUNTER_CORE_GATEWAY_URL` 旁注明「节点注册不要直连网关 8080」。
+- **取值一个字没改**：两个开关仍为 `true`，与旧版模板行为一致；变的只有注释与文档。
+- `README.md`（§4.3 启动提醒、§4 节点接入要点、§5 配置表注）与 `user_manual.md`（§2.1 首启必填表、§2.4、FAQ）、`deployment_and_operations.md`（§2.1 首启必填表与「模板取值 vs 代码默认」区分、§3.1 表注、§3.8、§5.8、§7）、`docs/单机部署指南.md`（版本演进句、§2 两个开关说明、必填表改为★首启必填并新增三项、§9 速查表新增四行）同步。
+- **预检提示补退路**（`cli/main.py`）：`sim_node` 因缺服务令牌报 fail 时，hint 除了「按接入清单配置」，同时给出「暂不接入置 `HUNTER_CORE_SIM_NODE_ENABLED=false`」。
+- **附带类型修正**（`visualization/sensor_view.py`）：开发 venv 装上 Pillow 后 mypy 开始解析真实类型存根，`Image.NEAREST` 报 `attr-defined`；改用 `Image.Resampling.NEAREST`（依赖下界 `Pillow>=10.0` 支持）。该分支为防御性下采样兜底，当前代码路径不触发（行为无变）。
+
+### 向后兼容
+
+- **只放宽不收紧**：原先能加载的配置继续按原值解析；原先因留空而崩溃的配置现在能加载。
+- **模板取值不变**：`HUNTER_CORE_ENABLED` / `HUNTER_CORE_SIM_NODE_ENABLED` 仍为 `true`，已有现场升级后行为与 V3.2.0 一致（变的只有注释与文档，以及可选字段留空的容错）。
+- 默认值、字段范围校验、接口契约、日志与指标均无变化；留空凭据由「空对象」变为 `None`，所有消费点判定结果相同（已逐一复核）。
+- **版本**：`pyproject.toml` / `huntersim version` / `/health` 应用版本 `3.2.0 → 3.2.1`，镜像 tag `hunter-sim:3.2.1`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）；`README.md`、`user_manual.md`、`deployment_and_operations.md`（§2.1 / §3.1 / §3.8 / §5.8 / §5.9 / §7）、`docs/单机部署指南.md`（§2 留空语义与首启必填 + §9 故障速查新增四行：`int_parsing`、`config` 单项 fail 短路、`sim_node` 参数缺失、`version` 旧值）、`.env.example` 已同步。
+
+### 风险
+
+- 归一后「留空 = 用默认」会**掩盖把必填凭据写成空值的意图**（例如本想禁用某功能却忘填口令）；此类情况仍由 `huntersim doctor` 的 `kafka` / `sim_node` 项与启动日志的降级原因暴露。
+- 模板保持预置开启意味着**新机器首检必带一条 `sim_node` fail**（不填令牌就过不了 `up` 预检）。这是选定口径的代价，已在四处给出退路：`.env.example` 分节注释、文件头首启清单、`docs/单机部署指南.md` §2 与 `huntersim doctor` 的 hint。
+
+### 验证（实测）
+
+- `pytest -q`：**1182 passed**（较 V3.2.0 +8），全仓行覆盖 84.30%（门禁 `fail_under=80`）。
+- `mypy src/hunter_sim`（strict）：**Success: no issues found in 87 source files**；`flake8 src tests`：**0 告警**（门禁四件全绿；`ruff` 不在门禁内，存量告警未动）。
+- 新增 8 条用例：`tests/test_settings_env.py::TestBlankOptionalValues` 5 条（留空端口解析为 `None`、留空凭据/证书路径解析为 `None`、非空值照常按类型解析、端口越界仍被拒（归一不得绕过范围校验）、**直接加载仓库 `.env.example` 必须成功**并断言两个接入开关为 `True`）+ 1 条**模板口径守护**（预置 `true` 必须与「本模板默认开启，需补凭据」「开启接入时必填」注释同口径，两处分节标题逐一断言）；`tests/test_doctor_cli.py` 新增 `TestSimNodeCheck` 2 条（缺令牌 fail 的 detail 与「置 false」退路、未启用为 skip）并给 `config` 失败补两条 hint 断言。
+- 手工复现验证：把 `.env.example` 拷为 `.env` 后加载 `HunterSimSettings` 不再抛错，`sim_node.manager_port` 为 `None`（由 `SimNodeClient` 回落 `ADAPTER_PORT=8090`），`node_id` 仍读出 `sim-node-01`。
+- 本地同路径实测（拷 `.env.example` 为 `.env` 后执行）：`huntersim version` → `3.2.1`；`huntersim doctor` 首项转为 `config ok 配置加载成功（env=dev）`，17 项检查全部跑完（`Summary: 9 ok, 6 warn, 2 fail, 0 skip`），不再止步于 `int_parsing`；`sim_node` 转为带退路说明的明确 fail（原文已核对：「模板默认开启接入：……暂不接入平台则置 HUNTER_CORE_SIM_NODE_ENABLED=false」）。本机的 2 项 `fail` 是环境事实（模板服务令牌留空、CARLA 未启动），不是配置加载问题；验证后已删除临时 `.env`。
+
+### 实机执行（现场待办）
+
+- 现场需 `git pull` → `uv pip install -e .`（刷新安装元数据）→ `huntersim version` 应为 `3.2.1` → `huntersim doctor`。
+- 修复后 `doctor`/`up` 不再报 `int_parsing`；因模板有意保留预置开启，服务令牌留空时仍会转为**明确的** `sim_node` fail：「节点注册参数缺失：HUNTER_CORE_SIM_NODE_SERVICE_TOKEN」。接入平台前需填 `node_id`/服务令牌/平台地址（并把 `ADAPTER_HOST` 改为非回环地址），暂不接入则置 `HUNTER_CORE_SIM_NODE_ENABLED=false`——本项属配置动作，非代码缺陷。
+- 本次模板改动只涉及注释与文档，**不需重建镜像**（`.env.example` 不在 wheel 内）；K8s 侧若沿用 `configmap.yaml` 里的显式取值，行为也不变。
+
+### 待办 / 已知边界
+
+- **模板开关口径（本版已选定）**：曾发现 `.env.example` 预置 `true` 与注释/文档「默认关闭」矛盾，上一轮只作为待办如实登记；经确认现场意图后，本版选定「**保留预置开启 + 注释与文档统一为默认开启、需补凭据**」（未动取值，以免已接入节点的部署发生默认漂移）。
+- **`HUNTER_CORE_GATEWAY_URL` 示例仍为网关 `8080`（未改）**：节点注册地址留空时会复用本行，因而命中 `doctor` 的 `sim_node` warn（平台可能学到网关容器地址）。本版只在模板与文档里加提醒，没改示例值——该地址同时被数据面使用，改动会影响已在用它的现场；待确认后决定是否拆分为两个示例。
+- **留空语义暂不得扩展至必填项**：`ADAPTER_PORT=`、`CARLA_HOST=` 等留空仍会以 `ValidationError` 中断加载（属真实配置错误）；若后续需要「留空即默认」的更一致口径，应连同报错文案一起重构，而非在各字段上逐个打补丁。
+- **`sensor_view.py` 的 `Image.Resampling.NEAREST` 分支无测试覆盖**：该 `resize` 守卫在当前代码路径下永不触发（上游已用 numpy 步长下采样），本轮只修类型，未新增用例；后续若确认冗余可整块删除。
+- **`Image.fromarray(..., mode=...)` 的 Pillow 13 前瞻问题（未改）**：装上 Pillow 11 后测试日志开始出现 `'mode' parameter is deprecated`（`sensor_view.py` 与 `image_codec.py` 共两处）。当前依赖上限 `Pillow<12.0` 不会被真的移除，且不产生功能差异，所以本轮不动；升级 Pillow 前需去掉 `mode` 参数。
 

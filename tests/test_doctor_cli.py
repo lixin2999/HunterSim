@@ -28,6 +28,7 @@ from hunter_sim.cli.main import (
     _check_platform,
     _check_ports,
     _check_recordings_dir,
+    _check_sim_node,
     _counts,
     _render_text,
     build_parser,
@@ -175,6 +176,9 @@ class TestDoctorChecks:
         assert results[0].name == "config"
         assert results[0].status == "fail"
         assert "bad enum" in results[0].detail
+        # V3.2.1：提示需说明「留空不算错误」并指向可查的排障章节
+        assert "留空" in results[0].hint
+        assert "§5.9" in results[0].hint
 
     def test_strict_promotes_warn_to_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cli, "_tcp_open", lambda host, port, timeout=1.5: False)
@@ -309,6 +313,35 @@ class TestMcapAndKafkaChecks:
 
         assert result.status == "fail"
         assert "KAFKA_CLIENT_KEY_PATH" in result.detail
+
+
+class TestSimNodeCheck:
+    """仿真节点接入项：缺凭据必须 fail，且 hint 同时给出「补什么」与「怎么关掉」。
+
+    V3.2.1 现场确认：`.env.example` 预置 `HUNTER_CORE_SIM_NODE_ENABLED=true`（面向
+    平台联调机），新机器首跑就会撞上这条 fail，提示必须带上暂不接入的退路。
+    """
+
+    def test_missing_token_fails_with_disable_hint(self) -> None:
+        settings = _settings()
+        settings.sim_node.enabled = True
+        settings.sim_node.node_id = "sim-node-01"
+        settings.sim_node.service_token = None
+
+        result = _check_sim_node(settings)
+
+        assert result.status == "fail"
+        assert "HUNTER_CORE_SIM_NODE_SERVICE_TOKEN" in result.detail
+        assert "HUNTER_CORE_SIM_NODE_ENABLED=false" in result.hint
+
+    def test_disabled_is_skip(self) -> None:
+        settings = _settings()
+        settings.sim_node.enabled = False
+
+        result = _check_sim_node(settings)
+
+        assert result.status == "skip"
+        assert "HUNTER_CORE_SIM_NODE_ENABLED=false" in result.detail
 
 
 class TestPlatformCheck:

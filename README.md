@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.2.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 章节，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入）。
+- **当前版本**：`3.2.1`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 章节，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，并把模板接入开关的注释与文档口径统一为「默认开启、需补凭据」）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -115,6 +115,8 @@ huntersim doctor --json --strict               # 脚本消费 / 上线门禁（w
 
 ```bash
 copy .env.example .env                        # Windows（Linux: cp）
+# 模板默认开启平台接入：先补 CARLA_HOST / 节点服务令牌 / 平台地址 / ADAPTER_HOST，
+# 否则 huntersim doctor 会在 sim_node 项报 fail（详见 §5 与《单机部署指南》§2）
 
 huntersim up                                  # 一键：预检 → 控制面 :8090 → 探针面 :8080 → 打开 /viz
 huntersim up --no-browser                     # 不起浏览器，只打印可视化地址
@@ -205,6 +207,7 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 
 要点：
 
+- **模板已默认开启**：`.env.example` 把 `HUNTER_CORE_SIM_NODE_ENABLED` 预置为 `true`（代码字段默认仍为 `false`），因此 `HUNTER_CORE_SIM_NODE_ID` / `_SERVICE_TOKEN` 与平台地址属于**首启必填**；不接入平台请把开关改回 `false`。
 - **地址只能由平台自学习**：注册体只声明 `manager_port`/`protocol`/`maps`/`capacity`；
   在请求体里塞 IP 会被平台 422 拒绝（设计如此）。
 - 节点走 **web-portal 80/443**，不要直连网关 `8080`：直连时平台学到的是网关容器地址，
@@ -236,6 +239,8 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 | `HUNTER_CORE_SIM_NODE_` | 仿真节点 | `enabled`(false) · `node_id` · `service_token` · `base_url`(空=复用 gateway_url) · `heartbeat_interval_seconds`(20，≤30) · `request_timeout_seconds`(5) · `capacity`(1) · `maps`(空=不过滤) · `carla_version` · `protocol`(http) · `manager_port`(空=ADAPTER_PORT) · `labels` · `runtime_hint` |
 
 > V3.0.0 起已移除 `API_*` / `STATE_*` / `PLATFORM_*` / `GUI_*` 前缀与 `EXECUTION_ENGINE_ENDPOINTS` 的双引擎示例（受支持形态 = 单世界串行，端点库存留空即单引擎）。
+
+> 上表括号里是**代码字段默认值**；[`.env.example`](.env.example) 模板把 `HUNTER_CORE_ENABLED` 与 `HUNTER_CORE_SIM_NODE_ENABLED` 预置为 `true`（面向平台联调机，注释里已标「需补凭据」）。拷模板后的**首启必填项**：`CARLA_HOST=127.0.0.1`（源码直跑）、`HUNTER_CORE_SIM_NODE_SERVICE_TOKEN`、平台地址（`HUNTER_CORE_SIM_NODE_BASE_URL` 或 `HUNTER_CORE_GATEWAY_URL`）、node 模式的 `ADAPTER_HOST=0.0.0.0`。缺服务令牌时 `huntersim doctor` 报 `sim_node` **fail** 并拦住 `huntersim up`；数据面凭据（SASL 账号/口令、`jwt_token`）缺失只静默降级 no-op。纯本机联调请把两个开关改回 `false`。
 
 ---
 

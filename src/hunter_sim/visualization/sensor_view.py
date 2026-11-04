@@ -178,7 +178,8 @@ def depth_png(frame: Frame, max_width: int = 480) -> Optional[bytes]:
         return _encode_gray_png(gray.tobytes(), width, height)
     image = Image.fromarray(gray, mode="L")
     if (image.width, image.height) != (width, height):
-        image = image.resize((width, height), Image.NEAREST)
+        # Pillow 10+ 重采样常量正式住在 Image.Resampling（顶层别名仅供旧代码）
+        image = image.resize((width, height), Image.Resampling.NEAREST)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=False)
     return buffer.getvalue()

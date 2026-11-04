@@ -9,9 +9,16 @@ from __future__ import annotations
 import enum
 import ipaddress
 import re
-from typing import Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    Field,
+    SecretStr,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 全局配置需要统一组装管理面配置；``platform_adapter.config`` 只依赖 pydantic，
@@ -196,6 +203,28 @@ class PerceptionResult(BaseModel):
     objects: list[DetectedObject] = Field(default_factory=list)
 
 
+# ─── 可选配置字段：空值即「未配置」 ───────────────────────────────────────────
+
+
+def _blank_is_unset(value: Any) -> Any:
+    """把空白字符串归一为 ``None``（回落字段默认值）。
+
+    现场普遍以 ``cp .env.example .env`` 起步，模板里的留空项（``KEY=``）按文档约定是
+    「用默认值」；但 pydantic-settings 会把空串原样交给字段校验，``Optional[int]``
+    这类标量随即以 ``int_parsing`` 报错，**整份配置加载中断**（``huntersim up`` /
+    ``huntersim doctor`` 起不来，且报错只提字段名，看不出是留空导致）。
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+# 可选标量/凭据字段统一走这组类型：留空 = 未配置，而不是校验失败或空凭据。
+OptionalInt = Annotated[Optional[int], BeforeValidator(_blank_is_unset)]
+OptionalStr = Annotated[Optional[str], BeforeValidator(_blank_is_unset)]
+OptionalSecret = Annotated[Optional[SecretStr], BeforeValidator(_blank_is_unset)]
+
+
 # ─── 服务配置模型 ─────────────────────────────────────────────────────────────
 
 
@@ -264,8 +293,8 @@ class KafkaSettings(BaseSettings):
         "", description="兼容单机调试的旧 telemetry_clean Topic（空则不订阅）"
     )
     sim_id: str = Field("", description="当前 VIL 实例的 sim_id（用于渲染 Topic 名）")
-    username: Optional[SecretStr] = None
-    password: Optional[SecretStr] = None
+    username: OptionalSecret = None
+    password: OptionalSecret = None
     # ── V3.1.2：消费侧接入安全（默认 PLAINTEXT，保持既有现场零改动）──
     security_protocol: str = Field(
         "PLAINTEXT",
@@ -274,13 +303,13 @@ class KafkaSettings(BaseSettings):
     sasl_mechanism: str = Field(
         "SCRAM-SHA-512", description="SASL 机制（仅 SASL_* 协议生效）"
     )
-    ca_cert_path: Optional[str] = Field(
+    ca_cert_path: OptionalStr = Field(
         None, description="SASL_SSL/SSL 的 CA 证书路径（None 用系统信任链）"
     )
-    client_cert_path: Optional[str] = Field(
+    client_cert_path: OptionalStr = Field(
         None, description="mTLS 客户端证书路径（broker 强制 ssl.client.auth=required 时必填）"
     )
-    client_key_path: Optional[str] = Field(
+    client_key_path: OptionalStr = Field(
         None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
     )
     # ── V2.7.0 P1-8：消费自愈与坏消息 DLQ ──
@@ -473,13 +502,13 @@ class CloudSettings(BaseSettings):
     kafka_bootstrap: str = Field("192.168.31.35:9092", description="Kafka broker（SASL_SSL）")
     security_protocol: str = Field("SASL_SSL", description="Kafka 安全协议")
     sasl_mechanism: str = Field("SCRAM-SHA-512", description="SASL 机制")
-    sasl_username: Optional[SecretStr] = None
-    sasl_password: Optional[SecretStr] = None
-    ca_cert_path: Optional[str] = Field(None, description="SASL_SSL CA 证书路径（None 用系统信任链）")
-    client_cert_path: Optional[str] = Field(
+    sasl_username: OptionalSecret = None
+    sasl_password: OptionalSecret = None
+    ca_cert_path: OptionalStr = Field(None, description="SASL_SSL CA 证书路径（None 用系统信任链）")
+    client_cert_path: OptionalStr = Field(
         None, description="mTLS 客户端证书路径（broker 强制 ssl.client.auth=required 时必填）"
     )
-    client_key_path: Optional[str] = Field(
+    client_key_path: OptionalStr = Field(
         None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
     )
     # ── sim_id 与 Topic 模板 ──
@@ -500,7 +529,7 @@ class CloudSettings(BaseSettings):
     telemetry_proxy_interval_s: float = Field(0.1, description="sim_telemetry 发布周期（秒，10Hz）")
     # ── data-collector 文件上传（经 api-gateway）──
     gateway_url: str = Field("http://192.168.31.35:8080", description="api-gateway 基础地址")
-    jwt_token: Optional[SecretStr] = Field(None, description="data-collector REST Bearer JWT")
+    jwt_token: OptionalSecret = Field(None, description="data-collector REST Bearer JWT")
     rosbag_bucket: str = Field("hunter-rosbag", description="bag 上传 Bucket")
     upload_timeout_s: float = Field(60.0, gt=0.0, description="预签名/直传 HTTP 超时（秒）")
     upload_queue_max_size: int = Field(
@@ -559,7 +588,7 @@ class SimNodeSettings(BaseSettings):
     base_url: str = Field(
         "", description="平台基础地址（空表示复用 HUNTER_CORE_GATEWAY_URL）"
     )
-    service_token: Optional[SecretStr] = Field(
+    service_token: OptionalSecret = Field(
         None, description="平台签发的服务令牌（service:{client_id}）"
     )
     heartbeat_interval_seconds: float = Field(
@@ -572,7 +601,7 @@ class SimNodeSettings(BaseSettings):
     maps: str = Field("", description="可用地图清单（逗号分隔；空=不做地图过滤）")
     carla_version: str = Field("", description="CARLA 版本（空=尝试从 SDK 推导）")
     protocol: Literal["http", "https"] = Field("http", description="管理 API 协议")
-    manager_port: Optional[int] = Field(
+    manager_port: OptionalInt = Field(
         None, ge=1, le=65535, description="管理 API 端口（空=复用 ADAPTER_PORT）"
     )
     labels: dict[str, str] = Field(

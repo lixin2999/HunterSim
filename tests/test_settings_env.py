@@ -3,10 +3,14 @@
 历史问题：`.env` 中写 `CARLA_HOST` 会因 `HunterSimSettings` 的 `extra=forbid`
 直接抛 ValidationError，且嵌套分组未配置 `env_file`，导致文档宣称的
 “环境变量 > .env > 默认值” 对 `CARLA_*/KAFKA_*/VIL_*/ADAPTER_*/PROBE_*` 不成立。
+
+V3.2.1 补充：模板里留空的 Optional 字段（`KEY=`）不得中断整份配置加载；模板预置
+开启的平台接入开关必须与注释、文档同口径。
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -19,7 +23,19 @@ _ENV_KEYS = (
     "ADAPTER_PORT",
     "PROBE_PORT",
     "HUNTER_SIM_ENV",
+    # 下面几项由空值/模板用例断言默认值，宿主机环境变量不得掺入
+    "KAFKA_USERNAME",
+    "KAFKA_PASSWORD",
+    "KAFKA_CA_CERT_PATH",
+    "HUNTER_CORE_JWT_TOKEN",
+    "HUNTER_CORE_SIM_NODE_ID",
+    "HUNTER_CORE_SIM_NODE_SERVICE_TOKEN",
+    "HUNTER_CORE_SIM_NODE_MANAGER_PORT",
+    # 模板口径用例断言的是模板取值，宿主机变量会覆盖 .env
+    "HUNTER_CORE_ENABLED",
+    "HUNTER_CORE_SIM_NODE_ENABLED",
 )
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -128,3 +144,78 @@ def test_cloud_unknown_keys_ignored(tmp_path: Path) -> None:
     _write_env(tmp_path, "HUNTER_CORE_TYPO_FIELD=1\nADAPTER_TYPO=2\n")
     settings = HunterSimSettings()
     assert settings.cloud.enabled is False
+
+
+class TestBlankOptionalValues:
+    """留空（`KEY=`）= 未配置：V3.2.1 回归现场问题。
+
+    现场按文档 `copy .env.example .env` 后，`HUNTER_CORE_SIM_NODE_MANAGER_PORT=`
+    会被 pydantic-settings 当空串送入 `Optional[int]` 校验，以 `int_parsing`
+    报错并使 `huntersim up` / `huntersim doctor` 直接起不来。
+    """
+
+    def test_blank_optional_int_falls_back_to_default(self, tmp_path: Path) -> None:
+        """留空的可选端口解析为 `None`（由调用方回落 `ADAPTER_PORT`），不抛错。"""
+        _write_env(tmp_path, "HUNTER_CORE_SIM_NODE_MANAGER_PORT=\n")
+        assert HunterSimSettings().sim_node.manager_port is None
+
+    def test_blank_optional_secrets_and_paths_are_none(self, tmp_path: Path) -> None:
+        """留空的凭据/证书路径统一为 `None`，不出现空口令与空路径。"""
+        _write_env(
+            tmp_path,
+            "KAFKA_USERNAME=\nKAFKA_PASSWORD=   \nKAFKA_CA_CERT_PATH=\n"
+            "HUNTER_CORE_JWT_TOKEN=\nHUNTER_CORE_SIM_NODE_SERVICE_TOKEN=\n",
+        )
+        settings = HunterSimSettings()
+        assert settings.kafka.username is None
+        assert settings.kafka.password is None
+        assert settings.kafka.ca_cert_path is None
+        assert settings.cloud.jwt_token is None
+        assert settings.sim_node.service_token is None
+
+    def test_non_blank_optional_values_still_parse(self, tmp_path: Path) -> None:
+        """归一只针对空白值：正常配置仍按声明类型与范围生效。"""
+        _write_env(
+            tmp_path,
+            "HUNTER_CORE_SIM_NODE_MANAGER_PORT=9100\nKAFKA_USERNAME=vil_reader\n"
+            "HUNTER_CORE_JWT_TOKEN=abc.def.ghi\n",
+        )
+        settings = HunterSimSettings()
+        assert settings.sim_node.manager_port == 9100
+        assert settings.kafka.username is not None
+        assert settings.kafka.username.get_secret_value() == "vil_reader"
+        assert settings.cloud.jwt_token is not None
+        assert settings.cloud.jwt_token.get_secret_value() == "abc.def.ghi"
+
+    def test_out_of_range_port_still_rejected(self, tmp_path: Path) -> None:
+        """空白归一不得绕过范围校验（端口越界仍是配置错误）。"""
+        _write_env(tmp_path, "HUNTER_CORE_SIM_NODE_MANAGER_PORT=70000\n")
+        with pytest.raises(ValueError):
+            HunterSimSettings()
+
+    def test_shipped_env_template_loads(self, tmp_path: Path) -> None:
+        """守护模板本身：`.env.example` 拷贝为 `.env` 后必须能直接加载。"""
+        shutil.copy(_REPO_ROOT / ".env.example", tmp_path / ".env")
+        settings = HunterSimSettings()
+        # 模板里留空的回访端口不得阻断加载，且真实值照常读出
+        assert settings.sim_node.manager_port is None
+        assert settings.sim_node.node_id == "sim-node-01"
+        # 模板面向平台联调机：两个接入开关预置为开启（代码字段默认仍是 False）
+        assert settings.cloud.enabled is True
+        assert settings.sim_node.enabled is True
+
+    def test_template_integration_switches_are_documented(self) -> None:
+        """模板口径守护：预置开启必须与注释同口径（防止取值与注释、文档背离）。
+
+        V3.2.1 现场确认：模板把 `HUNTER_CORE_ENABLED` / `HUNTER_CORE_SIM_NODE_ENABLED`
+        置为 `true`，而旧注释与文档写的是「默认关闭」，新机器拷完模板就会撞上
+        `sim_node` 缺服务令牌的 `fail`。现在两处必须同时成立。
+        """
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        assert "HUNTER_CORE_ENABLED=true" in text
+        assert "HUNTER_CORE_SIM_NODE_ENABLED=true" in text
+        # 两个分节标题都要写明「默认开启，需补凭据」
+        assert text.count("本模板默认开启，需补凭据") == 2
+        # 文件头必须给出首启清单，且服务令牌标注为必填
+        assert "必须补齐" in text
+        assert "开启接入时必填" in text
