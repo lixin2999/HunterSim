@@ -669,8 +669,9 @@ class SceneRunnerService:
     def _get_ego_state(self) -> dict[str, Any]:
         """获取自车状态字典。
 
-        尝试从 scenario 获取车辆 actor，否则通过 world 查找 vehicle 类型 Actor。
-        失败时返回零值字典。
+        自车引用统一走 ``ego_vehicle`` property（``ego_actor`` /
+        ``get_ego_vehicle()`` / ``_ego_vehicle`` 三种形态依次尝试），避免两处
+        解析规则漂移；失败时返回零值字典。
         """
         default: dict[str, Any] = {
             "x": 0.0,
@@ -683,13 +684,7 @@ class SceneRunnerService:
             "acceleration": 0.0,
         }
         try:
-            vehicle = None
-            scenario = self._scenario
-            if scenario is not None and hasattr(scenario, "get_ego_vehicle"):
-                vehicle = scenario.get_ego_vehicle()
-            if vehicle is None:
-                # 内置场景 BuiltinScenario 持有 _ego_vehicle
-                vehicle = getattr(scenario, "_ego_vehicle", None)
+            vehicle = self.ego_vehicle
             if vehicle is None:
                 return default
             loc = vehicle.get_location()

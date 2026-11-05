@@ -85,6 +85,8 @@ _FRAME_IDS: dict[str, str] = {
 _SENSOR_QUEUE_MAXSIZE = 32
 # 编码线程停止时等待排空/退出的超时（秒）
 _SENSOR_WORKER_JOIN_TIMEOUT_S = 1.0
+# 帧失败告警限频窗口（秒）：每流首次立即报，之后窗口内聚合成一条
+_SENSOR_ERROR_LOG_INTERVAL_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._frame_cond = threading.Condition()
         self._frame_pending = 0
         self._frame_accepting = True
+        # 帧失败告警限频状态（按流名，跨回调/编码线程访问）
+        self._frame_error_lock = threading.Lock()
+        self._frame_error_at: dict[str, float] = {}
+        self._frame_error_suppressed: dict[str, int] = {}
         self._ego: Any = None
         self._actors: list[Any] = []
         self._sensors: list[Any] = []
@@ -431,7 +437,7 @@ class BuiltinScenario(CustomScenarioBase):
         try:
             frame = _frame_of(stream, data)
         except Exception as exc:  # noqa: BLE001  单帧抽取异常不得冒泡到 CARLA
-            logger.debug(f"Sensor frame skipped ({stream}): {exc}")
+            self._warn_frame_error("extract", stream, exc)
             return
         self._ensure_frame_worker()
         with self._frame_cond:
@@ -467,7 +473,7 @@ class BuiltinScenario(CustomScenarioBase):
             try:
                 self._dispatch_sensor_data(frame.stream, frame.as_measurement())
             except Exception as exc:  # noqa: BLE001  单帧异常不得中断编码线程
-                logger.debug(f"Sensor frame dispatch skipped ({frame.stream}): {exc}")
+                self._warn_frame_error("dispatch", frame.stream, exc)
             finally:
                 with self._frame_cond:
                     self._frame_pending -= 1
@@ -509,6 +515,27 @@ class BuiltinScenario(CustomScenarioBase):
         with self._frame_cond:
             self._frame_pending = 0
         logger.debug("Sensor encoder thread stopped")
+
+    def _warn_frame_error(self, stage: str, stream: str, exc: Exception) -> None:
+        """帧取数/编码失败告警：每流首次立即报，之后按窗口聚合成一条。
+
+        真机测量对象形态不匹配时，静默降级会让画面/传感器数据全空且无任何线索
+        （V3.3.4 现场即因此无法从日志定位），故必须留下可视化面板可见的 WARNING；
+        限频是为了避免 50Hz 下形成日志风暴。
+        """
+        now = time.monotonic()
+        with self._frame_error_lock:
+            suppressed = self._frame_error_suppressed.get(stream, 0) + 1
+            if stream in self._frame_error_at:
+                if now - self._frame_error_at[stream] < _SENSOR_ERROR_LOG_INTERVAL_S:
+                    self._frame_error_suppressed[stream] = suppressed
+                    return
+            else:
+                suppressed = 1
+            self._frame_error_at[stream] = now
+            self._frame_error_suppressed[stream] = 0
+        suffix = f" (+{suppressed - 1} suppressed)" if suppressed > 1 else ""
+        logger.warning(f"Sensor frame {stage} failed ({stream}): {exc}{suffix}")
 
     def _dispatch_sensor_data(self, stream: str, data: Any) -> None:
         """实际分发逻辑（拆分便于单测直接调用）。"""
@@ -574,7 +601,7 @@ class BuiltinScenario(CustomScenarioBase):
             return
 
         if stream == "lidar":
-            payload, points = self._lidar_xyz(points_bytes=bytes(getattr(data, "data", b"")))
+            payload, points = self._lidar_xyz(points_bytes=_measurement_bytes(data))
             if self._frame_hub is not None:
                 self._frame_hub.push(stream, ts, payload, {"points": points})
             if self._recorder is not None and payload:
@@ -587,15 +614,15 @@ class BuiltinScenario(CustomScenarioBase):
             return
 
         if stream == "imu":
-            accel = tuple(float(v) for v in getattr(data, "accelerometer", (0.0, 0.0, 0.0)))
-            gyro = tuple(float(v) for v in getattr(data, "gyroscope", (0.0, 0.0, 0.0)))
+            accel = _vec3(getattr(data, "accelerometer", None))
+            gyro = _vec3(getattr(data, "gyroscope", None))
             if self._frame_hub is not None:
                 self._frame_hub.push(stream, ts, repr((accel, gyro)).encode("utf-8"), {})
             if self._recorder is not None:
                 self._recorder.push_stream(
                     stream,
                     log_time_ns,
-                    build_imu_message(accel, gyro, frame_id, log_time_ns),  # type: ignore[arg-type]
+                    build_imu_message(accel, gyro, frame_id, log_time_ns),
                 )
             self._publish_ros("imu", data)
 
@@ -622,7 +649,7 @@ class BuiltinScenario(CustomScenarioBase):
     @staticmethod
     def _raw_image(data: Any) -> tuple[bytes, int, int]:
         """取 CARLA 图像帧的原始字节与尺寸。"""
-        raw = bytes(getattr(data, "data", b"") or b"")
+        raw = _measurement_bytes(data)
         return raw, int(getattr(data, "width", 0)), int(getattr(data, "height", 0))
 
     @staticmethod
@@ -731,7 +758,7 @@ def _frame_of(stream: str, data: Any) -> _SensorFrame:
         raw, width, height = BuiltinScenario._raw_image(data)
         return _SensorFrame(stream=stream, ts=ts, payload=raw, width=width, height=height)
     if stream == "lidar":
-        points = bytes(getattr(data, "data", b"") or b"")
+        points = _measurement_bytes(data)
         return _SensorFrame(stream=stream, ts=ts, payload=points)
     if stream == "imu":
         return _SensorFrame(
@@ -743,8 +770,34 @@ def _frame_of(stream: str, data: Any) -> _SensorFrame:
     return _SensorFrame(stream=stream, ts=ts)
 
 
+def _measurement_bytes(data: Any) -> bytes:
+    """取测量对象的原始字节载荷。
+
+    官方 ``carla.Image`` / ``carla.LidarMeasurement`` 的字节在 ``raw_data``（两者都
+    没有 ``data`` 属性）；按 ``data`` 取使真机拿到空字节，表现为画面不出图、
+    点云为空。``data`` 仅用于兼容旧版 SDK 与内部跨线程帧对象。
+    """
+    raw = getattr(data, "raw_data", None)
+    if raw is None:
+        raw = getattr(data, "data", b"")
+    return bytes(raw or b"")
+
+
 def _vec3(value: Any) -> tuple[float, float, float]:
-    """把三元组量转为 ``tuple[float, float, float]``（非法输入回退零向量）。"""
+    """把三元组量转为 ``(x, y, z)``（非法输入回退零向量）。
+
+    官方 ``carla.Vector3D``（``IMUMeasurement.accelerometer/gyroscope``）只有
+    ``x/y/z`` 属性且不可迭代，故先按属性取，再回退序列形态（兼容内部
+    跨线程帧元组与单测桩）。
+    """
+    if value is None:
+        return (0.0, 0.0, 0.0)
+    try:
+        return (float(value.x), float(value.y), float(value.z))
+    except AttributeError:
+        pass
+    except (TypeError, ValueError):  # noqa: PERF203  属性存在但非数值时视为非法
+        return (0.0, 0.0, 0.0)
     try:
         values = [float(item) for item in value]
     except (TypeError, ValueError):

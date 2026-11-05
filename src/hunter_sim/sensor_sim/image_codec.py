@@ -1,6 +1,6 @@
 """传感器图像编码（V3.0.0）。
 
-CARLA 相机回调给出的是 ``Image.data``（BGRA 打包字节），MJPEG 推流与截图
+CARLA 相机回调给出的是 ``Image.raw_data``（BGRA 打包字节），MJPEG 推流与截图
 端点需要可直接放进 HTTP 响应的图像字节。
 
 编码策略：

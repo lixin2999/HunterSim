@@ -641,3 +641,149 @@ class TestSensorSpec:
         assert spec.enabled is False
         assert spec.ros_enabled is True
         assert spec.record is False
+
+
+# ─── 真实 CARLA 测量对象形态（V3.3.4 现场回归） ────────────────────────────────
+
+
+class _CarlaVector3D:
+    """``carla.Vector3D`` 形态：只有 ``x/y/z`` 属性，不可迭代也不可下标。"""
+
+    def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+def _carla_image_data(width: int = 4, height: int = 2, ts: float = 100.0) -> Any:
+    """``carla.Image`` 形态：像素字节在 ``raw_data``，没有 ``data`` 属性。"""
+    return types.SimpleNamespace(
+        raw_data=bytes(bytearray(range(width * height * _IMAGE_BYTES_PER_PIXEL))),
+        width=width,
+        height=height,
+        timestamp=ts,
+        frame=1,
+        fov=90.0,
+    )
+
+
+def _carla_lidar_data(points: int = 3, ts: float = 100.0) -> Any:
+    """``carla.LidarMeasurement`` 形态：点云字节同样只在 ``raw_data``。"""
+    return types.SimpleNamespace(
+        raw_data=bytes(bytearray(range(points * 16))),
+        timestamp=ts,
+        frame=1,
+        channels=16,
+    )
+
+
+def _carla_imu_data(ts: float = 100.0) -> Any:
+    """``carla.IMUMeasurement`` 形态：三轴是 ``carla.Vector3D``（静止时含重力）。"""
+    return types.SimpleNamespace(
+        accelerometer=_CarlaVector3D(0.0, 0.0, 9.81),
+        gyroscope=_CarlaVector3D(0.0, 0.0, 0.0),
+        compass=0.0,
+        timestamp=ts,
+        frame=1,
+    )
+
+
+class TestRealCarlaMeasurementShapes:
+    """按官方 API 属性名取数，真机不再把有效帧判成空帧（V3.3.4）。
+
+    回归现场：实机下发场景后画面提示「相机未挂载」、rgb/depth/lidar 帧数恒 0、
+    IMU 三轴恒 0.000，但 IMU 仍在出帧（说明回调与编码线程都活着）。官方
+    ``carla.Image`` / ``carla.LidarMeasurement`` 的字节在 ``raw_data``（二者都
+    没有 ``data`` 属性），``carla.IMUMeasurement`` 的三轴是不可迭代的
+    ``carla.Vector3D``；取数按测试桩形态（``.data`` + 元组）写死时，真机数据
+    一律落空，而异常只写 DEBUG 日志，现场看不到任何线索。
+    """
+
+    def test_rgb_from_raw_data_reaches_hub(self) -> None:
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+
+        scenario._on_sensor_data(STREAM_RGB, _carla_image_data())  # noqa: SLF001
+
+        assert scenario.drain_sensor_frames() is True
+        frame = hub.latest(STREAM_RGB)
+        assert frame is not None, "raw_data 形态的图像帧被当成空帧丢弃"
+        assert frame.payload
+
+    def test_depth_from_raw_data_reaches_hub(self) -> None:
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+
+        scenario._on_sensor_data(STREAM_DEPTH, _carla_image_data())  # noqa: SLF001
+
+        assert scenario.drain_sensor_frames() is True
+        frame = hub.latest(STREAM_DEPTH)
+        assert frame is not None
+        assert len(frame.payload) == 4 * 2 * 4
+
+    def test_lidar_from_raw_data_reaches_hub(self) -> None:
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+
+        scenario._on_sensor_data(STREAM_LIDAR, _carla_lidar_data(points=3))  # noqa: SLF001
+
+        assert scenario.drain_sensor_frames() is True
+        frame = hub.latest(STREAM_LIDAR)
+        assert frame is not None
+        assert frame.meta["points"] == 3
+        assert len(frame.payload) == 48
+
+    def test_imu_vector3d_components_are_parsed(self) -> None:
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+
+        scenario._on_sensor_data(STREAM_IMU, _carla_imu_data())  # noqa: SLF001
+
+        assert scenario.drain_sensor_frames() is True
+        frame = hub.latest(STREAM_IMU)
+        assert frame is not None
+        # 静止车辆的 IMU 必须带重力，三轴全 0 说明取数形态不对
+        assert b"9.81" in frame.payload
+        assert frame.payload != repr(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))).encode()
+
+    def test_all_four_streams_from_sensor_callbacks_with_carla_shapes(self) -> None:
+        """走真实挂载回调：四路都应进 FrameHub（现场「全空」的最小复现）。"""
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+        world = _SensorWorld()
+        scenario.setup(world)
+
+        payloads = {
+            "sensor.camera.rgb": _carla_image_data(),
+            "sensor.camera.depth": _carla_image_data(),
+            "sensor.lidar.ray_cast": _carla_lidar_data(),
+            "sensor.other.imu": _carla_imu_data(),
+        }
+        for actor in _sensor_actors(scenario):
+            actor.emit(payloads[actor.type_id])
+
+        assert scenario.drain_sensor_frames() is True
+        assert hub.stats()["total"] == 4
+
+    def test_frame_failure_is_warned_not_swallowed(self, caplog) -> None:
+        """帧处理失败必须留下 INFO 面板可见的告警（否则现场无从定位）。"""
+        scenario = _make_scenario()
+        bad = types.SimpleNamespace(width=640, height=480, timestamp=1.0)
+
+        with caplog.at_level("WARNING", logger="hunter_sim.scene_runner.builtin_scenario"):
+            scenario._on_sensor_data(STREAM_RGB, bad)  # noqa: SLF001
+            assert scenario.drain_sensor_frames() is True
+
+        assert any("Sensor frame" in rec.getMessage() for rec in caplog.records), (
+            "取数/编码失败只写 DEBUG，真机表现为无数据且无任何线索"
+        )

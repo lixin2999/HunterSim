@@ -5,7 +5,8 @@
 - build_ssl_kwargs：证书参数组装；
 - viz_url：TLS 启用时指向探针端口；
 - probes app：TLS 时注册代理路由、非 TLS 时不注册；
-- proxy_request：JSON 响应转发、流式响应转发、连接失败处理。
+- proxy_request：JSON 响应转发、流式响应转发、连接失败处理、
+  SSE/MJPEG 分块边界透传（V3.3.4）。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 from hunter_sim.common.models import AdapterSettings, HunterSimSettings, ProbeSettings
@@ -191,6 +193,52 @@ class TestProbesAppRoutes:
 
 class TestProxyRequest:
     """代理请求转发逻辑。"""
+
+    @staticmethod
+    def _stream_request() -> Any:
+        """GET ``/viz/api/logs/stream`` 的请求桩。"""
+        mock_request = MagicMock()
+        mock_request.method = "GET"
+        mock_request.url.path = "/viz/api/logs/stream"
+        mock_request.url.query = ""
+        mock_request.headers = {"host": "localhost"}
+        mock_request.body = AsyncMock(return_value=b"")
+        return mock_request
+
+    @pytest.mark.asyncio
+    async def test_stream_chunks_keep_upstream_boundaries(self) -> None:
+        """SSE/MJPEG 逐段原样转发：分段边界不得被代理重组。
+
+        回归现场：mTLS 下浏览器只能走探针面 :8080 代理，而代理用
+        ``aiter_bytes(chunk_size=4096)`` 取数——httpx 会把上游小段攒满 4KB
+        才吐一段，日志首屏回放和小尺寸 JPEG 帧因此迟迟不可达（画面空白、
+        日志不动）。
+        """
+        import httpx
+
+        from hunter_sim.probes.viz_proxy import proxy_request
+
+        events = [b"data: log-1\n\n", b"data: log-2\n\n", b"data: log-3\n\n"]
+
+        async def _upstream() -> Any:
+            for event in events:
+                yield event
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_upstream(),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await proxy_request(
+                self._stream_request(), client, "http://upstream"
+            )
+            assert isinstance(response, StreamingResponse)
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        assert chunks == events, "代理重组了上游分块（SSE/MJPEG 会被整段延迟送达）"
 
     @pytest.mark.asyncio
     async def test_json_forward(self) -> None:

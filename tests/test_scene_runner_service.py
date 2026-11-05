@@ -11,8 +11,12 @@
 
 from __future__ import annotations
 
+import math
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from hunter_sim.common.models import SceneStatus
 from hunter_sim.scene_runner.event_detector import DetectedEvent
@@ -329,3 +333,98 @@ class TestRunLoopThrottling:
         assert runner._sim_id == "sim-runner-test"
         assert runner._vehicle_id == "veh-test"
         assert runner._scene_id == "scene-test-001"
+
+
+# ── 测试：自车状态取数（V3.3.4 现场回归） ──────────────────────────────────────
+
+
+def _vehicle() -> Any:
+    return SimpleNamespace(
+        get_location=lambda: SimpleNamespace(x=12.5, y=-3.0, z=0.5),
+        get_rotation=lambda: SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
+        get_velocity=lambda: SimpleNamespace(x=10.0, y=0.0, z=0.0),
+        get_acceleration=lambda: SimpleNamespace(x=0.0, y=0.0, z=9.81),
+        get_control=lambda: SimpleNamespace(steer=-0.25, throttle=0.6, brake=0.0),
+    )
+
+
+class _BuiltinLikeScenario:
+    """``BuiltinScenario`` 形态：只暴露 ``ego_actor`` property，无 ``_ego_vehicle``。"""
+
+    def __init__(self, actor: Any) -> None:
+        self.ego_actor = actor
+
+
+class _LegacyScenario:
+    """旧形态：只提供 ``get_ego_vehicle()``。"""
+
+    def __init__(self, actor: Any) -> None:
+        self._actor = actor
+
+    def get_ego_vehicle(self) -> Any:
+        return self._actor
+
+
+class TestEgoState:
+    def test_ego_state_reads_ego_actor_attribute(self) -> None:
+        """真机自车状态必须非零：viz 面板、sim_status/sim_telemetry 上行都依赖它。
+
+        回归现场：``_get_ego_state`` 只找 ``get_ego_vehicle()`` / ``_ego_vehicle``，
+        而 ``BuiltinScenario`` 暴露的是 ``ego_actor`` property，导致可视化页面
+        「自车状态」全 0、上行位姿恒零、评估采样拿到静止假象。
+        """
+        runner = _make_runner()
+        runner._scenario = _BuiltinLikeScenario(_vehicle())  # noqa: SLF001
+
+        state = runner.get_ego_state()
+
+        assert state["x"] == pytest.approx(12.5)
+        assert state["y"] == pytest.approx(-3.0)
+        assert state["z"] == pytest.approx(0.5)
+        assert state["velocity"] == pytest.approx(10.0)
+        assert state["heading"] == pytest.approx(math.radians(90.0), abs=1e-6)
+        assert state["yaw"] == pytest.approx(math.radians(90.0), abs=1e-6)
+        assert state["steering"] == pytest.approx(-0.25)
+        assert state["acceleration"] == pytest.approx(9.81, abs=1e-3)
+
+    def test_ego_state_matches_ego_vehicle_property(self) -> None:
+        """状态取数必须与 ``ego_vehicle`` property 同源，避免两处解析规则漂移。"""
+        actor = _vehicle()
+        runner = _make_runner()
+        runner._scenario = _BuiltinLikeScenario(actor)  # noqa: SLF001
+
+        assert runner.ego_vehicle is actor
+        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+
+    def test_ego_state_supports_legacy_getter(self) -> None:
+        """向后兼容：旧 scenario 仍可通过 ``get_ego_vehicle()`` 取到状态。"""
+        runner = _make_runner()
+        runner._scenario = _LegacyScenario(_vehicle())  # noqa: SLF001
+
+        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+
+    def test_ego_state_without_scenario_returns_zeros(self) -> None:
+        """无场景时安全降级为零值字典，不抛异常。"""
+        runner = _make_runner()
+
+        state = runner.get_ego_state()
+
+        assert state["x"] == 0.0
+        assert set(state) >= {"x", "y", "z", "heading", "yaw", "velocity", "steering"}
+
+    def test_status_payload_carries_nonzero_ego_state(self) -> None:
+        """上行 sim_status 的 ego_state 不能恒零（平台侧据此判断车辆在动）。"""
+        producer = _FakeProducer()
+        runner = _make_runner(producer=producer)
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch.object(runner, "_cleanup"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(_minimal_config())
+        runner._scenario = _BuiltinLikeScenario(_vehicle())  # noqa: SLF001
+
+        runner._publish_sim_status()  # noqa: SLF001
+
+        msg = producer.status_calls[-1]
+        assert msg["payload"]["ego_state"]["x"] == pytest.approx(12.5)
+        assert msg["payload"]["ego_state"]["velocity"] == pytest.approx(10.0)

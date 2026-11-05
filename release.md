@@ -2608,3 +2608,88 @@ sim_node_endpoint_mismatch: node_id=sim-node-01, platform_learned=192.168.31.20,
   - `Ego blueprint 'HUNTER_SE' unavailable, fallback to 'vehicle.tesla.model3'`，属 CARLA 资源未安装 HUNTER_SE 蓝图，后果是自车外观/尺寸与实车不一致。
 - 沿用 3.2.2 待办项。
 
+---
+
+## V3.3.4 — 实机「画面空白 + 传感器无数据 + 自车状态恒 0」：传感器取数按测试占位对象形态写死，真机一律落空
+
+**发布日期**：2026-11-05
+**版本定位**：代码修复——传感器取数改按 CARLA 官方 API 属性名，自车状态与 `ego_vehicle` 同源，帧失败不再静默。
+
+### 现场
+
+V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天，`inst-4d020810…`），控制面本身健康（`doctor` 14 项全绿、mTLS 生效、实例 `running/RUNNING`、进度正常推至 13%），但可视化页面三处异常：
+
+| 区域 | 现象 |
+|------|------|
+| 主视区 | 「相机未挂载（场景未加载或实例已结束）」 |
+| 传感器流 | rgb **0 帧**、depth **0 帧**、点云「无点云数据」；imu **774 帧**但三轴恒 `0.000`、payload 只有 **34 B** |
+| 自车状态 | x/y/z/heading/velocity/steering **全 0**，车辆栏 `—`，事件 0 条 |
+| 日志 | `Sim sensors attached: 4 (profile=hunter_se_full, record=True, ros=False)` |
+
+关键矛盾：日志明确显示 4 个传感器**挂载成功**、IMU **仍在持续出帧**（774 帧），说明回调线程、编码线程、FrameHub 链路都是活的——不是「没数据进来」，而是「进来的数据被当成空帧」。「相机未挂载」只是 `/sensors/...` 返回 409（FrameHub 无帧）时的前端文案，并不反映挂载状态。
+
+### 根因
+
+传感器管线（V3.0.0 引入）按**单测占位对象的属性名**而非**官方 PythonAPI**取数，三处形态不匹配（已对照 CARLA 0.9.16 官方文档逐项确认）：
+
+1. **图像字节位置错**：官方 `carla.Image` 的像素在 `raw_data`，**没有 `data` 属性**；`_raw_image()` 写的是 `getattr(data, "data", b"")` → 真机得到 `b""` → `bgra_to_rgb()` 抛 `bgra buffer size mismatch: expect 1228800, got 0`。
+2. **点云字节位置错**：`carla.LidarMeasurement` 同样只有 `raw_data`；`_frame_of()` 的 lidar 分支读 `.data` → 空点云，`_lidar_xyz()` 长度不合法直接返回 `(b"", 0)`，连异常都不抛。
+3. **IMU 三轴形态错**：官方 `carla.IMUMeasurement.accelerometer/gyroscope` 是 `carla.Vector3D`，**只有 `x/y/z` 属性、不可迭代也不可下标**；`_vec3()` 用 `[float(item) for item in value]` 取值，`TypeError` 被吞后回退 `(0.0, 0.0, 0.0)`。34 B 恰好等于 `len(repr(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))))`，而静止车辆的 IMU 本应含重力 9.81——这是形态判断错误的铁证。
+
+上述异常全只写 `logger.debug(...)`，默认日志级别下不可见，**真机表现为「无数据且零线索」**，本次排查因此耗时。
+
+**自车状态恒 0** 是独立的第二个缺陷：`scene_runner_service._get_ego_state()` 只试 `scenario.get_ego_vehicle()` 与 `scenario._ego_vehicle`，而 `BuiltinScenario` 暴露的是 `ego_actor` property（内部存 `_ego`）——两者皆无 → 永远返回零值 default。同文件上方的 `ego_vehicle` property 已经实现了正确的三级解析，只是没被复用。影响面不止页面：SQLite 实例记录的 `ego_state`、上行 `sim_status` / `sim_telemetry` 的位姿与速度、`sample_sink` 评估采样均被污染为静止假象。
+
+同一坑 V2.2.1 曾在 `gui/camera_bridge` 修过并写入过 release（「`raw_data` 优先、`.data` 回退，否则表现为永不出图」），但该模块已在后续版本删除，修复经验没有沉进 V3.0.0 的新传感器管线。
+
+**「ROS2 未启用」不是缺陷**：`SimulationExecutor._ros_bridge_for()` 仅在场景 `sensors[].ros_enabled` 为真时才创建桥接器，下发场景默认 `false`（日志 `ros=False` 已印证），且需本机安装 `rclpy`。属配置开关，本版本不改默认值。
+
+### 修复内容
+
+- `src/hunter_sim/scene_runner/builtin_scenario.py`：
+  - 新增 `_measurement_bytes(data)`：**`raw_data` 优先、`data` 回退**（兼容旧版 SDK 与内部跨线程帧对象），`_raw_image()`、`_frame_of()` 的 lidar 分支、`_dispatch_sensor_data()` 的 lidar 分支统一改用它；
+  - `_vec3()` 先按 `x/y/z` 属性取（官方 `carla.Vector3D`），再回退序列形态（兼容元组占位对象），非法输入仍回退零向量；`_dispatch_sensor_data()` 的 imu 分支不再自行展开，改调 `_vec3()`；
+  - 新增 `_warn_frame_error(stage, stream, exc)`：帧取数/编码失败从 `debug` 提升为 **WARNING**（可视化日志面板可见），策略为「每流首次立即报 + 30s 窗口内聚合成一条」（`_SENSOR_ERROR_LOG_INTERVAL_S`，带锁计数，附 `(+N suppressed)`），既不留白也不形成 50Hz 日志风暴；`_on_sensor_data()` 与 `_frame_worker_loop()` 均改用它。
+- `src/hunter_sim/scene_runner/scene_runner_service.py`：`_get_ego_state()` 改用同文件已有的 `self.ego_vehicle` property，不再自己拼一套（旧名 `_ego_vehicle` 仍作为 property 的最后一档保留，向后兼容）；`_vec3` 返回定长三元组后，mypy 报多余的 `# type: ignore[arg-type]` 已删。
+- `src/hunter_sim/sensor_sim/image_codec.py`：模块注释「相机回调给出的是 `Image.data`」修正为 `Image.raw_data`，避免后人再按错属性名取数。
+- `src/hunter_sim/probes/viz_proxy.py`（本次一并确诊并修复，上一轮排查中的疑似项）：流式转发从 `aiter_bytes(chunk_size=4096)` 改为 **`aiter_raw()`**。实测（真 socket 上游逐段 1s）：`chunk_size=4096` 下前两段小字节数据被攒住，直到第三段 5000B 到达才一次性下发（到达时刻 2.16s vs 0.00s）；mTLS 下浏览器只能走探针面 :8080 代理，因此该缓冲会拖住日志首屏回放与小尺寸 MJPEG 帧。`aiter_raw()` 同时保证不重组上游分帧边界。
+- 无接口 / 配置 / 平台契约变更。
+
+### 向后兼容
+
+完全兼容。取数改为「`raw_data` 优先、`data` 回退」、`_vec3`「先属性后序列」，旧 SDK 与现有单测占位对象（`data=` / 元组）仍走回退分支；`_get_ego_state()` 对只提供 `get_ego_vehicle()` 的旧 scenario 行为不变。升级后无需改 `.env`、无需重新下发接入包。
+
+### 风险
+
+低。代理改 `aiter_raw()` 后转发的是**未解码字节流**（不再走 httpx 内容解码）；当前 viz 上游（MJPEG/SSE/JSON）均为 `identity` 不压缩，且响应头原样透传，行为一致；若未来给管理面加了 gzip 中间件，需连同 `content-encoding` 一起透传（已是现行为）。告警级别提升后，真机若仍有其他隐藏取数问题，会直接在日志面板暴露（预期行为，不是回归）。本版本不改变帧率、录制格式与上行 schema。
+
+### 验证
+
+- `pytest -q` 全量：**1246 passed**（较 V3.3.3 +12），覆盖率门禁达标；`mypy src/hunter_sim`（strict）无告警；`flake8 src tests` 0 告警。
+- 新增回归测试 `tests/test_builtin_scenario_sensors.py::TestRealCarlaMeasurementShapes`（6 例）——**用官方 API 形态的占位对象**（`_carla_image_data` / `_carla_lidar_data` / `_carla_imu_data` / `_CarlaVector3D`，只给 `raw_data`、只给 `x/y/z`）：rgb/depth/lidar 帧必须进 FrameHub，IMU payload 必须含 `9.81` 且不等于全零 repr，四路走真实挂载回调后 `hub.stats()["total"] == 4`，失败必须留下 WARNING。
+- 新增 `tests/test_scene_runner_service.py::TestEgoState`（5 例）：只暴露 `ego_actor` 的 scenario 必须取到位姿/速度/转向/加速度；`get_ego_state()` 与 `ego_vehicle` property 同源；旧 `get_ego_vehicle()` 形态仍可用；无场景时降级零值；上行 `sim_status.ego_state` 不再恒零。
+- 新增 `tests/test_probes_viz_proxy.py::TestProxyRequest::test_stream_chunks_keep_upstream_boundaries`：用 `httpx.MockTransport` 逐段下发三个 SSE 事件，断言代理输出与上游**分段逐个相等**（修复前被合并成一个 4KB 缓冲块）。
+- 先写测试后改代码：三组用例修改前均确认红灯（传感器 6 败 / 自车 3 败 / 代理 1 败；其中「四路只有 1 路」正对应现场的「只有 IMU 在空转出帧」）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .`（或 `pip install -e .`，必须重跑，否则 `huntersim version` 仍报旧版）→ 应为 `3.3.4`；
+2. 重启 `huntersim up`（CARLA 服务端不需重启）；平台**重新下发新实例**（终态实例不补帧）；
+3. 预期：主视区出现画面，rgb/depth/lidar 帧数随时间增长，IMU 三轴不再全 0（静止时 z 应接近 9.81），自车状态与进度同步变化；
+4. 若仍无图，看日志面板——本版本后帧失败会直接报 `Sensor frame extract/dispatch failed (<stream>): ...`，按该告警定位下一环；报「buffer size mismatch」类仍属取数，报蓝图/渲染类则转服务端排查；
+5. ROS2 话题仍为空属正常，除非场景配置 `sensors[].ros_enabled=true` 且本机装了 `rclpy`（平台侧在场景 JSON 里打开）。
+
+（本条目代码已落地并通过全量单测与静态检查；**尚未在实机 CARLA 上复验**，第 3–5 步待现场升级后执行确认。）
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.4`（`pyproject.toml` / `Makefile` 首行注释与 `IMAGE_TAG` / 两套 compose / `k8s/deployment.yaml` 已同步递增）。文档同步：《部署与运维指南》§5.7「画面与录制」新增 3 行（取数形态导致的无数据、ROS2 置灰属配置、代理分块缓冲），`docs/单机部署指南.md` §9 故障速查新增 2 行。
+
+### 待办 / 已知边界
+
+- **本版本修的是「取数形态」，不是「CARLA 渲染链路」**：升级后若帧数仍为 0，说明还存在第二个独立原因（地图/画质/传感器属性/渲染超时），不得提前当作已修复关闭工单。
+- **未确诊（仅登记）**：ROS2 出口 `camera_image_to_ros_image` 将 BGRA 字节与 `rgb8` / `16UC1` 编码搭配的合理性存疑；因为本次现场 `ros=False` 从未走过该路径，无真实证据，且开启 ROS2 需平台侧配合，本轮未动。
+- **未验证**：自车状态修复后，平台侧评估采样（`sample_sink`）与 `sim_telemetry` 的数据质量需实机复核；旧实例已写入的恒零 `ego_state` 不会回溯修正。
+- `image_codec.py:170` 与 `visualization/sensor_view.py:179` 存在 Pillow DeprecationWarning（`Image.fromarray(..., mode=...)` 将在 Pillow 13 移除），本版本未改。
+- 沿用 V3.3.3 待办项（含 `carla-manager` 异常退出不自动重启、HUNTER_SE 蓝图缺失回退、自签 CA 未导入导致上行静默丢失）。
+

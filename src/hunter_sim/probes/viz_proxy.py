@@ -13,7 +13,7 @@
   ``unsuitable certificate purpose``，故本机回环代理跳过服务端证书校验
   （``verify=False``），仅靠呈现客户端证书完成 mTLS 握手；
 - 流式响应（MJPEG ``multipart/x-mixed-replace``、SSE ``text/event-stream``）
-  逐块转发，不缓冲全量内容。
+  逐块透传：既不缓冲全量内容，也不重组上游分块边界（一帧/一事件一到即下发）。
 """
 
 from __future__ import annotations
@@ -128,7 +128,10 @@ async def proxy_request(
     if _is_streaming(content_type):
         async def _stream() -> Any:
             try:
-                async for chunk in upstream_response.aiter_bytes(chunk_size=4096):
+                # aiter_raw：按上游原分块逐段透传。httpx 的
+                # aiter_bytes(chunk_size=N) 会攒满 N 字节才吐一段，导致
+                # SSE 回放与小尺寸 MJPEG 帧被整段拖住。
+                async for chunk in upstream_response.aiter_raw():
                     yield chunk
             finally:
                 await upstream_response.aclose()
