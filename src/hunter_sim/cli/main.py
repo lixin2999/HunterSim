@@ -24,6 +24,7 @@ import importlib.util
 import json
 import shutil
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -594,10 +595,10 @@ def _cmd_carla_manager(args: argparse.Namespace) -> int:
         if adapter.ssl_ca_certfile:
             uvicorn_kwargs["ssl_ca_certs"] = adapter.ssl_ca_certfile
             if adapter.ssl_client_auth_required:
-                uvicorn_kwargs["ssl_cert_reqs"] = "required"
+                uvicorn_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
                 mode = "mTLS（强制平台客户端证书）"
             else:
-                uvicorn_kwargs["ssl_cert_reqs"] = "optional"
+                uvicorn_kwargs["ssl_cert_reqs"] = ssl.CERT_OPTIONAL
                 mode = "mTLS（信任平台 CA，客户端证书可选）"
             if adapter.ssl_allowed_client_cn:
                 print(

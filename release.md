@@ -2163,4 +2163,52 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **`ssl_allowed_client_cn` 仅登记不强制**：uvicorn/SSL 以 CA 链信任校验客户端证书，不做 CN 白名单过滤；因每个节点的 `sim-platform-{node_id}` 证书 CN 唯一，CA 信任已等效保证「只有平台签发证书可接入」，本版只把预期 CN 打印提示，未加自定义 ASGI 中间件做强 CN 校验。
 - **回传通道无凭据即 no-op**：`HUNTER_CORE_KAFKA_BOOTSTRAP`/SASL/证书留空时，实例级与节点级回传均降级为 no-op（本机场景与结果落库不受影响），符合「默认开、无凭据静默跳过」的选定口径。
 
+---
+
+## V3.2.3 — 修复 mTLS 启动 ssl_cert_reqs 参数类型错误
+
+**发布日期**：2026-11-05
+
+### 现场
+
+实机执行 `huntersim up` 启用下发通道 mTLS（`ADAPTER_SSL_CLIENT_AUTH_REQUIRED=true`）后，carla-manager 启动崩溃：
+```
+ValueError: 'required' is not a valid VerifyMode
+```
+
+### 根因
+
+`cli/main.py` 向 uvicorn 传递 `ssl_cert_reqs="required"`（字符串），而 uvicorn 0.29.0 的 `Config.__init__` 声明该参数为 `int`（默认 `ssl.CERT_NONE`=0），内部直接 `ssl.VerifyMode(cert_reqs)` 构造枚举——字符串无法被 `VerifyMode` 识别，抛 `ValueError`。
+
+### 修复内容
+
+- `src/hunter_sim/cli/main.py`：
+  - 顶部新增 `import ssl`；
+  - `ssl_cert_reqs` 赋值由 `"required"` → `ssl.CERT_REQUIRED`（整型 2）、`"optional"` → `ssl.CERT_OPTIONAL`（整型 1）。
+
+### 向后兼容
+
+纯修复，无接口/配置变更；未启用 mTLS 的部署完全不受影响。
+
+### 风险
+
+无——仅修正已有缺陷，不引入新逻辑分支。
+
+### 验证
+
+- `pytest tests/test_platform_adapter_app.py tests/test_settings_env.py tests/test_doctor_cli.py`：全部通过（115 passed）。
+- `py_compile src/hunter_sim/cli/main.py`：语法检查通过。
+
+### 实机执行
+
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.3` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 应正常以 mTLS 起 carla-manager。
+
+### 分发
+
+镜像 tag `hunter-sim:3.2.3`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。
+
+### 待办 / 已知边界
+
+无新增待办，沿用 3.2.2 待办项。
+
 
