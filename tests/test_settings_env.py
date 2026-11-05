@@ -27,10 +27,23 @@ _ENV_KEYS = (
     "KAFKA_USERNAME",
     "KAFKA_PASSWORD",
     "KAFKA_CA_CERT_PATH",
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "KAFKA_SECURITY_PROTOCOL",
+    "KAFKA_SASL_MECHANISM",
+    "KAFKA_CLIENT_CERT_PATH",
+    "KAFKA_CLIENT_KEY_PATH",
     "HUNTER_CORE_JWT_TOKEN",
     "HUNTER_CORE_SIM_NODE_ID",
     "HUNTER_CORE_SIM_NODE_SERVICE_TOKEN",
     "HUNTER_CORE_SIM_NODE_MANAGER_PORT",
+    "HUNTER_CORE_KAFKA_BOOTSTRAP",
+    "HUNTER_CORE_SASL_USERNAME",
+    "HUNTER_CORE_SASL_PASSWORD",
+    "HUNTER_CORE_SECURITY_PROTOCOL",
+    "HUNTER_CORE_SASL_MECHANISM",
+    "HUNTER_CORE_CA_CERT_PATH",
+    "HUNTER_CORE_CLIENT_CERT_PATH",
+    "HUNTER_CORE_CLIENT_KEY_PATH",
     # 模板口径用例断言的是模板取值，宿主机变量会覆盖 .env
     "HUNTER_CORE_ENABLED",
     "HUNTER_CORE_SIM_NODE_ENABLED",
@@ -232,4 +245,71 @@ class TestBlankOptionalValues:
         assert "静默跳过" in text
         assert "huntersim connect" in text
         # 调优项不再罗列：模板行数应大幅少于旧版（极简契约）
-        assert len(text.splitlines()) < 90
+        assert len(text.splitlines()) < 100
+
+
+class TestKafkaInheritance:
+    """V3.3.0：VIL 消费端 Kafka 连接参数自动继承 CloudSettings（消除 .env 重复）。"""
+
+    def test_no_cloud_sasl_keeps_kafka_defaults(self, tmp_path: Path) -> None:
+        """未配置平台 SASL 时，KafkaSettings 维持默认 localhost:9092 PLAINTEXT。"""
+        _write_env(tmp_path, "CARLA_HOST=127.0.0.1\n")
+        settings = HunterSimSettings()
+        assert settings.kafka.bootstrap_servers == "localhost:9092"
+        assert settings.kafka.security_protocol == "PLAINTEXT"
+        assert settings.kafka.username is None
+
+    def test_cloud_sasl_propagates_to_kafka(self, tmp_path: Path) -> None:
+        """配了 HUNTER_CORE_SASL_USERNAME 后，KafkaSettings 自动继承整套连接参数。"""
+        _write_env(
+            tmp_path,
+            "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.1.100:9093\n"
+            "HUNTER_CORE_SASL_USERNAME=test_user\n"
+            "HUNTER_CORE_SASL_PASSWORD=test_pass\n"
+            "HUNTER_CORE_CA_CERT_PATH=/certs/ca.pem\n"
+            "HUNTER_CORE_CLIENT_CERT_PATH=/certs/client.pem\n"
+            "HUNTER_CORE_CLIENT_KEY_PATH=/certs/client-key.pem\n",
+        )
+        settings = HunterSimSettings()
+        assert settings.kafka.bootstrap_servers == "192.168.1.100:9093"
+        assert settings.kafka.security_protocol == "SASL_SSL"
+        assert settings.kafka.sasl_mechanism == "SCRAM-SHA-512"
+        assert settings.kafka.username is not None
+        assert settings.kafka.username.get_secret_value() == "test_user"
+        assert settings.kafka.password is not None
+        assert settings.kafka.password.get_secret_value() == "test_pass"
+        assert settings.kafka.ca_cert_path == "/certs/ca.pem"
+        assert settings.kafka.client_cert_path == "/certs/client.pem"
+        assert settings.kafka.client_key_path == "/certs/client-key.pem"
+
+    def test_explicit_kafka_bootstrap_not_overridden(self, tmp_path: Path) -> None:
+        """用户显式配置了 KAFKA_BOOTSTRAP_SERVERS 时，不被 cloud 继承覆盖。"""
+        _write_env(
+            tmp_path,
+            "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.1.100:9093\n"
+            "HUNTER_CORE_SASL_USERNAME=test_user\n"
+            "HUNTER_CORE_SASL_PASSWORD=test_pass\n"
+            "KAFKA_BOOTSTRAP_SERVERS=10.0.0.1:9092\n"
+            "KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT\n",
+        )
+        settings = HunterSimSettings()
+        # 显式设定的不被覆盖
+        assert settings.kafka.bootstrap_servers == "10.0.0.1:9092"
+        assert settings.kafka.security_protocol == "SASL_PLAINTEXT"
+        # 未显式设定的仍继承
+        assert settings.kafka.sasl_mechanism == "SCRAM-SHA-512"
+        assert settings.kafka.username is not None
+        assert settings.kafka.username.get_secret_value() == "test_user"
+
+    def test_blank_cloud_sasl_does_not_trigger(self, tmp_path: Path) -> None:
+        """HUNTER_CORE_SASL_USERNAME= 留空时不触发继承（等同未配置）。"""
+        _write_env(
+            tmp_path,
+            "HUNTER_CORE_KAFKA_BOOTSTRAP=192.168.1.100:9093\n"
+            "HUNTER_CORE_SASL_USERNAME=\n"
+            "HUNTER_CORE_SASL_PASSWORD=\n",
+        )
+        settings = HunterSimSettings()
+        # 留空 = blank_is_unset → 不进入 model_fields_set → 不触发继承
+        assert settings.kafka.bootstrap_servers == "localhost:9092"
+        assert settings.kafka.security_protocol == "PLAINTEXT"

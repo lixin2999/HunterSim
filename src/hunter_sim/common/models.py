@@ -18,6 +18,7 @@ from pydantic import (
     Field,
     SecretStr,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -726,6 +727,58 @@ class HunterSimSettings(BaseSettings):
         if v not in valid:
             raise ValueError(f"log_level must be one of {valid}")
         return v
+
+    @model_validator(mode="after")
+    def _inherit_kafka_from_cloud(self) -> "HunterSimSettings":
+        """V3.3.0：VIL 消费端 Kafka 连接参数自动继承 CloudSettings（消除 .env 重复）。
+
+        规则：
+        - 若 cloud.sasl_username 已被显式配置（出现在 cloud.model_fields_set），
+          表明用户正在接入平台 Kafka，则把整套连接参数（bootstrap / 协议 / 机制 /
+          凭据 / 证书）继承到 KafkaSettings 中未被显式设定的字段。
+        - 若用户显式配置了 KAFKA_* 环境变量，则保留用户值（不覆盖）。
+        - 纯本机联调（未配任何 HUNTER_CORE_ 凭据）时不触发继承，KafkaSettings 维持
+          默认 localhost:9092 PLAINTEXT。
+        """
+        cloud_fields = self.cloud.model_fields_set
+        kafka_fields = self.kafka.model_fields_set
+
+        # 触发条件：用户显式配了 cloud 的 SASL 身份（意味着正在接入平台 Kafka）
+        # 留空（blank_is_unset → None）不触发
+        if "sasl_username" not in cloud_fields or self.cloud.sasl_username is None:
+            return self
+
+        overrides: dict[str, Any] = {}
+
+        # 1. Bootstrap
+        if "bootstrap_servers" not in kafka_fields:
+            overrides["bootstrap_servers"] = self.cloud.kafka_bootstrap
+
+        # 2. 安全协议与 SASL 机制（cloud 默认值即为平台期望的 SASL_SSL/SCRAM-SHA-512）
+        if "security_protocol" not in kafka_fields:
+            overrides["security_protocol"] = self.cloud.security_protocol
+        if "sasl_mechanism" not in kafka_fields:
+            overrides["sasl_mechanism"] = self.cloud.sasl_mechanism
+
+        # 3. SASL 凭据
+        if "username" not in kafka_fields and self.cloud.sasl_username:
+            overrides["username"] = self.cloud.sasl_username
+        if "password" not in kafka_fields and self.cloud.sasl_password:
+            overrides["password"] = self.cloud.sasl_password
+
+        # 4. 证书路径
+        if "ca_cert_path" not in kafka_fields and "ca_cert_path" in cloud_fields:
+            if self.cloud.ca_cert_path:
+                overrides["ca_cert_path"] = self.cloud.ca_cert_path
+        if "client_cert_path" not in kafka_fields and self.cloud.client_cert_path:
+            overrides["client_cert_path"] = self.cloud.client_cert_path
+        if "client_key_path" not in kafka_fields and self.cloud.client_key_path:
+            overrides["client_key_path"] = self.cloud.client_key_path
+
+        if overrides:
+            self.kafka = self.kafka.model_copy(update=overrides)
+
+        return self
 
 
 # ─── HUNTER SE 车辆规格常量 ───────────────────────────────────────────────────

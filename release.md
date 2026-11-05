@@ -2361,4 +2361,40 @@ Viz proxy connect failed: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify fa
 
 - 无新增。沿用 3.2.2 待办项。
 
+---
 
+## V3.3.0 — VIL 消费端 Kafka 连接参数自动继承 CloudSettings（消除 .env 重复）
+
+**发布日期**：2026-11-05
+**版本定位**：功能变更——减少平台接入配置重复，简化 .env 复杂度。
+
+### 背景与痛点
+
+VIL 消费端（`KAFKA_*`）与数据回传端（`HUNTER_CORE_KAFKA/SASL/CLIENT_*`）指向同一平台 Kafka broker，凭据和证书完全相同，但旧版要求用户在 .env 中写两份。接入平台后 .env 臃肿且易出现两处不一致。
+
+### 修复内容
+
+- **`HunterSimSettings._inherit_kafka_from_cloud`**（`common/models.py`）：新增 `model_validator(mode="after")`，当用户显式配置了 `HUNTER_CORE_SASL_USERNAME`（非空）时，自动把 CloudSettings 的整套 Kafka 连接参数（bootstrap / 安全协议 / SASL 机制 / 凭据 / 证书路径）继承到 KafkaSettings 中未被显式设定的字段。
+- **显式优先**：若用户单独配置了 `KAFKA_BOOTSTRAP_SERVERS` 等，不会被继承覆盖（保留精确控制能力）。
+- **本机零影响**：未配置任何平台 SASL 凭据时不触发继承，KafkaSettings 维持默认 `localhost:9092 PLAINTEXT`。
+
+### .env 简化效果
+
+接入平台时用户只需配置 `HUNTER_CORE_*` 一组 Kafka 参数，不再需要写 `KAFKA_BOOTSTRAP_SERVERS` / `KAFKA_USERNAME` / `KAFKA_PASSWORD` / `KAFKA_CA_CERT_PATH` / `KAFKA_CLIENT_CERT_PATH` / `KAFKA_CLIENT_KEY_PATH` 等重复行。`.env.example` 已同步更新。
+
+### 验证
+
+- 全量 `pytest -q`：**1221 passed**（较 V3.2.6 +4 新增继承测试）。
+- `mypy --strict`：无告警。
+- `flake8`：0 告警。
+- 新增测试 `TestKafkaInheritance`（4 例）：无平台配置保持默认、完整继承、显式不覆盖、留空不触发。
+
+### 兼容性
+
+- **默认零改动**：未配 `HUNTER_CORE_SASL_USERNAME` 的现场不受影响。
+- **已配 KAFKA_* 的现场**：仍优先用自己的值，行为不变。
+- **建议迁移**：平台接入现场可删除 .env 中整块 `KAFKA_*` 配置，仅保留 `HUNTER_CORE_*` 组（并补上 `HUNTER_CORE_CA_CERT_PATH`）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.0`。
