@@ -28,7 +28,6 @@ V3.1.0 追加可视化客户端（只读、独立前缀，不进 OpenAPI）：``
 
 from __future__ import annotations
 
-import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Optional, cast
@@ -41,7 +40,7 @@ from hunter_sim.common.metrics import observe_http_request, refresh_runtime_gaug
 from hunter_sim.common.models import HunterSimSettings, VizSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.execution.engine_pool import EnginePool, EngineEndpoint, parse_engine_endpoints
-from hunter_sim.execution.plane import ExecutionPlane
+from hunter_sim.execution.plane import ExecutionPlane, MapManagerResolver
 from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.executor import SimulationExecutor
 from hunter_sim.platform_adapter.models import (
@@ -62,8 +61,35 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 
 
+def _make_map_manager_resolver(settings: HunterSimSettings) -> MapManagerResolver:
+    """构造「引擎端点 → MapManager」解析器（V3.3.3：每次调用新建一条连接）。
+
+    不再跨实例缓存复用客户端：上一实例场景销毁后，缓存客户端在 LibCarla
+    侧的 episode 可能已随服务端世界重置失效，下一次 ``load_world`` 会命中
+    原生断言 ``_episode != nullptr``（Simulator.h）并 ``abort()`` 掉整个控制
+    面进程（退出码 0xC0000409，Python 侧无法捕获）。``carla.Client`` 构造是
+    惰性的（首次 RPC 才真正建连），每次装配重建的代价可忽略，换来干净的
+    连接状态。
+    """
+
+    def resolve(endpoint: EngineEndpoint) -> Optional[Any]:
+        """为本次装配新建 MapManager（无 CARLA SDK / 端点不可用时返回 None）。"""
+        try:
+            import carla  # noqa: PLC0415  惰性导入：仅真实 CARLA 环境可用
+            from hunter_sim.engine.map_manager import MapManager  # noqa: PLC0415
+
+            client = carla.Client(endpoint.host, endpoint.rpc_port)
+            client.set_timeout(float(settings.carla.timeout_seconds))
+            return MapManager(client)
+        except Exception as exc:  # noqa: BLE001  端点不可达 / SDK 缺失
+            logger.warning(f"Adapter map manager unavailable for {endpoint.key}: {exc}")
+            return None
+
+    return resolve
+
+
 def build_execution_plane(settings: HunterSimSettings) -> ExecutionPlane:
-    """构造适配器专用执行平面（单世界串行，惰性创建 MapManager）。"""
+    """构造适配器专用执行平面（单世界串行，每次装配新建 CARLA 连接）。"""
     endpoints = parse_engine_endpoints(
         settings.execution.engine_endpoints,
         settings.carla,
@@ -75,32 +101,10 @@ def build_execution_plane(settings: HunterSimSettings) -> ExecutionPlane:
         else 0.0
     )
     pool = EnginePool(endpoints, lease_ttl_seconds=lease_ttl)
-    managers: dict[str, Any] = {}
-    managers_lock = threading.RLock()
-
-    def resolve(endpoint: EngineEndpoint) -> Optional[Any]:
-        """按端点惰性创建 MapManager（无 CARLA SDK 时返回 None → 执行面不可用）。"""
-        with managers_lock:
-            cached = managers.get(endpoint.key)
-            if cached is not None:
-                return cached
-        try:
-            import carla  # noqa: PLC0415  惰性导入：仅真实 CARLA 环境可用
-            from hunter_sim.engine.map_manager import MapManager  # noqa: PLC0415
-
-            client = carla.Client(endpoint.host, endpoint.rpc_port)
-            client.set_timeout(float(settings.carla.timeout_seconds))
-            manager = MapManager(client)
-        except Exception as exc:  # noqa: BLE001  端点不可达 / SDK 缺失
-            logger.warning(f"Adapter map manager unavailable for {endpoint.key}: {exc}")
-            return None
-        with managers_lock:
-            managers[endpoint.key] = manager
-        return manager
 
     return ExecutionPlane(
         pool,
-        resolve,
+        _make_map_manager_resolver(settings),
         fixed_delta_seconds=float(settings.carla.fixed_delta_seconds),
         cloud_settings=settings.cloud,
     )

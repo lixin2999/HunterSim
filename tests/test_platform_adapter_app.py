@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import sys
 import time
+import types
 from datetime import datetime
 from typing import Any, Optional
 
 import pytest
 from fastapi.testclient import TestClient
 
-from hunter_sim.platform_adapter.app import create_app
+from hunter_sim.common.models import CarlaSettings, HunterSimSettings
+from hunter_sim.execution.engine_pool import EngineEndpoint
+from hunter_sim.platform_adapter.app import (
+    _make_map_manager_resolver,
+    build_execution_plane,
+    create_app,
+)
 from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.models import (
     CreateInstanceRequest,
@@ -290,3 +298,72 @@ class TestLifespan:
             assert app.state.adapter_service is not None
 
         assert executor.stopped == 1
+
+
+# ─── V3.3.3：CARLA 连接不得跨实例复用（LibCarla 原生断言崩溃回归） ───────────
+
+
+def _stub_carla(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
+    """注入最小 carla 模块替身，记录每次 ``carla.Client`` 构造的 (host, port)。"""
+    created: list[tuple[str, int]] = []
+
+    class _Client:
+        def __init__(self, host: str, port: int) -> None:
+            created.append((str(host), int(port)))
+
+        def set_timeout(self, _seconds: float) -> None:
+            return None
+
+    mod = types.ModuleType("carla")
+    mod.Client = _Client  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "carla", mod)
+    return created
+
+
+def _plane_settings() -> HunterSimSettings:
+    """单引擎默认配置（与现场 CARLA_HOST=127.0.0.1:2000 一致）。"""
+    return HunterSimSettings(env="dev", carla=CarlaSettings(host="127.0.0.1", rpc_port=2000))
+
+
+class TestMapManagerResolverFreshConnection:
+    """解析器每次调用都新建 CARLA 连接（V3.3.3 崩溃回归）。
+
+    回归现场：同进程第二个场景复用缓存客户端 ``load_world`` 触发 LibCarla
+    原生断言 ``_episode != nullptr``（Simulator.h）并 abort 掉整个控制面
+    进程（退出码 0xC0000409，Python 侧无法捕获）。
+
+    修复口径：装配之间不共享连接对象，每次重新建连。
+    """
+
+    def test_each_call_builds_a_new_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        created = _stub_carla(monkeypatch)
+        resolve = _make_map_manager_resolver(_plane_settings())
+        endpoint = EngineEndpoint("127.0.0.1", 2000, 2001)
+
+        first = resolve(endpoint)
+        second = resolve(endpoint)
+
+        assert first is not None and second is not None
+        assert first is not second, "跨装配复用同一 MapManager 会带走失效的 episode"
+        assert created == [("127.0.0.1", 2000), ("127.0.0.1", 2000)]
+
+    def test_execution_plane_resolves_fresh_client_per_assembly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """装配入口（build_execution_plane）同样不得缓存连接对象。"""
+        created = _stub_carla(monkeypatch)
+        plane = build_execution_plane(_plane_settings())
+        endpoint = EngineEndpoint("127.0.0.1", 2000, 2001)
+
+        # 解析器是执行面装配的唯一 CARLA 入口，测试直接按其契约取值
+        resolver = plane._resolve_map_manager  # noqa: SLF001
+        assert resolver(endpoint) is not None
+        assert resolver(endpoint) is not None
+        assert len(created) == 2
+
+    def test_sdk_missing_degrades_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无 CARLA SDK 时返回 None（执行面不可用），不抛异常、不阻断启动。"""
+        monkeypatch.setitem(sys.modules, "carla", None)  # import carla → ImportError
+        resolve = _make_map_manager_resolver(_plane_settings())
+
+        assert resolve(EngineEndpoint("127.0.0.1", 2000, 2001)) is None

@@ -2524,3 +2524,87 @@ sim_node_endpoint_mismatch: node_id=sim-node-01, platform_learned=192.168.31.20,
 - 若后续要精确枚举机器上**所有**网卡真实 IP（而不只是「访问平台走的这一张」），仍建议评估引入 `psutil.net_if_addrs()`；本次为控制依赖面未采用。
 - 沿用 3.2.2 待办项。
 
+---
+
+## V3.3.3 — 平台连续下发两个场景，第二个把整个控制面带崩：CARLA 客户端跨实例复用触发 LibCarla 原生断言
+
+**发布日期**：2026-11-05
+**版本定位**：代码修复——执行面装配不再跨实例缓存复用 `carla.Client`。
+
+### 现场
+
+平台在同一个 `carla-manager` 进程内连续下发两个 SIL 场景（均为 Town02）：
+
+| 时刻 | 事件 |
+|------|------|
+| 16:32:42 | ① `inst-9c18806b…` queued/created，`Loading map: Town02` → 16:32:51 加载成功（9402ms），场景正常跑完 |
+| 16:35:19 | ① `running → completed`、`Instance completed passed=True`、`Execution plane released` |
+| 16:35:44 | ② `inst-130c7e930…` queued/created，`McapRecorder opened`，`Loading map: Town02` |
+| 16:35:44 | **`Assertion failed: _episode != nullptr, file …/carla/client/detail/Simulator.h, line 129`** |
+| 16:35:53 | `/viz` 代理建连失败（`Viz proxy connect failed`），`/api/v1/instances` 转 502/500 |
+| 收尾 | **`[up] carla-manager 已退出（code=3221226505）`** → `[up] 已停止 probes` |
+
+页面表现：`控制面 离线`、`场景 pending`、主视区「暂无活动场景，等待平台下发实例…」、实例状态「无活动实例」（②停在 `pending`，从未进入 `running`）。
+
+### 根因
+
+`platform_adapter/app.py` 的 `build_execution_plane()` 把 `carla.Client` 连同 `MapManager` **按端点缓存在 `managers` 字典里、永久复用**（`resolve()` 命中缓存直接返回）。现场日志正好构成一组对比：
+
+- 首个实例（进程刚启动）用**新建**客户端 `load_world` → 成功；
+- 上一场景 `destroy` / 执行面释放后，第二个实例在**同一个缓存客户端**上再次 `load_world` → 命中 LibCarla 的 `_episode != nullptr` 原生断言。
+
+该断言在 C++ 侧（LibCarla），触发后直接 `abort()`，对应退出码 `3221226505` = `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN / fastfail）。**它不是 Python 异常，`try/except` 与看门狗都接不住**，整个控制面进程直接消失；因此②不是「慢」或「卡」，而是带着它的那个 `carla-manager` 已经死了。
+
+两个实例相差 25 s、①的引擎租约已释放，因此**不是并发冲突**，而是同一端点上的**跨实例连接复用**。页面里成片的 `409 Conflict`（`screenshot` / `sensors/lidar` / `stream.mjpg`）是传感器帧未就绪的正常响应，与本次崩溃无关。
+
+### 修复内容
+
+- `src/hunter_sim/platform_adapter/app.py`：
+  - 抽出模块级 `_make_map_manager_resolver(settings)`，其 `resolve(endpoint)` **每次调用都新建一个 `carla.Client` + `MapManager`**，不再返回缓存对象；
+  - 删除 `managers` 缓存字典与 `managers_lock`（连带移除不再使用的 `import threading`）；
+  - `build_execution_plane()` 改用 `_make_map_manager_resolver(settings)`，docstring 同步为「每次装配新建 CARLA 连接」。
+- 代价评估：`carla.Client(...)` 构造是惰性的（首次 RPC 才真正建连），每次装配重建只多一次亚秒级握手，相对 `load_world` 的秒级耗时可忽略；换来的是干净的连接状态。
+- 无接口 / 配置 / 平台契约变更；`ExecutionPlane`、`EnginePool`、`MapManager` 本身未改动。
+
+### 向后兼容
+
+完全兼容。仅影响控制面内部的装配方式；单引擎串行、多引擎并行、地图亲和调度、重启恢复、录制与上报链路行为均不变。升级后无需改 `.env`。
+
+### 风险
+
+低。每个实例多一个 `carla.Client` 对象，旧对象随运行器释放由 GC 回收；极端情况下若现场 CARLA 服务端对并发连接数有限制，旧连接回收延迟可能短暂占用一个槽位（不影响单世界串行形态）。
+
+### 验证
+
+- `pytest -q` 全量：**1234 passed**（较 V3.3.2 +3），覆盖率门禁达标。
+- 新增回归测试 `tests/test_platform_adapter_app.py::TestMapManagerResolverFreshConnection`（3 例）：
+  1. 连续两次 `resolve(同一端点)` 必须构造两个 `carla.Client`（替身计数断言）且返回不同 `MapManager`；
+  2. 装配入口 `build_execution_plane()` 同样不缓存（两次解析得到两条新连接）——防止只在子函数修、接线处仍缓存；
+  3. 无 CARLA SDK 时降级返回 `None`（报 `Adapter map manager unavailable`），不抛异常、不阻断启动。
+- 先写测试后改代码：修改前该组用例因 `ImportError: cannot import name '_make_map_manager_resolver'` 收集失败（红灯已确认）。
+- `mypy src/hunter_sim`（strict）无告警；`flake8 src tests` 0 告警。
+
+### 实机执行
+
+现场按下列顺序闭环：
+
+1. `git pull` → `uv pip install -e .`（或 `pip install -e .`）→ `huntersim version` 应为 `3.3.3`；
+2. 重启 `huntersim up`（CARLA 服务端不需重启）；
+3. 平台连续下发两个场景（建议仍用同一地图以复现本次现场序列），第二个应正常 `pending → running → succeeded`，`carla-manager` 不再退出；
+4. 若仍复现，先抓 `carla-manager` 日志确认是否仍是 `_episode != nullptr`，并检查 CARLA 服务端是否已先于控制面退出（看 `CarlaUE4` 窗口/日志）。
+
+（本条目代码已落地并通过全量单测与静态检查；**尚未在带真实 CARLA 服务端的现场复验**，实机第 3–4 步待现场升级后执行确认。）
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.3`（`pyproject.toml` / `Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步递增）。文档同步：《部署与运维指南》§5.6 与 `docs/单机部署指南.md` §9 故障速查均新增本现象条目。
+
+### 待办 / 已知边界
+
+- **episode 失效的确切内部条件尚未确诊**：本版本按现场日志对比（新建客户端成功 / 复用客户端崩溃）消除了「跨实例复用」这个变量，但未能证明 LibCarla 不存在按 `host:port` 共享底层连接状态的情形。若升级后实机仍报 `_episode != nullptr`，下一个候选方案是「目标地图与端点已加载地图相同时跳过 `load_world`，改用 `get_world()`」（正好避开本次出错的那次调用），仍未验证，不得当作已修复。
+- `huntersim up` 对 `carla-manager` 异常退出**只关停其余子进程、不自动重启**（本次现场即如此），缺少崩溃自愈与告警；建议后续补「异常退出自动重启 + 计数告警」。
+- 同一份现场日志还暴露两个与本崩溃无关、**本版本未改动**的问题（如实登记为待处理）：
+  - `SimDataProducer` / `NodeResultProducer` 初始化失败降级为 no-op：`SSLCertVerificationError … self-signed certificate in certificate chain`，属自签 CA 未导入（`HUNTER_CORE_CA_CERT_PATH` 等），后果是云端上行静默丢失；
+  - `Ego blueprint 'HUNTER_SE' unavailable, fallback to 'vehicle.tesla.model3'`，属 CARLA 资源未安装 HUNTER_SE 蓝图，后果是自车外观/尺寸与实车不一致。
+- 沿用 3.2.2 待办项。
+
