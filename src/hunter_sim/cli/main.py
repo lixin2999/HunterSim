@@ -848,14 +848,7 @@ def _cmd_up(args: argparse.Namespace) -> int:
     url = viz_url(settings)
     _print_plan(specs, url, settings)
     open_browser = (not args.no_browser) and settings.viz.auto_open_browser
-    # mTLS 强制客户端证书：浏览器无法直接访问本机 viz，跳过自动打开
-    if open_browser and settings.adapter.tls_enabled and settings.adapter.ssl_client_auth_required:
-        print(
-            "[up] mTLS 已启用，本机可视化页面需浏览器携带客户端证书，已跳过自动打开；\n"
-            f"     可通过平台 Web 端访问，或将证书导入 Windows 证书存储后手动访问：{url}"
-        )
-        open_browser = False
-    elif open_browser:
+    if open_browser:
         print("启动完成后将自动打开浏览器；可用 --no-browser 关闭。")
     on_ready = (lambda: _run_demo(settings)) if args.demo else None
     return Launcher().run(specs, url, open_browser=open_browser, on_ready=on_ready)

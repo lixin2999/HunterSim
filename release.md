@@ -2258,4 +2258,57 @@ V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim
 - **mTLS 下本机 viz 浏览器访问**：需将客户端证书导入 Windows 证书存储后浏览器才能完成 mTLS 握手；或通过平台 Web 端访问可视化页面。后续可考虑在探针面（:8080 HTTP）代理 viz 内容以方便本机访问。
 - 沿用 3.2.2 待办项。
 
+---
+
+## V3.2.5 — viz 改由探针面 HTTP 反向代理访问（免除浏览器导入证书）
+
+**发布日期**：2026-11-05
+
+### 现场
+
+V3.2.4 后 `huntersim up` 已能正常以 mTLS 起 carla-manager 并通过就绪探测，但本机访问可视化页面仍有障碍：管理面 `:8090` 全程 HTTPS+mTLS，浏览器需将 `client-cert.pem` + `client-key.pem` 导入 Windows 证书存储（`certutil -importpfx`）才能完成 mTLS 握手，操作繁琐；V3.2.4 临时以“跳过自动打开浏览器 + 提示导入证书”缓解。
+
+### 根因
+
+mTLS 是 TLS 层全有或全无，无法按路径豁免：`:8090` 一旦启用客户端证书校验，浏览器不导入证书就无法直接访问任何端点（含 `/viz`）。
+
+### 修复内容（功能完善：探针面反向代理）
+
+架构：`:8090` 保持 HTTPS+mTLS（平台下发通道安全契约不变）；`:8080` 探针面（HTTP）新增 viz 反向代理，浏览器直接访问 `http://<IP>:8080/viz`，无需任何客户端证书；探针进程用同机同一份 `ADAPTER_SSL_CERTFILE`/`KEYFILE` 作为客户端证书连接管理面，在本机回环完成 mTLS 握手。
+
+- 新增 `src/hunter_sim/probes/viz_proxy.py`：反向代理核心模块。
+  - `resolve_upstream_base()`：TLS 时计算 `https://<host>:<adapter_port>`（通配地址回落 127.0.0.1）；
+  - `build_ssl_kwargs()`：按 adapter TLS 配置组装 httpx 客户端 `cert`/`verify` 参数；
+  - `proxy_request()`：透明转发 method/path/query/headers/body，过滤 hop-by-hop 头；对流式响应（MJPEG `multipart/x-mixed-replace`、SSE `text/event-stream`）用 `StreamingResponse` 逐块转发，普通 JSON/图片缓冲返回；上游不可达 502、超时 504；
+  - `register_viz_proxy()`：在探针应用注册 `/viz`、`/viz/assets/{name}`（直读静态文件）、`/viz/api/*`、`/api/v1/*`、`/docs`、`/openapi.json`（代理到管理面）；client 由 lifespan 写入 `app.state`，路由内部延迟取值。
+- `src/hunter_sim/probes/app.py`：`create_probes_app()` 在 `adapter.tls_enabled` 时以 lifespan 管理全局 `httpx.AsyncClient`（证书缺失时降级、不阻断启动）并调用 `register_viz_proxy()`；`_fetch_upstream()` 新增 `ssl_kwargs` 透传，`_health_body()` TLS 时用 `resolve_upstream_base` 计算上游地址。
+- `src/hunter_sim/visualization/routes.py`：`viz_url()` 在 TLS 时返回 `http://<probe_host>:<probe_port>/viz`，非 TLS 保持 `http://<adapter_host>:<adapter_port>/viz`。
+- `src/hunter_sim/cli/main.py`：`_cmd_up()` 恢复无条件自动打开浏览器（URL 已自动指向 8080），移除 V3.2.4 临时加的“mTLS 跳过浏览器 + 导入证书提示”逻辑。
+
+### 向后兼容
+
+无平台侧接口/配置变更；未启用 mTLS 的部署完全不受影响（探针面不注册代理路由，`viz_url` 仍指向 8090，走原有 HTTP 探测 + 自动打开浏览器路径）。平台 Web 端仍通过 `https://<IP>:8090` 访问管理 API（mTLS 契约不变）。
+
+### 风险
+
+低。新增探针面 HTTP 代理仅在本机回环转发 viz 只读页面与 API；探针与管理面同机，代理使用与 server 端同一份证书完成 mTLS，不扩大攻击面。要求探针面与管理面同机部署。
+
+### 验证
+
+- `pytest tests/` 全量：**1217 passed**（新增 `tests/test_probes_viz_proxy.py` 17 项：`resolve_upstream_base`/`build_ssl_kwargs`/`viz_url` scheme 切换、TLS/非 TLS 路由注册差异、`proxy_request` JSON 转发与 502、`_fetch_upstream` ssl_kwargs 透传）。
+- `mypy src/hunter_sim`（strict）：89 文件无告警；`flake8` 变更文件零违规。
+
+### 实机执行
+
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.5` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 正常以 mTLS 起 carla-manager 并检测就绪；浏览器自动打开 `http://127.0.0.1:8080/viz`，无需导入任何证书即可看到画面/传感器/事件/日志。
+
+### 分发
+
+镜像 tag `hunter-sim:3.2.5`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。
+
+### 待办 / 已知边界
+
+- **mTLS 下本机 viz 浏览器访问**：已通过探针面（:8080 HTTP）反向代理解决，浏览器直接访问 `http://<IP>:8080/viz` 即可，无需导入证书。要求探针面与管理面同机部署（回环 mTLS 代理）。
+- 沿用 3.2.2 待办项。
+
 

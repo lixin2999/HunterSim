@@ -54,19 +54,29 @@ _DEFAULT_VIZ = VizSettings()
 
 
 def viz_url(settings: HunterSimSettings) -> str:
-    """可视化页面地址（监听通配地址时回落到 127.0.0.1）。
+    """可视化页面地址。
+
+    - 非 TLS：直接指向管理面 ``http://<host>:<adapter_port>/viz``；
+    - TLS/mTLS：指向探针面 ``http://<host>:<probe_port>/viz``（探针代理到管理面），
+      浏览器无需客户端证书即可访问。
 
     Args:
-        settings: 全局配置（读取 ``adapter.host/port``）。
+        settings: 全局配置（读取 ``adapter`` / ``probe``）。
 
     Returns:
-        ``http(s)://<host>:<port>/viz``。
+        ``http://<host>:<port>/viz``。
     """
+    if settings.adapter.tls_enabled:
+        # mTLS 下通过探针面 HTTP 代理访问 viz
+        host = (settings.probe.host or "").strip()
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"
+        return f"http://{host}:{settings.probe.port}/viz"
+    # 非 TLS：直接访问管理面
     host = (settings.adapter.host or "").strip()
     if host in ("", "0.0.0.0", "::", "[::]"):
         host = "127.0.0.1"
-    scheme = "https" if settings.adapter.tls_enabled else "http"
-    return f"{scheme}://{host}:{settings.adapter.port}/viz"
+    return f"http://{host}:{settings.adapter.port}/viz"
 
 
 def register_viz_routes(app: FastAPI) -> None:
