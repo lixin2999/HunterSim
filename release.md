@@ -2196,16 +2196,55 @@ ValueError: 'required' is not a valid VerifyMode
 
 ### 验证
 
-- `pytest tests/test_platform_adapter_app.py tests/test_settings_env.py tests/test_doctor_cli.py`：全部通过（115 passed）。
-- `py_compile src/hunter_sim/cli/main.py`：语法检查通过。
-
-### 实机执行
-
-`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.3` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 应正常以 mTLS 起 carla-manager。
+- `pytest tests/test_platform_adapter_app.py tests/test_settings_env.py tests/test_doctor_cli.py`：全部通过。
+- 实机验证：`huntersim up` 服务正常以 mTLS 启动，平台已检测到节点在线。
 
 ### 分发
 
-镜像 tag `hunter-sim:3.2.3`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。
+镜像 tag `hunter-sim:3.2.3`。
+
+---
+
+## V3.2.4 — 修复 mTLS 就绪探测失败
+
+**发布日期**：2026-11-05
+
+### 现场
+
+V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim-node-01 在线，但 `huntersim up` 报 “未在 60s 内就绪”并停止子进程。
+
+### 根因
+
+`ServiceSpec.url` 始终用 `http://` scheme，而 mTLS 服务监听在 HTTPS 端口。`http_ok()` 对 HTTPS 端口发纯 HTTP 请求必然失败；即使改为 HTTPS，mTLS 强制客户端证书也会拒绝无证书的健康检查。
+
+### 修复内容
+
+- `src/hunter_sim/visualization/launcher.py`：
+  - `ServiceSpec` 新增 `tls: bool = False` 字段，`url` 属性根据 `tls` 切换 `http`/`https` scheme；
+  - 新增 `probe_host` 属性（通配地址回落 127.0.0.1）；
+  - 新增 `tcp_port_ok(host, port, timeout)` 函数，用 TCP 端口连接判断服务是否已绑定 socket；
+  - `Launcher._probe_spec()` 方法：TLS 场景用 TCP 端口探测，非 TLS 保持原有 HTTP 探测；
+  - `build_service_specs()` 传入 `tls=adapter.tls_enabled`。
+
+### 向后兼容
+
+纯修复，无接口/配置变更；未启用 mTLS 的部署完全不受影响（`tls` 默认 `False`，走原有 HTTP 探测路径）。
+
+### 风险
+
+无——仅修正已有缺陷，不引入新逻辑分支。
+
+### 验证
+
+- `pytest tests/` 全量：**1200 passed**。
+
+### 实机执行
+
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.4` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 应正常以 mTLS 起 carla-manager 并检测就绪。
+
+### 分发
+
+镜像 tag `hunter-sim:3.2.4`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。
 
 ### 待办 / 已知边界
 

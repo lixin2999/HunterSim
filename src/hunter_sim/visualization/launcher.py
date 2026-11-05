@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 import time
@@ -53,6 +54,7 @@ class ServiceSpec:
         argv: 启动命令行。
         health_path: 就绪探测路径。
         required: 未就绪是否导致 ``up`` 失败。
+        tls: 是否以 TLS/mTLS 提供服务（影响探测方式：TLS 用 TCP 端口探测）。
     """
 
     name: str
@@ -61,6 +63,7 @@ class ServiceSpec:
     argv: tuple[str, ...]
     health_path: str = "/health"
     required: bool = True
+    tls: bool = False
 
     @property
     def url(self) -> str:
@@ -68,7 +71,16 @@ class ServiceSpec:
         host = (self.host or "").strip()
         if host in ("", "0.0.0.0", "::", "[::]"):
             host = "127.0.0.1"
-        return f"http://{host}:{self.port}"
+        scheme = "https" if self.tls else "http"
+        return f"{scheme}://{host}:{self.port}"
+
+    @property
+    def probe_host(self) -> str:
+        """探测用实际主机（通配地址回落 127.0.0.1）。"""
+        host = (self.host or "").strip()
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            return "127.0.0.1"
+        return host
 
     def health_url(self) -> str:
         """就绪探测地址。"""
@@ -113,6 +125,7 @@ def build_service_specs(
                 "--log-level",
                 log_level,
             ),
+            tls=adapter.tls_enabled,
         )
     ]
     if include_probes:
@@ -145,6 +158,19 @@ def http_ok(url: str, timeout: float = 1.5) -> bool:
         with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310  仅本机回环
             return 200 <= int(response.status) < 300
     except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def tcp_port_ok(host: str, port: int, timeout: float = 1.5) -> bool:
+    """TCP 端口是否可连通（TLS/mTLS 场景下的本地就绪探测）。
+
+    当服务端强制 mTLS 时，HTTP 健康检查需携带客户端证书，不适合做本机就绪
+    判断；TCP 端口可连接即表明 uvicorn 已绑定 socket 并完成启动。
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ConnectionRefusedError):
         return False
 
 
@@ -206,7 +232,7 @@ class Launcher:
         started: list[tuple[ServiceSpec, Any]] = []
         try:
             for spec in specs:
-                if self._probe(spec.health_url()):
+                if self._probe_spec(spec):
                     self._emit(f"[up] {spec.name} 已在运行（{spec.url}），复用现有进程")
                     continue
                 process = self._popen(list(spec.argv))
@@ -239,16 +265,22 @@ class Launcher:
 
     # ── 内部步骤 ────────────────────────────────────────────────────────────
 
+    def _probe_spec(self, spec: ServiceSpec) -> bool:
+        """按 spec 的 TLS 标志选择探测方式：TLS 用 TCP 端口，非 TLS 用 HTTP。"""
+        if spec.tls:
+            return tcp_port_ok(spec.probe_host, spec.port)
+        return self._probe(spec.health_url())
+
     def _wait_ready(self, spec: ServiceSpec, process: Any, timeout_s: float) -> bool:
         """轮询就绪（子进程提前退出即判定失败）。"""
         attempts = max(1, int(max(0.0, timeout_s) / _READY_POLL_INTERVAL_S))
         for _ in range(attempts):
-            if self._probe(spec.health_url()):
+            if self._probe_spec(spec):
                 return True
             if process.poll() is not None:
                 return False
             self._sleeper(_READY_POLL_INTERVAL_S)
-        return self._probe(spec.health_url())
+        return self._probe_spec(spec)
 
     def _fire_ready(self, on_ready: Callable[[], None]) -> None:
         """执行就绪回调（Demo 等附加动作失败不得影响守护）。"""
@@ -303,4 +335,5 @@ __all__ = [
     "ServiceSpec",
     "build_service_specs",
     "http_ok",
+    "tcp_port_ok",
 ]
