@@ -442,15 +442,28 @@ class SimNodeClient:
         logger.warning(message)
 
     def _warn_endpoint_mismatch(self, endpoint_ip: str) -> None:
-        """平台学到的地址与本机网卡不一致时告警（代理/NAT/直连网关的早期信号）。"""
+        """平台学到的地址与本机网卡不一致时告警（代理/NAT/多网卡的早期信号）。
+
+        V3.3.2：不再只看主机名解析到的那一个地址——多网卡机器上这样会漏检其它
+        网卡真实 IP，把正常拓扑误判成“平台学到陌生地址”。改用「本机访问平台时
+        内核路由实际选中的源地址」（见 ``_primary_source_ip_for``）交叉校验，
+        确实对不上时再把“疑似经过 NAT/代理”写成可直接定位的排障线索。
+        """
         if endpoint_ip in {"127.0.0.1", "::1", "localhost"}:
             return
+        host = urlsplit(self._base_url).hostname or ""
+        source_ip = _primary_source_ip_for(host)
         local = _local_ipv4_addresses()
+        if source_ip:
+            local.add(source_ip)
         if local and endpoint_ip not in local:
+            probe = f"，本机访问 {host} 的实际源地址={source_ip or '<探测失败>'}" if host else ""
             logger.warning(
                 f"sim_node_endpoint_mismatch: node_id={self._settings.node_id}, "
-                f"platform_learned={endpoint_ip}, local_ipv4={sorted(local)} "
-                "（若经代理/NAT 属预期；若平台回访不通请检查接入路径）"
+                f"platform_learned={endpoint_ip}, local_ipv4={sorted(local)}{probe} "
+                "（多为经过 NAT/代理：平台学到的是中间设备（如路由器 WAN 口）的地址而非"
+                "本机网卡地址；需保证平台回访路径可达——仿真机与平台直连同网段（不经 NAT），"
+                "或在中间设备上为管理端口配置端口转发；若不经代理/NAT，请检查本机多网卡/路由配置）"
             )
 
 
@@ -508,14 +521,41 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 def _local_ipv4_addresses() -> set[str]:
-    """本机 IPv4 地址集合（地址自学习排障用；失败返回空集合）。"""
+    """本机 IPv4 地址集合（多网卡枚举；失败返回空集合）。
+
+    仅用 ``getaddrinfo(gethostname())`` 在多网卡机器上常常只能解析到主机名对应的
+    那一个地址（通常是默认路由网卡），会漏掉其它网卡的真实 IP；补一次
+    ``gethostbyname_ex`` 拿同一主机名下的别名地址，降低漏检概率。
+    """
     addresses: set[str] = set()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             addresses.add(str(info[4][0]))
     except OSError:
-        return addresses
+        pass
+    try:
+        addresses.update(str(ip) for ip in socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
     return addresses
+
+
+def _primary_source_ip_for(destination_host: str, port: int = 80) -> Optional[str]:
+    """探测本机访问 ``destination_host`` 时内核路由选中的源 IPv4（不发送任何报文）。
+
+    ``SOCK_DGRAM`` 套接字的 ``connect()`` 只做一次路由查询、不发包，读回的本地地址即
+    「平台回访时应命中本机的那张网卡 IP」，不受主机名解析结果限制，用于交叉校验
+    ``endpoint_mismatch``，避免多网卡场景误报。
+    """
+    host = (destination_host or "").strip()
+    if not host:
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((host, port))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return None
 
 
 def _iso(value: float) -> Optional[str]:

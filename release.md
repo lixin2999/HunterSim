@@ -2398,3 +2398,129 @@ VIL 消费端（`KAFKA_*`）与数据回传端（`HUNTER_CORE_KAFKA/SASL/CLIENT_
 ### 分发
 
 镜像 tag `hunter-sim:3.3.0`。
+
+---
+
+## V3.3.1 — 平台下发报「Carla 管理 API 连接超时」：管理面监听改绑 0.0.0.0（配置修复）
+
+**发布日期**：2026-11-05
+**版本定位**：配置修复——无源码变更，仅本机 `.env` 调整。
+
+### 现场
+
+平台以 `SIM_DISPATCH_MODE=node` 下发仿真任务，前端显示 **「Carla 管理 API 连接超时」**。排障时 `netstat` 只见：
+
+```
+TCP    127.0.0.1:8090    ...    ESTABLISHED
+```
+
+管理 API 仅监听本机回环，外部（平台主机）连接根本到不了 8090 端口——**防火墙规则不是根因**。
+
+### 根因
+
+仿真机按极简模板纯本机联调启动，未创建 `.env`（或其中未设置 `ADAPTER_HOST`），`AdapterSettings.host` 落回代码默认值 `127.0.0.1`（仅回环可达）。node 模式平台需按心跳学习到的地址回访本机 `:8090`，回环绑定导致回访必然超时。该配置点在 `docs/单机部署指南.md`（`ADAPTER_HOST` 行）与 `.env.example` 中早有说明，属现场漏配，非代码缺陷。
+
+### 修复内容
+
+- 新建仓库根目录 `.env`（按 `.env.example` 极简模板生成，`.gitignore` 已排除、不入库），显式设定：
+  - `ADAPTER_HOST=0.0.0.0` —— 管理面接受所有网卡入站，平台可回访 `http://<本机内网IP>:8090`；
+  - 本机段保留 `CARLA_HOST=127.0.0.1` / `CARLA_VERSION=0.9.16` / `HUNTER_SIM_LOG_LEVEL=INFO`；
+  - 平台接入与 Kafka 回传凭据段留空（无凭据静默跳过，不阻断本机）。
+- 无源码 / 镜像 / 接口 / 文档结构变更（`docs/单机部署指南.md` §ADAPTER_HOST 既有指引与本次修复一致）。
+
+### 向后兼容
+
+完全兼容。纯本机联调不受影响（不建 `.env` 仍是默认 `127.0.0.1`）；Docker / k8s 部署本就固定 `ADAPTER_HOST=0.0.0.0`，不受本次调整影响。
+
+### 风险
+
+中低。`0.0.0.0` + 8090 **无鉴权**扩大了可达面：须确保仅在受信内网、Windows 防火墙只放行平台主机地址、绝不加 Ingress/NodePort 或映射公网。更收紧的做法是把 `ADAPTER_HOST` 绑到内网网卡具体 IP 而非 `0.0.0.0`。
+
+### 验证
+
+- 配置加载验证：`AdapterSettings()` 读取 `.env` 后解析为 `host = 0.0.0.0, port = 8090`（已在本机执行确认）。
+- `huntersim up`/`carla-manager` 启动路径与探针面按 settings 取值传参（`launcher.py` 以 `--host adapter.host` 透传），无硬编码冲突。
+
+### 实机执行
+
+重启管理面（`huntersim up` 或 `huntersim carla-manager`）后依次确认：
+
+1. 启动日志打印 `CARLA manager listening on http://0.0.0.0:8090`；
+2. `netstat -ano | findstr :8090` 出现 `0.0.0.0:8090 ... LISTENING`（不再是 `127.0.0.1:8090`）；
+3. 平台主机回访通：`curl http://<仿真机内网IP>:8090/health` 返回 `status=ok`；
+4. 平台重新下发仿真，「Carla 管理 API 连接超时」消除；本机 `/health` 的 `sim_node` 段可见 `endpoint_ip`/`endpoint_source`。
+
+（端到端 2–4 步待现场重启后执行确认，本文档如实登记为待实机闭环。）
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.1`（`pyproject.toml` / `Makefile` / 两套 compose / `k8s/deployment.yaml` / `README.md` 已同步递增；本次无源码变更，镜像内容较 3.3.0 完全一致）；`.env` 为本机私有配置，不随仓库/镜像分发，各仿真机需自行按本节补配。
+
+### 待办 / 已知边界
+
+- 本条目为**配置修复**，未改任何源码；若现场仍需 8090 鉴权或 TLS，走 V2.0 三步接入的 `ADAPTER_SSL_*`（绑 `0.0.0.0` 与 mTLS 可叠加）。
+- 沿用 3.2.2 待办项。
+- **本条目结论已被 V3.3.2 推翻**：现场后续排查证明，`ADAPTER_HOST=0.0.0.0` 当时早已正确配置且生效，最初的「Carla 管理 API 连接超时」根因并非绑定地址问题（详见 V3.3.2 根因小节）。本条目中的配置修复本身无害、可保留，但不应作为该次故障的定论。
+
+---
+
+## V3.3.2 — `endpoint_mismatch` 误报修复 + NAT 导致平台学到错误回调地址的排障定论
+
+**发布日期**：2026-11-05
+**版本定位**：代码修复——改进仿真节点自学习地址的校验逻辑；同时补充 V3.3.1 那次「Carla 管理 API 连接超时」的真实根因定论（此前误判为绑定地址问题）。
+
+### 现场
+
+现场机器网络拓扑为：仿真机接入一台路由器，路由器上联口地址 `192.168.31.20`（与平台 `192.168.31.35` 同网段），路由器自身为仿真机创建了下挂网段 `192.168.1.0/24`，仿真机实际地址是 `192.168.1.103`。仿真机对平台的注册/心跳出向请求经 NAT 出去，平台从入站请求头学到的源地址是路由器的上联口地址 `192.168.31.20`，而不是仿真机自己的 `192.168.1.103`。平台之后按学到的 `192.168.31.20:8090` 回访下发任务，路由器未做端口转发，导致连接必然超时——这正是最初「Carla 管理 API 连接超时」的真实根因，与 `ADAPTER_HOST` 绑定地址无关（V3.3.1 曾误判为绑定问题，见该节末尾的推翻说明）。
+
+排障过程中还发现一个干扰项：HunterSim 自诊断日志会打印
+
+```
+sim_node_endpoint_mismatch: node_id=sim-node-01, platform_learned=192.168.31.20, local_ipv4=['192.168.1.103']
+```
+
+但如果机器本身就是多网卡（如同时接办公网和仿真网两个真实网段，均无 NAT），这行日志也会因为旧实现探测不到其它网卡的真实 IP 而误报，把「正常拓扑」误判成「平台学到了陌生地址」，干扰排障方向。
+
+### 根因
+
+`src/hunter_sim/platform_adapter/sim_node.py` 的 `_local_ipv4_addresses()` 旧实现只用 `socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)` 取地址。该方法在多网卡机器上通常只返回主机名解析到的那一个地址（一般是默认路由网卡），**不会枚举机器上其它网卡的真实 IP**。`_warn_endpoint_mismatch()` 直接用这个不完整的集合判断「平台学到的地址是否属于本机」，因此：
+
+- 多网卡但无 NAT 的正常拓扑会被**误报**为 `endpoint_mismatch`；
+- 真正经过 NAT 的拓扑（本案例）也会被这个笼统提示掩盖——旧文案只有一句「若经代理/NAT 属预期」，没给出可直接定位的证据，排障时容易先怀疑到绑定地址/防火墙上去。
+
+### 修复内容
+
+- `_local_ipv4_addresses()`：在原 `getaddrinfo` 结果基础上补一次 `socket.gethostbyname_ex(socket.gethostname())[2]`，取同一主机名下的别名地址，降低漏检概率；两个探测各自 `try/except OSError` 独立降级，不再因为其中一个失败而直接返回空集合。
+- 新增 `_primary_source_ip_for(destination_host, port=80)`：用 `SOCK_DGRAM` 套接字对平台主机做一次 `connect()` + `getsockname()`（不发送任何报文，只借内核做一次路由查询），拿到「本机访问平台时内核实际选中的源 IPv4」——这是判断平台会看到哪个本机地址的可靠依据，不受主机名解析结果限制。
+- `_warn_endpoint_mismatch()`：改为用「`_local_ipv4_addresses()` ∪ 源地址探测结果」这个更完整的集合判断是否真的不一致；确属不一致时，告警文案新增本机访问平台的实际源地址（`本机访问 <host> 的实际源地址=<ip>`）和更明确的排障指引（直连同网段 / 中间设备配端口转发 / 检查多网卡路由），不再是一句笼统的「若经代理/NAT 属预期」。诊断逻辑本身不变（仍只打 `warning` 日志，不阻断注册/心跳/仿真）。
+
+### 向后兼容
+
+无接口 / 配置 / 平台契约变更；`_local_ipv4_addresses()`、`_primary_source_ip_for()` 均为模块内部私有函数，不影响 `SimNodeClient` 对外的 `register()`/`heartbeat()`/`snapshot()` 行为。
+
+### 风险
+
+低。`_primary_source_ip_for()` 打开的 UDP 套接字不做任何实际收发（不发包），仅在操作系统路由表不可达时按 `OSError` 捕获降级为 `None`；不影响注册/心跳主流程，也不引入新依赖（纯标准库 `socket` 实现，未新增 `psutil` 等可选依赖，与项目「最小依赖面」口径一致）。
+
+### 验证
+
+- `pytest tests/` 全量：**1231 passed**（`tests/test_sim_node_client.py` 新增 3 个测试类、10 个用例：`TestLocalIpv4Addresses`（多网卡枚举合并 / 单个探测失败降级 / 两个都失败返回空集）、`TestPrimarySourceIpFor`（命中路由源地址 / 空主机名 / 不可达降级）、`TestWarnEndpointMismatch`（回环不告警 / 多网卡但源地址命中不告警——回归本次误报场景 / 别名枚举命中不告警 / 确属 NAT 时告警且提示带源地址与端口转发线索））。
+- `mypy src/hunter_sim`（strict）与 `flake8` 变更文件均无告警。
+
+### 实机执行
+
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.3.2` → 重启 `huntersim carla-manager`：
+
+- 若换网后（仿真机与平台直连同网段、不经 NAT），`sim_node_endpoint_mismatch` 不再出现；
+- 若仍经 NAT/代理，日志会给出「本机访问 <平台主机> 的实际源地址=<ip>」，据此判断平台学到的地址是中间设备地址而非本机地址，应改走直连同网段或在中间设备上为 `:8090` 配端口转发。
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.2`（`pyproject.toml` / `Makefile` / 两套 compose / `k8s/deployment.yaml` / `README.md` 已同步递增）。
+
+### 待办 / 已知边界
+
+- 本版本修复的是**诊断准确性**，不改变网络拓扑本身：经过 NAT 的接入路径仍然需要现场按上文处理（直连同网段或端口转发），HunterSim 无法替现场穿透 NAT。
+- 若后续要精确枚举机器上**所有**网卡真实 IP（而不只是「访问平台走的这一张」），仍建议评估引入 `psutil.net_if_addrs()`；本次为控制依赖面未采用。
+- 沿用 3.2.2 待办项。
+

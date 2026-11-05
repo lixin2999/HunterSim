@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import socket as socket_module
 from typing import Any
 
 import httpx
@@ -22,7 +23,11 @@ from hunter_sim.common.models import (
     SimNodeSettings,
 )
 from hunter_sim.platform_adapter.app import create_app
-from hunter_sim.platform_adapter.sim_node import SimNodeClient
+from hunter_sim.platform_adapter.sim_node import (
+    SimNodeClient,
+    _local_ipv4_addresses,
+    _primary_source_ip_for,
+)
 
 _PLATFORM = "http://platform.example:8080"
 _NODE_ID = "sim-node-01"
@@ -322,3 +327,171 @@ class TestDoctor:
         result = _check_sim_node(settings)
         assert result.status == "warn"
         assert "8080" in result.detail
+
+
+class _FakeUdpSocket:
+    """模拟 ``socket.socket(AF_INET, SOCK_DGRAM)`` 的 UDP-trick 路由探测。"""
+
+    def __init__(self, source_ip: str | None, *, raise_on_connect: bool = False) -> None:
+        self._source_ip = source_ip
+        self._raise_on_connect = raise_on_connect
+
+    def __enter__(self) -> "_FakeUdpSocket":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def connect(self, address: tuple[str, int]) -> None:
+        if self._raise_on_connect or self._source_ip is None:
+            raise OSError("network unreachable")
+
+    def getsockname(self) -> tuple[str, int]:
+        assert self._source_ip is not None
+        return (self._source_ip, 54321)
+
+
+def _patch_ip_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    getaddrinfo_ips: list[str],
+    alias_ips: list[str],
+    source_ip: str | None,
+    raise_on_connect: bool = False,
+) -> None:
+    """统一打桩本机地址枚举 + UDP 源地址探测（测试专用，退出后自动恢复）。"""
+
+    def _fake_getaddrinfo(
+        host: str, port: object, family: object = None, **_kwargs: object
+    ) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+        return [(0, 0, 0, "", (ip, 0)) for ip in getaddrinfo_ips]
+
+    monkeypatch.setattr(socket_module, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(socket_module, "getaddrinfo", _fake_getaddrinfo)
+    monkeypatch.setattr(
+        socket_module, "gethostbyname_ex", lambda host: (host, [], alias_ips)
+    )
+    monkeypatch.setattr(
+        socket_module,
+        "socket",
+        lambda *args, **kwargs: _FakeUdpSocket(source_ip, raise_on_connect=raise_on_connect),
+    )
+
+
+def _mismatch_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "sim_node_endpoint_mismatch" in r.getMessage()
+    ]
+
+
+class TestLocalIpv4Addresses:
+    def test_unions_getaddrinfo_and_alias_results(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """回归：仅靠 ``getaddrinfo(gethostname())`` 会漏掉同一主机名下的其它网卡地址。"""
+        _patch_ip_probes(
+            monkeypatch,
+            getaddrinfo_ips=["192.168.1.103"],
+            alias_ips=["192.168.31.20", "192.168.1.103"],
+            source_ip=None,
+        )
+        assert _local_ipv4_addresses() == {"192.168.1.103", "192.168.31.20"}
+
+    def test_survives_getaddrinfo_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise OSError("no such host")
+
+        monkeypatch.setattr(socket_module, "gethostname", lambda: "test-host")
+        monkeypatch.setattr(socket_module, "getaddrinfo", _boom)
+        monkeypatch.setattr(
+            socket_module, "gethostbyname_ex", lambda host: (host, [], ["10.0.0.1"])
+        )
+        assert _local_ipv4_addresses() == {"10.0.0.1"}
+
+    def test_returns_empty_when_both_probes_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise OSError("no such host")
+
+        monkeypatch.setattr(socket_module, "gethostname", lambda: "test-host")
+        monkeypatch.setattr(socket_module, "getaddrinfo", _boom)
+        monkeypatch.setattr(socket_module, "gethostbyname_ex", _boom)
+        assert _local_ipv4_addresses() == set()
+
+
+class TestPrimarySourceIpFor:
+    def test_returns_route_selected_ip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ip_probes(
+            monkeypatch, getaddrinfo_ips=[], alias_ips=[], source_ip="192.168.31.20"
+        )
+        assert _primary_source_ip_for("platform.example") == "192.168.31.20"
+
+    def test_blank_host_returns_none(self) -> None:
+        assert _primary_source_ip_for("") is None
+        assert _primary_source_ip_for("   ") is None
+
+    def test_unreachable_host_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            socket_module,
+            "socket",
+            lambda *args, **kwargs: _FakeUdpSocket(None, raise_on_connect=True),
+        )
+        assert _primary_source_ip_for("platform.example") is None
+
+
+class TestWarnEndpointMismatch:
+    """V3.3.2：多网卡/NAT 场景下 ``endpoint_mismatch`` 的判定行为。"""
+
+    def _client(self) -> SimNodeClient:
+        return SimNodeClient(_settings(), base_url=_PLATFORM, manager_port=8090)
+
+    def test_loopback_endpoint_never_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="hunter_sim.platform_adapter.sim_node")
+        _patch_ip_probes(monkeypatch, getaddrinfo_ips=[], alias_ips=[], source_ip=None)
+        self._client()._warn_endpoint_mismatch("127.0.0.1")
+        assert _mismatch_logs(caplog) == []
+
+    def test_multi_nic_source_ip_match_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """回归：``getaddrinfo`` 只解析到无关网卡时，源地址探测应消解误报。"""
+        caplog.set_level("WARNING", logger="hunter_sim.platform_adapter.sim_node")
+        _patch_ip_probes(
+            monkeypatch,
+            getaddrinfo_ips=["192.168.1.103"],
+            alias_ips=[],
+            source_ip="192.168.31.20",
+        )
+        self._client()._warn_endpoint_mismatch("192.168.31.20")
+        assert _mismatch_logs(caplog) == []
+
+    def test_alias_enumeration_match_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="hunter_sim.platform_adapter.sim_node")
+        _patch_ip_probes(
+            monkeypatch,
+            getaddrinfo_ips=["192.168.1.103"],
+            alias_ips=["192.168.31.20"],
+            source_ip=None,
+        )
+        self._client()._warn_endpoint_mismatch("192.168.31.20")
+        assert _mismatch_logs(caplog) == []
+
+    def test_real_mismatch_warns_with_actionable_hint(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """确属 NAT/代理导致的不一致：仍告警，且提示要可直接定位（源地址 + 端口转发）。"""
+        caplog.set_level("WARNING", logger="hunter_sim.platform_adapter.sim_node")
+        _patch_ip_probes(
+            monkeypatch,
+            getaddrinfo_ips=["192.168.1.103"],
+            alias_ips=[],
+            source_ip="192.168.1.103",
+        )
+        self._client()._warn_endpoint_mismatch("192.168.31.20")
+        logs = _mismatch_logs(caplog)
+        assert len(logs) == 1
+        assert "本机访问 platform.example 的实际源地址=192.168.1.103" in logs[0]
+        assert "端口转发" in logs[0]
