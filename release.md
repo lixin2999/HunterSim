@@ -2129,7 +2129,7 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 - **执行器终态挂载**：`platform_adapter/executor.py` 在四个终态路径（`_complete_instance` / `_fail_instance`（含看门狗超时与场景失败）/ `cancel`）挂载 `_publish_node_result`，惰性连接、全程 `try/except`，回传失败仅告警、不影响结果落库；非终态与配置不足时安全跳过。
 - **接入配置字段（`common/models.py`）**：`SimNodeSettings` 新增 `result_enabled`（默认开）、`result_topic_template`、`result_dlq_template` 与 `render_result_topic()` / `render_result_dlq_topic()`（`node_id` 为空返回空串，表示不可用）。
 - **下发通道 mTLS（接入清单 §1.5 step3）**：`platform_adapter/config.py` 的 `AdapterSettings` 新增 `ssl_certfile` / `ssl_keyfile` / `ssl_ca_certfile` / `ssl_client_auth_required` / `ssl_allowed_client_cn` 与 `tls_enabled` 属性（空白证书路径归一为 `None`）。`huntersim carla-manager` 在成对配置服务端证书/私钥时以 TLS 提供服务，配置 CA 即信任平台 CA 校验回访客户端证书，`ssl_client_auth_required=true` 时强制双向 TLS（`ssl_cert_reqs=required`，否则 `optional`）。
-- **三步接入 step1 —— 接入包下载**：`platform_adapter/sim_node.py` 的 `SimNodeClient.download_bundle()` 从平台 `GET /api/v1/scene/sim-nodes/{node_id}/bundle` 拉取 ZIP（内含平台 CA + 双证书 + `kafka.properties` + README）并落盘解压，网络/格式异常仅记日志返回 `None`（与心跳一样不阻断本机）。新增 `huntersim connect` 子命令封装 step1，并打印 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS、注册体转 `https`）的后续指引。
+- **三步接入 step1→配置 —— 安装管理员转交的接入包**：`platform_adapter/sim_node.py` 提供 `SimNodeClient.install_bundle()`（本地操作，不访问平台）。因 `GET /sim-nodes/{node_id}/bundle` 挂 `scene:execute`（admin/operator）且包内含节点 Kafka 客户端**私钥**（敏感物），节点服务令牌（`data-uploader`）**无权下载**（缺身份头→1001、角色不足→1002），故接入包由**管理员下载并安全转交**仿真机，仿真端只做本地解压与配置。新增 `huntersim connect --bundle <路径>` 子命令安装转交包（校验合法 ZIP → 解压到本地工作目录），并打印 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS、注册体转 `https`）的后续指引。文件缺失/非法 ZIP/解压出错仅记日志返回 `None`（与心跳一样不阻断本机）。
 
 ### 配置简化（现场核心诉求）
 
@@ -2154,7 +2154,7 @@ huntersim probes         :8080   只读探针面（/health + /metrics）
 ### 实机执行（现场待办）
 
 - `git pull` → `uv pip install -e .`（刷新安装元数据）→ `huntersim version` 应为 `3.2.2` → `huntersim doctor`：`sim_node` 缺凭据转为 `warn`（不再是 `fail`），本机 `huntersim up` 不再被拦住。
-- 接入平台（V2.0）：管理员一键开通后，仿真端执行 `huntersim connect`（step1 下载/解压接入包）→ 把一次性 SCRAM 口令填入包内 `kafka.properties`（step2）→ 用包内证书配 `ADAPTER_SSL_*` 并重启 `carla-manager` 启用 TLS/mTLS、把 `HUNTER_CORE_SIM_NODE_PROTOCOL` 改为 `https`（step3）。
+- 接入平台（V2.0）：管理员一键开通后，由**管理员下载接入包并连同一次性 SCRAM 口令安全转交**仿真机，仿真端执行 `huntersim connect --bundle <路径>`（step1 本地解压/配置）→ 把一次性 SCRAM 口令填入包内 `kafka.properties`（step2）→ 用包内证书配 `ADAPTER_SSL_*` 并重启 `carla-manager` 启用 TLS/mTLS、把 `HUNTER_CORE_SIM_NODE_PROTOCOL` 改为 `https`（step3）。
 - `.env.example` 属仓库根目录、不在 wheel 内，**模板改动无需重建镜像**；mTLS/`connect` 属代码改动，容器部署需 `--force-recreate` 生效。
 
 ### 待办 / 已知边界

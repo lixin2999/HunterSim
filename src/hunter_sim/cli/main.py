@@ -641,51 +641,35 @@ def _cmd_probes(args: argparse.Namespace) -> int:
 
 
 def _cmd_connect(args: argparse.Namespace) -> int:
-    """``huntersim connect`` 子命令：V2.0 三步接入 step1 —— 下载并解压节点接入包。
+    """``huntersim connect`` 子命令：安装管理员转交的节点接入包并给出配置指引。
 
-    从平台 ``GET /api/v1/scene/sim-nodes/{node_id}/bundle`` 拉取 ZIP（内含平台
-    CA + 双证书 + ``kafka.properties`` + README），落盘到 ``--dest``（默认
-    ``./connect/{node_id}``）并解压。后续手工完成 step2/step3（见输出提示）。
+    V1.24.2 起接入包由**管理员下载并转交**（``GET /sim-nodes/{node_id}/bundle`` 挂
+    ``scene:execute``、内含 Kafka 客户端私钥，节点服务令牌 ``data-uploader`` 无权
+    下载）。本命令只做本地解压与配置指引（三步接入 step1→配置），**不向平台请求 /bundle**。
     """
     from hunter_sim.platform_adapter.sim_node import SimNodeClient
 
-    settings, error = _load_settings()
-    if settings is None:
-        print(f"配置加载失败，无法接入：{error}", file=sys.stderr)
-        return EXIT_FAIL
-    node = settings.sim_node
-    if not node.node_id:
+    bundle_arg = str(getattr(args, "bundle", "") or "").strip()
+    if not bundle_arg:
         print(
-            "未配置 HUNTER_CORE_SIM_NODE_ID，无法定位接入包（请先按接入清单 §3 确定节点标识）",
-            file=sys.stderr,
-        )
-        return EXIT_FAIL
-    base_url = (node.base_url or settings.cloud.gateway_url or "").strip()
-    if not base_url:
-        print(
-            "平台地址为空（需配 HUNTER_CORE_SIM_NODE_BASE_URL 或 HUNTER_CORE_GATEWAY_URL）",
+            "缺少 --bundle：接入包（{node_id}-bundle.zip）由平台管理员下载并安全转交，仿真机不自行下载。\n"
+            "  向管理员索取一键开通产出的接入包（内含平台 CA + Kafka/平台证书 + kafka.properties），\n"
+            "  再执行：huntersim connect --bundle <路径>。\n"
+            "  （详见 HunterCore docs/HunterSim接入清单.md §1.5；节点服务令牌调 /bundle 会 403/1002）",
             file=sys.stderr,
         )
         return EXIT_FAIL
 
-    client = SimNodeClient(
-        node,
-        base_url=base_url,
-        manager_port=settings.adapter.port,
-    )
-    dest = args.dest or f"./connect/{node.node_id}"
-    result = client.download_bundle(dest, extract=not args.no_extract)
+    dest = str(getattr(args, "dest", "") or "").strip() or None
+    result = SimNodeClient.install_bundle(bundle_arg, dest, extract=not args.no_extract)
     if result is None:
-        print(
-            "接入包下载失败（检查服务令牌/平台地址/节点是否已一键开通），详见上方日志",
-            file=sys.stderr,
-        )
+        print("接入包安装失败（文件不存在/非法 ZIP/解压出错），详见上方日志", file=sys.stderr)
         return EXIT_FAIL
     print(f"[connect] 接入包已就绪：{result}")
     print(
         "[connect] 后续两步（接入清单 §1.5）：\n"
-        "  step2 把开通响应里的一次性 SCRAM 口令填入包内 kafka.properties 的 "
-        "sasl.password（口令不落库/不入包，丢失只能 rotate-scram）；\n"
+        "  step2 把管理员转交的一次性 SCRAM 口令填入 kafka.properties 的 "
+        "sasl.password（口令不入包/不落库，丢失只能 rotate-scram）；\n"
         "  step3 把包内平台 CA/证书配到 ADAPTER_SSL_*，重启 carla-manager 启用 TLS/mTLS，"
         "并把注册体 protocol 改为 https（HUNTER_CORE_SIM_NODE_PROTOCOL=https）。"
     )
@@ -994,18 +978,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect = subparsers.add_parser(
         "connect",
-        help="V2.0 三步接入 step1：从平台下载/解压节点接入包（bundle）",
+        help="V2.0 三步接入：安装管理员转交的节点接入包并给出配置指引（仿真机只做配置）",
         description=(
-            "一键接入第一步：从平台 GET /sim-nodes/{node_id}/bundle 拉取接入包 ZIP"
-            "（平台 CA + 双证书 + kafka.properties + README）并解压到 --dest；"
-            "随后按提示手工完成 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS）。"
+            "接入包由平台管理员下载并转交（GET /sim-nodes/{node_id}/bundle 挂 scene:execute、"
+            "内含 Kafka 客户端私钥，节点服务令牌无权下载）。本命令把转交来的 bundle.zip "
+            "解压到本地工作目录，并打印 step2（填一次性 SCRAM 口令）与 step3（启用 TLS/mTLS）"
+            "配置指引；不向平台请求 /bundle。"
         ),
     )
     connect.add_argument(
-        "--dest", default="", help="接入包保存目录（默认 ./connect/{node_id}）"
+        "--bundle", default="",
+        help="管理员转交的接入包 ZIP 路径（必填；仿真机不自行下载）",
     )
     connect.add_argument(
-        "--no-extract", action="store_true", help="只下载 zip，不解压"
+        "--dest", default="", help="解压目标目录（默认解压到 bundle 同级的 <名>-bundle/）"
+    )
+    connect.add_argument(
+        "--no-extract", action="store_true", help="只校验是否合法 ZIP，不解压"
     )
     connect.set_defaults(handler=_cmd_connect)
     return parser

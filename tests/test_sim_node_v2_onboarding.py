@@ -5,7 +5,7 @@
 - ``SimNodeSettings`` 节点级 Topic 渲染与接入开关默认打开；
 - ``NodeResultProducer`` 配置门控 + no-op 降级 + 经工厂注入的发布；
 - ``AdapterSettings`` 下发通道 TLS/mTLS 字段与空白证书归一；
-- ``SimNodeClient.download_bundle`` 三步接入 step1（下载 + 解压 + 失败降级）；
+- ``SimNodeClient.install_bundle`` 三步接入 step1（安装管理员转交包 + 解压 + 非法/缺失降级）；
 - ``SimulationExecutor._publish_node_result`` 终态挂载与幂等门控；
 - ``huntersim doctor`` 的 sim_node 缺凭据由 fail 降级为 warn。
 """
@@ -16,11 +16,11 @@ import io
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
-from hunter_sim.cli.main import _check_sim_node
+from hunter_sim.cli.main import EXIT_FAIL, EXIT_OK, _check_sim_node, _cmd_connect
 from hunter_sim.cloud.node_result_producer import NodeResultProducer, build_node_result
 from hunter_sim.common.models import CloudSettings, HunterSimSettings, SimNodeSettings
 from hunter_sim.platform_adapter import executor as executor_module
@@ -164,27 +164,7 @@ def test_adapter_tls_enabled_with_keypair(tmp_path: Path) -> None:
     assert adapter.tls_enabled is True
 
 
-# ── SimNodeClient.download_bundle（三步接入 step1）──────────────────────────
-
-
-class _Response:
-    def __init__(self, status_code: int, content: bytes = b"", text: str = "") -> None:
-        self.status_code = status_code
-        self.content = content
-        self.text = text
-
-
-class _StubClient:
-    def __init__(self, response: _Response) -> None:
-        self.response = response
-        self.last_url: Optional[str] = None
-
-    def request(self, method: str, url: str, headers: Any = None, timeout: Any = None) -> _Response:
-        self.last_url = url
-        return self.response
-
-    def close(self) -> None:
-        pass
+# ── SimNodeClient.install_bundle（三步接入 step1：安装管理员转交包）──────────
 
 
 def _make_zip_bytes() -> bytes:
@@ -195,30 +175,50 @@ def _make_zip_bytes() -> bytes:
     return buf.getvalue()
 
 
-def test_download_bundle_success(tmp_path: Path) -> None:
-    """200 响应落盘 zip 并解压，返回解压目录且内含 kafka.properties。"""
-    client = _StubClient(_Response(200, content=_make_zip_bytes()))
-    node = SimNodeSettings(node_id="sim-node-01", service_token="service:sim-node-01")
-    sim_client = SimNodeClient(node, base_url="http://platform", client_factory=lambda: client)
-    result = sim_client.download_bundle(tmp_path / "connect")
+def test_install_bundle_success(tmp_path: Path) -> None:
+    """安装管理员转交的本地 ZIP：解压并返回目录，内含 kafka.properties。"""
+    zip_path = tmp_path / "sim-node-01-bundle.zip"
+    zip_path.write_bytes(_make_zip_bytes())
+    result = SimNodeClient.install_bundle(zip_path, tmp_path / "work")
     assert result is not None and result.is_dir()
     assert (result / "kafka.properties").is_file()
-    assert client.last_url is not None and client.last_url.endswith("/sim-nodes/sim-node-01/bundle")
 
 
-def test_download_bundle_http_error_returns_none(tmp_path: Path) -> None:
-    """非 2xx（未开通/无权限）返回 None，不抛异常。"""
-    client = _StubClient(_Response(404, text="not found"))
-    node = SimNodeSettings(node_id="sim-node-01", service_token="service:sim-node-01")
-    sim_client = SimNodeClient(node, base_url="http://platform", client_factory=lambda: client)
-    assert sim_client.download_bundle(tmp_path / "connect") is None
+def test_install_bundle_no_extract_returns_zip(tmp_path: Path) -> None:
+    """``extract=False`` 时只校验并返回 zip 路径，不解压。"""
+    zip_path = tmp_path / "sim-node-01-bundle.zip"
+    zip_path.write_bytes(_make_zip_bytes())
+    assert SimNodeClient.install_bundle(zip_path, extract=False) == zip_path
 
 
-def test_download_bundle_requires_node_id(tmp_path: Path) -> None:
-    """缺 node_id 时拒绝下载并返回 None。"""
-    node = SimNodeSettings(node_id="")
-    sim_client = SimNodeClient(node, base_url="http://platform", client_factory=lambda: _StubClient(_Response(200)))
-    assert sim_client.download_bundle(tmp_path) is None
+def test_install_bundle_missing_file_returns_none(tmp_path: Path) -> None:
+    """文件不存在（管理员尚未转交）返回 None，不抛异常（仿真机不自行下载）。"""
+    assert SimNodeClient.install_bundle(tmp_path / "nope.zip") is None
+
+
+def test_install_bundle_invalid_zip_returns_none(tmp_path: Path) -> None:
+    """非合法 ZIP（转交物损坏/被截断）返回 None。"""
+    bad = tmp_path / "broken.zip"
+    bad.write_text("not a zip")
+    assert SimNodeClient.install_bundle(bad) is None
+
+
+def test_connect_command_requires_bundle(tmp_path: Path, capsys: Any) -> None:
+    """``huntersim connect`` 缺 --bundle 时直接失败并提示由管理员转交（不调平台 /bundle）。"""
+    args = SimpleNamespace(bundle="", dest="", no_extract=False)
+    assert _cmd_connect(args) == EXIT_FAIL
+    err = capsys.readouterr().err
+    assert "--bundle" in err and "不自行下载" in err
+
+
+def test_connect_command_installs_bundle(tmp_path: Path, capsys: Any) -> None:
+    """``huntersim connect --bundle`` 本地解压成功并打印 step2/step3 配置指引。"""
+    zip_path = tmp_path / "sim-node-01-bundle.zip"
+    zip_path.write_bytes(_make_zip_bytes())
+    args = SimpleNamespace(bundle=str(zip_path), dest=str(tmp_path / "work"), no_extract=False)
+    assert _cmd_connect(args) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "kafka.properties" in out and "ADAPTER_SSL" in out
 
 
 # ── 执行器终态挂载 ────────────────────────────────────────────────────────────
