@@ -60,12 +60,13 @@ def viz_url(settings: HunterSimSettings) -> str:
         settings: 全局配置（读取 ``adapter.host/port``）。
 
     Returns:
-        ``http://<host>:<port>/viz``。
+        ``http(s)://<host>:<port>/viz``。
     """
     host = (settings.adapter.host or "").strip()
     if host in ("", "0.0.0.0", "::", "[::]"):
         host = "127.0.0.1"
-    return f"http://{host}:{settings.adapter.port}/viz"
+    scheme = "https" if settings.adapter.tls_enabled else "http"
+    return f"{scheme}://{host}:{settings.adapter.port}/viz"
 
 
 def register_viz_routes(app: FastAPI) -> None:

@@ -2205,17 +2205,20 @@ ValueError: 'required' is not a valid VerifyMode
 
 ---
 
-## V3.2.4 — 修复 mTLS 就绪探测失败
+## V3.2.4 — 修复 mTLS 就绪探测失败与可视化页面不可达
 
 **发布日期**：2026-11-05
 
 ### 现场
 
-V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim-node-01 在线，但 `huntersim up` 报 “未在 60s 内就绪”并停止子进程。
+V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim-node-01 在线，但：
+1. `huntersim up` 报 “未在 60s 内就绪”并停止子进程；
+2. 浏览器自动打开 `http://127.0.0.1:8090/viz` 显示 `ERR_EMPTY_RESPONSE`。
 
 ### 根因
 
-`ServiceSpec.url` 始终用 `http://` scheme，而 mTLS 服务监听在 HTTPS 端口。`http_ok()` 对 HTTPS 端口发纯 HTTP 请求必然失败；即使改为 HTTPS，mTLS 强制客户端证书也会拒绝无证书的健康检查。
+1. **就绪探测失败**：`ServiceSpec.url` 始终用 `http://` scheme，而 mTLS 服务监听在 HTTPS 端口。`http_ok()` 对 HTTPS 端口发纯 HTTP 请求必然失败；即使改为 HTTPS，mTLS 强制客户端证书也会拒绝无证书的健康检查。
+2. **可视化页面不可达**：`viz_url()` 同样硬编码 `http://`，浏览器对 HTTPS 端口发纯 HTTP 请求得到空响应；且 mTLS 要求客户端证书，浏览器无法直接访问。
 
 ### 修复内容
 
@@ -2225,10 +2228,14 @@ V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim
   - 新增 `tcp_port_ok(host, port, timeout)` 函数，用 TCP 端口连接判断服务是否已绑定 socket；
   - `Launcher._probe_spec()` 方法：TLS 场景用 TCP 端口探测，非 TLS 保持原有 HTTP 探测；
   - `build_service_specs()` 传入 `tls=adapter.tls_enabled`。
+- `src/hunter_sim/visualization/routes.py`：
+  - `viz_url()` 根据 `adapter.tls_enabled` 返回正确 scheme。
+- `src/hunter_sim/cli/main.py`：
+  - `_cmd_up()` 检测 mTLS 强制客户端证书时跳过自动打开浏览器，并提示用户通过平台 Web 端访问或导入证书后手动访问。
 
 ### 向后兼容
 
-纯修复，无接口/配置变更；未启用 mTLS 的部署完全不受影响（`tls` 默认 `False`，走原有 HTTP 探测路径）。
+纯修复，无接口/配置变更；未启用 mTLS 的部署完全不受影响（`tls` 默认 `False`，走原有 HTTP 探测 + 自动打开浏览器路径）。
 
 ### 风险
 
@@ -2240,7 +2247,7 @@ V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim
 
 ### 实机执行
 
-`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.4` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 应正常以 mTLS 起 carla-manager 并检测就绪。
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.4` → 配好 `ADAPTER_SSL_*` 后 `huntersim up` 应正常以 mTLS 起 carla-manager 并检测就绪，不再报超时。
 
 ### 分发
 
@@ -2248,6 +2255,7 @@ V3.2.3 修复后 carla-manager 已正常以 mTLS 启动，平台也检测到 sim
 
 ### 待办 / 已知边界
 
-无新增待办，沿用 3.2.2 待办项。
+- **mTLS 下本机 viz 浏览器访问**：需将客户端证书导入 Windows 证书存储后浏览器才能完成 mTLS 握手；或通过平台 Web 端访问可视化页面。后续可考虑在探针面（:8080 HTTP）代理 viz 内容以方便本机访问。
+- 沿用 3.2.2 待办项。
 
 
