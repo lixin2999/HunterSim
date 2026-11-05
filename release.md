@@ -2311,4 +2311,54 @@ mTLS 是 TLS 层全有或全无，无法按路径豁免：`:8090` 一旦启用�
 - **mTLS 下本机 viz 浏览器访问**：已通过探针面（:8080 HTTP）反向代理解决，浏览器直接访问 `http://<IP>:8080/viz` 即可，无需导入证书。要求探针面与管理面同机部署（回环 mTLS 代理）。
 - 沿用 3.2.2 待办项。
 
+---
+
+## V3.2.6 — 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败（502）
+
+**发布日期**：2026-11-05
+
+### 现场
+
+V3.2.5 后 `huntersim up` 启用下发 mTLS 能正常起 carla-manager 并自动打开 `http://127.0.0.1:8080/viz`，`/viz` 页面与 `/viz/assets/*` 静态资源直出正常（200）；但所有代理到管理面的 API 请求（`/viz/api/status`、`/viz/api/logs`、`/api/v1/instances` 等）全部返回 **502 Bad Gateway**，日志刷屏：
+
+```
+Viz proxy connect failed: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unsuitable certificate purpose (_ssl.c:1000)
+```
+
+页面表现为“加载中 / 未推流”，控制面本身健康（平台仍可正常下发）。
+
+### 根因
+
+管理面 `:8090` 的服务端证书 `ADAPTER_SSL_CERTFILE` 复用接入包内的**客户端证书**（EKU 为 `clientAuth`，用于节点向平台认证）。V3.2.5 的 `build_ssl_kwargs()` 在有 CA 时传 `verify=ssl_ca_certfile`，httpx（Python `ssl`）以 `SERVER_AUTH` purpose 校验管理面服务端证书链时，因该证书 EKU 不含 `serverAuth` 而报 `unsuitable certificate purpose`，握手直接失败。平台（Go 客户端）不强制校验 EKU，故平台→管理面正常，仅本机 Python 代理受影响。
+
+### 修复内容
+
+- `src/hunter_sim/probes/viz_proxy.py`：`build_ssl_kwargs()` 不再以 CA 校验服务端证书，固定返回 `verify=False`（本机回环不跨网，不验证服务端证书可接受）；仍保留 `cert=(ssl_certfile, ssl_keyfile)` 呈现客户端证书，管理面 `CERT_REQUIRED` 照常校验该证书完成 mTLS 握手。同步更新模块设计约束注释。
+- `tests/test_probes_viz_proxy.py`：`test_cert_and_verify` 改为断言 `verify is False`（回环代理不验证服务端证书）。
+
+### 向后兼容
+
+无接口/配置变更；仅影响 mTLS 下的本机 viz 代理链路。非 TLS 部署不注册代理路由，完全不受影响；平台→管理面的 mTLS 契约不变。
+
+### 风险
+
+低。`verify=False` 仅作用于探针→管理面的 **127.0.0.1 回环**一跳（不经网络），不降低对外链路安全。
+
+### 验证
+
+- `pytest tests/` 全量：**1217 passed**（`tests/test_probes_viz_proxy.py` 17 项）。
+- `mypy src/hunter_sim`（strict）与 `flake8` 变更文件均无告警。
+
+### 实机执行
+
+`git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.2.6` → 配好 `ADAPTER_SSL_*` 后 `huntersim up`，浏览器打开 `http://127.0.0.1:8080/viz` 后顶栏状态灯转绿、实例/日志/传感器面板正常拉取（不再 502）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.2.6`（`Makefile` / 两套 compose / `k8s/deployment.yaml` 已同步）。
+
+### 待办 / 已知边界
+
+- 无新增。沿用 3.2.2 待办项。
+
 

@@ -81,7 +81,8 @@ class TestBuildSslKwargs:
         )
         kwargs = build_ssl_kwargs(settings)
         assert kwargs["cert"] == ("/cert.pem", "/key.pem")
-        assert kwargs["verify"] == "/ca.pem"
+        # 本机回环代理：管理面服务端证书为 clientAuth EKU，跳过服务端校验
+        assert kwargs["verify"] is False
 
     def test_verify_false_without_ca(self) -> None:
         settings = HunterSimSettings(

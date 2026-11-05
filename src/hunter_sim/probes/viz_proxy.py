@@ -8,7 +8,10 @@
 设计约束：
 - 仅在 ``adapter.tls_enabled`` 为 True 时激活，非 TLS 场景不注册任何代理路由；
 - 代理使用 ``ADAPTER_SSL_CERTFILE``/``KEYFILE`` 作为客户端证书连接管理面
-  （同一台机器、同一份证书，CN 与 ``ssl_allowed_client_cn`` 一致）；
+  （同一台机器、同一份证书）；管理面服务端证书复用接入包内的客户端证书
+  （EKU=clientAuth），Python 客户端按 SERVER_AUTH purpose 校验会报
+  ``unsuitable certificate purpose``，故本机回环代理跳过服务端证书校验
+  （``verify=False``），仅靠呈现客户端证书完成 mTLS 握手；
 - 流式响应（MJPEG ``multipart/x-mixed-replace``、SSE ``text/event-stream``）
   逐块转发，不缓冲全量内容。
 """
@@ -48,13 +51,11 @@ def build_ssl_kwargs(settings: "HunterSimSettings") -> dict[str, Any]:
     adapter = settings.adapter
     if not adapter.tls_enabled:
         return {}
-    kwargs: dict[str, Any] = {}
-    # CA 验证：有 CA 证书时严格校验，否则跳过（本机回环，自签证书）
-    if adapter.ssl_ca_certfile:
-        kwargs["verify"] = adapter.ssl_ca_certfile
-    else:
-        kwargs["verify"] = False
-    # 客户端证书（与 server 端同一份，本机 mTLS）
+    # 本机回环代理：管理面服务端证书复用接入包内的客户端证书（EKU=clientAuth），
+    # Python 客户端按 SERVER_AUTH purpose 校验会报 "unsuitable certificate purpose"，
+    # 故跳过服务端证书校验（verify=False）；回环不跨网，不验证服务端证书可接受。
+    kwargs: dict[str, Any] = {"verify": False}
+    # 客户端证书（与 server 端同一份，本机 mTLS：管理面 CERT_REQUIRED 仍会校验该证书）
     if adapter.ssl_certfile and adapter.ssl_keyfile:
         kwargs["cert"] = (adapter.ssl_certfile, adapter.ssl_keyfile)
     return kwargs
