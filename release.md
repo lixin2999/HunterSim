@@ -2717,6 +2717,7 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
   - RGB 相机（line 288）与深度相机（line 299）的蓝图属性 `"fps"` → `"sensor_tick"`，值从 `str(config.fps)` 改为 `str(1.0 / config.fps)`，与 IMU/GNSS 分支写法统一；
 - `src/hunter_sim/scene_runner/scene_runner_service.py`：
   - 新增 `_ego_state_cache: dict[str, Any]` 属性，由 tick 线程在 `_get_ego_state()` 成功读取后写入；
+  - tick 循环中 `world.tick()` 后**无条件**调用 `_get_ego_state()` 更新缓存（不依赖 sample_sink / sim_data_producer 是否激活）；
   - `get_ego_state()`（公开 API，executor 线程调用）改为优先返回缓存副本，避免跨线程 CARLA RPC；首次 tick 前缓存为空时回退直接调用（无副作用）；
   - `_get_ego_state()` 返回前赋值 `self._ego_state_cache = state`，保证缓存与 tick 循环同步更新。
 - 无接口 / 配置 / 平台契约变更。

@@ -401,10 +401,13 @@ class SceneRunnerService:
                 self._weather_manager.update_transition()
                 tick_count += 1
 
+                # 无条件更新自车状态缓存（供 executor 线程安全读取，不依赖 sample_sink / producer）
+                self._get_ego_state()
+
                 # 评估/回传采样钩子（VIL 轨迹、指标计算用）
                 if self._sample_sink is not None:
                     try:
-                        self._sample_sink(self._get_ego_state(), tick_count * delta_seconds)
+                        self._sample_sink(dict(self._ego_state_cache), tick_count * delta_seconds)
                     except Exception as exc:  # noqa: BLE001  采样失败不阻断仿真
                         logger.debug(f"sample_sink failed: {exc}")
 
