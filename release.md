@@ -2693,3 +2693,61 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - `image_codec.py:170` 与 `visualization/sensor_view.py:179` 存在 Pillow DeprecationWarning（`Image.fromarray(..., mode=...)` 将在 Pillow 13 移除），本版本未改。
 - 沿用 V3.3.3 待办项（含 `carla-manager` 异常退出不自动重启、HUNTER_SE 蓝图缺失回退、自签 CA 未导入导致上行静默丢失）。
 
+---
+
+## V3.3.5 — CARLA 运行时崩溃与自车状态冻结修复
+
+**发布日期**：2026-11-06
+**版本定位**：修复 V3.3.4 实机运行中暴露的两个缺陷：CARLA 服务端 GPU 过载导致 Fatal Error（退出码 3221226505）及可视化页面自车状态冻结。
+
+### 问题现象
+
+1. **CarlaUE 崩溃**：场景正常运行约 6 分钟后，CARLA 服务端报 `Fatal error!` 并退出，对应 Windows 退出码 3221226505（`STATUS_STACK_BUFFER_OVERRUN`）。日志可见：`Blueprint attribute 'fps' set failed: attribute 'fps' not found`（出现两次）。
+2. **可视化黑屏 + 自车状态全零**：主视区画面全黑，x/y/z/heading/velocity/steering/acceleration 始终显示 0.00，但传感器计数持续增长（证明帧管线存活）。
+
+### 根因分析
+
+**崩溃根因**：`sensor_factory.py` 中 RGB 和 Depth 相机使用了不存在的蓝图属性名 `"fps"`，CARLA 0.9.16 的正确属性名为 `"sensor_tick"`（单位：秒，值 = 1/fps）。`_safe_set_attribute` 捕获异常后仅记日志，导致相机未被限帧——以世界 tick 率 50Hz 渲染而非配置的 30Hz，GPU 负载翻倍。两个 1280×720 相机 50Hz 渲染最终压垮服务端。
+
+**状态冻结根因**：executor 轮询线程调用 `runner.get_ego_state()` 时，内部通过 CARLA RPC 访问 `vehicle.get_location()` 等，与 tick 线程的 `world.tick()` 并发。CARLA Python 客户端非线程安全，跨线程 RPC 可能失败抛异常，`_get_ego_state()` 捕获后返回零值 default 字典。
+
+### 修复内容
+
+- `src/hunter_sim/sensor_sim/sensor_factory.py`：
+  - RGB 相机（line 288）与深度相机（line 299）的蓝图属性 `"fps"` → `"sensor_tick"`，值从 `str(config.fps)` 改为 `str(1.0 / config.fps)`，与 IMU/GNSS 分支写法统一；
+- `src/hunter_sim/scene_runner/scene_runner_service.py`：
+  - 新增 `_ego_state_cache: dict[str, Any]` 属性，由 tick 线程在 `_get_ego_state()` 成功读取后写入；
+  - `get_ego_state()`（公开 API，executor 线程调用）改为优先返回缓存副本，避免跨线程 CARLA RPC；首次 tick 前缓存为空时回退直接调用（无副作用）；
+  - `_get_ego_state()` 返回前赋值 `self._ego_state_cache = state`，保证缓存与 tick 循环同步更新。
+- 无接口 / 配置 / 平台契约变更。
+
+### 向后兼容
+
+完全兼容。`sensor_tick=0.0333` 与原期望 fps=30 语义等价；旧场景配置若未指定 fps 则仍用默认 30.0。`get_ego_state()` 返回类型不变，仅内部实现由「每次 RPC」改为「读缓存」，调用方无感。
+
+### 风险
+
+低。`sensor_tick` 修复后相机按 30Hz 出帧，GPU 负载预期降低约 40%，可消除运行时崩溃。自车状态缓存在极早期（第一 tick 前）有微小窗口仍走直接 RPC，但此时场景尚未启动不会导致问题。
+
+### 验证
+
+- `pytest -q` 全量：**1246 passed**，无失败。
+- 日志对比：修复后不再出现 `Blueprint attribute 'fps' set failed` 告警，相机按 `sensor_tick=0.0333` 正确设置。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → 应为 `3.3.5`；
+2. 重启 `huntersim up`（CARLA 服务端需重启以释放之前可能残留的 GPU 资源）；
+3. 平台重新下发新实例；
+4. 预期：不再出现 `Fatal error!` 崩溃；主视区画面正常显示（非全黑）；自车状态随场景运行实时更新。
+
+### 分发
+
+镜像 tag `hunter-sim:3.3.5`。
+
+### 待办 / 已知边界
+
+- **黑屏另一个可能原因**：若平台下发的场景 `map.spawn_point` 为 `(0,0,0)`，自车会生成在地图原点附近（可能不在有效路面上）。此属场景配置问题，需平台侧确保 spawn_point 指向有效车道坐标。本版本的 `sensor_tick` 修复可解决因 GPU 过载导致的黑屏，但无法修正配置错误引起的渲染空白。
+- **自动重启**：CARLA 服务端崩溃后 `carla-manager` 不会自动拉起，仍需运维手动介入（延续 V3.3.3/V3.3.4 待办）。
+- **缓存窗口**：场景启动的第一帧前，若 executor 轮询已到，仍会尝试直接 RPC——此时 ego_vehicle 尚未生成，返回空 dict 不写入 DB，无副作用。
+

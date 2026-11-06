@@ -121,6 +121,8 @@ class SceneRunnerService:
         self._telemetry_interval: float = max(0.01, float(telemetry_interval_s))
         # 终态只补发一次（stop() 与运行循环结束都可能到达终态）
         self._terminal_status_published: bool = False
+        # 自车状态缓存（由 tick 线程写入，executor 线程安全读取，避免跨线程 CARLA RPC）
+        self._ego_state_cache: dict[str, Any] = {}
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -663,15 +665,21 @@ class SceneRunnerService:
         return len(self._event_detector.detected_events)
 
     def get_ego_state(self) -> dict[str, Any]:
-        """获取自车状态字典（平台适配器/进度视图使用）。"""
-        return self._get_ego_state()
+        """获取自车状态字典（平台适配器/进度视图使用）。
+
+        返回 tick 线程缓存的最近一次快照，避免 executor 线程直接调用 CARLA
+        RPC（非线程安全），从而消除因跨线程读取导致的零值问题。
+        """
+        return dict(self._ego_state_cache) if self._ego_state_cache else self._get_ego_state()
 
     def _get_ego_state(self) -> dict[str, Any]:
-        """获取自车状态字典。
+        """获取自车状态字典（仅由 tick 线程调用）。
 
         自车引用统一走 ``ego_vehicle`` property（``ego_actor`` /
         ``get_ego_vehicle()`` / ``_ego_vehicle`` 三种形态依次尝试），避免两处
         解析规则漂移；失败时返回零值字典。
+
+        成功读取时同步更新 ``_ego_state_cache``，供 executor 线程无锁读取。
         """
         default: dict[str, Any] = {
             "x": 0.0,
@@ -693,7 +701,7 @@ class SceneRunnerService:
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             ctrl = vehicle.get_control()
             yaw = round(math.radians(rot.yaw), 6)
-            return {
+            state = {
                 "x": round(loc.x, 4),
                 "y": round(loc.y, 4),
                 "z": round(loc.z, 4),
@@ -703,6 +711,8 @@ class SceneRunnerService:
                 "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
                 "acceleration": round(self._acceleration_magnitude(vehicle), 4),
             }
+            self._ego_state_cache = state  # tick 线程写入缓存，executor 线程安全读取
+            return state
         except Exception:  # noqa: BLE001
             return default
 

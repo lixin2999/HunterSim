@@ -284,8 +284,8 @@ class SensorBlueprintFactory:
             cls._safe_set_attribute(bp, "image_size_x", str(config.width))
             cls._safe_set_attribute(bp, "image_size_y", str(config.height))
             cls._safe_set_attribute(bp, "fov", str(config.fov_deg))
-            # 文档 §6.2.2：相机帧率 fps=30
-            cls._safe_set_attribute(bp, "fps", str(config.fps))
+            # 文档 §6.2.2：相机帧率 fps=30 → sensor_tick = 1/fps（秒）
+            cls._safe_set_attribute(bp, "sensor_tick", str(1.0 / config.fps))
             # 文档 §6.4：运动模糊可配置（蓝图原生属性 motion_blur_intensity）
             if config.motion_blur:
                 cls._safe_set_attribute(bp, "motion_blur_intensity", "0.45")
@@ -295,8 +295,8 @@ class SensorBlueprintFactory:
             cls._safe_set_attribute(bp, "image_size_x", str(config.width))
             cls._safe_set_attribute(bp, "image_size_y", str(config.height))
             cls._safe_set_attribute(bp, "fov", str(config.fov_deg))
-            # 文档 §6.2.2：深度相机帧率 fps=30
-            cls._safe_set_attribute(bp, "fps", str(config.fps))
+            # 文档 §6.2.2：深度相机帧率 fps=30 → sensor_tick = 1/fps（秒）
+            cls._safe_set_attribute(bp, "sensor_tick", str(1.0 / config.fps))
 
         elif sensor_type == SensorType.IMU and isinstance(config, IMUConfig):
             # 文档 §6.2.3：三轴加速度计/陀螺仪噪声标准差 + sensor_tick（100Hz → 0.01）

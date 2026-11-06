@@ -85,8 +85,8 @@ class TestSensorBlueprintFactory:
         assert bp.attributes["image_size_x"] == "1920"
         assert bp.attributes["image_size_y"] == "1080"
         assert bp.attributes["fov"] == "90.0"
-        # 文档 §6.2.2：默认 fps=30
-        assert bp.attributes["fps"] == "30.0"
+        # 文档 §6.2.2：默认 fps=30 → sensor_tick = 1/30
+        assert bp.attributes["sensor_tick"] == str(1.0 / 30.0)
 
     def test_create_rgb_motion_blur(self) -> None:
         factory = SensorBlueprintFactory(_StubLib())
@@ -98,7 +98,7 @@ class TestSensorBlueprintFactory:
         factory = SensorBlueprintFactory(_StubLib())
         bp = factory.create(SensorType.DEPTH_CAMERA, DepthCameraConfig())
         assert bp.id == "sensor.camera.depth"
-        assert bp.attributes["fps"] == "30.0"
+        assert bp.attributes["sensor_tick"] == str(1.0 / 30.0)
 
     def test_create_imu_sets_noise_attributes(self) -> None:
         factory = SensorBlueprintFactory(_StubLib())
