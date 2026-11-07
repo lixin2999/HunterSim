@@ -23,7 +23,11 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from hunter_sim.common.exceptions import CarlaSimulationError, SensorSimulationError
+from hunter_sim.common.exceptions import (
+    CarlaSimulationError,
+    ConfigurationError,
+    SensorSimulationError,
+)
 from hunter_sim.common.metrics import SENSOR_FRAMES_DROPPED_TOTAL
 from hunter_sim.common.models import SensorType
 from hunter_sim.common.utils import get_logger
@@ -38,6 +42,12 @@ from hunter_sim.scene_runner.scene_config import (
     TrafficParticipantConfig,
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
+from hunter_sim.scene_runner.spawn_resolver import (
+    resolve_actor_spawn,
+    resolve_ego_spawn_candidates,
+    scene_key_of,
+    transform_to_spawn_point,
+)
 from hunter_sim.sensor_sim.frame_hub import FrameHub, STREAM_DEPTH, STREAM_RGB
 from hunter_sim.sensor_sim.image_codec import depth_bgra_to_meters, encode_rgb_frame
 from hunter_sim.sensor_sim.mcap_recorder import (
@@ -170,6 +180,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._frame_error_at: dict[str, float] = {}
         self._frame_error_suppressed: dict[str, int] = {}
         self._ego: Any = None
+        # 自车实际生成位姿（原点替换/兜底后），参与者相对偏移以它为基准
+        self._ego_spawn: Optional[SpawnPoint] = None
         self._actors: list[Any] = []
         self._sensors: list[Any] = []
         self._cleaned = False
@@ -247,6 +259,7 @@ class BuiltinScenario(CustomScenarioBase):
             except Exception as exc:  # noqa: BLE001  Actor 可能已被外部销毁
                 logger.debug(f"Actor destroy failed: {exc}")
         self._ego = None
+        self._ego_spawn = None
         self._actors.clear()
 
     # ── 内部实现 ─────────────────────────────────────────────────────────
@@ -273,16 +286,50 @@ class BuiltinScenario(CustomScenarioBase):
                 f"Ego blueprint '{ego_cfg.vehicle_blueprint}' unavailable, "
                 f"fallback to '{getattr(blueprint, 'id', blueprint)}': {exc}"
             )
-        transform = self._make_transform(world, ego_cfg.spawn_point)
-        actor = self._spawn_actor(world, blueprint, transform)
+        actor: Any = None
+        actual_spawn: Optional[SpawnPoint] = None
+        candidates = resolve_ego_spawn_candidates(
+            world,
+            ego_cfg.spawn_point,
+            map_type=self._config.map_type,
+            scene_key=scene_key_of(self._config.scene_id, self._config.scene_version),
+            variant_index=self._spawn_variant_index(),
+        )
+        for index, candidate in enumerate(candidates):
+            transform = self._make_transform(world, candidate)
+            actor = self._spawn_actor(world, blueprint, transform)
+            if actor is not None:
+                actual_spawn = candidate
+                if index > 0:
+                    logger.warning(
+                        "ego_spawn_fallback scene=%s attempt=%d spawn=(%.2f,%.2f,%.2f)",
+                        self._config.scene_id,
+                        index + 1,
+                        candidate.x,
+                        candidate.y,
+                        candidate.z,
+                    )
+                break
+            logger.warning(
+                "ego_spawn_attempt_failed scene=%s attempt=%d spawn=(%.2f,%.2f,%.2f) "
+                "(位置被占用或不在路面)",
+                self._config.scene_id,
+                index + 1,
+                candidate.x,
+                candidate.y,
+                candidate.z,
+            )
+
         if actor is None:
             raise CarlaSimulationError(
                 "builtin_scenario.spawn_ego",
                 (
                     f"自车生成失败（位置被占用或非法）：blueprint={ego_cfg.vehicle_blueprint}, "
-                    f"spawn=({ego_cfg.spawn_point.x:.1f}, {ego_cfg.spawn_point.y:.1f})"
+                    f"spawn=({ego_cfg.spawn_point.x:.1f}, {ego_cfg.spawn_point.y:.1f}), "
+                    f"已尝试 {len(candidates)} 个候选出生点"
                 ),
             )
+        self._ego_spawn = self._actual_ego_spawn(actor, actual_spawn)
         if ego_cfg.autopilot:
             set_autopilot = getattr(actor, "set_autopilot", None)
             if callable(set_autopilot):
@@ -299,7 +346,12 @@ class BuiltinScenario(CustomScenarioBase):
         prefix = "walker." if participant.actor_type in ("walker", "cyclist") else "vehicle."
         try:
             blueprint = self._find_blueprint(library, participant.blueprint, prefix)
-            transform = self._make_transform(world, participant.spawn_point)
+            spawn_point = resolve_actor_spawn(
+                self._ego_spawn if self._ego_spawn is not None else self._config.ego_vehicle.spawn_point,
+                participant.spawn_point,
+                self._config.spawn_semantics,
+            )
+            transform = self._make_transform(world, spawn_point)
             actor = self._spawn_actor(world, blueprint, transform)
         except CarlaSimulationError as exc:
             # 单个参与者失败不阻断整场景（平台可能下发未安装的蓝图）
@@ -395,7 +447,17 @@ class BuiltinScenario(CustomScenarioBase):
             logger.warning("Sim sensors skipped: no available blueprint")
             return
 
-        mount_manager = SensorMountManager(self._ego)
+        try:
+            mount_manager = SensorMountManager(
+                self._ego,
+                sensor_mount_reference=self._config.sensor_mount_reference,
+            )
+        except SensorSimulationError as exc:
+            logger.warning(f"Sim sensors skipped: mount resolution failed: {exc}")
+            return
+        except ConfigurationError as exc:
+            logger.warning(f"Sim sensors skipped: sensor mount config invalid: {exc}")
+            return
         attached = 0
         for sensor_type, blueprint in blueprints.items():
             stream = _SIM_STREAM_BY_TYPE.get(sensor_type)
@@ -697,6 +759,25 @@ class BuiltinScenario(CustomScenarioBase):
             "builtin_scenario.fallback_blueprint",
             "蓝图库中没有可用车辆蓝图，无法生成自车",
         )
+
+    def _spawn_variant_index(self) -> int:
+        """同批实例分散序号（缺省 0，保持单实例可复现）。"""
+        raw = self._config.extra_params.get("spawn_variant", 0)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _actual_ego_spawn(actor: Any, fallback: Optional[SpawnPoint]) -> Optional[SpawnPoint]:
+        """读取自车实际 transform 作为参与者偏移基准（取不到时用候选点）。"""
+        getter = getattr(actor, "get_transform", None)
+        if callable(getter):
+            try:
+                return transform_to_spawn_point(getter())
+            except Exception as exc:  # noqa: BLE001  读取失败退回候选点，不阻断场景
+                logger.debug(f"ego_transform_unavailable: {exc}")
+        return fallback
 
     def _make_transform(self, world: Any, spawn_point: SpawnPoint) -> Any:
         if self._transform_factory is not None:

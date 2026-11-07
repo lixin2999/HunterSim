@@ -2752,3 +2752,69 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - **自动重启**：CARLA 服务端崩溃后 `carla-manager` 不会自动拉起，仍需运维手动介入（延续 V3.3.3/V3.3.4 待办）。
 - **缓存窗口**：场景启动的第一帧前，若 executor 轮询已到，仍会尝试直接 RPC——此时 ego_vehicle 尚未生成，返回空 dict 不写入 DB，无副作用。
 
+---
+
+## V3.4.0 — 实现出生点有效坐标替换 + 传感器按实际外形挂载
+
+**发布日期**：2026-11-07
+**版本定位**：承接 HunterCore V1.25.0「出生点职责转移」契约与 V1.24.9「传感器挂载依据」契约，修复平台下发占位原点 `(0,0,0)` 导致的黑屏/全黑，以及相机按写死车身尺寸挂载导致「只见路面 / 镜头埋进车身」。
+
+### 问题背景
+
+1. **黑屏 / 场景全黑**：平台场景模板的 `map.spawn_point` 常为占位原点 `(0,0,0)`，仿真端直接使用会让自车落在世界原点，HUD 自车状态恒为 0，画面全黑。
+2. **参与者挤在原点**：`spawn_semantics=relative_to_ego` 时，`actors[].spawn_point` 是相对自车基准的偏移；若自车基准未替换就叠加，参与者全部落在原点附近。
+3. **只见路面 / 相机埋进车身**：`sensor_mount.py` 用写死的 `(0.40, 0.30, 0.70)` 等车身尺寸挂载；实际 spawn 到的回退蓝图尺寸不同，相机光心过低、pitch 过负，画面只剩沥青。
+
+### 修复内容
+
+**第一部分：出生点有效坐标替换（`scene_runner/spawn_resolver.py` 新增）**
+
+- `map_type=carla_town` 且 `map.spawn_point` 为占位原点（`|x|,|y|,|z|,|yaw| < 0.1`）或经 `get_waypoint` 判定不在路面时，改用 `world.get_map().get_spawn_points()` 的合法点；非 `carla_town`（`hd_map` / `site_map`）绝不替换。
+- 候选点按 `scene_key = scene_id::scene_version` 做 SHA-256 稳定散列选择，同一场景可复现；`extra_params.spawn_variant` 用于同批实例分散（`(base + variant) % count`）。
+- 自车 spawn 失败（点被占用）时按候选序列依次重试，最多 16 个候选，并记录每次失败/回退日志。
+- `spawn_semantics=relative_to_ego` 时，参与者坐标 = **替换后的自车实际 transform** + 平台偏移（世界平移 + yaw 累加并归一到 `[-180,180)`）；`absolute` 保持原样。
+- 替换前后坐标、替换原因（`placeholder_origin` / `off_road`）均打日志，便于定位是否生效。
+
+**第二部分：传感器挂载按实际蓝图包围盒换算（`sensor_sim/sensor_mount.py` 重写）**
+
+- 新增 `SensorEnvelope` / `local_envelope()` / `resolve_envelope()`：优先使用平台 `sensor_mount_reference.status=resolved` 的 `envelope_m`；`blueprint` 与实际 actor `type_id` 不一致或字段不完整时降级本地实测。
+- 本地实测直接调用已 spawn 车辆 `get_bounding_box()` 的 `location ± extent`，与平台 envelope 同一套算术；拿不到 bbox 或 extent 非法时抛 `SensorSimulationError`，**绝不回落到写死车身尺寸**。
+- 新增 `compute_local_transform()` / `resolve_mount_transforms()` / `load_mount_config()`，安装位统一为 `mount_loc = anchor(envelope_m) + offset_m`。
+- `configs/sensor_configs.json` 的 `mounts` 改为 `anchor` + `offset_m` + `rot_deg` 结构并真正生效：前视相机锚点 `front_edge`、默认 `(-0.45, 0, -0.10)`、pitch `-8°`；LiDAR 锚点 `roof`、默认 `z=+0.15`；同时覆盖深度相机、IMU、GNSS、碰撞、车道偏离、障碍物。
+- 实例创建时打一行 `mount source=platform|local status=<status> plat_bp=... actual_bp=... roof_z=... front_x=...`，运维可据此判断挂载依据来自平台还是本地实测。
+- 配置文件缺失时使用内建「锚点 + 传感器余量」默认（不含车身尺寸）并告警；JSON 格式错误抛 `ConfigurationError`。
+
+**场景契约（`scene_config.py` / `platform_adapter/scene_mapper.py`）**
+
+- `SceneConfig` 新增 `map_type`、`spawn_semantics`、`sensor_mount_reference`；内部默认 `spawn_semantics="absolute"` 保持旧场景兼容。
+- 平台 mapper 读取 `map.map_type` / `spawn_semantics` / `sensor_mount_reference`；缺失 `map_type` 时，`Town*` 地图推断为 `carla_town`（保证旧载荷也能触发原点兜底）；缺失 `spawn_semantics` 时按 V1.25.0 契约取 `relative_to_ego`。
+
+### 向后兼容
+
+- 直接构造 `SceneConfig` 的旧场景：`map_type=""`、`spawn_semantics="absolute"`，不会触发替换与偏移叠加，行为与 V3.3.5 一致。
+- 平台非 `carla_town` 地图坐标逐字使用，不做任何替换。
+- 传感器挂载数值会随实际蓝图包围盒变化，属于预期修复；若需固定特殊车辆安装位，仍可通过 `custom_mounts` 显式覆盖。
+
+### 验证
+
+- `pytest -q` 全量：**1273 passed**，无失败（新增 `tests/test_spawn_resolver.py` 及自车替换/参与者偏移/挂载换算用例）。
+- `mypy src/hunter_sim`：90 个源文件无问题；`flake8 src tests`：无告警。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → 应为 `3.4.0`；
+2. 重启 `huntersim up`；
+3. 平台下发使用 `spawn_semantics=relative_to_ego` 的场景；
+4. 预期日志出现 `ego_spawn_replaced reason=placeholder_origin ...` 与 `mount source=local status=<未解析状态> ...`；
+5. 预期：HUD 自车 `x/y` 非 0、画面出现地平线/车道线、相机不再埋入车身、参与者跟随新自车基准。
+
+### 分发
+
+镜像 tag `hunter-sim:3.4.0`。
+
+### 待办 / 已知边界
+
+- 平台 `sensor_mount_reference` 在当前部署环境（HUNTER_SE 无蓝图 + dev build 采不出尺寸）常态为 `table_uncalibrated` / `blueprint_unmatched`，主路径仍是本地 `local_envelope()`；平台几何表入库后自动优先使用。
+- `get_bounding_box()` 的 `location` 与 `attach_to()` 参考原点是否同址，仍需按方案 §11 在与服务器同版本的客户端上实测确认。
+- `side_edge_y_m` 只给绝对值，左右侧相机符号需按实机画面确认。
+

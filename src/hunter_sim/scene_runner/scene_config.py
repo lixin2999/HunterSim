@@ -209,6 +209,9 @@ class SceneConfig(BaseModel):
         scene_name: 场景显示名称。
         scene_version: 配置版本号。
         map_id: 地图 ID。
+        map_type: 地图类型（``carla_town`` / ``hd_map`` / ``site_map``）。
+        spawn_semantics: 出生点语义（``relative_to_ego`` 表示参与者坐标为相对自车偏移）。
+        sensor_mount_reference: 平台下发的传感器挂载依据（``envelope_m`` 等）。
         quality: 渲染画质等级。
         mode: 仿真模式（VIL/SIL）。
         ego_vehicle: 自车配置。
@@ -226,6 +229,15 @@ class SceneConfig(BaseModel):
     scene_name: str = ""
     scene_version: str = "1.0"
     map_id: str = Field("Town03", description="地图 ID")
+    map_type: str = Field("", description="地图类型（carla_town/hd_map/site_map）")
+    spawn_semantics: str = Field(
+        "absolute",
+        description="出生点语义：relative_to_ego（平台 V1.25.0+）或 absolute（历史）",
+    )
+    sensor_mount_reference: dict[str, Any] = Field(
+        default_factory=dict,
+        description="平台下发的传感器挂载依据（非 resolved 时不携带尺寸）",
+    )
     quality: QualityLevel = QualityLevel.MEDIUM
     mode: SimMode = SimMode.SIL
     ego_vehicle: EgoVehicleConfig

@@ -55,46 +55,55 @@
       "components": ["helios_16p", "d435", "ch10x"]
     }
   },
+  "mounts_description": "挂载点 = 车辆实际外形边界锚点 + 传感器本体安装余量（offset_m）；车身尺寸不在配置中写死",
   "mounts": {
     "lidar": {
-      "x": 0.23,
-      "y": 0.0,
-      "z": 0.35,
-      "pitch": 0.0,
-      "yaw": 0.0,
-      "roll": 0.0
+      "mount_id": "lidar_top",
+      "anchor": "roof",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.15},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
     },
     "rgb_camera": {
-      "x": 0.4,
-      "y": 0.0,
-      "z": 0.3,
-      "pitch": 0.0,
-      "yaw": 0.0,
-      "roll": 0.0
+      "mount_id": "camera_front_rgb",
+      "anchor": "front_edge",
+      "offset_m": {"x": -0.45, "y": 0.0, "z": -0.10},
+      "rot_deg": {"pitch": -8.0, "yaw": 0.0, "roll": 0.0}
     },
     "depth_camera": {
-      "x": 0.4,
-      "y": 0.0,
-      "z": 0.3,
-      "pitch": 0.0,
-      "yaw": 0.0,
-      "roll": 0.0
+      "mount_id": "camera_front_depth",
+      "anchor": "front_edge",
+      "offset_m": {"x": -0.45, "y": 0.0, "z": -0.10},
+      "rot_deg": {"pitch": -8.0, "yaw": 0.0, "roll": 0.0}
     },
     "imu": {
-      "x": 0.23,
-      "y": 0.0,
-      "z": 0.15,
-      "pitch": 0.0,
-      "yaw": 0.0,
-      "roll": 0.0
+      "mount_id": "imu_cg",
+      "anchor": "center",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
     },
     "gnss": {
-      "x": 0.0,
-      "y": 0.0,
-      "z": 0.33,
-      "pitch": 0.0,
-      "yaw": 0.0,
-      "roll": 0.0
+      "mount_id": "gnss_roof",
+      "anchor": "roof",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.02},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
+    },
+    "collision": {
+      "mount_id": "collision_front",
+      "anchor": "front_edge",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.10},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
+    },
+    "lane_invasion": {
+      "mount_id": "lane_invasion_center",
+      "anchor": "center",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.10},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
+    },
+    "obstacle": {
+      "mount_id": "obstacle_front",
+      "anchor": "front_edge",
+      "offset_m": {"x": 0.0, "y": 0.0, "z": 0.10},
+      "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
     }
   },
   "topics": {

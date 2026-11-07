@@ -18,6 +18,7 @@ from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
+from hunter_sim.scene_runner.spawn_resolver import is_placeholder_origin
 from tests.mocks.carla_mocks import (
     MockActor,
     MockBlueprint,
@@ -219,3 +220,107 @@ class TestLifecycle:
         scenario._start_time = time.perf_counter() - 31.0
         scenario._update_elapsed()
         assert scenario.check_finish(world, 31.0) is True
+
+
+class _FlakyEgoWorld(MockWorld):
+    """首次 spawn 返回 None（位置被占用），用于验证候选出生点重试。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spawn_attempts = 0
+
+    def try_spawn_actor(self, blueprint: Any, transform: Any, attach_to: Any = None) -> Any:
+        self.spawn_attempts += 1
+        if self.spawn_attempts == 1:
+            return None
+        return super().spawn_actor(blueprint, transform, attach_to=attach_to)
+
+
+class TestSpawnReplacement:
+    """原点替换 + 参与者相对偏移（HunterCore V1.25.0 契约）。"""
+
+    def test_origin_ego_replaced_and_participants_follow(self) -> None:
+        scenario = _make_scenario(
+            {
+                "map_type": "carla_town",
+                "spawn_semantics": "relative_to_ego",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": False,
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 5.0, "y": -2.0},
+                        "behavior": "static",
+                    }
+                ],
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        ego = scenario.ego_actor
+        assert ego is not None
+        ego_spawn = scenario._ego_spawn
+        assert ego_spawn is not None
+        # 原点被替换为地图合法出生点
+        assert is_placeholder_origin(ego_spawn) is False
+
+        participant = next(a for a in world.get_actors() if a.id != ego.id)
+        transform = participant.get_transform()
+        assert transform.location.x == pytest.approx(ego_spawn.x + 5.0)
+        assert transform.location.y == pytest.approx(ego_spawn.y - 2.0)
+
+    def test_absolute_semantics_keeps_participant_coordinates(self) -> None:
+        scenario = _make_scenario(
+            {
+                "map_type": "carla_town",
+                "spawn_semantics": "absolute",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 7.0, "y": 3.0},
+                        "behavior": "static",
+                    }
+                ],
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        ego = scenario.ego_actor
+        participant = next(a for a in world.get_actors() if a.id != ego.id)
+        assert participant.get_transform().location.x == pytest.approx(7.0)
+        assert participant.get_transform().location.y == pytest.approx(3.0)
+
+    def test_ego_spawn_retries_next_candidate(self) -> None:
+        scenario = _make_scenario(
+            {
+                "map_type": "carla_town",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                },
+                "traffic_participants": [],
+            }
+        )
+        world = _FlakyEgoWorld()
+
+        scenario.setup(world)
+
+        assert scenario.ego_actor is not None
+        assert world.spawn_attempts >= 2
+        assert scenario._ego_spawn is not None
+        assert is_placeholder_origin(scenario._ego_spawn) is False

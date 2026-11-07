@@ -171,6 +171,9 @@ def map_scene_config(
     ego_spawn = _spawn_point(map_section.get("spawn_point"), "map.spawn_point")
     ego_blueprint = str(ego_section.get("model") or "hunter_se").strip() or "hunter_se"
     initial_speed = _clamp(_as_float(ego_section.get("initial_speed"), 0.0), 0.0, 50.0)
+    map_type = _map_type(map_section, map_id)
+    spawn_semantics = _spawn_semantics(platform_config.get("spawn_semantics"))
+    sensor_mount_reference = _as_dict(platform_config.get("sensor_mount_reference"))
 
     duration = _as_float(platform_config.get("duration"), default_duration_seconds)
     if duration <= 0:
@@ -195,6 +198,9 @@ def map_scene_config(
         scene_id=scene_id,
         scene_name=scene_name,
         map_id=map_id,
+        map_type=map_type,
+        spawn_semantics=spawn_semantics,
+        sensor_mount_reference=sensor_mount_reference,
         quality=_quality(quality),
         mode=mode,
         ego_vehicle=EgoVehicleConfig(
@@ -214,6 +220,8 @@ def map_scene_config(
             "success_criteria": success_criteria,
             "platform_scene_config": {
                 "map": map_section,
+                "spawn_semantics": spawn_semantics,
+                "sensor_mount_reference": sensor_mount_reference,
                 "success_criteria": success_criteria,
             },
         },
@@ -374,6 +382,24 @@ def _map_weather(section: dict[str, Any]) -> WeatherConfig:
         sun_altitude_angle=_clamp(_as_float(section.get("sun_altitude"), 45.0), -90.0, 90.0),
         fog_density=_clamp(_as_float(section.get("fog"), 0.0), 0.0, 100.0),
     )
+
+
+def _map_type(map_section: dict[str, Any], map_id: str) -> str:
+    """规范化地图类型；缺省时按 CARLA 内置城镇命名推断。
+
+    平台 V1.25.0 恒带 ``map_type``；旧载荷缺失时，``Town*`` 地图仍按
+    ``carla_town`` 处理，才能触发仿真端「占位原点 → 合法出生点」兜底。
+    """
+    raw = str(map_section.get("map_type") or "").strip().lower()
+    if raw:
+        return raw
+    return "carla_town" if map_id.strip().lower().startswith("town") else ""
+
+
+def _spawn_semantics(raw: Any) -> str:
+    """规范化出生点语义；缺省按 V1.25.0 契约取 ``relative_to_ego``。"""
+    value = str(raw or "relative_to_ego").strip().lower()
+    return "absolute" if value == "absolute" else "relative_to_ego"
 
 
 def _spawn_point(section: Any, label: str) -> SpawnPoint:
