@@ -2778,7 +2778,7 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 **第二部分：传感器挂载按实际蓝图包围盒换算（`sensor_sim/sensor_mount.py` 重写）**
 
 - 新增 `SensorEnvelope` / `local_envelope()` / `resolve_envelope()`：优先使用平台 `sensor_mount_reference.status=resolved` 的 `envelope_m`；`blueprint` 与实际 actor `type_id` 不一致或字段不完整时降级本地实测。
-- 本地实测直接调用已 spawn 车辆 `get_bounding_box()` 的 `location ± extent`，与平台 envelope 同一套算术；拿不到 bbox 或 extent 非法时抛 `SensorSimulationError`，**绝不回落到写死车身尺寸**。
+- 本地实测读取已 spawn 车辆的包围盒 `location ± extent`，与平台 envelope 同一套算术；同时兼容 CARLA Python API 的 `actor.bounding_box` 属性与部分封装的 `get_bounding_box()` 方法（实机 CARLA 只提供属性形态，此前只认方法会误判为不支持而跳过全部传感器）。拿不到 bbox 或 extent 非法时抛 `SensorSimulationError`（错误信息含 `type_id` 与可用 bbox 属性），**绝不回落到写死车身尺寸**。
 - 新增 `compute_local_transform()` / `resolve_mount_transforms()` / `load_mount_config()`，安装位统一为 `mount_loc = anchor(envelope_m) + offset_m`。
 - `configs/sensor_configs.json` 的 `mounts` 改为 `anchor` + `offset_m` + `rot_deg` 结构并真正生效：前视相机锚点 `front_edge`、默认 `(-0.45, 0, -0.10)`、pitch `-8°`；LiDAR 锚点 `roof`、默认 `z=+0.15`；同时覆盖深度相机、IMU、GNSS、碰撞、车道偏离、障碍物。
 - 实例创建时打一行 `mount source=platform|local status=<status> plat_bp=... actual_bp=... roof_z=... front_x=...`，运维可据此判断挂载依据来自平台还是本地实测。
@@ -2797,7 +2797,7 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 
 ### 验证
 
-- `pytest -q` 全量：**1273 passed**，无失败（新增 `tests/test_spawn_resolver.py` 及自车替换/参与者偏移/挂载换算用例）。
+- `pytest -q` 全量：**1274 passed**，无失败（新增 `tests/test_spawn_resolver.py` 及自车替换/参与者偏移/挂载换算用例，并覆盖 `bounding_box` 属性与 `get_bounding_box()` 方法两种 API 形态）。
 - `mypy src/hunter_sim`：90 个源文件无问题；`flake8 src tests`：无告警。
 
 ### 实机执行
@@ -2815,6 +2815,6 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 ### 待办 / 已知边界
 
 - 平台 `sensor_mount_reference` 在当前部署环境（HUNTER_SE 无蓝图 + dev build 采不出尺寸）常态为 `table_uncalibrated` / `blueprint_unmatched`，主路径仍是本地 `local_envelope()`；平台几何表入库后自动优先使用。
-- `get_bounding_box()` 的 `location` 与 `attach_to()` 参考原点是否同址，仍需按方案 §11 在与服务器同版本的客户端上实测确认。
+- 包围盒 `location` 与 `attach_to()` 参考原点是否同址，仍需按方案 §11 在与服务器同版本的客户端上实测确认。
 - `side_edge_y_m` 只给绝对值，左右侧相机符号需按实机画面确认。
 

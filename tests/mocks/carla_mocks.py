@@ -97,7 +97,9 @@ class MockActor:
     def get_acceleration(self) -> MockVector3D:
         return self._acceleration
 
-    def get_bounding_box(self) -> MockBoundingBox:
+    @property
+    def bounding_box(self) -> MockBoundingBox:
+        """与 CARLA Python API 一致：包围盒是属性而非方法。"""
         return self._bounding_box
 
     def get_location(self) -> MockLocation:

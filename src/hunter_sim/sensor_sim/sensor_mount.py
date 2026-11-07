@@ -4,7 +4,8 @@
 
 1. 优先使用平台下发 ``sensor_mount_reference.envelope_m``（``status=resolved``
    且 ``blueprint`` 与实际 actor 一致时）；
-2. 否则用当前 spawn 出来的车辆 ``get_bounding_box()`` 本地实测（当前部署常态）；
+2. 否则用当前 spawn 出来的车辆包围盒（``bounding_box`` 属性 / ``get_bounding_box()``
+   方法，兼容不同 CARLA 版本）本地实测（当前部署常态）；
 3. 两者都不可用时显式报错，绝不回落到写死米数。
 
 安装位统一表达为 ``mount_loc = anchor(envelope_m) + offset_m``，其中
@@ -249,16 +250,58 @@ def local_envelope(vehicle: Any) -> dict[str, float]:
     return _local_envelope(vehicle).to_mapping()
 
 
+def _read_bounding_box(vehicle: Any) -> Any:
+    """读取 Actor 包围盒，兼容 CARLA 不同版本的 API 形态。
+
+    CARLA Python API 的标准形态是 ``actor.bounding_box`` 属性；部分封装/回调
+    版本提供 ``get_bounding_box()`` 方法。两者都尝试，避免因 API 形态差异
+    导致全部传感器被跳过。
+
+    Raises:
+        SensorSimulationError: 两种形态都拿不到包围盒。
+    """
+    errors: list[str] = []
+    for name in ("bounding_box", "get_bounding_box"):
+        try:
+            candidate = getattr(vehicle, name, None)
+        except Exception as exc:  # noqa: BLE001  属性访问可能因 Actor 失效抛错
+            errors.append(f"{name} 访问失败: {exc}")
+            continue
+        if candidate is None:
+            continue
+        try:
+            bounding_box = candidate() if callable(candidate) else candidate
+        except Exception as exc:  # noqa: BLE001  CARLA 调用异常统一转仿真异常
+            errors.append(f"{name} 读取失败: {exc}")
+            continue
+        if bounding_box is None:
+            errors.append(f"{name} 返回 None")
+            continue
+        if (
+            getattr(bounding_box, "location", None) is None
+            or getattr(bounding_box, "extent", None) is None
+        ):
+            errors.append(f"{name} 缺少 location/extent")
+            continue
+        return bounding_box
+
+    available = sorted(
+        name
+        for name in dir(vehicle)
+        if "bound" in name.lower() or "box" in name.lower()
+    )
+    detail = "; ".join(errors) if errors else "未找到 bounding_box / get_bounding_box"
+    raise SensorSimulationError(
+        "mount",
+        "unknown",
+        "车辆 Actor 无法读取包围盒，不能按实际外形挂载传感器"
+        f"（type_id={getattr(vehicle, 'type_id', '-') or '-'}，"
+        f"可用属性={available or '无'}）: {detail}",
+    )
+
+
 def _local_envelope(vehicle: Any) -> SensorEnvelope:
-    getter = getattr(vehicle, "get_bounding_box", None)
-    if not callable(getter):
-        raise SensorSimulationError(
-            "mount", "unknown", "车辆 Actor 不支持 get_bounding_box()，无法按实际外形挂载传感器"
-        )
-    try:
-        bounding_box = getter()
-    except Exception as exc:  # noqa: BLE001  CARLA 调用异常统一转仿真异常
-        raise SensorSimulationError("mount", "unknown", f"读取 bounding_box 失败: {exc}") from exc
+    bounding_box = _read_bounding_box(vehicle)
     location = getattr(bounding_box, "location", None)
     extent = getattr(bounding_box, "extent", None)
     if location is None or extent is None:

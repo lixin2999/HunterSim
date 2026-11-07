@@ -54,9 +54,19 @@ class _BBox:
 
 
 class _FakeVehicle:
-    """带真实包围盒的车辆桩（挂载换算依据）。"""
+    """带真实包围盒的车辆桩（与 CARLA Python API 一致：``bounding_box`` 属性）。"""
 
     type_id = "vehicle.fallback"
+
+    @property
+    def bounding_box(self) -> _BBox:
+        return _BBox()
+
+
+class _MethodBBoxVehicle:
+    """只提供 ``get_bounding_box()`` 的车辆桩（兼容旧封装/测试替身）。"""
+
+    type_id = "vehicle.method_bbox"
 
     def get_bounding_box(self) -> _BBox:
         return _BBox()
@@ -107,6 +117,12 @@ class TestEnvelope:
         assert envelope["side_edge_y_m"] == pytest.approx(0.9)
         assert envelope["roof_z_m"] == pytest.approx(1.5)
         assert envelope["bottom_z_m"] == pytest.approx(0.0)
+
+    def test_local_envelope_from_get_bounding_box(self) -> None:
+        # 兼容提供 get_bounding_box() 方法的封装
+        envelope = local_envelope(_MethodBBoxVehicle())
+        assert envelope["roof_z_m"] == pytest.approx(1.5)
+        assert envelope["front_edge_x_m"] == pytest.approx(2.0)
 
     def test_from_mapping_requires_all_fields(self) -> None:
         with pytest.raises(ValueError):
