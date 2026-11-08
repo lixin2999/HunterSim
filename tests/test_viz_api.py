@@ -131,20 +131,26 @@ class TestPageAndAssets:
         assert client.get("/viz/assets/..%2F..%2Fpyproject.toml").status_code == 404
 
     def test_terminal_instance_stops_frame_polling(self, client: TestClient) -> None:
-        """终态实例必须短路帧类轮询（V3.1.3）。
+        """终态/未运行实例必须短路帧类轮询（V3.1.3 / V3.4.1）。
 
         回归背景：实例进入 succeeded/failed/canceled 后不再产生新帧，但
-        ``/sensors/lidar``、``/sensors/imu`` 仍按 1.5s 被轮询并持续返回 409，
-        长驻运行会刷满服务端日志。这里以源码接线方式锁定守卫存在。
+        ``/sensors/lidar``、``/sensors/imu`` 仍按 1.5s 被轮询并持续返回空内容，
+        长驻运行会刷满服务端日志；pending（场景加载中）同样没有帧。
         """
         script = client.get("/viz/assets/app.js").text
 
         assert "function isTerminalInstance()" in script
-        # 预览（激光点云 / IMU / 深度）本身带终态短路
-        assert "if (!state.instanceId || isTerminalInstance())" in script
+        assert "function isRunningInstance()" in script
+        # 预览（激光点云 / IMU / 深度）同时带终态与未运行短路
+        assert "if (!state.instanceId || isTerminalInstance() || !isRunningInstance())" in script
         # 传感器帧统计与事件列表的定时轮询也必须走同一短路（不能直挂 setInterval）
-        for name in ("refreshSensors", "refreshEvents", "refreshPreviews"):
+        for name in ("refreshSensors", "refreshEvents"):
             assert f"setInterval(function () {{\n      if (!isTerminalInstance()) {{\n        {name}();" in script
+        assert (
+            "setInterval(function () {\n"
+            "      if (!isTerminalInstance() && isRunningInstance()) {\n"
+            "        refreshPreviews();"
+        ) in script
         # 终态后仍需一次收尾加载，否则传感器/事件面板停在旧值
         assert "state.terminalSynced = true" in script
 
@@ -221,11 +227,35 @@ class TestSensors:
         assert response.content == b"\xff\xd8fake-jpeg"
         assert response.headers["content-type"] == "image/jpeg"
 
-    def test_missing_frame_is_409(self, client: TestClient) -> None:
+    def test_overview_frame_passthrough(self, client: TestClient, service: _FakeService) -> None:
+        service.frames["overview"] = _frame(
+            "overview",
+            b"\xff\xd8overview-jpeg",
+            {"content_type": "image/jpeg", "width": 960, "height": 540},
+        )
+
+        response = client.get("/viz/api/instances/inst-1/sensors/overview")
+
+        assert response.status_code == 200
+        assert response.content == b"\xff\xd8overview-jpeg"
+        assert response.headers["content-type"] == "image/jpeg"
+
+    def test_overview_falls_back_to_rgb(self, client: TestClient, service: _FakeService) -> None:
+        service.frames["rgb"] = _frame(
+            "rgb", b"\xff\xd8front-jpeg", {"content_type": "image/jpeg"}
+        )
+
+        response = client.get("/viz/api/instances/inst-1/sensors/overview")
+
+        assert response.status_code == 200
+        assert response.content == b"\xff\xd8front-jpeg"
+
+    def test_missing_frame_is_204(self, client: TestClient) -> None:
+        """无帧时返回 204（启动早期不产生 409 错误日志）。"""
         response = client.get("/viz/api/instances/inst-1/sensors/imu")
 
-        assert response.status_code == 409
-        assert "sensor_frame_unavailable" in response.json()["detail"]
+        assert response.status_code == 204
+        assert response.content == b""
 
     def test_unknown_stream_is_404(self, client: TestClient) -> None:
         assert client.get("/viz/api/instances/inst-1/sensors/radar").status_code == 404

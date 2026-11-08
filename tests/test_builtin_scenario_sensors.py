@@ -17,7 +17,13 @@ from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig, SensorSpec
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
-from hunter_sim.sensor_sim.frame_hub import STREAM_DEPTH, STREAM_IMU, STREAM_LIDAR, STREAM_RGB
+from hunter_sim.sensor_sim.frame_hub import (
+    STREAM_DEPTH,
+    STREAM_IMU,
+    STREAM_LIDAR,
+    STREAM_OVERVIEW,
+    STREAM_RGB,
+)
 from hunter_sim.sensor_sim.mcap_recorder import McapRecorder
 from tests.mocks.carla_mocks import (
     MockActor,
@@ -293,6 +299,17 @@ class TestAttach:
 
         assert scenario._ros_enabled is False  # noqa: SLF001
 
+    def test_overview_camera_is_separate_from_data_sensors(self) -> None:
+        """环视相机独立挂载：不计入 _sensors，也不影响数据传感器数量。"""
+        scenario = _make_scenario()
+        scenario.setup(_SensorWorld())
+
+        overview = scenario._overview_sensor  # noqa: SLF001
+        assert overview is not None
+        assert overview.type_id == "sensor.camera.rgb"
+        assert overview not in scenario._sensors  # noqa: SLF001
+        assert len(scenario._sensors) == 4  # noqa: SLF001
+
     def test_setup_twice_does_not_leak_sensors(self) -> None:
         scenario = _make_scenario()
         world = _SensorWorld()
@@ -311,13 +328,17 @@ class TestCleanup:
         world = _SensorWorld()
         scenario.setup(world)
         actors = _sensor_actors(scenario)
+        overview = scenario._overview_sensor  # noqa: SLF001
 
         scenario.cleanup(world)
 
         assert actors
         assert all(actor.stop_calls == 1 for actor in actors)
         assert all(actor.is_alive() is False for actor in actors)
+        assert overview is not None
+        assert overview.stop_calls == 1
         assert scenario._sensors == []  # noqa: SLF001
+        assert scenario._overview_sensor is None  # noqa: SLF001
         assert scenario.ego_actor is None
 
     def test_cleanup_is_idempotent(self) -> None:
@@ -372,6 +393,27 @@ class TestDispatch:
         assert frame is not None
         assert frame.meta["width"] == 2
         assert frame.meta["height"] == 1
+
+    def test_overview_pushes_hub_only(self) -> None:
+        """overview 只进 FrameHub（主视区），不录 mcap、不发 ROS。"""
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        recorder = _FakeRecorder()
+        ros = _FakeRosBridge()
+        scenario = _make_scenario(frame_hub=hub, recorder=recorder, ros_bridge=ros)
+        scenario._ros_enabled = True  # noqa: SLF001
+
+        scenario._dispatch_sensor_data(  # noqa: SLF001
+            STREAM_OVERVIEW, _image_data(width=8, height=4)
+        )
+
+        frame = hub.latest(STREAM_OVERVIEW)
+        assert frame is not None
+        assert frame.meta["width"] == 8
+        assert frame.meta["content_type"] in ("image/png", "image/jpeg")
+        assert recorder.messages == []
+        assert ros.calls == []
 
     def test_depth_is_recorded_as_metric_image(self) -> None:
         from hunter_sim.sensor_sim.frame_hub import FrameHub

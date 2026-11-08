@@ -19,7 +19,7 @@ import json
 import time
 from typing import Any, Callable, Optional
 
-from hunter_sim.cloud.kafka_security import build_ssl_kwargs
+from hunter_sim.cloud.kafka_security import build_ssl_kwargs, ssl_failure_hint
 from hunter_sim.common.metrics import NODE_RESULT_PUBLISHED_TOTAL
 from hunter_sim.common.models import CloudSettings, SimNodeSettings
 from hunter_sim.common.utils import get_logger
@@ -150,7 +150,8 @@ class NodeResultProducer:
             self._producer = None
             self._available = False
             logger.warning(
-                f"NodeResultProducer 初始化失败，降级为 no-op：{type(exc).__name__}: {exc}"
+                f"NodeResultProducer 初始化失败，降级为 no-op："
+                f"{type(exc).__name__}: {exc}{ssl_failure_hint(exc)}"
             )
         return self._available
 

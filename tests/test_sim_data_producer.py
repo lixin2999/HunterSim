@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import threading
 from typing import Any
 
@@ -363,6 +364,41 @@ class TestSslKwargs:
         _, cert, _ = _cert_files(tmp_path)
         with pytest.raises(ValueError, match="CLIENT_KEY_PATH"):
             build_ssl_kwargs(_settings(client_cert_path=cert))
+
+    def test_auto_discovery_from_cert_dirs(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """未显式配置时从 HUNTER_SIM_CERT_DIRS 自动发现 CA / 客户端证书。"""
+        ca, cert, key = _cert_files(tmp_path)
+        monkeypatch.setenv("HUNTER_SIM_CERT_DIRS", str(tmp_path))
+
+        kwargs = build_ssl_kwargs(_settings(ca_cert_path=None))
+
+        assert kwargs == {
+            "ssl_cafile": ca,
+            "ssl_certfile": cert,
+            "ssl_keyfile": key,
+        }
+
+    def test_auto_discovery_can_be_disabled(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _cert_files(tmp_path)
+        monkeypatch.setenv("HUNTER_SIM_CERT_DIRS", str(tmp_path))
+
+        kwargs = build_ssl_kwargs(_settings(ca_cert_path=None, auto_discover_certs=False))
+
+        assert kwargs == {}
+
+    def test_ssl_verify_false_builds_unverified_context(self) -> None:
+        kwargs = build_ssl_kwargs(_settings(ssl_verify=False))
+
+        context = kwargs["ssl_context"]
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode == ssl.CERT_NONE
+        assert context.check_hostname is False
+        # ssl_context 会覆盖 kafka-python 的其他 ssl_* 参数，不能同时下发
+        assert "ssl_cafile" not in kwargs
 
     def test_missing_file_raises(self, tmp_path: Any) -> None:
         """证书路径指向不存在的文件时提前失败，避免只看到模糊的 SSL 握手错误。"""

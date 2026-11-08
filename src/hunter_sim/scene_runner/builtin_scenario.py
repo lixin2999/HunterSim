@@ -48,7 +48,12 @@ from hunter_sim.scene_runner.spawn_resolver import (
     scene_key_of,
     transform_to_spawn_point,
 )
-from hunter_sim.sensor_sim.frame_hub import FrameHub, STREAM_DEPTH, STREAM_RGB
+from hunter_sim.sensor_sim.frame_hub import (
+    FrameHub,
+    STREAM_DEPTH,
+    STREAM_OVERVIEW,
+    STREAM_RGB,
+)
 from hunter_sim.sensor_sim.image_codec import depth_bgra_to_meters, encode_rgb_frame
 from hunter_sim.sensor_sim.mcap_recorder import (
     McapRecorder,
@@ -57,8 +62,11 @@ from hunter_sim.sensor_sim.mcap_recorder import (
     build_pointcloud2_message,
 )
 from hunter_sim.sensor_sim.profiles import resolve_profiles
-from hunter_sim.sensor_sim.sensor_factory import SensorBlueprintFactory
-from hunter_sim.sensor_sim.sensor_mount import SensorMountManager
+from hunter_sim.sensor_sim.sensor_factory import RGBCameraConfig, SensorBlueprintFactory
+from hunter_sim.sensor_sim.sensor_mount import (
+    SensorMountManager,
+    load_overview_camera_config,
+)
 
 logger = get_logger(__name__)
 
@@ -71,6 +79,9 @@ _DEFAULT_CLEARANCE_M = 0.3
 _FALLBACK_Z_M = 0.5
 
 _AUTOPILOT_TM_PORT = 8000
+
+#: 环视相机挂载位置（configs/sensor_configs.json 的 mounts.overview_camera）
+_OVERVIEW_MOUNT_ID = "overview_camera"
 
 # 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
 _SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
@@ -184,6 +195,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_spawn: Optional[SpawnPoint] = None
         self._actors: list[Any] = []
         self._sensors: list[Any] = []
+        # 仅可视化用环视相机：不进入 _sensors 计数，不录 mcap / 不发 ROS
+        self._overview_sensor: Any = None
         self._cleaned = False
 
     @property
@@ -241,7 +254,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._frame_accepting = False
         self._stop_frame_worker()
 
-        for sensor in self._sensors:
+        for sensor in (
+            ([self._overview_sensor] if self._overview_sensor is not None else [])
+            + self._sensors
+        ):
             try:
                 stop = getattr(sensor, "stop", None)
                 if callable(stop):
@@ -252,6 +268,7 @@ class BuiltinScenario(CustomScenarioBase):
             except Exception as exc:  # noqa: BLE001  传感器可能已随世界销毁
                 logger.debug(f"Sensor stop failed: {exc}")
         self._sensors.clear()
+        self._overview_sensor = None
 
         for actor in ([self._ego] if self._ego is not None else []) + self._actors:
             try:
@@ -282,9 +299,10 @@ class BuiltinScenario(CustomScenarioBase):
             # 标准 CARLA 不带 vehicle.hunter_se 资产：回退到通用车辆，
             # 保证「未部署 HUNTER SE 蓝图」时 REST 场景闭环仍能跑通
             blueprint = self._fallback_vehicle_blueprint(library)
-            logger.warning(
+            logger.info(
                 f"Ego blueprint '{ego_cfg.vehicle_blueprint}' unavailable, "
-                f"fallback to '{getattr(blueprint, 'id', blueprint)}': {exc}"
+                f"fallback to '{getattr(blueprint, 'id', blueprint)}': {exc}。"
+                "如需实车尺寸请安装 vehicle.hunter_se.* 蓝图（挂载仍按实际包围盒换算）"
             )
         actor: Any = None
         actual_spawn: Optional[SpawnPoint] = None
@@ -429,22 +447,14 @@ class BuiltinScenario(CustomScenarioBase):
         ``FrameHub`` / ``McapRecorder`` / ROS2 桥接。单型传感器失败只降级该型，
         不阻断场景（蓝图缺失常见于未部署 hunter_se 资产的环境）。
 
+        另挂一台仅用于可视化主视区的环视相机（``overview`` 流）：它不进入
+        ``_sensors`` 计数、不录 mcap、不发 ROS，因此不影响平台数据契约。
+
         Args:
             world: CARLA World。
             library: BlueprintLibrary。
         """
-        specs: list[SensorSpec] = [spec for spec in self._config.sensors if spec.enabled]
-        if not specs or self._ego is None:
-            return
-
-        bundle = resolve_profiles([spec.profile for spec in specs])
-        try:
-            blueprints = SensorBlueprintFactory(library).create_bundle(bundle)
-        except Exception as exc:  # noqa: BLE001  蓝图库异常不得阻断场景
-            logger.warning(f"Sim sensor blueprint creation failed: {exc}")
-            return
-        if not blueprints:
-            logger.warning("Sim sensors skipped: no available blueprint")
+        if self._ego is None:
             return
 
         try:
@@ -458,6 +468,23 @@ class BuiltinScenario(CustomScenarioBase):
         except ConfigurationError as exc:
             logger.warning(f"Sim sensors skipped: sensor mount config invalid: {exc}")
             return
+
+        self._attach_overview_camera(world, library, mount_manager)
+
+        specs: list[SensorSpec] = [spec for spec in self._config.sensors if spec.enabled]
+        if not specs:
+            return
+
+        bundle = resolve_profiles([spec.profile for spec in specs])
+        try:
+            blueprints = SensorBlueprintFactory(library).create_bundle(bundle)
+        except Exception as exc:  # noqa: BLE001  蓝图库异常不得阻断场景
+            logger.warning(f"Sim sensor blueprint creation failed: {exc}")
+            return
+        if not blueprints:
+            logger.warning("Sim sensors skipped: no available blueprint")
+            return
+
         attached = 0
         for sensor_type, blueprint in blueprints.items():
             stream = _SIM_STREAM_BY_TYPE.get(sensor_type)
@@ -479,6 +506,43 @@ class BuiltinScenario(CustomScenarioBase):
                 f"Sim sensors attached: {attached} (profile={bundle.profile_name}, "
                 f"record={self._recorder is not None}, ros={self._ros_enabled})"
             )
+
+    def _attach_overview_camera(
+        self, world: Any, library: Any, mount_manager: SensorMountManager
+    ) -> None:
+        """挂载仅可视化用的环视相机（失败只告警，不影响数据传感器）。"""
+        config = load_overview_camera_config()
+        if not bool(config.get("enabled", True)):
+            logger.info("Overview camera disabled by sensor config")
+            return
+        try:
+            camera_config = RGBCameraConfig(
+                width=int(config.get("width", 960)),
+                height=int(config.get("height", 540)),
+                fov_deg=float(config.get("fov_deg", 100.0)),
+                fps=float(config.get("fps", 10.0)),
+            )
+            blueprint = SensorBlueprintFactory(library).create(
+                SensorType.RGB_CAMERA, camera_config
+            )
+            sensor = mount_manager.attach_sensor(
+                SensorType.RGB_CAMERA,
+                blueprint,
+                world,
+                mount_id=_OVERVIEW_MOUNT_ID,
+            )
+        except Exception as exc:  # noqa: BLE001  可视化相机不得阻断场景
+            logger.warning(f"Overview camera attach skipped: {exc}")
+            return
+        self._listen_sensor(sensor, STREAM_OVERVIEW)
+        self._overview_sensor = sensor
+        logger.info(
+            "Overview camera attached: mount=%s fov=%.0f size=%dx%d",
+            _OVERVIEW_MOUNT_ID,
+            camera_config.fov_deg,
+            camera_config.width,
+            camera_config.height,
+        )
 
     def _listen_sensor(self, sensor: Any, stream: str) -> None:
         """注册传感器回调（回调异常不得冒泡到 CARLA 线程）。"""
@@ -604,6 +668,30 @@ class BuiltinScenario(CustomScenarioBase):
         ts = float(getattr(data, "timestamp", 0.0)) or time.time()
         log_time_ns = int(ts * 1e9)
         frame_id = _FRAME_IDS.get(stream, stream)
+
+        if stream == STREAM_OVERVIEW:
+            # 仅可视化：推 FrameHub 供主视区取帧，不录 mcap、不发 ROS
+            raw, width, height = self._raw_image(data)
+            encoded = encode_rgb_frame(
+                raw,
+                width,
+                height,
+                quality=self._screenshot_quality,
+                max_width=self._stream_max_width,
+            )
+            if self._frame_hub is not None:
+                self._frame_hub.push(
+                    stream,
+                    ts,
+                    encoded.payload,
+                    {
+                        "content_type": encoded.content_type,
+                        "format": encoded.format,
+                        "width": encoded.width,
+                        "height": encoded.height,
+                    },
+                )
+            return
 
         if stream == STREAM_RGB:
             raw, width, height = self._raw_image(data)
@@ -828,14 +916,14 @@ def _frame_of(stream: str, data: Any) -> _SensorFrame:
     """把 CARLA 测量对象抽取为可跨线程的不可变载荷（数据在此一次性拷贝）。
 
     Args:
-        stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu``）。
+        stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu`` / ``overview``）。
         data: CARLA 传感器测量对象（或单测桩）。
 
     Returns:
         仅含基本类型的帧载荷。
     """
     ts = float(getattr(data, "timestamp", 0.0)) or time.time()
-    if stream in (STREAM_RGB, STREAM_DEPTH):
+    if stream in (STREAM_RGB, STREAM_DEPTH, STREAM_OVERVIEW):
         raw, width, height = BuiltinScenario._raw_image(data)
         return _SensorFrame(stream=stream, ts=ts, payload=raw, width=width, height=height)
     if stream == "lidar":

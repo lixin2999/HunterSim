@@ -104,7 +104,21 @@
       "anchor": "front_edge",
       "offset_m": {"x": 0.0, "y": 0.0, "z": 0.10},
       "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
+    },
+    "overview_camera": {
+      "mount_id": "overview_camera",
+      "anchor": "rear_edge",
+      "offset_m": {"x": -5.0, "y": 0.0, "z": 2.5},
+      "rot_deg": {"pitch": -20.0, "yaw": 0.0, "roll": 0.0}
     }
+  },
+  "overview_camera": {
+    "description": "仅可视化环视主视区相机（不录 mcap / 不发 ROS）",
+    "enabled": true,
+    "width": 960,
+    "height": 540,
+    "fov_deg": 100.0,
+    "fps": 10.0
   },
   "topics": {
     "lidar": {

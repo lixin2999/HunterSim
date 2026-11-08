@@ -1,6 +1,12 @@
 # HunterSim 发布说明
 
 > 本文件采用**追加式**版本记录：新增版本时追加新章节，不修改历史内容。
+>
+> **版本号与条目规则（自 V3.4.1 起执行）**
+> 1. **每次改动都必须新增发布条目**：无论是功能开发还是问题修复，均不得合并进已有版本章节，也不得改写历史内容。
+> 2. **功能新增或功能变更**：版本号在**第二位（minor）**递增，第三位归零（例：`3.4.1` → `3.5.0`）。
+> 3. **问题修复或功能完善**：版本号在**第三位（patch）**递增（例：`3.4.0` → `3.4.1`）。
+> 4. 新条目需同步更新 `pyproject.toml` 的 `version`，并在条目中写明「验证（测试/mypy/flake8）」与「分发」tag。
 
 ---
 
@@ -2817,4 +2823,73 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 平台 `sensor_mount_reference` 在当前部署环境（HUNTER_SE 无蓝图 + dev build 采不出尺寸）常态为 `table_uncalibrated` / `blueprint_unmatched`，主路径仍是本地 `local_envelope()`；平台几何表入库后自动优先使用。
 - 包围盒 `location` 与 `attach_to()` 参考原点是否同址，仍需按方案 §11 在与服务器同版本的客户端上实测确认。
 - `side_edge_y_m` 只给绝对值，左右侧相机符号需按实机画面确认。
+
+---
+
+## V3.4.1 — 环视主视区 + 启动期日志治理 + Kafka TLS 证书自动发现
+
+**发布日期**：2026-11-07
+**版本定位**：V3.4.0 实机验证后的**问题修复 / 功能完善**（patch，第三位递增）。V3.4.0 已确认传感器按实际包围盒挂载生效（`Sim sensors attached: 4`、mcap 正常出包），但实机仍有三类问题：主视区只见车头/路面看不到整车周边；场景启动前日志被大量 `409 Conflict` 刷屏；`SimDataProducer` / `NodeResultProducer` 初始化失败于 `CERTIFICATE_VERIFY_FAILED`（自签证书链）。
+
+### 问题背景
+
+1. **主视区视野过窄**：前置 RGB 相机锚点 `front_edge`、pitch `-8°`，只能看到车头前方，无法判断整车左右/后方环境。
+2. **启动期 409 噪声**：实例 `pending`（场景加载中）阶段前端已开始拉流与轮询，`/screenshot`、`/stream.mjpg`、`/viz/.../sensors/{lidar,depth,imu}` 全部以 `409 camera_not_attached` / `sensor_frame_unavailable` 作答，日志被无意义错误刷满，现场排查时难以分辨真实故障。
+3. **Kafka TLS 握手失败**：平台 CA 已随接入包下发到 `data/certs/` 或 `data/kafka-certs/`，但未写入 `.env`，客户端退回系统信任链后报 `SSLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain`；失败日志只有一行原始异常，没有可操作提示。
+4. **`HUNTER_SE` 回退告警误导**：未部署 `vehicle.hunter_se.*` 资产的环境常态回退 `vehicle.tesla.model3`，却以 WARNING 级别每次启动都报，容易被当成故障。
+
+### 修复内容
+
+**一、环视主视区（`overview` 流，仅可视化）**
+
+- `sensor_sim/frame_hub.py` 新增 `STREAM_OVERVIEW`（加入 `KNOWN_STREAMS`）。
+- `sensor_sim/sensor_mount.py` 新增 `overview_camera` 安装位：锚点 `rear_edge`，默认 `offset_m=(-5.0, 0, +2.5)`、`pitch=-20°`，配合 FOV 100° 可同时看到整车前后左右；新增 `get_mount_by_id()`、`attach_sensor(..., mount_id=...)`、`load_overview_camera_config()`。
+- `configs/sensor_configs.json` 新增 `mounts.overview_camera` 与 `overview_camera` 参数段（`enabled/width/height/fov_deg/fps`，默认 `960×540 @ 10Hz`）。
+- `scene_runner/builtin_scenario.py` 独立挂载环视相机（`_overview_sensor`）：**只推 `FrameHub`**，不进入 `_sensors` 计数、不录 mcap、不发 ROS，因此不改变平台数据契约与 mcap 话题集；`cleanup()` 一并停止销毁。
+- `platform_adapter/service.py` 新增 `_latest_frame()`；`screenshot()` / `stream_frames()` 支持 `stream` 参数。
+- `platform_adapter/app.py`：`/screenshot`、`/stream.mjpg` 支持 `?stream=overview`（缺省仍 `rgb`；`overview` 无帧时回退 `rgb`，保证平台调用方零改动可用）。
+- `visualization/routes.py`：`/viz/.../sensors/overview` 支持同语义透传与回退；`visualization/sensor_view.py` 按 RGB 原样透传。
+- `visualization/assets/app.js`：主视区优先请求 `overview`，未挂环视相机时自动回退前置 RGB。
+
+**二、启动期日志治理（409 → 204 / running 门控）**
+
+- 无首帧时 `/screenshot`、`/stream.mjpg`、`/viz/.../sensors/{stream}` 返回 **204 No Content**（替代 409），语义明确为「暂无内容，属启动早期正常状态」。
+- 前端仅在实例状态 `running` 时启动 MJPEG 拉流与深度/点云/IMU 预览轮询；`pending` 阶段显示「等待实例启动…」，不发无效请求；204 显示「等待首帧…」。
+- 保留终态（`succeeded/failed/canceled`）短路逻辑与一次收尾加载，面板仍能落到最终值。
+- `Ego blueprint 'HUNTER_SE' unavailable` 由 WARNING 降为 INFO，并提示如需实车尺寸请安装 `vehicle.hunter_se.*` 蓝图（挂载仍按实际包围盒换算，不受影响）。
+
+**三、Kafka TLS 证书自动发现与可操作失败提示**
+
+- `common/models.py`：`CloudSettings` / `KafkaSettings` 新增 `ssl_verify`（默认 `true`）、`auto_discover_certs`（默认 `true`），并纳入 `_inherit_kafka_from_cloud` 继承规则。
+- `cloud/kafka_security.py`：
+  - 证书路径**全部未显式配置**时自动搜索 `data/certs/`、`data/kafka-certs/`、`certs/`（cwd 与仓库根各试一次）；`HUNTER_SIM_CERT_DIRS` 可追加证书目录（按证书目录语义解析，`;`/`,` 分隔）。
+  - **任一证书路径被显式配置即不做自动发现**，避免拼出「显式 CA + 自动发现的客户端证书」这类易错组合。
+  - `ssl_verify=false` 时构造 `ssl.SSLContext`（`check_hostname=False`、`verify_mode=CERT_NONE`，仍加载 mTLS 客户端证书），并打 WARNING 提示仅限内网自签环境；`ssl_context` 会覆盖 kafka-python 其他 `ssl_*` 参数，故不同时下发。
+  - 新增 `ssl_failure_hint()`：TLS/证书类异常附加「放 CA 到默认目录 / 显式配置路径 / 临时关闭校验」的排查提示。
+- `cloud/sim_data_producer.py` / `cloud/node_result_producer.py`：初始化失败日志追加 `ssl_failure_hint()` 输出。
+- `.env.example` 补充 `HUNTER_CORE_AUTO_DISCOVER_CERTS` / `HUNTER_CORE_SSL_VERIFY` / `HUNTER_SIM_CERT_DIRS` 及说明。
+
+### 向后兼容
+
+- `overview` 为**新增可选流**：不传 `stream` 时行为与 V3.4.0 完全一致；平台侧无需改动。
+- 无首帧状态码由 `409` 改为 `204`：如调用方或告警规则按 409 分支判断「相机未挂载」，需同步调整为「204 = 等待首帧 / 非错误」。实例不存在仍为 `404`，并发超限仍为 `503`。
+- `ssl_verify` / `auto_discover_certs` 默认 `true`，未配置证书的场景行为不变；仅当默认目录下存在证书文件时才会自动启用。
+
+### 验证
+
+- `pytest -q` 全量：**1285 passed**，无失败（新增/更新 `tests/test_sensor_mount.py`、`tests/test_builtin_scenario_sensors.py`、`tests/test_adapter_stream.py`、`tests/test_viz_api.py`、`tests/test_sim_data_producer.py`）。
+- `mypy src/hunter_sim`：90 个源文件无问题；`flake8 src tests`：无告警。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.4.1`；
+2. 重启 `huntersim up`；
+3. 预期日志出现 `Overview camera attached: mount=overview_camera fov=100 size=960x540`，`Sim sensors attached` 计数保持 4（环视相机不计入）；
+4. 预期 `/viz` 主视区可见整车及前后左右环境；`curl -o f.jpg "$BASE/api/v1/instances/<ID>/screenshot?stream=overview"` 返回 200；
+5. 预期启动期不再出现 `/screenshot`、`/stream.mjpg`、`/sensors/*` 的 409；
+6. 证书放入 `data/certs/` 或 `data/kafka-certs/` 后重启，预期 `Kafka TLS 证书自动发现: ca=... cert=... key=...` 且 producer 初始化成功；若仍失败，日志会给出可操作提示。
+
+### 分发
+
+镜像 tag `hunter-sim:3.4.1`；wheel / 容器版本号与 `pyproject.toml` 的 `3.4.1` 一致。
 

@@ -27,13 +27,21 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
-# 支持的视频/点云流（与 ROS 话题、mcap topic 一一对应）
+# 支持的视频/点云流（rgb/depth/lidar/imu 与 ROS 话题、mcap topic 对应；
+# overview 仅用于可视化环视主视区，不录 mcap、不发 ROS）
 STREAM_RGB = "rgb"
 STREAM_DEPTH = "depth"
 STREAM_LIDAR = "lidar"
 STREAM_IMU = "imu"
+STREAM_OVERVIEW = "overview"
 
-KNOWN_STREAMS: tuple[str, ...] = (STREAM_RGB, STREAM_DEPTH, STREAM_LIDAR, STREAM_IMU)
+KNOWN_STREAMS: tuple[str, ...] = (
+    STREAM_RGB,
+    STREAM_DEPTH,
+    STREAM_LIDAR,
+    STREAM_IMU,
+    STREAM_OVERVIEW,
+)
 
 # fps 滑动窗口时长（秒）：太短会抖动，太长会掩盖掉帧
 _FPS_WINDOW_S = 5.0
@@ -46,7 +54,7 @@ class Frame:
     """一帧传感器数据（不可变快照）。
 
     Attributes:
-        stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu``）。
+        stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu`` / ``overview``）。
         ts: 数据时间戳（Unix 秒，CARLA 仿真时刻）。
         seq: 该流的单调递增帧序号（从 1 开始）。
         payload: 序列化后的原始字节（JPEG/PNG/点云/IMU 二进制）。
@@ -184,6 +192,7 @@ __all__ = [
     "STREAM_DEPTH",
     "STREAM_IMU",
     "STREAM_LIDAR",
+    "STREAM_OVERVIEW",
     "STREAM_RGB",
     "now_ts",
 ]

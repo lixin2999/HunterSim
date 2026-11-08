@@ -45,6 +45,9 @@ _MOUNT_KEY_TO_TYPE: dict[str, SensorType] = {
     "lidar": SensorType.LIDAR,
     "rgb_camera": SensorType.RGB_CAMERA,
     "camera_front_rgb": SensorType.RGB_CAMERA,
+    # 仅可视化用环视相机（不录 mcap / 不发 ROS）；类型复用 RGB_CAMERA，
+    # 通过 mount_id 与前置相机区分
+    "overview_camera": SensorType.RGB_CAMERA,
     "depth_camera": SensorType.DEPTH_CAMERA,
     "camera_front_depth": SensorType.DEPTH_CAMERA,
     "imu": SensorType.IMU,
@@ -73,6 +76,13 @@ _DEFAULT_MOUNTS: dict[str, dict[str, Any]] = {
         "anchor": "front_edge",
         "offset_m": {"x": -0.45, "y": 0.0, "z": -0.10},
         "rot_deg": {"pitch": -8.0, "yaw": 0.0, "roll": 0.0},
+    },
+    # 环视主视区：挂在车尾后上方并俯视，确保整车前后左右都在画面内
+    "overview_camera": {
+        "mount_id": "overview_camera",
+        "anchor": "rear_edge",
+        "offset_m": {"x": -5.0, "y": 0.0, "z": 2.5},
+        "rot_deg": {"pitch": -20.0, "yaw": 0.0, "roll": 0.0},
     },
     "imu": {
         "mount_id": "imu_cg",
@@ -104,6 +114,15 @@ _DEFAULT_MOUNTS: dict[str, dict[str, Any]] = {
         "offset_m": {"x": 0.0, "y": 0.0, "z": 0.10},
         "rot_deg": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
     },
+}
+
+#: 环视相机默认参数（仅可视化，不进 ROS / mcap）
+_DEFAULT_OVERVIEW_CAMERA: dict[str, Any] = {
+    "enabled": True,
+    "width": 960,
+    "height": 540,
+    "fov_deg": 100.0,
+    "fps": 10.0,
 }
 
 
@@ -394,12 +413,8 @@ def _log_mount_source(
 # ─── 配置加载与换算 ───────────────────────────────────────────────────────────
 
 
-def load_mount_config(path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
-    """读取 ``configs/sensor_configs.json`` 的 ``mounts`` 段。
-
-    查找顺序：显式 ``path`` → ``HUNTER_SIM_SENSOR_CONFIGS`` → 仓库 ``configs/``
-    → 当前工作目录 ``configs/``。全部缺失时使用内建默认（仅锚点+余量），并告警。
-    """
+def _config_candidates(path: Optional[Path] = None) -> list[Path]:
+    """返回传感器配置候选路径（显式 → 环境变量 → 仓库 → 工作目录）。"""
     candidates: list[Path] = []
     if path is not None:
         candidates.append(Path(path))
@@ -408,20 +423,42 @@ def load_mount_config(path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
         candidates.append(Path(env_path))
     candidates.append(Path(__file__).resolve().parents[3] / "configs" / "sensor_configs.json")
     candidates.append(Path.cwd() / "configs" / "sensor_configs.json")
+    return candidates
 
-    config_path = next((item for item in candidates if item.is_file()), None)
+
+def _find_config_file(path: Optional[Path] = None) -> Optional[Path]:
+    """定位第一个存在的配置文件（不存在返回 None）。"""
+    return next((item for item in _config_candidates(path) if item.is_file()), None)
+
+
+def _read_config_data(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """读取并解析配置文件（找不到文件返回 None）。"""
+    config_path = _find_config_file(path)
     if config_path is None:
-        logger.warning(
-            "sensor_configs.json 未找到（%s），使用内建锚点+余量默认值",
-            ", ".join(str(item) for item in candidates),
-        )
-        return _copy_default_mounts()
+        return None
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigurationError(
             "load_sensor_configs", f"读取 {config_path} 失败: {exc}"
         ) from exc
+    return data if isinstance(data, dict) else None
+
+
+def load_mount_config(path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
+    """读取 ``configs/sensor_configs.json`` 的 ``mounts`` 段。
+
+    查找顺序：显式 ``path`` → ``HUNTER_SIM_SENSOR_CONFIGS`` → 仓库 ``configs/``
+    → 当前工作目录 ``configs/``。全部缺失时使用内建默认（仅锚点+余量），并告警。
+    """
+    config_path = _find_config_file(path)
+    if config_path is None:
+        logger.warning(
+            "sensor_configs.json 未找到（%s），使用内建锚点+余量默认值",
+            ", ".join(str(item) for item in _config_candidates(path)),
+        )
+        return _copy_default_mounts()
+    data = _read_config_data(path)
     mounts = data.get("mounts") if isinstance(data, dict) else None
     if not isinstance(mounts, dict) or not mounts:
         raise ConfigurationError(
@@ -430,6 +467,24 @@ def load_mount_config(path: Optional[Path] = None) -> dict[str, dict[str, Any]]:
     merged = _copy_default_mounts()
     merged.update({str(key): value for key, value in mounts.items() if isinstance(value, dict)})
     return merged
+
+
+def load_overview_camera_config(path: Optional[Path] = None) -> dict[str, Any]:
+    """读取 ``overview_camera`` 段（环视相机分辨率/FOV/帧率）。
+
+    配置文件缺失或该段不存在时使用内建默认值；数值非法留给
+    ``RGBCameraConfig`` 校验抛错，由调用方降级为不挂载。
+    """
+    config = dict(_DEFAULT_OVERVIEW_CAMERA)
+    try:
+        data = _read_config_data(path)
+    except ConfigurationError as exc:
+        logger.warning(f"overview_camera 配置读取失败，使用默认值: {exc}")
+        return config
+    section = data.get("overview_camera") if isinstance(data, dict) else None
+    if isinstance(section, dict):
+        config.update(section)
+    return config
 
 
 def _copy_default_mounts() -> dict[str, dict[str, Any]]:
@@ -611,11 +666,21 @@ class SensorMountManager:
                 return spec
         return None
 
+    def get_mount_by_id(self, mount_id: str) -> Optional[SensorMountSpec]:
+        """按安装位置 ID 查找（同类型多安装位时用于精确指定）。"""
+        self._ensure_mounts()
+        target = (mount_id or "").strip()
+        for spec in self._mounts:
+            if spec.mount_id == target:
+                return spec
+        return None
+
     def attach_sensor(
         self,
         sensor_type: SensorType,
         blueprint: Any,
         world: Any,
+        mount_id: Optional[str] = None,
     ) -> Any:
         """在车辆上挂载指定类型的传感器。
 
@@ -623,6 +688,7 @@ class SensorMountManager:
             sensor_type: 传感器类型。
             blueprint: 已配置的 ActorBlueprint。
             world: CARLA World 对象。
+            mount_id: 指定安装位置 ID（None 时取该类型第一个挂载点）。
 
         Returns:
             生成的传感器 Actor。
@@ -630,11 +696,12 @@ class SensorMountManager:
         Raises:
             SensorSimulationError: 找不到安装位置或生成失败。
         """
-        mount = self.get_mount(sensor_type)
+        mount = self.get_mount_by_id(mount_id) if mount_id else self.get_mount(sensor_type)
         if mount is None:
-            raise SensorSimulationError(
-                sensor_type.value, "unknown", f"No mount position for {sensor_type.value}"
-            )
+            detail = f"No mount position for {sensor_type.value}"
+            if mount_id:
+                detail = f"No mount position '{mount_id}' for {sensor_type.value}"
+            raise SensorSimulationError(sensor_type.value, mount_id or "unknown", detail)
 
         try:
             tf = mount.to_carla_transform()
@@ -691,6 +758,7 @@ __all__ = [
     "SensorMountSpec",
     "compute_local_transform",
     "load_mount_config",
+    "load_overview_camera_config",
     "local_envelope",
     "resolve_envelope",
     "resolve_mount_transforms",

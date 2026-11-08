@@ -187,6 +187,22 @@ class TestMountQueries:
         assert camera.z == pytest.approx(1.40)
         assert camera.pitch_deg == pytest.approx(-8.0)
 
+    def test_overview_camera_uses_rear_edge_and_look_down(self) -> None:
+        """环视相机挂在车尾后上方（rear_edge + offset，pitch=-20），与前置 RGB 分离。"""
+        mgr = SensorMountManager(_FakeVehicle())
+        overview = mgr.get_mount_by_id("overview_camera")
+        assert overview is not None
+        assert overview.sensor_type == SensorType.RGB_CAMERA
+        # rear_edge = center_x(0) - extent_x(2.0)；再后移 5m、升高 2.5m
+        assert overview.x == pytest.approx(-7.0)
+        assert overview.y == pytest.approx(0.0)
+        assert overview.z == pytest.approx(4.0)
+        assert overview.pitch_deg == pytest.approx(-20.0)
+        # 按类型查询仍返回前置相机（overview 不参与数据链路的默认挂载）
+        front = mgr.get_mount(SensorType.RGB_CAMERA)
+        assert front is not None
+        assert front.mount_id == "camera_front_rgb"
+
     def test_missing_bbox_is_loud(self) -> None:
         with pytest.raises(SensorSimulationError):
             SensorMountManager(_NoBBoxVehicle())
@@ -258,6 +274,25 @@ class TestAttachDetach:
         mgr = SensorMountManager(_FakeVehicle())
         with pytest.raises(SensorSimulationError):
             mgr.attach_sensor(SensorType.IMU, blueprint="bp", world=_BoomWorld())
+
+    def test_attach_by_mount_id(self) -> None:
+        mgr = SensorMountManager(_FakeVehicle())
+        world = _FakeWorld()
+        actor = mgr.attach_sensor(
+            SensorType.RGB_CAMERA, blueprint="bp", world=world, mount_id="overview_camera"
+        )
+        assert mgr.attached_count == 1
+        assert mgr._attached["overview_camera"] is actor
+
+    def test_attach_unknown_mount_id_raises(self) -> None:
+        mgr = SensorMountManager(_FakeVehicle())
+        with pytest.raises(SensorSimulationError):
+            mgr.attach_sensor(
+                SensorType.RGB_CAMERA,
+                blueprint="bp",
+                world=_FakeWorld(),
+                mount_id="missing_mount",
+            )
 
     def test_detach_single(self) -> None:
         mgr = SensorMountManager(_FakeVehicle())

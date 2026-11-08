@@ -28,7 +28,7 @@
   var LOG_MAX_LINES = 1500;
   var VIDEO_WATCHDOG_MS = 6000;
   var TERMINAL = ["succeeded", "failed", "canceled"];
-  var STREAM_ORDER = ["rgb", "depth", "lidar", "imu"];
+  var STREAM_ORDER = ["overview", "rgb", "depth", "lidar", "imu"];
 
   var state = {
     instanceId: "",
@@ -317,9 +317,15 @@
   }
 
   // 终态实例（succeeded/failed/canceled）不会再产生新帧：帧类轮询必须短路，
-  // 否则 /sensors/lidar 、/sensors/imu 会持续返回 409 并刷满服务端日志
+  // 否则 /sensors/lidar 、/sensors/imu 会持续返回无内容并刷满服务端日志
   function isTerminalInstance() {
     return TERMINAL.indexOf(state.instanceStatus) >= 0;
+  }
+
+  // 只有 running 的实例才可能有传感器帧：pending（场景加载中）不启动拉流
+  // 与预览轮询，避免启动前的无效请求（平台状态 pending → running）
+  function isRunningInstance() {
+    return state.instanceStatus === "running";
   }
 
   function selectInstance(instanceId) {
@@ -344,11 +350,13 @@
     fillKv($("imu-info"), []);
     updateControls();
     if (state.instanceId) {
-      startVideo(state.instanceId);
+      // 状态未知时先不拉流：等 refreshDetail 拿到 running 后再启动
       refreshDetail();
       refreshSensors();
       refreshEvents();
-      refreshPreviews();
+      setNote("video-empty", "等待实例启动…");
+      setNote("stream-state", "未开始推流");
+      setNote("video-meta", "等待运行");
     } else {
       stopVideo();
       setNote("sensor-note", "未选择实例");
@@ -393,6 +401,17 @@
       return;
     }
     applyRecord(payload);
+    // 平台状态 pending → running 时才启动拉流；running → 终态由下方停流
+    if (isRunningInstance()) {
+      if (!state.videoMode) {
+        startVideo(state.instanceId);
+      }
+    } else if (!isTerminalInstance() && state.videoMode) {
+      stopVideo();
+      setNote("video-empty", "等待实例启动…");
+      setNote("stream-state", "未开始推流");
+      setNote("video-meta", "等待运行");
+    }
     var progress =
       typeof payload.progress_percent === "number" ? payload.progress_percent.toFixed(1) + "%" : "—";
     // 失败/取消时必须把原因写在页面上：平台侧也是靠 message 判断故障类型
@@ -461,12 +480,20 @@
     var stage = img.parentElement;
     stage.classList.remove("live");
     if (TERMINAL.indexOf(state.instanceStatus) >= 0) {
-      // 终态实例不会再有帧：直接说明原因，避免陷入 409 → 截图轮询循环
+      // 终态实例不会再有帧：直接说明原因，避免陷入轮询循环
       state.videoMode = "";
       var reason = state.instanceMessage ? "：" + state.instanceMessage : "";
       setNote("video-empty", "实例已结束（" + state.instanceStatus + "）" + reason);
       setNote("stream-state", "无实时画面（实例已结束）");
       setNote("video-meta", "未推流");
+      return;
+    }
+    if (!isRunningInstance()) {
+      // 场景加载中：不建立 MJPEG 连接（首帧未就绪时服务端只会回 204）
+      state.videoMode = "";
+      setNote("video-empty", "等待实例启动…");
+      setNote("stream-state", "未开始推流");
+      setNote("video-meta", "等待运行");
       return;
     }
     setNote("video-empty", "连接图像流…");
@@ -488,7 +515,7 @@
         switchToScreenshot(instanceId, "MJPEG 不可用（相机未挂载或推流已达上限）");
       }
     };
-    img.src = instancePath("/stream.mjpg?t=" + Date.now(), instanceId);
+    img.src = instancePath("/stream.mjpg?stream=overview&t=" + Date.now(), instanceId);
 
     state.videoWatchdog = window.setTimeout(function () {
       if (state.videoInstance !== instanceId || state.videoMode !== "mjpeg") {
@@ -546,10 +573,18 @@
     var img = $("video");
     var stage = img.parentElement;
     try {
-      var response = await fetch(instancePath("/screenshot?t=" + Date.now(), instanceId), {
-        cache: "no-store"
-      });
-      if (!response.ok) {
+      var response = await fetch(
+        instancePath("/screenshot?stream=overview&t=" + Date.now(), instanceId),
+        {
+          cache: "no-store"
+        }
+      );
+      if (response.status === 204) {
+        // 场景已 running 但首帧还没到：保持轮询并提示等待
+        stage.classList.remove("live");
+        setNote("video-empty", "等待首帧…");
+        setNote("video-meta", "无画面");
+      } else if (!response.ok) {
         stage.classList.remove("live");
         if (response.status === 409) {
           setNote("video-empty", "相机未挂载（场景未加载或实例已结束）");
@@ -652,7 +687,7 @@
   // ── 预览：深度图 / 点云 / IMU ────────────────────────────────────────────
 
   async function refreshPreviews() {
-    if (!state.instanceId || isTerminalInstance()) {
+    if (!state.instanceId || isTerminalInstance() || !isRunningInstance()) {
       return;
     }
     var target = state.instanceId;
@@ -676,6 +711,12 @@
         cache: "no-store"
       });
       if (state.instanceId !== instanceId) {
+        return;
+      }
+      if (response.status === 204) {
+        img.classList.remove("live");
+        $("depth-empty").style.display = "";
+        setNote("depth-empty", "等待深度帧…");
         return;
       }
       if (!response.ok) {
@@ -1012,7 +1053,7 @@
       }
     }, POLL_MS.events);
     setInterval(function () {
-      if (!isTerminalInstance()) {
+      if (!isTerminalInstance() && isRunningInstance()) {
         refreshPreviews();
       }
     }, POLL_MS.preview);

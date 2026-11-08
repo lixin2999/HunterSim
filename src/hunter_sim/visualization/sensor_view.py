@@ -5,6 +5,7 @@ IMU 的 ``repr`` 文本），浏览器无法直接使用，因此在这一层做
 轻量渲染：
 
 - ``rgb``     → 原样返回 JPEG/PNG 字节（客户端 ``<img>`` 直显）；
+- ``overview``→ 同 ``rgb``（仅可视化环视帧，不录 mcap / 不发 ROS）；
 - ``depth``   → 归一化为 8bit 灰度 PNG（近处亮、远处暗，截断 0~50 m）；
 - ``lidar``   → 抽样后的点坐标 JSON（默认上限 4000 点，避免一次推上百 KB）；
 - ``imu``     → 加速度/角速度 JSON。
@@ -27,6 +28,7 @@ from hunter_sim.sensor_sim.frame_hub import (
     STREAM_DEPTH,
     STREAM_IMU,
     STREAM_LIDAR,
+    STREAM_OVERVIEW,
     STREAM_RGB,
     Frame,
 )
@@ -218,7 +220,7 @@ def render_stream(frame: Frame, *, max_points: int = 4000, max_width: int = 480)
     Returns:
         ``(payload, media_type)``；无法渲染时 payload 为空串（由路由转 503）。
     """
-    if frame.stream == STREAM_RGB:
+    if frame.stream in (STREAM_RGB, STREAM_OVERVIEW):
         content_type = str(frame.meta.get("content_type") or "image/jpeg")
         return frame.payload, content_type
     if frame.stream == STREAM_DEPTH:

@@ -57,6 +57,17 @@ class StreamLimitExceeded(RuntimeError):
         self.limit = limit
 
 
+def _latest_frame(hub: FrameHub, stream: Optional[str]) -> Optional[Frame]:
+    """取指定流最新帧；指定流无帧时回退 ``rgb``（缺省即 ``rgb``）。"""
+    name = (stream or STREAM_RGB).strip().lower()
+    frame = hub.latest(name)
+    if frame is not None:
+        return frame
+    if name != STREAM_RGB:
+        return hub.latest(STREAM_RGB)
+    return None
+
+
 class AdapterService:
     """控制面编排（create/submit/control/query）。
 
@@ -288,12 +299,15 @@ class AdapterService:
             "disk_usage_ratio": _disk_usage_ratio(self._adapter.recordings_dir),
         }
 
-    def screenshot(self, instance_id: str) -> Optional[Frame]:
-        """取实例最新 RGB 帧（无活动场景/未挂相机时返回 None）。"""
+    def screenshot(self, instance_id: str, stream: Optional[str] = None) -> Optional[Frame]:
+        """取实例最新帧（默认 ``rgb``；``overview`` 无帧时回退 ``rgb``）。
+
+        无活动场景/未挂相机时返回 None。
+        """
         hub = self._frame_hub_provider(instance_id)
         if hub is None:
             return None
-        return hub.latest(STREAM_RGB)
+        return _latest_frame(hub, stream)
 
     # ── 可视化只读视图（/viz 面板数据源） ──────────────────────────────────────
 
@@ -401,9 +415,9 @@ class AdapterService:
             return self._stream_clients
 
     async def stream_frames(
-        self, instance_id: str, fps: Optional[float] = None
+        self, instance_id: str, fps: Optional[float] = None, stream: Optional[str] = None
     ) -> AsyncGenerator[Frame, None]:
-        """持续产出最新 RGB 帧（客户端断开即终止）。
+        """持续产出最新帧（默认 ``rgb``；``overview`` 无帧时回退 ``rgb``）。
 
         异步生成器：帧读取本身非阻塞，等待用 ``asyncio.sleep``，因此不占用
         anyio 工作线程（同步生成器 + ``time.sleep`` 会每个客户端独占 1 个线程，
@@ -415,6 +429,7 @@ class AdapterService:
         Args:
             instance_id: 实例 ID。
             fps: 推流帧率（None 时取 ``ADAPTER_STREAM_FPS``）。
+            stream: 流名（None 时取 ``rgb``）。
 
         Raises:
             StreamLimitExceeded: 在线客户端数已达 ``stream_max_clients`` 上限。
@@ -429,7 +444,7 @@ class AdapterService:
                 hub = self._frame_hub_provider(instance_id)
                 if hub is None:
                     return
-                frame = hub.latest(STREAM_RGB)
+                frame = _latest_frame(hub, stream)
                 if frame is not None:
                     last_frame = frame
                     last_seen_at = time.time()

@@ -313,6 +313,19 @@ class KafkaSettings(BaseSettings):
     client_key_path: OptionalStr = Field(
         None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
     )
+    ssl_verify: bool = Field(
+        True,
+        description=(
+            "是否校验 Kafka broker 服务端证书（False 时构造 CERT_NONE 的 "
+            "ssl.SSLContext，仅限内网自签环境临时使用）"
+        ),
+    )
+    auto_discover_certs: bool = Field(
+        True,
+        description=(
+            "未显式配置证书路径时自动搜索 data/certs、data/kafka-certs、certs 目录"
+        ),
+    )
     # ── V2.7.0 P1-8：消费自愈与坏消息 DLQ ──
     enable_self_heal: bool = Field(
         True, description="连续轮询错误达阈值后自动重建 KafkaConsumer（P1-8）"
@@ -517,6 +530,12 @@ class CloudSettings(BaseSettings):
     )
     client_key_path: OptionalStr = Field(
         None, description="mTLS 客户端私钥路径（须与 client_cert_path 成对配置）"
+    )
+    ssl_verify: bool = Field(
+        True, description="是否校验 Kafka broker 服务端证书（False 仅限内网自签环境）"
+    )
+    auto_discover_certs: bool = Field(
+        True, description="未显式配置证书路径时自动搜索 data/certs 等目录"
     )
     # ── sim_id 与 Topic 模板 ──
     sim_id: str = Field("", description="当前实例 sim_id（空=运行时由 instance_manager 分配）")
@@ -774,6 +793,10 @@ class HunterSimSettings(BaseSettings):
             overrides["client_cert_path"] = self.cloud.client_cert_path
         if "client_key_path" not in kafka_fields and self.cloud.client_key_path:
             overrides["client_key_path"] = self.cloud.client_key_path
+        if "ssl_verify" not in kafka_fields:
+            overrides["ssl_verify"] = self.cloud.ssl_verify
+        if "auto_discover_certs" not in kafka_fields:
+            overrides["auto_discover_certs"] = self.cloud.auto_discover_certs
 
         if overrides:
             self.kafka = self.kafka.model_copy(update=overrides)

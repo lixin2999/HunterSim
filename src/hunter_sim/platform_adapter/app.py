@@ -393,14 +393,27 @@ def _register_routes(app: FastAPI) -> None:
         return _control(_service(request).stop(instance_id), instance_id)
 
     @app.get("/api/v1/instances/{instance_id}/screenshot")
-    def screenshot(instance_id: str, request: Request) -> Response:
-        """当前 RGB 相机单帧截图（未挂相机→409，实例不存在→404）。"""
+    def screenshot(
+        instance_id: str,
+        request: Request,
+        stream: Optional[str] = Query(
+            None,
+            description="流名（默认 rgb；overview 用于环视主视区，无帧回退 rgb）",
+        ),
+    ) -> Response:
+        """当前相机单帧截图（无帧→204，实例不存在→404）。"""
         service = _service(request)
         if service.get(instance_id) is None:
             raise _not_found(instance_id)
-        frame = service.screenshot(instance_id)
+        frame = (
+            service.screenshot(instance_id, stream)
+            if stream
+            else service.screenshot(instance_id)
+        )
         if frame is None:
-            raise HTTPException(status_code=409, detail="camera_not_attached")
+            # 场景启动早期还没有首帧：用 204 表示「暂无内容」，
+            # 避免前端把正常的启动等待打成 409 错误日志
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
         media_type = str(frame.meta.get("content_type") or "image/jpeg")
         return Response(
             content=frame.payload,
@@ -409,25 +422,42 @@ def _register_routes(app: FastAPI) -> None:
         )
 
     @app.get("/api/v1/instances/{instance_id}/stream.mjpg")
-    async def stream_mjpeg(instance_id: str, request: Request) -> StreamingResponse:
+    async def stream_mjpeg(
+        instance_id: str,
+        request: Request,
+        stream: Optional[str] = Query(
+            None,
+            description="流名（默认 rgb；overview 用于环视主视区，无帧回退 rgb）",
+        ),
+    ) -> Response:
         """MJPEG 实时画面（``multipart/x-mixed-replace``，客户端断开即结束）。
 
         异步端点：等待用 ``asyncio.sleep``，不占用 anyio 工作线程。
         并发客户端超 ``ADAPTER_STREAM_MAX_CLIENTS`` 时返回 503（而不是把控制面拖满）。
+        首帧未就绪时返回 204（而非 409），前端按「等待首帧」展示。
         """
         service = _service(request)
         if service.get(instance_id) is None:
             raise _not_found(instance_id)
-        if service.screenshot(instance_id) is None:
-            raise HTTPException(status_code=409, detail="camera_not_attached")
-        frames = service.stream_frames(instance_id)
+        first_frame = (
+            service.screenshot(instance_id, stream)
+            if stream
+            else service.screenshot(instance_id)
+        )
+        if first_frame is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        frames = (
+            service.stream_frames(instance_id, stream=stream)
+            if stream
+            else service.stream_frames(instance_id)
+        )
         # 先拉首帧：名额超限（StreamLimitExceeded）只能在首次迭代抛出，
         # 此时返回 503 比“先 200 再中途断流”对平台友好
         try:
             first = await anext(frames)
         except StopAsyncIteration:
             await frames.aclose()
-            raise HTTPException(status_code=409, detail="camera_not_attached") from None
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
         except StreamLimitExceeded as exc:
             raise HTTPException(status_code=503, detail="stream_limit_reached") from exc
         return StreamingResponse(

@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from hunter_sim.common.models import HunterSimSettings, VizSettings
 from hunter_sim.common.utils import get_logger
 from hunter_sim.platform_adapter.models import ACTIVE_STATUSES
-from hunter_sim.sensor_sim.frame_hub import KNOWN_STREAMS, STREAM_RGB
+from hunter_sim.sensor_sim.frame_hub import KNOWN_STREAMS, STREAM_OVERVIEW, STREAM_RGB
 from hunter_sim.visualization.logbus import LogBus, LogRecord, normalize_level
 from hunter_sim.visualization.sensor_view import render_stream
 
@@ -201,7 +201,8 @@ def register_viz_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail=f"unknown sensor stream: {stream}")
         frame = _read_frame(service, instance_id, name)
         if frame is None:
-            raise HTTPException(status_code=409, detail=f"sensor_frame_unavailable:{name}")
+            # 场景启动早期尚无帧：204 让前端显示「等待首帧」而不刷 409 错误
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
         viz = _viz(request)
         payload, media_type = render_stream(
             frame,
@@ -370,7 +371,7 @@ def _log_stats(request: Request) -> dict[str, Any]:
 
 
 def _read_frame(service: Any, instance_id: str, stream: str) -> Any:
-    """读取指定流最新帧（兼容只有 ``screenshot`` 的测试替身）。"""
+    """读取指定流最新帧（``overview`` 无帧回退 ``rgb``）。"""
     getter = getattr(service, "sensor_frame", None)
     if callable(getter):
         try:
@@ -380,7 +381,15 @@ def _read_frame(service: Any, instance_id: str, stream: str) -> Any:
             frame = None
         if frame is not None:
             return frame
-    if stream != STREAM_RGB:
+        if stream == STREAM_OVERVIEW:
+            try:
+                frame = getter(instance_id, STREAM_RGB)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Viz overview fallback failed for {instance_id}: {exc}")
+                frame = None
+            if frame is not None:
+                return frame
+    if stream not in (STREAM_RGB, STREAM_OVERVIEW):
         return None
     fallback = getattr(service, "screenshot", None)
     if not callable(fallback):

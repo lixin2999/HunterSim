@@ -1,7 +1,7 @@
 """实时画面端点测试（``/screenshot`` 与 ``/stream.mjpg``）。
 
 两层覆盖：
-- **端点层**（``platform_adapter/app.py``）：404/409/200 分支、JPEG/PNG 媒体类型、
+- **端点层**（``platform_adapter/app.py``）：404/204/200 分支、JPEG/PNG 媒体类型、
   MJPEG 分片帧头（``--frame`` + Content-Type/Length）与流结束；
 - **编排层**（``platform_adapter/service.py``）：最新帧读取、无新帧时重发上一帧、
   连续无帧超时结束、客户端断开后客户端计数归零、并发客户端上限。
@@ -45,17 +45,19 @@ class _StreamService:
         self._frame = frame
         self._frames = frames or []
         self.stream_calls = 0
+        self.screenshot_streams: list[Optional[str]] = []
 
     def get(self, instance_id: str) -> Optional[InstanceRecord]:
         if instance_id != "inst-1":
             return None
         return InstanceRecord(instance_id="inst-1", sim_id="sim-1", scene_id="scene-1")
 
-    def screenshot(self, instance_id: str) -> Optional[Frame]:
+    def screenshot(self, instance_id: str, stream: Optional[str] = None) -> Optional[Frame]:
+        self.screenshot_streams.append(stream)
         return self._frame
 
     async def stream_frames(
-        self, instance_id: str, fps: Optional[float] = None
+        self, instance_id: str, fps: Optional[float] = None, stream: Optional[str] = None
     ) -> AsyncIterator[Frame]:
         self.stream_calls += 1
         for frame in self._frames:
@@ -87,11 +89,19 @@ class TestScreenshotEndpoint:
             response = client.get("/api/v1/instances/inst-404/screenshot")
         assert response.status_code == 404
 
-    def test_missing_camera_is_409(self) -> None:
+    def test_missing_camera_is_204(self) -> None:
+        """场景启动早期无首帧：204 让前端展示「等待首帧」，不打 409 错误。"""
         with _client(_StreamService(None)) as client:
             response = client.get("/api/v1/instances/inst-1/screenshot")
-        assert response.status_code == 409
-        assert response.json()["detail"] == "camera_not_attached"
+        assert response.status_code == 204
+        assert response.content == b""
+
+    def test_overview_stream_is_forwarded(self) -> None:
+        service = _StreamService(_frame())
+        with _client(service) as client:
+            response = client.get("/api/v1/instances/inst-1/screenshot?stream=overview")
+        assert response.status_code == 200
+        assert service.screenshot_streams == ["overview"]
 
 
 class TestStreamEndpoint:
@@ -99,11 +109,11 @@ class TestStreamEndpoint:
         with _client(_StreamService(_frame())) as client:
             assert client.get("/api/v1/instances/inst-404/stream.mjpg").status_code == 404
 
-    def test_missing_camera_is_409(self) -> None:
+    def test_missing_camera_is_204(self) -> None:
         with _client(_StreamService(None)) as client:
             response = client.get("/api/v1/instances/inst-1/stream.mjpg")
-        assert response.status_code == 409
-        assert response.json()["detail"] == "camera_not_attached"
+        assert response.status_code == 204
+        assert response.content == b""
 
     def test_frames_are_multipart_chunks(self) -> None:
         service = _StreamService(_frame(), [_frame(), _frame(_PNG, "image/png")])

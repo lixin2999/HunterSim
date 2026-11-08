@@ -23,7 +23,7 @@ import threading
 from collections import deque
 from typing import Any, Callable, Optional
 
-from hunter_sim.cloud.kafka_security import build_ssl_kwargs
+from hunter_sim.cloud.kafka_security import build_ssl_kwargs, ssl_failure_hint
 from hunter_sim.cloud.sim_data_mapper import (
     build_artifact,
     build_sensor_file,
@@ -109,7 +109,7 @@ class SimDataProducer:
             SIM_DATA_PRODUCER_ERRORS_TOTAL.labels(sim_id=self._sim_id, op="connect").inc()
             logger.warning(
                 f"SimDataProducer[{self._sim_id}] 初始化失败，降级为 no-op："
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}{ssl_failure_hint(exc)}"
             )
         return self._available
 
