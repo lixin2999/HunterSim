@@ -415,6 +415,26 @@ class TestDispatch:
         assert recorder.messages == []
         assert ros.calls == []
 
+    def test_overview_ignores_stream_max_width(self) -> None:
+        """主视区必须输出相机原生分辨率：不套用数据流的 stream_max_width 降采样。
+
+        现场回归：``ADAPTER_STREAM_MAX_WIDTH``（默认 640）同时作用于 overview，
+        1920x1080 被压成 640 宽后再放大到面板上，画面明显模糊。
+        """
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub, stream_max_width=2)
+
+        scenario._dispatch_sensor_data(  # noqa: SLF001
+            STREAM_OVERVIEW, _image_data(width=8, height=4)
+        )
+
+        frame = hub.latest(STREAM_OVERVIEW)
+        assert frame is not None
+        assert frame.meta["width"] == 8
+        assert frame.meta["height"] == 4
+
     def test_depth_is_recorded_as_metric_image(self) -> None:
         from hunter_sim.sensor_sim.frame_hub import FrameHub
 

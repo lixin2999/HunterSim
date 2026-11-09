@@ -42,7 +42,7 @@
       </div>
       <div class="video-foot">
         <span class="muted" id="stream-state">图像流（MJPEG）</span>
-        <label class="check"><input type="checkbox" id="toggle-depth" /> 深度图预览</label>
+        <label class="check"><input type="checkbox" id="toggle-depth" checked /> 深度图预览</label>
       </div>
     </section>
 
@@ -72,7 +72,7 @@
         <div class="preview-block">
           <h3>深度图（32FC1 → 归一化）</h3>
           <img id="depth-preview" alt="深度图预览" />
-          <p class="muted small" id="depth-empty">未开启（勾选上方「深度图预览」）</p>
+          <p class="muted small" id="depth-empty">等待深度帧…</p>
         </div>
         <div class="preview-block">
           <h3>激光雷达俯视（XY 抽样）</h3>

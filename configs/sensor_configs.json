@@ -115,8 +115,8 @@
   "overview_camera": {
     "description": "仅可视化环视主视区相机（不录 mcap / 不发 ROS）",
     "enabled": true,
-    "width": 960,
-    "height": 540,
+    "width": 1920,
+    "height": 1080,
     "fov_deg": 100.0,
     "fps": 10.0
   },

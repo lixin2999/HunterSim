@@ -116,11 +116,13 @@ _DEFAULT_MOUNTS: dict[str, dict[str, Any]] = {
     },
 }
 
-#: 环视相机默认参数（仅可视化，不进 ROS / mcap）
+#: 环视相机默认参数（仅可视化，不进 ROS / mcap）。
+#: 分辨率取 1080p：主视区是验收画面的唯一来源，960x540 放大后明显模糊；
+#: 编码侧不再降采样（见 ``BuiltinScenario._dispatch_sensor_data``）。
 _DEFAULT_OVERVIEW_CAMERA: dict[str, Any] = {
     "enabled": True,
-    "width": 960,
-    "height": 540,
+    "width": 1920,
+    "height": 1080,
     "fov_deg": 100.0,
     "fps": 10.0,
 }

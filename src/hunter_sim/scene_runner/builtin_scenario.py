@@ -97,6 +97,17 @@ _OVERVIEW_MOUNT_ID = "overview_camera"
 # 避免 RGB/深度/点云/IMU 高负载时可视化画面被饿死
 _OVERVIEW_QUEUE_MAXSIZE = 4
 
+#: 环视主视区 JPEG 质量下限：主视区是验收画面的唯一来源，不再套用数据流质量
+#: （数据流默认 75 只保证传输，主视区需要看清行人与车辆轮廓）
+_OVERVIEW_JPEG_QUALITY = 90
+
+#: 交通参与者「可视距离」告警阈值（米）：超出该距离时环视相机基本拍不到，
+#: 日志给出 WARNING 便于定位「参与者生成了但画面里看不到」
+_MAX_VISIBLE_DISTANCE_M = 80.0
+
+#: 行人脚本化横穿的到达判定阈值（米）
+_WALKER_ARRIVE_EPS_M = 0.3
+
 # 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
 _SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
     SensorType.LIDAR: "lidar",
@@ -122,6 +133,29 @@ _SENSOR_QUEUE_MAXSIZE = 32
 _SENSOR_WORKER_JOIN_TIMEOUT_S = 1.0
 # 帧失败告警限频窗口（秒）：每流首次立即报，之后窗口内聚合成一条
 _SENSOR_ERROR_LOG_INTERVAL_S = 30.0
+
+
+@dataclass
+class _ScriptedWalker:
+    """脚本化行人（walker AI 控制器不可用时的兜底）。
+
+    CARLA 的 ``controller.ai.walker`` 依赖蓝图库与 TM 状态，服务端缺资源时
+    行人会原地不动，可视化里就只看到自车在跑。兜底方案是每个 tick 按速度把
+    行人直行推向横穿目标点，保证画面里始终能看到「行人过街」这一行为。
+
+    Attributes:
+        actor: CARLA walker Actor。
+        destination: 目标点 ``(x, y, z)``。
+        speed_ms: 直行速度（m/s）。
+        carla_module: 已导入的 carla 模块（构造 Transform/Location/Rotation）。
+        done: 是否已到达/放弃（到达后不再抖动）。
+    """
+
+    actor: Any
+    destination: tuple[float, float, float]
+    speed_ms: float
+    carla_module: Any
+    done: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,6 +261,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._participant_controllers: list[ScriptedActorController] = []
         self._walker_controllers: list[WalkerControllerWrapper] = []
         self._walker_ai_controllers: list[Any] = []
+        # 行人 AI 不可用时的脚本化横穿兜底（保证可视化可见）
+        self._scripted_walkers: list[_ScriptedWalker] = []
         self._cut_in_done: set[int] = set()
         # 自车非 autopilot 时的简单速度保持
         self._ego_manual_speed: float = 0.0
@@ -259,22 +295,40 @@ class BuiltinScenario(CustomScenarioBase):
         self._participant_controllers.clear()
         self._walker_controllers.clear()
         self._walker_ai_controllers.clear()
+        self._scripted_walkers.clear()
         self._cut_in_done.clear()
         self._ego_manual_speed = 0.0
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
-        for participant in self._config.traffic_participants:
-            self._spawn_participant(world, library, participant)
+        requested = list(self._config.traffic_participants)
+        spawned_ids: list[str] = []
+        for participant in requested:
+            if self._spawn_participant(world, library, participant):
+                spawned_ids.append(participant.participant_id)
         self._attach_event_sensors(world, library)
         self._attach_sim_sensors(world, library)
         self._configure_ego_motion()
 
         logger.info(
             f"Builtin scenario '{self._config.scene_id}' ready: "
-            f"ego={getattr(self._ego, 'id', 'n/a')}, actors={len(self._actors)}, "
+            f"ego={getattr(self._ego, 'id', 'n/a')}, "
+            f"actors={len(self._actors)}/{len(requested)}, "
             f"sensors={len(self._sensors)}"
         )
+        if len(self._actors) < len(requested):
+            missing = [
+                participant.participant_id
+                for participant in requested
+                if participant.participant_id not in spawned_ids
+            ]
+            logger.warning(
+                "Builtin scenario '%s' 参与者未全部生成：%d/%d，未生成=%s",
+                self._config.scene_id,
+                len(self._actors),
+                len(requested),
+                missing or "未知",
+            )
 
     def tick(self, world: Any, timestamp: float, delta_seconds: float) -> None:
         """每帧推进自车与交通参与者行为。
@@ -284,6 +338,7 @@ class BuiltinScenario(CustomScenarioBase):
         使可视化里自车与参与者真正按场景设置运动。行人由 AI 控制器导航。
         """
         self._apply_ego_manual_speed(delta_seconds)
+        self._advance_scripted_walkers(delta_seconds)
         if not self._participant_controllers:
             return
         for controller in list(self._participant_controllers):
@@ -332,6 +387,7 @@ class BuiltinScenario(CustomScenarioBase):
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"Walker AI controller destroy failed: {exc}")
         self._walker_ai_controllers.clear()
+        self._scripted_walkers.clear()
         self._participant_controllers.clear()
         self._cut_in_done.clear()
 
@@ -429,6 +485,7 @@ class BuiltinScenario(CustomScenarioBase):
                 ),
             )
         self._ego_spawn = self._actual_ego_spawn(actor, actual_spawn)
+        self._tag_ego_role(actor)
         if ego_cfg.autopilot:
             set_autopilot = getattr(actor, "set_autopilot", None)
             if callable(set_autopilot):
@@ -444,37 +501,73 @@ class BuiltinScenario(CustomScenarioBase):
 
     def _spawn_participant(
         self, world: Any, library: Any, participant: TrafficParticipantConfig
-    ) -> None:
+    ) -> bool:
+        """生成单个交通参与者，返回是否成功（失败只告警，不阻断场景）。
+
+        可视化验收要求「画面里必须能看到场景声明的参与者」，因此这里不再静默
+        跳过：蓝图缺失时按 ``actor_type`` 回退到同类通用蓝图，出生点被占用时
+        沿自车航向 / 横向小幅偏移重试；成功后打印参与者 ID / 蓝图 / 坐标与到
+        自车的距离，便于从日志判断它是否落在环视相机视野内。
+        """
         is_walker = participant.actor_type == "walker"
         prefix = "walker." if participant.actor_type in ("walker", "cyclist") else "vehicle."
-        try:
-            blueprint = self._find_blueprint(library, participant.blueprint, prefix)
-            spawn_point = resolve_actor_spawn(
-                self._ego_spawn if self._ego_spawn is not None else self._config.ego_vehicle.spawn_point,
-                participant.spawn_point,
-                self._config.spawn_semantics,
+        blueprint = self._participant_blueprint(library, participant, prefix)
+        if blueprint is None:
+            logger.warning(
+                f"Participant '{participant.participant_id}' spawn skipped: "
+                f"蓝图 '{participant.blueprint}' 及同类回退蓝图均不可用"
             )
-            transform = self._make_transform(world, spawn_point)
-            actor = self._spawn_actor(world, blueprint, transform)
-        except CarlaSimulationError as exc:
-            # 单个参与者失败不阻断整场景（平台可能下发未安装的蓝图）
-            logger.warning(f"Participant '{participant.participant_id}' spawn skipped: {exc}")
-            return
+            return False
+        base = (
+            self._ego_spawn
+            if self._ego_spawn is not None
+            else self._config.ego_vehicle.spawn_point
+        )
+        try:
+            spawn_point = resolve_actor_spawn(
+                base, participant.spawn_point, self._config.spawn_semantics
+            )
+        except Exception as exc:  # noqa: BLE001  坐标非法不影响其他参与者
+            logger.warning(
+                f"Participant '{participant.participant_id}' spawn skipped: {exc}"
+            )
+            return False
+
+        actor: Any = None
+        actual = spawn_point
+        for candidate in self._participant_spawn_candidates(spawn_point):
+            try:
+                transform = self._make_transform(world, candidate)
+                actor = self._spawn_actor(world, blueprint, transform)
+            except CarlaSimulationError as exc:
+                # 无 CARLA SDK / 变换构造失败：重试无意义，直接报原因
+                logger.warning(
+                    f"Participant '{participant.participant_id}' spawn skipped: {exc}"
+                )
+                return False
+            if actor is not None:
+                actual = candidate
+                break
         if actor is None:
-            logger.warning(f"Participant '{participant.participant_id}' spawn failed (位置被占用)")
-            return
+            logger.warning(
+                f"Participant '{participant.participant_id}' spawn failed: "
+                f"全部候选出生点被占用（起点 {spawn_point.x:.1f},{spawn_point.y:.1f}）"
+            )
+            return False
+
         self._actors.append(actor)
+        self._log_participant_spawned(participant, actor, actual)
 
         try:
             if is_walker:
                 if participant.behavior == ScenarioBehaviorType.STATIC:
-                    return  # 静止行人：不挂 AI 控制器，保持原地
-                self._setup_walker_ai(world, library, actor, spawn_point, participant)
-                return
+                    return True  # 静止行人：不挂 AI 控制器，保持原地
+                self._setup_walker_ai(world, library, actor, actual, participant)
+                return True
             if participant.behavior == ScenarioBehaviorType.STATIC:
                 # 静止障碍：显式刹停，避免被 TM 接管后自行开走
                 self._apply_vehicle_control(actor, throttle=0.0, brake=1.0, steer=0.0)
-                return
+                return True
             # 车辆类参与者统一交给 TM autopilot 保持在车道内行驶；
             # 场景化行为再通过每帧期望速度 / 变道指令叠加。
             self._enable_autopilot(actor, participant)
@@ -484,6 +577,116 @@ class BuiltinScenario(CustomScenarioBase):
         except Exception as exc:  # noqa: BLE001  单个参与者行为配置失败不影响场景
             logger.warning(
                 f"Participant '{participant.participant_id}' motion setup failed: {exc}"
+            )
+        return True
+
+    @staticmethod
+    def _participant_blueprint(
+        library: Any, participant: TrafficParticipantConfig, prefix: str
+    ) -> Any:
+        """按配置取参与者蓝图；缺失时回退到同类通用蓝图（不抛异常）。"""
+        try:
+            return BuiltinScenario._find_blueprint(library, participant.blueprint, prefix)
+        except CarlaSimulationError as exc:
+            logger.info(
+                f"Participant '{participant.participant_id}' blueprint fallback: {exc}"
+            )
+        fallbacks = (
+            ("walker.pedestrian.0001", "walker.pedestrian.*")
+            if prefix == "walker."
+            else ("vehicle.tesla.model3", "vehicle.*")
+        )
+        for candidate in fallbacks:
+            if candidate.endswith("*"):
+                try:
+                    matches = list(library.filter(candidate))
+                except Exception:  # noqa: BLE001  蓝图库不支持 filter
+                    matches = []
+                if matches:
+                    logger.warning(
+                        f"Participant '{participant.participant_id}' 使用通配回退蓝图 "
+                        f"'{getattr(matches[0], 'id', candidate)}'"
+                    )
+                    return matches[0]
+                continue
+            blueprint = _safe_find(library, candidate)
+            if blueprint is not None:
+                logger.warning(
+                    f"Participant '{participant.participant_id}' 蓝图 "
+                    f"'{participant.blueprint}' 不可用，回退到 '{candidate}'"
+                )
+                return blueprint
+        return None
+
+    def _participant_spawn_candidates(self, spawn_point: SpawnPoint) -> list[SpawnPoint]:
+        """参与者出生点候选：原坐标优先，被占用时做小幅偏移重试。
+
+        CARLA 的 ``try_spawn_actor`` 在位置重叠时返回 None；若只试一个点，
+        参与者会被静默丢弃（画面里就只剩自车）。这里沿自车航向前后 / 左右
+        各偏移 2~6m 重试，仍失败才报 WARNING。
+        """
+        base = self._ego_spawn
+        yaw = math.radians(base.yaw_deg if base is not None else spawn_point.yaw_deg)
+        forward = (math.cos(yaw), math.sin(yaw))
+        lateral = (-math.sin(yaw), math.cos(yaw))
+        offsets = (
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (-2.0, 0.0),
+            (0.0, 2.0),
+            (0.0, -2.0),
+            (4.0, 2.0),
+            (-4.0, -2.0),
+            (6.0, 0.0),
+            (-6.0, 0.0),
+        )
+        return [
+            SpawnPoint(
+                x=spawn_point.x + forward[0] * ahead + lateral[0] * side,
+                y=spawn_point.y + forward[1] * ahead + lateral[1] * side,
+                z=spawn_point.z,
+                yaw_deg=spawn_point.yaw_deg,
+            )
+            for ahead, side in offsets
+        ]
+
+    def _distance_to_ego(self, spawn_point: SpawnPoint) -> Optional[float]:
+        """参与者出生点到自车的水平距离（无自车基准时返回 None）。"""
+        ego = self._ego_spawn
+        if ego is None:
+            return None
+        return math.hypot(spawn_point.x - ego.x, spawn_point.y - ego.y)
+
+    def _log_participant_spawned(
+        self, participant: TrafficParticipantConfig, actor: Any, spawn_point: SpawnPoint
+    ) -> None:
+        """参与者生成成功日志 + 「可能拍不到」告警（可视化验收排障用）。"""
+        distance = self._distance_to_ego(spawn_point)
+        distance_text = "n/a" if distance is None else f"{distance:.1f}m"
+        behavior = getattr(participant.behavior, "value", participant.behavior)
+        logger.info(
+            "Participant '%s' spawned: actor=%s blueprint=%s type=%s behavior=%s "
+            "spawn=(%.1f,%.1f,%.1f,yaw=%.0f) distance_to_ego=%s",
+            participant.participant_id,
+            getattr(actor, "id", "n/a"),
+            getattr(actor, "type_id", participant.blueprint),
+            participant.actor_type,
+            behavior,
+            spawn_point.x,
+            spawn_point.y,
+            spawn_point.z,
+            spawn_point.yaw_deg,
+            distance_text,
+        )
+        if participant.behavior == ScenarioBehaviorType.STATIC:
+            return
+        if distance is not None and distance > _MAX_VISIBLE_DISTANCE_M:
+            logger.warning(
+                "Participant '%s' 距自车 %.1fm（> %.0fm），环视主视区可能拍不到；"
+                "如需看到行为请收小平台下发的相对偏移",
+                participant.participant_id,
+                distance,
+                _MAX_VISIBLE_DISTANCE_M,
             )
 
     # ── 运动/行为控制 ─────────────────────────────────────────────────────
@@ -722,50 +925,171 @@ class BuiltinScenario(CustomScenarioBase):
         spawn_point: SpawnPoint,
         participant: TrafficParticipantConfig,
     ) -> None:
-        """为行人挂载 AI 控制器并导航横穿道路（失败时保持静态）。"""
+        """为行人挂载 AI 控制器并导航横穿自车车道。
+
+        AI 控制器必须用**相对** transform 附着到行人上：CARLA 的
+        ``spawn_actor(..., attach_to=actor)`` 语义下 transform 是相对父级的偏移，
+        传世界坐标会把控制器摆到「出生点×2」的位置，导航目标因此错位，画面里
+        就看不到行人过街。AI 控制器缺失 / 导航启动失败时退化为脚本化直行，
+        保证可视化里仍能看到行人行为。
+        """
         try:
             import carla  # noqa: PLC0415  惰性导入：无 SDK 环境跳过
         except ImportError:
             logger.warning("carla SDK 不可用，行人保持静态")
             return
+        speed = float(participant.speed_ms) if participant.speed_ms > 0 else 1.2
+        speed = min(1.4, max(0.3, speed))
+        destination = self._walker_destination(spawn_point, carla)
+
         blueprint = _safe_find(library, "controller.ai.walker")
         if blueprint is None:
-            logger.warning("controller.ai.walker 蓝图缺失，行人保持静态")
+            logger.warning(
+                f"Participant '{participant.participant_id}' controller.ai.walker "
+                "蓝图缺失，退化为脚本化横穿"
+            )
+            self._register_scripted_walker(
+                actor, spawn_point, destination, speed, participant, carla
+            )
             return
         try:
-            controller = world.spawn_actor(
-                blueprint, carla.Transform(), attach_to=actor
-            )
+            controller = world.spawn_actor(blueprint, carla.Transform(), attach_to=actor)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Participant '{participant.participant_id}' walker controller spawn failed: {exc}"
+                f"Participant '{participant.participant_id}' walker controller spawn "
+                f"failed: {exc}；退化为脚本化横穿"
+            )
+            self._register_scripted_walker(
+                actor, spawn_point, destination, speed, participant, carla
             )
             return
         self._walker_ai_controllers.append(controller)
-        speed = float(participant.speed_ms) if participant.speed_ms > 0 else 1.2
-        speed = min(1.4, max(0.3, speed))
         try:
             wrapper = WalkerControllerWrapper(actor, controller)
-            destination = self._walker_destination(spawn_point, carla)
             wrapper.start_navigation(destination, speed_ms=speed)
             self._walker_controllers.append(wrapper)
-            logger.info(
-                f"Walker '{participant.participant_id}' crossing at {speed:.2f} m/s"
-            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Participant '{participant.participant_id}' walker navigation failed: {exc}"
+                f"Participant '{participant.participant_id}' walker navigation "
+                f"failed: {exc}；退化为脚本化横穿"
             )
+            self._register_scripted_walker(
+                actor, spawn_point, destination, speed, participant, carla
+            )
+            return
+        logger.info(
+            "Walker '%s' crossing at %.2f m/s: from=(%.1f,%.1f) to=(%.1f,%.1f) "
+            "distance_to_ego=%s",
+            participant.participant_id,
+            speed,
+            spawn_point.x,
+            spawn_point.y,
+            float(getattr(destination, "x", 0.0)),
+            float(getattr(destination, "y", 0.0)),
+            _format_distance(self._distance_to_ego(spawn_point)),
+        )
 
-    @staticmethod
-    def _walker_destination(spawn_point: SpawnPoint, carla_module: Any) -> Any:
-        """计算横穿目的地：沿道路横向（相对出生朝向）偏移 8m。"""
-        yaw = math.radians(spawn_point.yaw_deg)
-        offset = 8.0
-        x = spawn_point.x - math.sin(yaw) * offset
-        y = spawn_point.y + math.cos(yaw) * offset
+    def _walker_destination(self, spawn_point: SpawnPoint, carla_module: Any) -> Any:
+        """计算行人横穿目的地：朝自车车道方向走过整条车道。
+
+        方向取「垂直于自车航向」的横向：行人在自车左侧就向右走，反之向左走。
+        这样无论平台下发的 yaw 是「朝车道」还是「顺车道」，画面里都能看到行人
+        从路边走向 / 穿过自车行驶线；距离按横向偏离量 + 安全余量取 8~18m，
+        比固定 8m 更容易在环视相机里持续可见。
+        """
+        ego = self._ego_spawn
+        heading = math.radians(ego.yaw_deg if ego is not None else spawn_point.yaw_deg)
+        # 自车左侧单位向量（yaw 以北向顺时针为正）
+        left_x, left_y = -math.sin(heading), math.cos(heading)
+        side = 0.0
+        if ego is not None:
+            side = (spawn_point.x - ego.x) * left_x + (spawn_point.y - ego.y) * left_y
+        direction = -1.0 if side > 0 else 1.0
+        offset = min(18.0, max(8.0, abs(side) + 6.0))
+        x = spawn_point.x + direction * left_x * offset
+        y = spawn_point.y + direction * left_y * offset
         z = spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M
         return carla_module.Location(x=x, y=y, z=z)
+
+    def _register_scripted_walker(
+        self,
+        actor: Any,
+        spawn_point: SpawnPoint,
+        destination: Any,
+        speed_ms: float,
+        participant: TrafficParticipantConfig,
+        carla_module: Any,
+    ) -> None:
+        """登记脚本化行人（AI 不可用时每个 tick 直行推向目的地）。"""
+        target = (
+            float(getattr(destination, "x", spawn_point.x)),
+            float(getattr(destination, "y", spawn_point.y)),
+            float(getattr(destination, "z", spawn_point.z)),
+        )
+        self._scripted_walkers.append(
+            _ScriptedWalker(
+                actor=actor,
+                destination=target,
+                speed_ms=max(0.1, speed_ms),
+                carla_module=carla_module,
+            )
+        )
+        logger.info(
+            "Walker '%s' scripted crossing: speed=%.2f m/s from=(%.1f,%.1f) "
+            "to=(%.1f,%.1f) distance_to_ego=%s",
+            participant.participant_id,
+            speed_ms,
+            spawn_point.x,
+            spawn_point.y,
+            target[0],
+            target[1],
+            _format_distance(self._distance_to_ego(spawn_point)),
+        )
+
+    def _advance_scripted_walkers(self, delta_seconds: float) -> None:
+        """把脚本化行人按速度推向目标点（到达后停止，避免来回抖动）。"""
+        if not self._scripted_walkers:
+            return
+        step_budget = max(0.0, float(delta_seconds))
+        for walker in self._scripted_walkers:
+            if walker.done:
+                continue
+            transform_getter = getattr(walker.actor, "get_transform", None)
+            setter = getattr(walker.actor, "set_transform", None)
+            if not callable(transform_getter) or not callable(setter):
+                walker.done = True
+                continue
+            try:
+                transform = transform_getter()
+                location = getattr(transform, "location", None)
+                if location is None:
+                    walker.done = True
+                    continue
+                dx = walker.destination[0] - float(location.x)
+                dy = walker.destination[1] - float(location.y)
+                distance = math.hypot(dx, dy)
+                if distance <= _WALKER_ARRIVE_EPS_M:
+                    walker.done = True
+                    continue
+                step = min(distance, walker.speed_ms * step_budget)
+                carla_module = walker.carla_module
+                rotation = getattr(transform, "rotation", None)
+                new_transform = carla_module.Transform(
+                    carla_module.Location(
+                        x=float(location.x) + dx / distance * step,
+                        y=float(location.y) + dy / distance * step,
+                        z=float(location.z),
+                    ),
+                    carla_module.Rotation(
+                        pitch=float(getattr(rotation, "pitch", 0.0) or 0.0),
+                        yaw=math.degrees(math.atan2(dy, dx)),
+                        roll=float(getattr(rotation, "roll", 0.0) or 0.0),
+                    ),
+                )
+                setter(new_transform)
+            except Exception as exc:  # noqa: BLE001  单帧推进失败不阻断场景
+                logger.debug(f"Scripted walker update failed: {exc}")
+                walker.done = True
 
     def _attach_event_sensors(self, world: Any, library: Any) -> None:
         """按场景事件声明挂载碰撞/车道偏离传感器（事件回调驱动 EventDetector）。"""
@@ -894,8 +1218,8 @@ class BuiltinScenario(CustomScenarioBase):
             return
         try:
             camera_config = RGBCameraConfig(
-                width=int(config.get("width", 960)),
-                height=int(config.get("height", 540)),
+                width=int(config.get("width", 1920)),
+                height=int(config.get("height", 1080)),
                 fov_deg=float(config.get("fov_deg", 100.0)),
                 fps=float(config.get("fps", 10.0)),
             )
@@ -914,11 +1238,13 @@ class BuiltinScenario(CustomScenarioBase):
         self._listen_sensor(sensor, STREAM_OVERVIEW)
         self._overview_sensor = sensor
         logger.info(
-            "Overview camera attached: mount=%s fov=%.0f size=%dx%d",
+            "Overview camera attached: mount=%s fov=%.0f size=%dx%d "
+            "(native encode, jpeg>=%d, no downscale)",
             _OVERVIEW_MOUNT_ID,
             camera_config.fov_deg,
             camera_config.width,
             camera_config.height,
+            _OVERVIEW_JPEG_QUALITY,
         )
 
     def _listen_sensor(self, sensor: Any, stream: str) -> None:
@@ -1107,14 +1433,17 @@ class BuiltinScenario(CustomScenarioBase):
         frame_id = _FRAME_IDS.get(stream, stream)
 
         if stream == STREAM_OVERVIEW:
-            # 仅可视化：推 FrameHub 供主视区取帧，不录 mcap、不发 ROS
+            # 仅可视化：推 FrameHub 供主视区取帧，不录 mcap、不发 ROS。
+            # 主视区必须看到 CARLA 原生画面：不再套用数据流的 stream_max_width
+            # 降采样（默认 640 会把 1920x1080 压成 640 宽，主视区明显模糊），
+            # JPEG 质量下限提到 _OVERVIEW_JPEG_QUALITY。
             raw, width, height = self._raw_image(data)
             encoded = encode_rgb_frame(
                 raw,
                 width,
                 height,
-                quality=self._screenshot_quality,
-                max_width=self._stream_max_width,
+                quality=max(self._screenshot_quality, _OVERVIEW_JPEG_QUALITY),
+                max_width=0,
             )
             if self._frame_hub is not None:
                 self._frame_hub.push(
@@ -1294,6 +1623,17 @@ class BuiltinScenario(CustomScenarioBase):
             return 0
 
     @staticmethod
+    def _tag_ego_role(actor: Any) -> None:
+        """给自车打 ``role_name=hero``：自车引用丢失时可按角色名从世界找回。"""
+        setter = getattr(actor, "set_attribute", None)
+        if not callable(setter):
+            return
+        try:
+            setter("role_name", "hero")
+        except Exception as exc:  # noqa: BLE001  个别 Actor 不支持属性写入
+            logger.debug(f"ego role_name set failed: {exc}")
+
+    @staticmethod
     def _actual_ego_spawn(actor: Any, fallback: Optional[SpawnPoint]) -> Optional[SpawnPoint]:
         """读取自车实际 transform 作为参与者偏移基准（取不到时用候选点）。"""
         getter = getattr(actor, "get_transform", None)
@@ -1419,6 +1759,11 @@ def _safe_find(library: Any, blueprint_id: str) -> Any:
         return library.find(blueprint_id)
     except Exception:  # noqa: BLE001  缺失蓝图交由候选/回退逻辑处理
         return None
+
+
+def _format_distance(distance: Optional[float]) -> str:
+    """距离格式化（日志用；无法测量时返回 n/a）。"""
+    return "n/a" if distance is None else f"{distance:.1f}m"
 
 
 def build_default_scenario(

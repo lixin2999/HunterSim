@@ -42,7 +42,7 @@
     videoTimer: 0,
     videoWatchdog: 0,
     videoObjectUrl: "",
-    depthOn: false,
+    depthOn: true,
     depthUrl: "",
     logSource: null,
     logPoller: 0,
@@ -1035,6 +1035,14 @@
 
   function bootstrap() {
     bindEvents();
+    // 深度图预览默认勾选：以 DOM 勾选态为准，避免刷新后状态与复选框不一致
+    var depthToggle = $("toggle-depth");
+    if (depthToggle) {
+      state.depthOn = Boolean(depthToggle.checked);
+      if (state.depthOn) {
+        setNote("depth-empty", "等待深度帧…");
+      }
+    }
     updateControls();
     refreshStatus();
     refreshInstances().then(refreshDetail);

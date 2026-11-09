@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.4.2`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索）。
+- **当前版本**：`3.4.3`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 / V3.4.3 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.4.3 让主视区回归 CARLA 原生 1080p 画质（overview 不再套用 `ADAPTER_STREAM_MAX_WIDTH` 降采样）、深度图预览默认勾选、修复行人 AI 附着坐标错误并新增蓝图回退/出生点重试/脚本化兜底，自车状态取不到时改返回空值不再写零位姿，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -232,7 +232,7 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 | `VIL_` | 虚实映射 | `target_hz`(10.0) · `extrapolation_ms`(150) · `max_data_latency_ms`(500) · `warning_latency_ms`(50) · `buffer_max_frames`(10) · `ordering_guard_enabled`(true) · `telemetry_frequency_hz`(10.0) · `auto_buffer_depth`(true) · `overlay_enabled`(true) · `lights_enabled`(true) · `clock_offset_auto`(false) |
 | `RESOURCE_` | 生命周期 | `instance_max_lifetime_seconds`(7200) · `health_check_interval_seconds`(10) |
 | `EXECUTION_` | 执行面 | `engine_endpoints`(空=单引擎) · `max_engines`(8) · `restore_scene_on_assemble`(true) · `lease_heartbeat_enabled`(true) · `lease_ttl_seconds`(120) |
-| `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `artifact_retention_hours`(72) · `recordings_dir` · `recording_retention_hours`(24) · `record_enabled`(true) · `record_min_free_gb`(0.5) · `upload_on_failure`(false) · `stream_fps`(10.0) · `stream_max_width`(640) · `stream_max_clients`(8) · `screenshot_quality`(75) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
+| `ADAPTER_` | 控制面 | `host`(127.0.0.1) · `port`(8090) · `db_path` · `artifacts_dir` · `artifact_bucket` · `artifact_retention_hours`(72) · `recordings_dir` · `recording_retention_hours`(24) · `record_enabled`(true) · `record_min_free_gb`(0.5) · `upload_on_failure`(false) · `stream_fps`(10.0) · `stream_max_width`(640，V3.4.3 起仅约束 `rgb` 数据流，`overview` 主视区固定原生分辨率不降采样) · `stream_max_clients`(8) · `screenshot_quality`(75；`overview` 编码质量下限 90) · `watchdog_factor`(3.0) · `watchdog_grace_seconds`(120) · `progress_interval_seconds`(0.5) · `default_duration_seconds`(60) · `max_scene_seconds`(7200) · `busy_timeout_seconds`(5.0) |
 | `PROBE_` | 探针面 | `host`(127.0.0.1) · `port`(8080) · `adapter_url`(`http://127.0.0.1:8090`) |
 | `VIZ_` | 可视化客户端 | `enabled`(true) · `auto_open_browser`(true) · `log_buffer_size`(2000) · `log_history_limit`(500) · `event_limit`(200) · `lidar_max_points`(4000) · `depth_max_width`(480) |
 | `HUNTER_CORE_` | 云端接入 | `enabled`(**true**，V3.2.2 翻转) · `kafka_bootstrap` · SASL 凭据 · `sensor_data_topic_template` · `sensor_data_dlq_template` · `gateway_url` · `jwt_token` · `rosbag_bucket` · `upload_queue_max_size`(32) · `upload_max_retries`(2) · `upload_retry_backoff_s`(1.0) |
@@ -268,7 +268,7 @@ ADAPTER_HOST=0.0.0.0                                     # 必须允许平台回
 
 `ros_enabled=true` 时额外投递 ROS2 话题（需 `rclpy`，缺失自动降级为不出 ROS；桥接器装配后会调用 `initialize()` 建立发布者）；`record=true` 时写入 `ADAPTER_RECORDINGS_DIR` 下的 `.mcap`。录制还受 `ADAPTER_RECORD_ENABLED`（总开关）与 `ADAPTER_RECORD_MIN_FREE_GB`（磁盘余量闸门）约束，运行期每 5s 复查、跌破阈值主动停录；`rgb`/`depth`/`lidar`/`imu` 四路均进入 `FrameHub`（`depth` 为 `32FC1` 米制字节）。
 
-传感器回调只做内存拷贝并入有界队列（上限 32 帧），编码/落盘/ROS 发布由 `hunter-sensor-encoder` 线程串行执行，避免把 CARLA `world.tick()` 线程拖出 50 Hz 预算；队满时丢帧并计入 `huntersim_sensor_frames_dropped_total{stream}`。环视主视区（`overview`）走独立的 `hunter-overview-encoder` 线程与小容量队列（仅保留最新帧），不与数据传感器争用编码队列，数据侧高负载时画面仍保持最新。mcap 写入连续失败 10 次即熔断（`RecordStats.write_errors` 上报），已写入部分仍会 `finish()` 落盘。
+传感器回调只做内存拷贝并入有界队列（上限 32 帧），编码/落盘/ROS 发布由 `hunter-sensor-encoder` 线程串行执行，避免把 CARLA `world.tick()` 线程拖出 50 Hz 预算；队满时丢帧并计入 `huntersim_sensor_frames_dropped_total{stream}`。环视主视区（`overview`）走独立的 `hunter-overview-encoder` 线程与小容量队列（仅保留最新帧），不与数据传感器争用编码队列，数据侧高负载时画面仍保持最新。V3.4.3 起 `overview` 固定按相机原生分辨率（默认 1920×1080）编码、不套用 `ADAPTER_STREAM_MAX_WIDTH`，JPEG 质量下限 90，启动日志会打印 `Overview camera attached: ... size=1920x1080 (native encode, jpeg>=90, no downscale)`；`ADAPTER_STREAM_MAX_WIDTH` 只影响 `rgb` 数据流。mcap 写入连续失败 10 次即熔断（`RecordStats.write_errors` 上报），已写入部分仍会 `finish()` 落盘。
 
 ---
 
@@ -304,8 +304,8 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1156 passed`（单元 + 集成），全仓行覆盖 **84.7%**（门禁 ≥80%）。
-- **类型**：`mypy src/hunter_sim`（strict）**86 个源文件 0 错误**。
+- **测试**：`1305 passed`（单元 + 集成），全仓行覆盖 **83.3%**（门禁 ≥80%）。
+- **类型**：`mypy src/hunter_sim`（strict）**90 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。
 - CARLA / ROS2 / mcap 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）无引擎运行。
@@ -320,7 +320,7 @@ make doctor        # 部署预检
 | 状态库 | SQLite（WAL + 单写者），需 RWO 卷；丢失会失去幂等与历史查询 |
 | 水平扩展 | **不受支持**（多副本需外置共享状态与分布式租约） |
 | 录制磁盘 | 三传感器约 **1.5–3 GB/分钟**（LiDAR 为主），默认保留 24 小时；`doctor` 校验剩余 ≥ 5 GiB |
-| MJPEG 带宽 | 默认 10fps + `screenshot_quality=75` + `stream_max_width=640`；按客户端数线性增长 |
+| MJPEG 带宽 | 默认 10fps；`rgb` 数据流 `screenshot_quality=75` + `stream_max_width=640`；`overview` 主视区为原生 1920×1080、JPEG≥90、不降采样（单路约 400–900 KB/帧，按客户端数线性增长）；带宽不足时给 `overview` 降低相机分辨率，而不是依赖 `ADAPTER_STREAM_MAX_WIDTH` |
 | 并行 | 需要并行时部署多个控制面进程/端口并在平台侧分片（不共享注册表） |
 
 ---

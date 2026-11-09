@@ -2970,3 +2970,74 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - `TriggerType.POSITION` 参与者行为触发暂不支持（`SceneEventTrigger` 无坐标），需平台下发可解析的位置条件后再补。
 - 行人横穿目的地为出生点横向固定 8 m，复杂路口 / 人行道场景可能需平台提供路径点。
 
+
+## V3.4.3 — 主视区原生画质 + 深度图默认开启 + 交通参与者可见 + 自车状态真实上报
+
+**发布日期**：2026-11-09  
+**版本定位**：V3.4.2 实机验证后的**可视化验收缺陷修复**（patch，第三位递增）。四项问题：主视区画面模糊；深度图预览默认未勾选；下发「儿童追球」类场景时主视区只有自车、看不到交通参与者与行为；行驶中「自车状态」面板全 0。V3.4.2 已让参与者与行为在 CARLA 里运动起来，但可视化链路上还有四处断点，表现为「看不见、看不清、看不到数据」。
+
+### 问题背景
+
+1. **主视区被按数据流降采样**：`ADAPTER_STREAM_MAX_WIDTH`（默认 640）原本只应约束 RGB 数据流，却同样作用在 `overview` 环视帧上：原生画面被压到 640 宽（现场为 960x540 相机），再按 JPEG 质量 75 编码，放大到面板后明显模糊。只把相机分辨率提到 1080p 而不改编码分支无效。
+2. **深度图预览默认关闭**：`app.js` 的 `depthOn` 初值为 false，HTML 复选框也没有 `checked`，每次打开页面都要手动勾选。
+3. **参与者生成了但画面里看不到**：`actors=1`、UI「参与者 2」说明参与者确实进入了世界，但 `_spawn_participant()` 在蓝图缺失时只记一条 WARNING 就丢弃；`_setup_walker_ai()` 把**世界坐标**当作 `attach_to` 的相对偏移传给 `controller.ai.walker`（CARLA 语义：attach 时的 transform 是相对父级的偏移），控制器被摆到「出生点×2」的位置，导航目标错位，行人不横穿；成功日志里也没有坐标/距离，无法判断参与者是否落在相机视野内。
+4. **自车状态被「零值兜底」掩盖**：`_get_ego_state()` 取不到自车或读取异常时返回**非空零值字典**，`SimulationExecutor._persist_progress()` 的 `if ego:` 判定为真，把 0.000 当成真实位姿写进实例记录，可视化面板与 `sim_telemetry` 上行就整场显示 0；异常本身被 `except Exception: return default` 静默吞掉，日志里没有任何线索。
+
+### 修复内容
+
+**一、主视区回归 CARLA 原生画质（`scene_runner/builtin_scenario.py`、`sensor_sim/sensor_mount.py`、`configs/sensor_configs.json`）**
+
+- `_dispatch_sensor_data()` 的 `overview` 分支不再套用 `stream_max_width`（固定 `max_width=0`，不降采样），JPEG 质量下限提到 90（`_OVERVIEW_JPEG_QUALITY`）；`ADAPTER_STREAM_MAX_WIDTH` 只保留给 `rgb` 数据流。
+- 环视相机分辨率默认 1920x1080（`configs/sensor_configs.json` 与代码内建默认值同步），日志改为 `Overview camera attached: ... size=1920x1080 (native encode, jpeg>=90, no downscale)`，可直接从日志确认生效参数。
+
+**二、深度图预览默认开启（`visualization/assets/app.js`、`index.html`）**
+
+- `state.depthOn` 初值 true、复选框加 `checked`；`bootstrap()` 以 DOM 勾选态回填 `state.depthOn`，刷新页面后状态与复选框不再脱节；预览区初始提示改为「等待深度帧…」。
+
+**三、交通参与者与行为在画面里可见（`scene_runner/builtin_scenario.py`）**
+
+- 蓝图回退：参与者蓝图未安装时按 `actor_type` 回退到同类通用蓝图（walker → `walker.pedestrian.0001` / `walker.pedestrian.*`，vehicle → `vehicle.tesla.model3` / `vehicle.*`），不再静默丢弃。
+- 出生点重试：`try_spawn_actor` 返回 None（位置被占用）时，沿自车航向前后 / 左右偏移 2~6 m 重试至多 9 个候选点，全部失败才告警并给出起点坐标。
+- 行人 AI 修正：`controller.ai.walker` 改回以**单位变换**附着（`carla.Transform()`），符合 `attach_to` 的相对语义；横穿目的地改为「垂直于自车航向、朝自车车道方向走 8~18 m」，不再依赖平台下发的行人 yaw 约定，行人一定会穿过自车行驶线。
+- 脚本化兜底：AI 蓝图缺失、控制器生成失败或导航启动失败时登记 `_ScriptedWalker`，每个 tick 按 `speed_ms` 把行人直行推向目标点（到达即停），保证可视化里始终能看到「行人过街」。
+- 可诊断日志：参与者生成成功打印 `actor / blueprint / type / behavior / spawn 坐标 / distance_to_ego`；距自车超过 80 m 且非 `static` 时告警提示「环视主视区可能拍不到」；`Builtin scenario ... ready` 改为 `actors=已生成/声明`，未全部生成时列出 ID。
+- 自车生成后写入 `role_name=hero`，为自车引用兜底提供锚点。
+
+**四、自车状态真实上报（`scene_runner/scene_runner_service.py`）**
+
+- 新增 `_resolve_ego_actor()`：按 `ego_actor` / `_ego_vehicle` / `_ego` / `get_ego_vehicle()` 顺序取第一个**非 None** 的引用（旧实现取到 None 也直接返回），仍取不到时用世界兜底——`role_name=hero` 优先，其次「世界中唯一车辆」。
+- `_get_ego_state()` 取不到自车或读取失败时返回**空字典**，不再返回零值 → `_persist_progress()` 不会把假位姿写进实例记录，面板显示「—」而不是误导性的 0.000。
+- 失败按 30 s 窗口限频打 WARNING（`Ego state unavailable (stage=actor_missing|resolve|read): ...`，含被抑制条数），50 Hz 下不形成日志风暴，也不再吞掉根因。
+
+### 向后兼容
+
+- 平台数据契约不变：`ego_state` 仍为可选字段，取不到时为 `{}`（此前为零值字典）；`sim_status` / `sim_telemetry` 读取缺失键按 0 处理，行为不变。
+- `ADAPTER_STREAM_MAX_WIDTH` 语义收窄为「rgb 数据流最大宽度」；如需限制主视区带宽请调 `configs/sensor_configs.json` 的 `overview_camera` 分辨率。
+- 参与者蓝图回退只在原蓝图不可用时触发，已安装蓝图的场景行为不变；`_spawn_participant()` 返回值由 `None` 改为 `bool`（内部方法，无外部调用方）。
+- 行人 AI 正常可用时不进入脚本化兜底，导航路径与 V3.4.2 一致（目的地距离由固定 8 m 扩到 8~18 m，更易持续可见）。
+
+### 验证
+
+- `pytest -q` 全量：**1305 passed**，无失败（更新 `tests/test_builtin_scenario.py`、`tests/test_scene_runner_service.py`、`tests/test_builtin_scenario_sensors.py`、`tests/mocks/carla_mocks.py`）。
+- `mypy src/hunter_sim`：无问题；`flake8 src tests`：无告警。
+- 真机 CARLA 端到端验证待执行（当前开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.4.3`；
+2. 重启 `huntersim up`；
+3. 预期日志出现 `Overview camera attached: mount=overview_camera fov=100 size=1920x1080 (native encode, jpeg>=90, no downscale)`；
+4. 打开 `/viz`：主视区为原生分辨率画面（不再模糊），「深度图预览」默认已勾选；
+5. 下发 `SCN-2141-CCB-STD-L1-v10.7`（儿童追球）等含行人的场景，预期日志出现 `Participant '...' spawned: ... distance_to_ego=...m`、`Walker '...' crossing at ... m/s: from=(...) to=(...)`；主视区可见儿童参与者与过街行为；
+6. 观察「自车状态」面板：位置 x/y/z、航向、速度、转角、加速度随车辆运动变化；若仍为空，日志会给出 `Ego state unavailable (stage=...)` 的明确原因（`actor_missing` = 世界内找不到自车；`read` = CARLA 读取异常）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.4.3`；`pyproject.toml` 版本 `3.4.3`；wheel / 容器版本号一致。
+
+### 待办 / 已知边界
+
+- 真机需重点确认：1920x1080@10fps + JPEG 90 的 MJPEG 带宽（约 2~4 MB/s 每客户端）在平台网络下的表现；带宽吃紧时可把 `overview_camera` 降到 1280x720（仍是原生编码，不再降采样）。
+- 「儿童追球」目前映射为行人横穿（`child_chase_ball` → `PEDESTRIAN_CROSS`），球道具与追球跑位尚未建模，需要平台下发道具 Actor 后再补。
+- 脚本化行人兜底用 `set_transform` 直行，不含步态动画；AI 控制器可用时走原生导航。
+- 行人横穿目的地为「横穿自车车道 8~18 m」，复杂路口仍建议平台提供路径点。

@@ -147,6 +147,8 @@ class MockActorControl:
         self._started = False
         self.max_speed: float = 0.0
         self.destination: MockLocation | None = None
+        self.attached_transform: Any = None
+        self.attached_to: Any = None
 
     def start(self) -> None:
         self._started = True
@@ -306,7 +308,12 @@ class MockWorld:
         elif blueprint.id.startswith("vehicle"):
             actor = MockVehicle(blueprint.id)
         elif blueprint.id.startswith("controller"):
-            return MockActorControl()
+            controller = MockActorControl()
+            # 记录附着时的 transform：CARLA 语义下它是相对父级的偏移，
+            # 必须为单位变换，否则控制器会摆到「出生点×2」的位置
+            controller.attached_transform = transform
+            controller.attached_to = attach_to
+            return controller
         else:
             actor = MockActor(blueprint.id)
         actor._transform = transform

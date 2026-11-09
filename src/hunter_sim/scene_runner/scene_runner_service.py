@@ -40,6 +40,12 @@ logger = get_logger(__name__)
 # 场景终态：到达后不再推进，需向平台补发最终 sim_status
 _TERMINAL_SCENE_STATUSES = (SceneStatus.COMPLETED, SceneStatus.FAILED)
 
+#: 自车状态取数失败告警限频窗口（秒）：50Hz 下每 tick 告警会淹没日志
+_EGO_STATE_WARN_INTERVAL_S = 30.0
+
+#: 视为「自车」的 CARLA role_name（与 CARLA 官方 example 一致）
+_EGO_ROLE_NAME = "hero"
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -128,6 +134,9 @@ class SceneRunnerService:
         self._terminal_status_published: bool = False
         # 自车状态缓存（由 tick 线程写入，executor 线程安全读取，避免跨线程 CARLA RPC）
         self._ego_state_cache: dict[str, Any] = {}
+        # 自车状态取数失败告警限频状态
+        self._ego_state_warn_at: float = 0.0
+        self._ego_state_warn_count: int = 0
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -147,16 +156,63 @@ class SceneRunnerService:
     @property
     def ego_vehicle(self) -> Any:
         """当前场景自车 Actor（未就绪时返回 None）。"""
+        return self._resolve_ego_actor()
+
+    def _resolve_ego_actor(self) -> Any:
+        """解析自车 Actor：场景对象各形态访问器 → 世界兜底。
+
+        「自车状态全 0」的根因往往不是状态算错，而是自车引用没解析到：不同场景
+        实现分别用 ``ego_actor`` / ``get_ego_vehicle()`` / ``_ego_vehicle`` /
+        ``_ego`` 暴露，旧实现只取第一个非 None 的属性且不跳 None，任一形态返回
+        None 就会让整个状态取数落到零值。这里逐个尝试（跳过 None），仍取不到时
+        按 ``role_name=hero`` 与「世界中唯一车辆」兜底。
+        """
         scenario = self._scenario
-        if scenario is None:
-            return None
-        getter = getattr(scenario, "ego_actor", None)
-        if getter is not None:
-            return getter
+        if scenario is not None:
+            actor = self._actor_from_scenario(scenario)
+            if actor is not None:
+                return actor
+        return self._actor_from_world()
+
+    @staticmethod
+    def _actor_from_scenario(scenario: Any) -> Any:
+        """从场景对象取自车 Actor（属性 / 方法两种形态，跳过 None）。"""
+        for name in ("ego_actor", "_ego_vehicle", "_ego"):
+            try:
+                candidate = getattr(scenario, name, None)
+            except Exception as exc:  # noqa: BLE001  property 求值异常不阻断解析
+                logger.debug(f"ego attribute '{name}' failed: {exc}")
+                continue
+            if candidate is not None:
+                return candidate
         getter = getattr(scenario, "get_ego_vehicle", None)
         if callable(getter):
-            return getter()
-        return getattr(scenario, "_ego_vehicle", None)
+            try:
+                candidate = getter()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"get_ego_vehicle failed: {exc}")
+            else:
+                if candidate is not None:
+                    return candidate
+        return None
+
+    def _actor_from_world(self) -> Any:
+        """世界兜底寻找自车：``role_name=hero`` 优先，否则「唯一车辆」。"""
+        world = self._world
+        if world is None:
+            return None
+        try:
+            actors = list(world.get_actors().filter("vehicle.*"))
+        except Exception as exc:  # noqa: BLE001  接口缺失 / 跨线程读失败
+            logger.debug(f"ego actor world lookup failed: {exc}")
+            return None
+        for actor in actors:
+            try:
+                if str(actor.attributes.get("role_name", "")).lower() == _EGO_ROLE_NAME:
+                    return actor
+            except Exception:  # noqa: BLE001  测试桩无 attributes
+                continue
+        return actors[0] if len(actors) == 1 else None
 
     @property
     def current_scene_id(self) -> Optional[str]:
@@ -743,26 +799,25 @@ class SceneRunnerService:
     def _get_ego_state(self) -> dict[str, Any]:
         """获取自车状态字典（仅由 tick 线程调用）。
 
-        自车引用统一走 ``ego_vehicle`` property（``ego_actor`` /
-        ``get_ego_vehicle()`` / ``_ego_vehicle`` 三种形态依次尝试），避免两处
-        解析规则漂移；失败时返回零值字典。
+        自车引用统一走 ``ego_vehicle`` property（多形态访问器 + 世界兜底），
+        避免两处解析规则漂移。
+
+        取不到自车或读取失败时返回 **空字典**（不是零值字典）：零值会被进度
+        落库当作真实位姿写入实例记录，可视化面板与上行遥测就整场显示 0.000，
+        把「自车引用解析失败」掩盖成「车没动」。同时按窗口限频打 WARNING，
+        避免 50Hz 下形成日志风暴。
 
         成功读取时同步更新 ``_ego_state_cache``，供 executor 线程无锁读取。
         """
-        default: dict[str, Any] = {
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0,
-            "heading": 0.0,
-            "yaw": 0.0,
-            "velocity": 0.0,
-            "steering": 0.0,
-            "acceleration": 0.0,
-        }
         try:
             vehicle = self.ego_vehicle
-            if vehicle is None:
-                return default
+        except Exception as exc:  # noqa: BLE001  解析异常与读取异常分开定位
+            self._warn_ego_state("resolve", exc)
+            return {}
+        if vehicle is None:
+            self._warn_ego_state("actor_missing", None)
+            return {}
+        try:
             loc = vehicle.get_location()
             rot = vehicle.get_rotation()
             vel = vehicle.get_velocity()
@@ -779,10 +834,24 @@ class SceneRunnerService:
                 "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
                 "acceleration": round(self._acceleration_magnitude(vehicle), 4),
             }
-            self._ego_state_cache = state  # tick 线程写入缓存，executor 线程安全读取
-            return state
-        except Exception:  # noqa: BLE001
-            return default
+        except Exception as exc:  # noqa: BLE001  单帧读取失败不阻断场景
+            self._warn_ego_state("read", exc)
+            return {}
+        self._ego_state_cache = state  # tick 线程写入缓存，executor 线程安全读取
+        return state
+
+    def _warn_ego_state(self, stage: str, exc: Optional[BaseException]) -> None:
+        """自车状态取数失败告警（按窗口限频，串行输出被抑制条数）。"""
+        now = time.monotonic()
+        if self._ego_state_warn_at and now - self._ego_state_warn_at < _EGO_STATE_WARN_INTERVAL_S:
+            self._ego_state_warn_count += 1
+            return
+        suppressed = self._ego_state_warn_count
+        self._ego_state_warn_at = now
+        self._ego_state_warn_count = 0
+        detail = "" if exc is None else f": {type(exc).__name__}: {exc}"
+        suffix = f" (+{suppressed} suppressed)" if suppressed else ""
+        logger.warning(f"Ego state unavailable (stage={stage}){detail}{suffix}")
 
     @staticmethod
     def _acceleration_magnitude(vehicle: Any) -> float:

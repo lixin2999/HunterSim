@@ -426,14 +426,37 @@ class TestEgoState:
 
         assert runner.get_ego_state()["x"] == pytest.approx(12.5)
 
-    def test_ego_state_without_scenario_returns_zeros(self) -> None:
-        """无场景时安全降级为零值字典，不抛异常。"""
+    def test_ego_state_without_scenario_returns_empty(self) -> None:
+        """无场景时返回空字典（而不是零值），避免把「无自车」写成真实位姿。"""
         runner = _make_runner()
 
         state = runner.get_ego_state()
 
-        assert state["x"] == 0.0
-        assert set(state) >= {"x", "y", "z", "heading", "yaw", "velocity", "steering"}
+        assert state == {}
+
+    def test_ego_state_falls_back_to_world_hero(self) -> None:
+        """场景对象拿不到自车时，按 ``role_name=hero`` 从世界兜底。"""
+        hero = _vehicle()
+        hero.attributes = {"role_name": "hero"}
+        other = _vehicle()
+        other.attributes = {"role_name": ""}
+        world = SimpleNamespace(
+            get_actors=lambda: SimpleNamespace(filter=lambda _pattern: [other, hero])
+        )
+        runner = _make_runner(world=world)
+
+        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+
+    def test_ego_state_falls_back_to_single_vehicle(self) -> None:
+        """世界里没有 hero 标签但只有一辆车时，仍应取到该车状态。"""
+        vehicle = _vehicle()
+        vehicle.attributes = {"role_name": ""}
+        world = SimpleNamespace(
+            get_actors=lambda: SimpleNamespace(filter=lambda _pattern: [vehicle])
+        )
+        runner = _make_runner(world=world)
+
+        assert runner.get_ego_state()["velocity"] == pytest.approx(10.0)
 
     def test_status_payload_carries_nonzero_ego_state(self) -> None:
         """上行 sim_status 的 ego_state 不能恒零（平台侧据此判断车辆在动）。"""

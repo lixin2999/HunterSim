@@ -95,7 +95,12 @@ class TestSetup:
         assert vehicle._autopilot is True  # 非 static 车辆参与者交由 TM 驾驶
         assert walker.type_id.startswith("walker.")
 
-    def test_unknown_participant_blueprint_is_skipped(self) -> None:
+    def test_unknown_participant_blueprint_falls_back_to_generic(self) -> None:
+        """未安装的参与者蓝图必须回退到同类通用蓝图，而不是静默丢弃。
+
+        现场回归：平台下发的 walker/vehicle 蓝图在标准 CARLA 里不存在时，旧实现
+        只记一条 WARNING 就跳过，可视化里就只剩自车在跑（看不到儿童追球）。
+        """
         scenario = _make_scenario(
             {
                 "traffic_participants": [
@@ -112,7 +117,9 @@ class TestSetup:
         scenario.setup(world)
 
         assert scenario.ego_actor is not None
-        assert len(world.get_actors()) == 1  # 仅自车，参与者失败不阻断场景
+        actors = world.get_actors()
+        assert len(actors) == 2  # 自车 + 回退蓝图的参与者
+        assert any(actor.type_id == "vehicle.tesla.model3" for actor in actors)
 
     def test_setup_twice_recycles_previous_actors(self) -> None:
         scenario = _make_scenario()
@@ -362,6 +369,65 @@ class TestMotionAndBehaviors:
         assert controller._started is True
         assert controller.destination is not None
         assert controller.max_speed == pytest.approx(1.2)
+        # 控制器必须以相对 transform（单位变换）附着，否则会摆到「出生点×2」
+        assert controller.attached_transform == MockTransform()
+
+    def test_missing_ai_controller_falls_back_to_scripted_crossing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``controller.ai.walker`` 缺失时行人仍应横穿（脚本化兜底）。"""
+
+        class _Rotation:
+            def __init__(self, pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0) -> None:
+                self.pitch = pitch
+                self.yaw = yaw
+                self.roll = roll
+
+        class _Transform:
+            def __init__(self, location: Any = None, rotation: Any = None) -> None:
+                self.location = location or MockLocation(0.0, 0.0, 0.0)
+                self.rotation = rotation or _Rotation()
+
+        fake_carla = types.SimpleNamespace(
+            Transform=_Transform,
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+            Rotation=_Rotation,
+        )
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "walker-1",
+                        "actor_type": "walker",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 20.0, "y": 0.0},
+                        "behavior": "pedestrian_cross",
+                        "speed_ms": 1.2,
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+        library = world.get_blueprint_library()
+        library._blueprints = [  # noqa: SLF001  模拟服务端未安装行人 AI 蓝图
+            bp for bp in library._blueprints if bp.id != "controller.ai.walker"  # noqa: SLF001
+        ]
+
+        scenario.setup(world)
+
+        assert scenario._walker_ai_controllers == []  # noqa: SLF001
+        assert len(scenario._scripted_walkers) == 1  # noqa: SLF001
+        walker = next(
+            actor for actor in world.get_actors() if actor.type_id.startswith("walker.")
+        )
+        before = walker.get_transform().location
+        for _ in range(25):
+            scenario.tick(world, time.time(), 0.2)
+        after = walker.get_transform().location
+
+        assert ((after.x - before.x) ** 2 + (after.y - before.y) ** 2) ** 0.5 > 1.0
 
 
 class TestEgoFallback:
