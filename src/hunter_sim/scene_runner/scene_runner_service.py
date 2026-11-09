@@ -83,6 +83,8 @@ class SceneRunnerService:
         ros_bridge: Optional[Any] = None,
         screenshot_quality: int = 75,
         stream_max_width: int = 0,
+        traffic_manager: Optional[Any] = None,
+        traffic_manager_port: int = 8000,
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -101,6 +103,9 @@ class SceneRunnerService:
         self._ros_bridge = ros_bridge
         self._screenshot_quality = screenshot_quality
         self._stream_max_width = stream_max_width
+        # Traffic Manager（同步模式下必须同步推进 autopilot 车辆）
+        self._traffic_manager = traffic_manager
+        self._traffic_manager_port = int(traffic_manager_port)
 
         # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
         self._weather_manager = WeatherManager(world)
@@ -219,6 +224,11 @@ class SceneRunnerService:
 
         # 运行中重新下发：先停机（join 在锁外执行，避免与 _run_loop 互等）
         self._stop_if_running()
+        # 运行循环退出时会把世界恢复为异步（便于安全清理），重下发后需要
+        # 重新切回同步，否则下一轮 world.tick() 不再驱动仿真
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._ensure_sync_mode()
 
         with self._lock:
             logger.info(f"Loading scene: {config.scene_id} ({config.mode.value} mode)")
@@ -251,6 +261,8 @@ class SceneRunnerService:
                     ros_bridge=self._ros_bridge,
                     screenshot_quality=self._screenshot_quality,
                     stream_max_width=self._stream_max_width,
+                    traffic_manager=self._traffic_manager,
+                    traffic_manager_port=self._traffic_manager_port,
                 )
             self._scenario = scenario
             self._scenario_cleaned = False
@@ -308,7 +320,12 @@ class SceneRunnerService:
         logger.info("Scene resumed")
 
     def stop(self, timeout_s: float = 5.0) -> None:
-        """停止场景运行并清理资源。状态 → COMPLETED。"""
+        """停止场景运行并清理资源。状态 → COMPLETED。
+
+        注意：若 tick 线程在超时内未能退出，**不会**在这里并发清理场景资源
+        （CARLA 客户端非线程安全，跨线程销毁 Actor 会让 LibCarla 原生断言）；
+        运行循环退出时会自行执行 ``_cleanup()``。
+        """
         with self._lock:
             if self._state_mgr is None:
                 return
@@ -316,15 +333,28 @@ class SceneRunnerService:
                 self._state_mgr.transition_to(SceneStatus.COMPLETED)
 
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout_s)
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=timeout_s)
+            if thread.is_alive():
+                logger.warning(
+                    f"Scene loop did not stop within {timeout_s:.0f}s; "
+                    "deferring cleanup to the tick thread"
+                )
+                return
 
+        self._restore_async()
         self._cleanup()
         logger.info("Scene stopped and cleaned up")
 
     def destroy(self) -> None:
         """销毁场景，释放所有资源。"""
         self.stop()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            # 运行循环仍在 world.tick() 内：保留场景引用，退出时会自行清理
+            logger.warning("Scene destroy deferred: tick thread still alive")
+            return
         with self._lock:
             self._config = None
             self._state_mgr = None
@@ -442,7 +472,42 @@ class SceneRunnerService:
 
         # 终态补发：运行循环 break 后平台需收到最终状态（而非停在最后一条 RUNNING）
         self._publish_terminal_status()
+        # 先恢复异步再清理：同步模式下销毁 Actor/传感器会阻塞等待 tick
+        # （没有后续 tick 时即表现为 CARLA 卡死）；异步模式下销毁不依赖 tick
+        self._restore_async()
         self._cleanup()
+
+    def _restore_async(self) -> None:
+        """把世界与 Traffic Manager 恢复为异步模式（幂等、失败不抛）。"""
+        if self._traffic_manager is not None:
+            try:
+                self._traffic_manager.set_synchronous_mode(False)
+            except Exception as exc:  # noqa: BLE001  TM 可能已随世界失效
+                logger.debug(f"Restore Traffic Manager async failed: {exc}")
+        try:
+            settings = self._world.get_settings()
+            if settings is not None:
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = 0.0
+                self._world.apply_settings(settings)
+        except Exception as exc:  # noqa: BLE001  Mock/已销毁世界无设置接口
+            logger.debug(f"Restore world async failed: {exc}")
+
+    def _ensure_sync_mode(self) -> None:
+        """把世界与 Traffic Manager 切回同步模式（重下发场景时幂等、失败不抛）。"""
+        if self._traffic_manager is not None:
+            try:
+                self._traffic_manager.set_synchronous_mode(True)
+            except Exception as exc:  # noqa: BLE001  TM 可能已随世界失效
+                logger.debug(f"Enable Traffic Manager sync failed: {exc}")
+        try:
+            settings = self._world.get_settings()
+            if settings is not None:
+                settings.synchronous_mode = True
+                settings.fixed_delta_seconds = 0.02
+                self._world.apply_settings(settings)
+        except Exception as exc:  # noqa: BLE001  Mock/已销毁世界无设置接口
+            logger.debug(f"Enable world sync failed: {exc}")
 
     def _cleanup(self) -> None:
         """清理场景资源（幂等：同一场景只清理一次）。"""

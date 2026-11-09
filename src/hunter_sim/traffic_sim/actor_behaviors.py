@@ -175,6 +175,11 @@ class CutInBehavior(ActorBehavior):
             throttle=throttle,
         )
 
+    @property
+    def lateral_offset_m(self) -> float:
+        """横向切入位移量（正数向左，负数向右）。"""
+        return self._lateral
+
 
 class StaticBehavior(ActorBehavior):
     """静止障碍物行为。"""
@@ -241,6 +246,7 @@ def create_behavior_from_config(config: dict[str, Any]) -> ActorBehavior:
         return CutInBehavior(
             speed_ms=float(config.get("speed", 6.0)),
             duration_s=float(config.get("duration", 4.0)),
+            behavior_id=str(config.get("behavior_id", "cut_in")),
         )
     if btype == "static":
         return StaticBehavior()
@@ -283,6 +289,11 @@ class ScriptedActorController:
     def is_triggered(self) -> bool:
         """触发条件是否已满足。"""
         return self._triggered
+
+    @property
+    def actor(self) -> Any:
+        """被控 Actor。"""
+        return self._actor
 
     @property
     def behavior(self) -> ActorBehavior:

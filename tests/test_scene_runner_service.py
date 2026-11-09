@@ -57,11 +57,28 @@ class _FakeProducer:
         return self._seq
 
 
+class _FakeWorldSettings:
+    def __init__(self) -> None:
+        self.synchronous_mode = True
+        self.fixed_delta_seconds = 0.02
+
+
 class _FakeWorld:
     """Mock CARLA World。"""
 
+    def __init__(self) -> None:
+        self.settings = _FakeWorldSettings()
+        self.apply_calls = 0
+
     def tick(self) -> int:
         return 0
+
+    def get_settings(self) -> _FakeWorldSettings:
+        return self.settings
+
+    def apply_settings(self, settings: _FakeWorldSettings) -> None:
+        self.settings = settings
+        self.apply_calls += 1
 
     def get_actors(self) -> list[Any]:
         return []
@@ -91,15 +108,21 @@ def _minimal_config() -> SceneConfig:
     )
 
 
-def _make_runner(producer: Optional[Any] = None) -> SceneRunnerService:
+def _make_runner(
+    producer: Optional[Any] = None,
+    *,
+    world: Optional[_FakeWorld] = None,
+    traffic_manager: Optional[Any] = None,
+) -> SceneRunnerService:
     """构造带/不带 sim_data_producer 的 SceneRunnerService。"""
-    world = _FakeWorld()
+    world = world or _FakeWorld()
     return SceneRunnerService(
         world=world,
         sim_data_producer=producer,
         sim_id="sim-runner-test",
         vehicle_id="veh-test",
         scene_id="scene-test-001",
+        traffic_manager=traffic_manager,
     )
 
 
@@ -428,3 +451,52 @@ class TestEgoState:
         msg = producer.status_calls[-1]
         assert msg["payload"]["ego_state"]["x"] == pytest.approx(12.5)
         assert msg["payload"]["ego_state"]["velocity"] == pytest.approx(10.0)
+
+
+class TestRestoreAsync:
+    """场景结束/停止后必须恢复世界与 Traffic Manager 到异步模式。"""
+
+    def test_restore_async_resets_world_and_tm(self) -> None:
+        world = _FakeWorld()
+        traffic_manager = MagicMock()
+        runner = _make_runner(world=world, traffic_manager=traffic_manager)
+
+        runner._restore_async()  # noqa: SLF001
+
+        assert world.settings.synchronous_mode is False
+        assert world.settings.fixed_delta_seconds == pytest.approx(0.0)
+        assert world.apply_calls == 1
+        traffic_manager.set_synchronous_mode.assert_called_once_with(False)
+
+    def test_stop_restores_async_after_thread_joined(self) -> None:
+        world = _FakeWorld()
+        traffic_manager = MagicMock()
+        runner = _make_runner(world=world, traffic_manager=traffic_manager)
+        runner._state_mgr = MagicMock()  # noqa: SLF001
+        runner._state_mgr.status = SceneStatus.RUNNING  # noqa: SLF001
+
+        runner.stop(timeout_s=0.1)
+
+        assert world.settings.synchronous_mode is False
+        traffic_manager.set_synchronous_mode.assert_called_once_with(False)
+
+    def test_restore_async_swallows_missing_world_api(self) -> None:
+        runner = _make_runner(world=object())  # type: ignore[arg-type]
+        runner._restore_async()  # noqa: SLF001  不抛异常
+
+    def test_load_scene_reapplies_sync_after_previous_run(self) -> None:
+        """运行循环退出会恢复异步；重下发场景必须重新切回同步再启动。"""
+        world = _FakeWorld()
+        world.settings.synchronous_mode = False
+        world.settings.fixed_delta_seconds = 0.0
+        traffic_manager = MagicMock()
+        runner = _make_runner(world=world, traffic_manager=traffic_manager)
+
+        with patch.object(runner, "_apply_scene_weather"), \
+             patch("hunter_sim.scene_runner.scene_runner_service.BuiltinScenario") as MockScenario:
+            MockScenario.return_value.setup = MagicMock()
+            runner.load_scene(_minimal_config())
+
+        assert world.settings.synchronous_mode is True
+        assert world.settings.fixed_delta_seconds == pytest.approx(0.02)
+        traffic_manager.set_synchronous_mode.assert_called_with(True)

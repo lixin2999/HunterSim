@@ -61,16 +61,39 @@ class _World:
 class _MapManager:
     """MapManager 替身：按需返回 world 或抛错。"""
 
-    def __init__(self, world: Optional[_World] = None, error: Optional[Exception] = None) -> None:
+    def __init__(
+        self,
+        world: Optional[_World] = None,
+        error: Optional[Exception] = None,
+        traffic_manager: Optional["_TrafficManager"] = None,
+    ) -> None:
         self.world = world or _World()
         self.error = error
+        self.traffic_manager = traffic_manager
         self.loaded: list[str] = []
+        self.tm_ports: list[int] = []
 
     def load_map(self, map_id: str) -> _World:
         if self.error is not None:
             raise self.error
         self.loaded.append(map_id)
         return self.world
+
+    def get_traffic_manager(self, port: int = 8000) -> "_TrafficManager":
+        self.tm_ports.append(port)
+        if self.traffic_manager is None:
+            raise RuntimeError("traffic manager unavailable")
+        return self.traffic_manager
+
+
+class _TrafficManager:
+    """Traffic Manager 替身：记录同步模式切换。"""
+
+    def __init__(self) -> None:
+        self.sync_calls: list[bool] = []
+
+    def set_synchronous_mode(self, value: bool) -> None:
+        self.sync_calls.append(value)
 
 
 class _Runner:
@@ -291,6 +314,20 @@ class TestEnsureRunner:
 
         assert runner.destroyed == 1
 
+    def test_enables_tm_sync_and_passes_to_runner(self) -> None:
+        world = _World()
+        traffic_manager = _TrafficManager()
+        manager = _MapManager(world, traffic_manager=traffic_manager)
+        runners: list[_Runner] = []
+        plane = _plane(manager=manager, runners=runners)
+
+        plane.ensure_runner(_instance())
+
+        assert traffic_manager.sync_calls == [True]
+        assert manager.tm_ports == [8000]
+        assert runners[0].kwargs["traffic_manager"] is traffic_manager
+        assert runners[0].kwargs["traffic_manager_port"] == 8000
+
 
 # ─── 释放 ────────────────────────────────────────────────────────────────────
 
@@ -307,6 +344,31 @@ class TestRelease:
         assert plane.get_runner("inst-1") is None
         assert plane.pool.get("inst-1") is None
         assert plane.release("inst-1") is False
+
+    def test_release_restores_world_and_tm_to_async(self) -> None:
+        """释放后必须恢复异步模式，否则 CARLA 会等待 tick 而卡死。"""
+        world = _World()
+        traffic_manager = _TrafficManager()
+        manager = _MapManager(world, traffic_manager=traffic_manager)
+        plane = _plane(manager=manager)
+
+        plane.ensure_runner(_instance())
+        assert world.settings.synchronous_mode is True
+
+        plane.release("inst-1")
+
+        assert world.settings.synchronous_mode is False
+        assert world.settings.fixed_delta_seconds == pytest.approx(0.0)
+        assert traffic_manager.sync_calls == [True, False]
+
+    def test_release_restores_async_even_without_tm(self) -> None:
+        world = _World()
+        plane = _plane(world=world)
+        plane.ensure_runner(_instance())
+
+        plane.release("inst-1")
+
+        assert world.settings.synchronous_mode is False
 
     def test_release_swallows_destroy_failure(self) -> None:
         runners: list[_Runner] = []

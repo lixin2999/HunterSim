@@ -329,9 +329,17 @@ class MockWorld:
 class MockTrafficManager:
     def __init__(self) -> None:
         self.settings: dict[str, Any] = {}
+        self.desired_speeds: dict[int, float] = {}
+        self.lane_changes: list[tuple[int, bool]] = []
 
     def set_synchronous_mode(self, enabled: bool) -> None:
         self.settings["synchronous_mode"] = enabled
+
+    def set_desired_speed(self, actor: Any, speed: float) -> None:
+        self.desired_speeds[int(getattr(actor, "id", -1))] = float(speed)
+
+    def force_lane_change(self, actor: Any, direction: bool) -> None:
+        self.lane_changes.append((int(getattr(actor, "id", -1)), bool(direction)))
 
     def set_global_distance_to_leading_vehicle(self, distance_m: float) -> None:
         self.settings["follow_distance_m"] = distance_m

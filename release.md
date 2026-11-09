@@ -2893,3 +2893,80 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 
 镜像 tag `hunter-sim:3.4.1`；wheel / 容器版本号与 `pyproject.toml` 的 `3.4.1` 一致。
 
+---
+
+## V3.4.2 — 场景车辆运动/行为生效 + 场景结束恢复异步 + 环视独立编码
+
+**发布日期**：2026-11-09
+**版本定位**：V3.4.1 实机验证后的**问题修复 / 功能完善**（patch，第三位递增）。V3.4.0 / V3.4.1 已确认地图、天气、传感器与环视主视区画面正常，但实机仍有四类问题：可视化里自车与交通参与者基本静止，只能看到静态地图/环境；场景声明的行为（匀速 / 减速 / 切入 / 横穿）在测试全程看不到；场景结束后 CARLA 模拟器无响应、后续 `load_map` 超时；高负载场景下环视主视区掉帧甚至无画面。
+
+### 问题背景
+
+1. **Traffic Manager 未同步**：世界已切到同步模式（50 Hz 固定步长），但 Traffic Manager 仍工作在异步模式；`set_autopilot(True)` 的车辆会等待世界 tick，表现为自车和参与者停在原地。
+2. **`BuiltinScenario.tick()` 是空实现**：参与者只在装配时启用 autopilot，场景声明的行为从未在 tick 中推进；行人 / 骑行者也只静态生成，没有 AI 导航。
+3. **释放路径未恢复异步模式**：场景结束（成功 / 失败 / 取消）后世界仍停留在同步模式，CARLA 持续等待不再到来的 `world.tick()`；且同步模式下销毁 Actor / 传感器会阻塞，表现为模拟器卡死、后续实例一直 `pending` / `load_map` 超时。
+4. **环视流被数据编码队列饿死**：环视帧与 RGB / 深度 / LiDAR / IMU 共用 `hunter-sensor-encoder` 有界队列；数据传感器繁忙时环视帧被大量丢弃，主视区卡顿或黑屏。
+
+### 修复内容
+
+**一、Traffic Manager 与世界同步（`engine/map_manager.py`、`execution/plane.py`）**
+
+- `MapManager` 新增 `client` 属性与 `get_traffic_manager(port)`（CARLA 0.9.16 的 TM 归属于 `carla.Client`，不在 `World` 上）；`CarlaClientProtocol` 同步补充 `get_trafficmanager`。
+- `ExecutionPlane` 在装配时：世界切同步成功后，通过 `EngineEndpoint.tm_port` 取 TM 并 `set_synchronous_mode(True)`；TM 不可用只告警、不阻断场景（降级为参与者可能静止）。
+- `traffic_manager` / `traffic_manager_port` 透传给 `SceneRunnerService` 与 `BuiltinScenario`，替换原先写死的 TM 端口。
+
+**二、场景运动与行为真正生效（`scene_runner/builtin_scenario.py`）**
+
+- `tick()` 由空实现改为每帧推进：自车初始速度保持（非 autopilot 时 P 控制油门 / 刹车）、参与者行为控制器更新、行人 AI 导航。
+- 自车：`ego_vehicle.initial_speed > 0` 时优先通过 TM `set_desired_speed` 设置；TM 不可用时退回手动速度保持，避免自车不动。
+- 车辆参与者：非 `static` 行为统一启用 TM autopilot 保持车道内行驶，再叠加场景行为——`constant_speed` / `accelerate` 设期望速度，`decelerate` / `stop_and_go` 逐步降到 0，`cut_in` / `cut_out` 触发后只发一次 `force_lane_change`。
+- 变道方向遵循 CARLA 语义（`True` 向右、`False` 向左）：优先按自车相对参与者的横向位置选择切向自车所在车道；读不到位姿时退回 `CutInBehavior.lateral_offset_m` 的符号；`cut_out` 取反。
+- 行人 / 骑行者：非 `static` 时挂 `controller.ai.walker` + `WalkerControllerWrapper`，按出生朝向横向 8 m 导航横穿；`static` 保持原地；CARLA SDK 或 AI 蓝图缺失时告警并保持静态，不阻断场景。
+- `static` 车辆显式 `brake=1.0` 刹停，避免启用 autopilot 后自行开走。
+- 行为触发条件复用 `traffic_sim/trigger_conditions`：`time` / `distance` / `velocity` / `event` 生效；`position` 因 `SceneEventTrigger` 不携带坐标而跳过并记 debug 日志。
+- `CutInBehavior` 新增 `lateral_offset_m` 属性与 `behavior_id` 工厂参数，`ScriptedActorController` 暴露 `actor`，供方向判断与清理使用。
+- `cleanup()` 停止行人导航、销毁 AI 控制器、清空行为控制器与变道去重集合。
+
+**三、场景结束恢复异步，保证 CARLA 可继续使用（`execution/plane.py`、`scene_runner/scene_runner_service.py`）**
+
+- `ExecutionPlane` 记录每实例 `(world, traffic_manager)`，释放 / 装配失败 / 取消时先恢复 TM 与世界为异步模式，再清理或归还端点。
+- `SceneRunnerService` 新增 `_restore_async()`：运行循环退出、`stop()`、失败路径统一恢复异步后再 `_cleanup()`，避免同步模式下 `actor.destroy()` 阻塞等待 tick。
+- 新增 `_ensure_sync_mode()`：同一运行器重新下发场景时重新切回同步（TM + 世界），避免上一轮恢复异步后 `world.tick()` 不再推进。
+- `stop()` / `destroy()` 在 tick 线程未能在超时内退出时**不并发清理**（CARLA 客户端非线程安全），改为延迟到运行循环自行清理；仅在拿到引擎锁后销毁，和后续装配串行。
+
+**四、环视独立编码（`scene_runner/builtin_scenario.py`）**
+
+- 环视帧不再进入数据传感器队列，改走独立 `hunter-overview-encoder` 线程与小容量队列（仅保留最新帧，队满丢最旧）；数据传感器高负载时主视区不再被饿死。
+- 环视仍只推 `FrameHub`，不录 mcap、不发 ROS，不改变平台数据契约；`cleanup()` 一并停止线程并清空队列。
+
+### 向后兼容
+
+- 场景 JSON 与平台数据契约不变；`overview` 仍是可选流，不传 `stream` 时行为不变。
+- TM 不可用的旧版 CARLA / 受限客户端：仅记录 warning，自车退回手动速度保持、参与者可能静止，但场景仍可运行。
+- `CutInBehavior.lateral_offset_m` 为新增内部属性，未改动现有场景字段；方向判断缺省仍按自车相对位置。
+- `stop()` 在 tick 线程未退出时不再等待清理完成，调用方看到的实例终态与之前一致。
+
+### 验证
+
+- `pytest -q` 全量：**1301 passed**，无失败（新增 / 更新 `tests/test_builtin_scenario.py`、`tests/test_execution_plane_lifecycle.py`、`tests/test_scene_runner_service.py` 与 `tests/mocks/carla_mocks.py`）。
+- `mypy src/hunter_sim`：无问题；`flake8 src tests`：无告警。
+- 真机 CARLA 端到端验证待执行（当前开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.4.2`；
+2. 重启 `huntersim up`；
+3. 下发含交通参与者与行为（`constant_speed` / `decelerate` / `cut_in` / `pedestrian_cross`）的 SIL 场景；
+4. 预期日志出现 `Traffic Manager switched to synchronous mode (port=...)`、`Ego initial speed ...`、`Walker '...' crossing at ...`；`/viz` 主视区可见自车与参与者持续行驶，切入 / 减速等行为按触发条件出现；
+5. 场景结束后再下发同一地图的新场景，预期 `load_map` 不再超时；日志出现 `World restored to asynchronous mode: instance=...`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.4.2`；wheel / 容器版本号与 `pyproject.toml` 的 `3.4.2` 一致。
+
+### 待办 / 已知边界
+
+- 真机需重点验证：TM `set_desired_speed` / `force_lane_change` 在目标 CARLA 0.9.16 上的实际效果；`stop_and_go` 仍以「减速到 0」近似，未实现停车后的再起步；`accelerate` 以更高目标速度近似。
+- `TriggerType.POSITION` 参与者行为触发暂不支持（`SceneEventTrigger` 无坐标），需平台下发可解析的位置条件后再补。
+- 行人横穿目的地为出生点横向固定 8 m，复杂路口 / 人行道场景可能需平台提供路径点。
+

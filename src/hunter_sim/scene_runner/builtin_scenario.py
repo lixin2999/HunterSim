@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -35,11 +36,13 @@ from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
+    ScenarioBehaviorType,
     SceneConfig,
     SceneEventType,
     SensorSpec,
     SpawnPoint,
     TrafficParticipantConfig,
+    TriggerType,
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
 from hunter_sim.scene_runner.spawn_resolver import (
@@ -67,6 +70,13 @@ from hunter_sim.sensor_sim.sensor_mount import (
     SensorMountManager,
     load_overview_camera_config,
 )
+from hunter_sim.traffic_sim.actor_behaviors import (
+    CutInBehavior,
+    ScriptedActorController,
+    create_behavior_from_config,
+)
+from hunter_sim.traffic_sim.trigger_conditions import create_trigger_from_config
+from hunter_sim.traffic_sim.walker_controller import WalkerControllerWrapper
 
 logger = get_logger(__name__)
 
@@ -82,6 +92,10 @@ _AUTOPILOT_TM_PORT = 8000
 
 #: 环视相机挂载位置（configs/sensor_configs.json 的 mounts.overview_camera）
 _OVERVIEW_MOUNT_ID = "overview_camera"
+
+# 环视可视化帧队列容量：只保留最新画面，独立于数据传感器编码队列，
+# 避免 RGB/深度/点云/IMU 高负载时可视化画面被饿死
+_OVERVIEW_QUEUE_MAXSIZE = 4
 
 # 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
 _SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
@@ -165,6 +179,8 @@ class BuiltinScenario(CustomScenarioBase):
         ros_bridge: Optional[Any] = None,
         screenshot_quality: int = 75,
         stream_max_width: int = 0,
+        traffic_manager: Optional[Any] = None,
+        traffic_manager_port: int = _AUTOPILOT_TM_PORT,
     ) -> None:
         super().__init__(config, state_manager, event_detector)
         self._transform_factory = transform_factory
@@ -173,6 +189,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ros_bridge = ros_bridge
         self._screenshot_quality = screenshot_quality
         self._stream_max_width = stream_max_width
+        # Traffic Manager：同步模式下 autopilot 车辆是否移动取决于 TM 是否同步
+        self._traffic_manager = traffic_manager
+        self._traffic_manager_port = int(traffic_manager_port)
         # 由 config.sensors 在挂载时确定（任一 spec 开启 ros 即发布）
         self._ros_enabled = False
         # 传感器帧异步编码：CARLA tick 线程只做拷贝+入队
@@ -197,6 +216,20 @@ class BuiltinScenario(CustomScenarioBase):
         self._sensors: list[Any] = []
         # 仅可视化用环视相机：不进入 _sensors 计数，不录 mcap / 不发 ROS
         self._overview_sensor: Any = None
+        # 环视相机独立编码队列/线程（防止被数据传感器队列饿死）
+        self._overview_queue: "queue.Queue[_SensorFrame]" = queue.Queue(
+            maxsize=_OVERVIEW_QUEUE_MAXSIZE
+        )
+        self._overview_worker: Optional[threading.Thread] = None
+        self._overview_worker_lock = threading.Lock()
+        self._overview_stop = threading.Event()
+        # 场景化行为控制：参与者 ID → 控制器；行人 AI 控制器单独登记
+        self._participant_controllers: list[ScriptedActorController] = []
+        self._walker_controllers: list[WalkerControllerWrapper] = []
+        self._walker_ai_controllers: list[Any] = []
+        self._cut_in_done: set[int] = set()
+        # 自车非 autopilot 时的简单速度保持
+        self._ego_manual_speed: float = 0.0
         self._cleaned = False
 
     @property
@@ -223,6 +256,11 @@ class BuiltinScenario(CustomScenarioBase):
             self.cleanup(world)
         self._cleaned = False
         self._frame_accepting = True
+        self._participant_controllers.clear()
+        self._walker_controllers.clear()
+        self._walker_ai_controllers.clear()
+        self._cut_in_done.clear()
+        self._ego_manual_speed = 0.0
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
@@ -230,6 +268,7 @@ class BuiltinScenario(CustomScenarioBase):
             self._spawn_participant(world, library, participant)
         self._attach_event_sensors(world, library)
         self._attach_sim_sensors(world, library)
+        self._configure_ego_motion()
 
         logger.info(
             f"Builtin scenario '{self._config.scene_id}' ready: "
@@ -238,7 +277,27 @@ class BuiltinScenario(CustomScenarioBase):
         )
 
     def tick(self, world: Any, timestamp: float, delta_seconds: float) -> None:
-        """每帧回调：P0 阶段行为由 Traffic Manager 接管，此处无需额外推进。"""
+        """每帧推进自车与交通参与者行为。
+
+        车辆由 Traffic Manager autopilot 保持车道内行驶；本方法在每个 tick
+        把场景化行为（减速 / 切入 / 停车等）翻译成 TM 期望速度或手动控制，
+        使可视化里自车与参与者真正按场景设置运动。行人由 AI 控制器导航。
+        """
+        self._apply_ego_manual_speed(delta_seconds)
+        if not self._participant_controllers:
+            return
+        for controller in list(self._participant_controllers):
+            try:
+                action = controller.update(self._ego, delta_seconds)
+            except Exception as exc:  # noqa: BLE001  单个参与者异常不阻断场景
+                logger.debug(f"Participant behavior update failed: {exc}")
+                continue
+            if action is None:
+                continue
+            try:
+                self._apply_participant_action(controller, action)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Participant behavior apply failed: {exc}")
 
     def check_finish(self, world: Any, timestamp: float) -> bool:
         """运行时长达到 ``duration_seconds`` 时结束场景。"""
@@ -253,6 +312,28 @@ class BuiltinScenario(CustomScenarioBase):
         # 先关回调入口并排空编码队列，再销毁传感器（避免后续帧写已关闭的录制器）
         self._frame_accepting = False
         self._stop_frame_worker()
+        self._stop_overview_worker()
+
+        # 停止行人导航/控制器
+        for wrapper in self._walker_controllers:
+            try:
+                wrapper.stop_navigation()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Walker stop failed: {exc}")
+        self._walker_controllers.clear()
+        for controller in self._walker_ai_controllers:
+            try:
+                stop = getattr(controller, "stop", None)
+                if callable(stop):
+                    stop()
+                destroy = getattr(controller, "destroy", None)
+                if callable(destroy):
+                    destroy()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Walker AI controller destroy failed: {exc}")
+        self._walker_ai_controllers.clear()
+        self._participant_controllers.clear()
+        self._cut_in_done.clear()
 
         for sensor in (
             ([self._overview_sensor] if self._overview_sensor is not None else [])
@@ -352,8 +433,11 @@ class BuiltinScenario(CustomScenarioBase):
             set_autopilot = getattr(actor, "set_autopilot", None)
             if callable(set_autopilot):
                 try:
-                    set_autopilot(True, _AUTOPILOT_TM_PORT)
-                    logger.info("Ego autopilot enabled (Traffic Manager)")
+                    set_autopilot(True, self._traffic_manager_port)
+                    logger.info(
+                        f"Ego autopilot enabled (Traffic Manager port="
+                        f"{self._traffic_manager_port})"
+                    )
                 except Exception as exc:  # noqa: BLE001  TM 未就绪时降级为手动控制
                     logger.warning(f"Ego autopilot enable failed: {exc}")
         return actor
@@ -361,6 +445,7 @@ class BuiltinScenario(CustomScenarioBase):
     def _spawn_participant(
         self, world: Any, library: Any, participant: TrafficParticipantConfig
     ) -> None:
+        is_walker = participant.actor_type == "walker"
         prefix = "walker." if participant.actor_type in ("walker", "cyclist") else "vehicle."
         try:
             blueprint = self._find_blueprint(library, participant.blueprint, prefix)
@@ -380,15 +465,307 @@ class BuiltinScenario(CustomScenarioBase):
             return
         self._actors.append(actor)
 
-        if participant.actor_type == "vehicle" and participant.behavior.value != "static":
-            set_autopilot = getattr(actor, "set_autopilot", None)
-            if callable(set_autopilot):
-                try:
-                    set_autopilot(True, _AUTOPILOT_TM_PORT)
-                except Exception as exc:  # noqa: BLE001  TM 未就绪时保持静止
-                    logger.warning(
-                        f"Participant '{participant.participant_id}' autopilot failed: {exc}"
-                    )
+        try:
+            if is_walker:
+                if participant.behavior == ScenarioBehaviorType.STATIC:
+                    return  # 静止行人：不挂 AI 控制器，保持原地
+                self._setup_walker_ai(world, library, actor, spawn_point, participant)
+                return
+            if participant.behavior == ScenarioBehaviorType.STATIC:
+                # 静止障碍：显式刹停，避免被 TM 接管后自行开走
+                self._apply_vehicle_control(actor, throttle=0.0, brake=1.0, steer=0.0)
+                return
+            # 车辆类参与者统一交给 TM autopilot 保持在车道内行驶；
+            # 场景化行为再通过每帧期望速度 / 变道指令叠加。
+            self._enable_autopilot(actor, participant)
+            controller = self._build_participant_controller(actor, participant)
+            if controller is not None:
+                self._participant_controllers.append(controller)
+        except Exception as exc:  # noqa: BLE001  单个参与者行为配置失败不影响场景
+            logger.warning(
+                f"Participant '{participant.participant_id}' motion setup failed: {exc}"
+            )
+
+    # ── 运动/行为控制 ─────────────────────────────────────────────────────
+
+    def _configure_ego_motion(self) -> None:
+        """应用自车初始速度（autopilot 优先交给 TM，否则手动油门）。"""
+        if self._ego is None:
+            return
+        speed = float(self._config.ego_vehicle.initial_speed_ms)
+        if speed <= 0:
+            return
+        if self._config.ego_vehicle.autopilot and self._set_desired_speed(self._ego, speed):
+            logger.info(f"Ego initial speed set via Traffic Manager: {speed:.1f} m/s")
+            return
+        self._ego_manual_speed = speed
+        logger.info(f"Ego initial speed set via manual control: {speed:.1f} m/s")
+
+    def _enable_autopilot(
+        self, actor: Any, participant: TrafficParticipantConfig
+    ) -> None:
+        """启用参与者 autopilot（TM 端口来自实例配置）并设置初始速度。"""
+        set_autopilot = getattr(actor, "set_autopilot", None)
+        if callable(set_autopilot):
+            try:
+                set_autopilot(True, self._traffic_manager_port)
+            except Exception as exc:  # noqa: BLE001  TM 未就绪时降级为手动行为
+                logger.warning(
+                    f"Participant '{participant.participant_id}' autopilot failed: {exc}"
+                )
+        self._set_desired_speed(actor, participant.speed_ms)
+
+    def _set_desired_speed(self, actor: Any, speed_ms: float) -> bool:
+        """设置 TM 期望速度（m/s），返回是否成功。"""
+        if self._traffic_manager is None:
+            return False
+        try:
+            self._traffic_manager.set_desired_speed(actor, max(0.0, float(speed_ms)))
+            return True
+        except Exception as exc:  # noqa: BLE001  个别 Actor 未注册 TM 时静默降级
+            logger.debug(f"TM set_desired_speed failed: {exc}")
+            return False
+
+    def _build_participant_controller(
+        self, actor: Any, participant: TrafficParticipantConfig
+    ) -> Optional[ScriptedActorController]:
+        """按配置构造参与者行为控制器（无行为时返回 None）。"""
+        behavior_cfg = self._behavior_config(participant)
+        if behavior_cfg is None:
+            return None
+        try:
+            behavior = create_behavior_from_config(behavior_cfg)
+        except ValueError as exc:
+            logger.warning(
+                f"Participant '{participant.participant_id}' behavior skipped: {exc}"
+            )
+            return None
+        return ScriptedActorController(actor, behavior, self._trigger_for(participant))
+
+    @staticmethod
+    def _behavior_config(participant: TrafficParticipantConfig) -> Optional[dict[str, Any]]:
+        """场景行为类型 → ``actor_behaviors`` 工厂配置。"""
+        speed = float(participant.speed_ms)
+        behavior = participant.behavior
+        if behavior == ScenarioBehaviorType.STATIC:
+            return None
+        if behavior == ScenarioBehaviorType.CONSTANT_SPEED:
+            return {"type": "constant_speed", "speed": speed}
+        if behavior == ScenarioBehaviorType.ACCELERATE:
+            # 无独立加速行为：以更高目标速度的匀速行为近似
+            return {"type": "constant_speed", "speed": speed}
+        if behavior in (ScenarioBehaviorType.DECELERATE, ScenarioBehaviorType.STOP_AND_GO):
+            return {
+                "type": "decelerate",
+                "initial_speed": speed,
+                "target_speed": 0.0,
+                "deceleration": 2.0,
+            }
+        if behavior in (ScenarioBehaviorType.CUT_IN, ScenarioBehaviorType.CUT_OUT):
+            return {
+                "type": "cut_in",
+                "speed": speed,
+                "behavior_id": behavior.value,
+            }
+        if behavior == ScenarioBehaviorType.PEDESTRIAN_CROSS:
+            return {"type": "pedestrian_cross", "speed": speed}
+        return {"type": "constant_speed", "speed": speed}
+
+    @staticmethod
+    def _trigger_for(participant: TrafficParticipantConfig) -> Optional[Any]:
+        """行为触发条件 → ``trigger_conditions`` 工厂实例。"""
+        trigger = participant.behavior_trigger
+        if trigger is None:
+            return None
+        trigger_type = trigger.trigger_type
+        if trigger_type == TriggerType.POSITION:
+            # SceneEventTrigger 不携带坐标，无法构造位置触发
+            logger.debug(
+                f"Participant '{participant.participant_id}' position trigger unsupported"
+            )
+            return None
+        config: dict[str, Any] = {"type": trigger_type.value}
+        if trigger_type == TriggerType.EVENT:
+            config["event_name"] = trigger.event_name
+        else:
+            config["value"] = trigger.value
+        try:
+            return create_trigger_from_config(config)
+        except ValueError as exc:
+            logger.warning(
+                f"Participant '{participant.participant_id}' trigger skipped: {exc}"
+            )
+            return None
+
+    def _apply_participant_action(self, controller: ScriptedActorController, action: Any) -> None:
+        """把行为输出落到参与者（TM 期望速度 / 手动控制 + 变道）。"""
+        actor = controller.actor
+        if actor is None:
+            return
+        if self._traffic_manager is not None and self._has_autopilot(actor):
+            target = 0.0 if action.is_stop else float(action.target_speed_ms)
+            self._set_desired_speed(actor, target)
+        else:
+            self._apply_vehicle_control(
+                actor,
+                throttle=float(action.throttle),
+                brake=float(action.brake),
+                steer=float(action.steering),
+            )
+        # 切入/切出：触发后只发一次变道指令，由 TM 完成平滑变道
+        if isinstance(controller.behavior, CutInBehavior) and controller.is_triggered:
+            key = id(actor)
+            if key not in self._cut_in_done:
+                self._cut_in_done.add(key)
+                direction = self._lane_change_direction(actor, controller.behavior)
+                if controller.behavior.behavior_id == "cut_out":
+                    # 切出是朝远离自车的另一侧变道
+                    direction = not direction
+                self._force_lane_change(actor, direction)
+
+    def _lane_change_direction(self, actor: Any, behavior: CutInBehavior) -> bool:
+        """决定变道方向（CARLA 语义：True 向右，False 向左）。
+
+        优先按自车相对参与者的横向位置判断（切向自车所在车道）；
+        无法读取位姿时退回行为配置的 ``lateral_offset_m`` 符号。
+        """
+        lateral = self._ego_relative_lateral(actor)
+        if lateral is not None and abs(lateral) >= 1.0:
+            return lateral > 0.0
+        return behavior.lateral_offset_m < 0.0
+
+    def _ego_relative_lateral(self, actor: Any) -> Optional[float]:
+        """自车相对 ``actor`` 的横向偏移（正数在右，负数在左）。"""
+        if self._ego is None:
+            return None
+        try:
+            actor_transform = actor.get_transform()
+            ego_transform = self._ego.get_transform()
+            dx = float(ego_transform.location.x) - float(actor_transform.location.x)
+            dy = float(ego_transform.location.y) - float(actor_transform.location.y)
+        except Exception:  # noqa: BLE001  Mock/无位姿 Actor
+            return None
+        get_right = getattr(actor_transform, "get_right_vector", None)
+        if callable(get_right):
+            try:
+                right = get_right()
+                return dx * float(right.x) + dy * float(right.y)
+            except Exception:  # noqa: BLE001  退回按 yaw 计算
+                pass
+        yaw = math.radians(float(actor_transform.rotation.yaw))
+        # 右向量 = (-sin(yaw), cos(yaw))
+        return dx * -math.sin(yaw) + dy * math.cos(yaw)
+
+    def _force_lane_change(self, actor: Any, direction: bool) -> None:
+        """请求 TM 变道（CARLA 语义：direction=True 向右，False 向左）。"""
+        if self._traffic_manager is None:
+            return
+        try:
+            self._traffic_manager.force_lane_change(actor, bool(direction))
+        except Exception as exc:  # noqa: BLE001  部分版本/未注册 Actor 不支持
+            logger.debug(f"TM force_lane_change failed: {exc}")
+
+    @staticmethod
+    def _has_autopilot(actor: Any) -> bool:
+        """判断 Actor 当前是否由 autopilot 接管（无法判断时按 True 处理）。"""
+        getter = getattr(actor, "get_autopilot", None)
+        if not callable(getter):
+            return True
+        try:
+            return bool(getter())
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _apply_ego_manual_speed(self, delta_seconds: float) -> None:
+        """非 autopilot 自车的简单速度保持（P 控制）。"""
+        if self._ego is None or self._ego_manual_speed <= 0:
+            return
+        error = self._ego_manual_speed - self._current_speed(self._ego)
+        throttle = min(1.0, max(0.0, error * 0.5))
+        brake = 1.0 if error < -1.0 else 0.0
+        self._apply_vehicle_control(self._ego, throttle=throttle, brake=brake, steer=0.0)
+
+    @staticmethod
+    def _current_speed(actor: Any) -> float:
+        try:
+            velocity = actor.get_velocity()
+            return math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    @staticmethod
+    def _apply_vehicle_control(
+        actor: Any, throttle: float, brake: float, steer: float
+    ) -> None:
+        """下发车辆控制（无 CARLA SDK 时用轻量对象兼容单测桩）。"""
+        apply = getattr(actor, "apply_control", None)
+        if not callable(apply):
+            return
+        try:
+            import carla  # noqa: PLC0415
+
+            control: Any = carla.VehicleControl(
+                throttle=throttle, steer=steer, brake=brake
+            )
+        except ImportError:
+            control = SimpleNamespace(throttle=throttle, steer=steer, brake=brake)
+        try:
+            apply(control)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"apply_control failed: {exc}")
+
+    def _setup_walker_ai(
+        self,
+        world: Any,
+        library: Any,
+        actor: Any,
+        spawn_point: SpawnPoint,
+        participant: TrafficParticipantConfig,
+    ) -> None:
+        """为行人挂载 AI 控制器并导航横穿道路（失败时保持静态）。"""
+        try:
+            import carla  # noqa: PLC0415  惰性导入：无 SDK 环境跳过
+        except ImportError:
+            logger.warning("carla SDK 不可用，行人保持静态")
+            return
+        blueprint = _safe_find(library, "controller.ai.walker")
+        if blueprint is None:
+            logger.warning("controller.ai.walker 蓝图缺失，行人保持静态")
+            return
+        try:
+            controller = world.spawn_actor(
+                blueprint, carla.Transform(), attach_to=actor
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Participant '{participant.participant_id}' walker controller spawn failed: {exc}"
+            )
+            return
+        self._walker_ai_controllers.append(controller)
+        speed = float(participant.speed_ms) if participant.speed_ms > 0 else 1.2
+        speed = min(1.4, max(0.3, speed))
+        try:
+            wrapper = WalkerControllerWrapper(actor, controller)
+            destination = self._walker_destination(spawn_point, carla)
+            wrapper.start_navigation(destination, speed_ms=speed)
+            self._walker_controllers.append(wrapper)
+            logger.info(
+                f"Walker '{participant.participant_id}' crossing at {speed:.2f} m/s"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Participant '{participant.participant_id}' walker navigation failed: {exc}"
+            )
+
+    @staticmethod
+    def _walker_destination(spawn_point: SpawnPoint, carla_module: Any) -> Any:
+        """计算横穿目的地：沿道路横向（相对出生朝向）偏移 8m。"""
+        yaw = math.radians(spawn_point.yaw_deg)
+        offset = 8.0
+        x = spawn_point.x - math.sin(yaw) * offset
+        y = spawn_point.y + math.cos(yaw) * offset
+        z = spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M
+        return carla_module.Location(x=x, y=y, z=z)
 
     def _attach_event_sensors(self, world: Any, library: Any) -> None:
         """按场景事件声明挂载碰撞/车道偏离传感器（事件回调驱动 EventDetector）。"""
@@ -565,6 +942,9 @@ class BuiltinScenario(CustomScenarioBase):
         except Exception as exc:  # noqa: BLE001  单帧抽取异常不得冒泡到 CARLA
             self._warn_frame_error("extract", stream, exc)
             return
+        if stream == STREAM_OVERVIEW:
+            self._enqueue_overview(frame)
+            return
         self._ensure_frame_worker()
         with self._frame_cond:
             self._frame_pending += 1
@@ -641,6 +1021,63 @@ class BuiltinScenario(CustomScenarioBase):
         with self._frame_cond:
             self._frame_pending = 0
         logger.debug("Sensor encoder thread stopped")
+
+    # ── 环视可视化编码（独立队列/线程，避免被数据传感器饿死） ─────────────
+
+    def _enqueue_overview(self, frame: _SensorFrame) -> None:
+        """环视帧入独立队列；队满丢弃最旧帧，保证画面始终是最新一帧。"""
+        self._ensure_overview_worker()
+        try:
+            self._overview_queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                self._overview_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._overview_queue.put_nowait(frame)
+            except queue.Full:
+                SENSOR_FRAMES_DROPPED_TOTAL.labels(stream=STREAM_OVERVIEW).inc()
+
+    def _ensure_overview_worker(self) -> None:
+        """惰性启动环视编码线程（幂等）。"""
+        with self._overview_worker_lock:
+            if self._overview_worker is not None and self._overview_worker.is_alive():
+                return
+            self._overview_stop.clear()
+            self._overview_worker = threading.Thread(
+                target=self._overview_worker_loop,
+                name="hunter-overview-encoder",
+                daemon=True,
+            )
+            self._overview_worker.start()
+            logger.debug("Overview encoder thread started")
+
+    def _overview_worker_loop(self) -> None:
+        """消费环视队列并编码推流（与数据传感器编码互不阻塞）。"""
+        while not self._overview_stop.is_set():
+            try:
+                frame = self._overview_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._dispatch_sensor_data(frame.stream, frame.as_measurement())
+            except Exception as exc:  # noqa: BLE001
+                self._warn_frame_error("overview", frame.stream, exc)
+
+    def _stop_overview_worker(self) -> None:
+        """停止环视编码线程并清空队列（幂等）。"""
+        with self._overview_worker_lock:
+            worker, self._overview_worker = self._overview_worker, None
+        if worker is None:
+            return
+        self._overview_stop.set()
+        worker.join(timeout=_SENSOR_WORKER_JOIN_TIMEOUT_S)
+        while True:
+            try:
+                self._overview_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _warn_frame_error(self, stage: str, stream: str, exc: Exception) -> None:
         """帧取数/编码失败告警：每流首次立即报，之后按窗口聚合成一条。

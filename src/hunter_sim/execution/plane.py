@@ -76,6 +76,9 @@ class ExecutionPlane:
         self._fixed_delta_seconds = fixed_delta_seconds
         self._runners: dict[str, Any] = runners if runners is not None else {}
         self._runner_engines: dict[str, str] = {}
+        # 实例 → (world, traffic_manager)：释放时用于恢复异步模式，避免 CARLA
+        # 停在同步模式等待 tick（场景结束后表现为模拟器卡死）
+        self._cleanup_info: dict[str, tuple[Any, Any]] = {}
         # 端点 key → 引擎级装配/销毁锁（在注册表锁内懒创建，避免建锁竞态）
         self._engine_locks: dict[str, threading.RLock] = {}
         # V2.9.0：在途装配计数与取消标记（解决"装配窗口内销毁实例"的泄漏竞态）
@@ -162,27 +165,38 @@ class ExecutionPlane:
                         f"(target {lease.endpoint.host}:{lease.endpoint.rpc_port})"
                     )
                 world = map_manager.load_map(instance.map_id)
-                self._configure_world(world)
+                sync_enabled = self._configure_world(world)
+                traffic_manager = (
+                    self._configure_traffic_manager(map_manager, lease.endpoint.tm_port)
+                    if sync_enabled
+                    else None
+                )
                 # P2-14：以事实加载的地图登记端点地图，下次调度才能命中亲和
                 self._pool.note_loaded_map(
                     lease.endpoint.key, _world_map_id(world, instance.map_id)
                 )
+                self._cleanup_info[instance_id] = (world, traffic_manager)
+                runner_kwargs = self._runner_kwargs(instance, runner_hooks)
+                runner_kwargs.setdefault("traffic_manager", traffic_manager)
+                runner_kwargs.setdefault("traffic_manager_port", lease.endpoint.tm_port)
                 runner = self._runner_factory(
                     world,
                     on_state_change=on_state_change,
                     on_event=on_event,
-                    **self._runner_kwargs(instance, runner_hooks),
+                    **runner_kwargs,
                 )
         except ExecutionUnavailable:
             with self._registry_lock:
                 self._release_assembly_slot(instance_id)
                 self._cancelled.discard(instance_id)
+            self._restore_world_async(instance_id)
             self._pool.release(instance_id)
             raise
         except Exception as exc:
             with self._registry_lock:
                 self._release_assembly_slot(instance_id)
                 self._cancelled.discard(instance_id)
+            self._restore_world_async(instance_id)
             self._pool.release(instance_id)
             raise ExecutionUnavailable(
                 f"Failed to assemble scene runtime on engine "
@@ -210,6 +224,8 @@ class ExecutionPlane:
                     runner.destroy()
                 except Exception as exc:  # noqa: BLE001  取消路径的销毁失败不阻断
                     logger.warning(f"Cancelled runner destroy failed for {instance_id}: {exc}")
+                # 恢复到异步模式，否则端点上的世界会等待已不存在的 tick 线程
+                self._restore_world_async(instance_id)
             logger.info(f"Execution plane assembly cancelled: instance={instance_id}")
             raise ExecutionUnavailable(
                 f"Scene assembly cancelled: instance '{instance_id}' was released while loading"
@@ -231,21 +247,28 @@ class ExecutionPlane:
             # V2.9.0：若有在途装配，登记取消标记；装配完成时自弃运行器与租约
             if self._assembling.get(instance_id):
                 self._cancelled.add(instance_id)
+            assembling = bool(self._assembling.get(instance_id))
             runner = self._runners.pop(instance_id, None)
             engine_key = self._runner_engines.pop(instance_id, None)
             released = self._pool.release(instance_id)
             engine_lock = self._engine_locks.get(engine_key) if engine_key else None
         self._close_producer_for_instance(instance_id)
-        if runner is None:
+        # 装配在途时由 ensure_runner 的取消路径在引擎锁内完成销毁/异步恢复，
+        # 避免这里无锁操作仍在使用中的 world
+        if runner is None and (assembling or instance_id not in self._cleanup_info):
             return released
 
         # 销毁场景 Actor 同样是 CARLA 操作：在同一引擎锁下与后续装配串行，
         # 避免“旧运行器还在销毁、新实例已在同端点 load_world”的并发
         def _destroy() -> None:
-            try:
-                runner.destroy()
-            except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
-                logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
+            if runner is not None:
+                try:
+                    runner.destroy()
+                except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
+                    logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
+            # runner.destroy() 已 join tick 线程；此时把世界/TM 恢复异步模式，
+            # 否则端点上的 CARLA 会停在同步模式等待永远不会到来的 tick
+            self._restore_world_async(instance_id)
 
         if engine_lock is not None:
             with engine_lock:
@@ -253,7 +276,7 @@ class ExecutionPlane:
         else:
             _destroy()
         logger.info(f"Execution plane released: instance={instance_id}")
-        return True
+        return runner is not None or released
 
     def release_all(self) -> int:
         """释放全部运行器（服务关停），返回释放数量。"""
@@ -389,15 +412,20 @@ class ExecutionPlane:
             tm_port=tm_port,
         )
 
-    def _configure_world(self, world: Any) -> None:
-        """把世界切换到同步模式（固定 50Hz），与场景循环帧率保持一致。"""
+    def _configure_world(self, world: Any) -> bool:
+        """把世界切换到同步模式（固定 50Hz），返回是否成功。
+
+        Returns:
+            True 表示世界已进入同步模式；False 表示读取/应用设置失败
+            （调用方应跳过 Traffic Manager 同步设置）。
+        """
         try:
             settings = world.get_settings()
         except Exception as exc:  # noqa: BLE001  Mock/受限 world 无设置接口
             logger.warning(f"Cannot read world settings: {exc}")
-            return
+            return False
         if settings is None:
-            return
+            return False
         try:
             settings.synchronous_mode = True
             settings.fixed_delta_seconds = self._fixed_delta_seconds
@@ -405,8 +433,58 @@ class ExecutionPlane:
             logger.info(
                 f"World switched to synchronous mode ({1.0 / self._fixed_delta_seconds:.0f}Hz)"
             )
+            return True
         except Exception as exc:  # noqa: BLE001  同步模式失败时退回异步推进
             logger.warning(f"Cannot enable synchronous mode: {exc}")
+            return False
+
+    def _configure_traffic_manager(self, map_manager: Any, tm_port: int) -> Any:
+        """把 Traffic Manager 同步到世界的同步模式。
+
+        世界进入同步模式后，Traffic Manager 若仍处于异步模式，所有
+        ``set_autopilot(True)`` 的车辆会停在原地等待世界 tick。这里通过
+        ``client.get_trafficmanager(port)`` 取 TM 并显式开启同步模式。
+
+        Returns:
+            Traffic Manager 实例；不可用时返回 None（场景仍可运行，
+            仅 autopilot 车辆可能静止）。
+        """
+        try:
+            traffic_manager = map_manager.get_traffic_manager(tm_port)
+        except Exception as exc:  # noqa: BLE001  旧版/受限客户端不支持 TM
+            logger.warning(f"Traffic Manager unavailable (port={tm_port}): {exc}")
+            return None
+        try:
+            traffic_manager.set_synchronous_mode(True)
+            logger.info(f"Traffic Manager switched to synchronous mode (port={tm_port})")
+        except Exception as exc:  # noqa: BLE001  TM 同步失败不阻断场景装配
+            logger.warning(f"Cannot enable Traffic Manager synchronous mode: {exc}")
+        return traffic_manager
+
+    def _restore_world_async(self, instance_id: str) -> None:
+        """把实例对应的世界与 Traffic Manager 恢复为异步模式。
+
+        场景结束后若世界仍停留在同步模式，CARLA 会等待 ``world.tick()``，
+        表现为模拟器无响应（后续 ``load_map`` 超时）。释放路径必须恢复。
+        """
+        info = self._cleanup_info.pop(instance_id, None)
+        if info is None:
+            return
+        world, traffic_manager = info
+        if traffic_manager is not None:
+            try:
+                traffic_manager.set_synchronous_mode(False)
+            except Exception as exc:  # noqa: BLE001  TM 可能已随世界失效
+                logger.debug(f"Restore Traffic Manager async failed: {exc}")
+        try:
+            settings = world.get_settings()
+            if settings is not None:
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = 0.0
+                world.apply_settings(settings)
+                logger.info(f"World restored to asynchronous mode: instance={instance_id}")
+        except Exception as exc:  # noqa: BLE001  世界可能已被重置/销毁
+            logger.debug(f"Restore world async failed for {instance_id}: {exc}")
 
     # ── V2.10.0 平台发布工厂辅助 ──────────────────────────────────────
 

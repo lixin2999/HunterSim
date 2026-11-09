@@ -36,11 +36,7 @@ _LEGACY_EXPORTS: frozenset[str] = frozenset(
         "VehicleControllerFactory",
         "ScenarioRunnerAdapter",
         "SceneConfigValidator",
-        "ScriptedActorController",
-        "create_behavior_from_config",
         "TrafficFlowManager",
-        "create_trigger_from_config",
-        "WalkerControllerWrapper",
         "CalibrationManager",
     }
 )

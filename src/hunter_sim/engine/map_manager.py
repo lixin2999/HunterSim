@@ -71,6 +71,7 @@ class CarlaClientProtocol(Protocol):
     def get_world(self) -> CarlaWorldProtocol: ...
     def load_world(self, map_name: str) -> CarlaWorldProtocol: ...
     def generate_opendrive_world(self, xodr_str: str) -> CarlaWorldProtocol: ...
+    def get_trafficmanager(self, port: int = 8000) -> object: ...
 
 
 class MapManager:
@@ -115,9 +116,38 @@ class MapManager:
         return self._current_map_id
 
     @property
+    def client(self) -> CarlaClientProtocol:
+        """底层 CARLA Client（Traffic Manager 等扩展用）。"""
+        return self._client
+
+    @property
     def current_world(self) -> Optional[CarlaWorldProtocol]:
         """当前 CARLA World 对象引用。"""
         return self._current_world
+
+    def get_traffic_manager(self, port: int = 8000) -> Any:
+        """获取指定端口的 CARLA Traffic Manager 实例。
+
+        CARLA 的 Traffic Manager 归属于 ``client``（``carla.Client.get_trafficmanager``），
+        并不在 ``World`` 上。同步模式下必须显式把 TM 也切到同步模式，否则
+        ``set_autopilot(True)`` 的车辆会一直等待世界 tick 而不移动。
+
+        Args:
+            port: Traffic Manager 端口（默认 8000）。
+
+        Returns:
+            Traffic Manager 实例。
+
+        Raises:
+            CarlaSimulationError: 客户端不支持 Traffic Manager。
+        """
+        getter = getattr(self._client, "get_trafficmanager", None)
+        if not callable(getter):
+            raise CarlaSimulationError(
+                operation="get_traffic_manager",
+                message="CARLA client 不支持 get_trafficmanager()",
+            )
+        return getter(int(port))
 
     def list_available_maps(self) -> list[MapInfo]:
         """返回所有已注册地图的元信息列表。

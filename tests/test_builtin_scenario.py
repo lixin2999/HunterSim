@@ -23,6 +23,7 @@ from tests.mocks.carla_mocks import (
     MockActor,
     MockBlueprint,
     MockLocation,
+    MockTrafficManager,
     MockTransform,
     MockVector3D,
     MockWorld,
@@ -56,7 +57,12 @@ _BASE_CONFIG: dict[str, Any] = {
 }
 
 
-def _make_scenario(overrides: dict[str, Any] | None = None) -> BuiltinScenario:
+def _make_scenario(
+    overrides: dict[str, Any] | None = None,
+    *,
+    traffic_manager: Any = None,
+    traffic_manager_port: int = 8000,
+) -> BuiltinScenario:
     """构造内置场景（注入 Transform 工厂，脱离 carla SDK）。"""
     config = SceneConfig(**{**_BASE_CONFIG, **(overrides or {})})
     return BuiltinScenario(
@@ -64,6 +70,8 @@ def _make_scenario(overrides: dict[str, Any] | None = None) -> BuiltinScenario:
         SceneStateManager(config.scene_id),
         EventDetector(config.scene_events),
         transform_factory=lambda _world, sp: MockTransform(MockLocation(sp.x, sp.y, sp.z or 0.5)),
+        traffic_manager=traffic_manager,
+        traffic_manager_port=traffic_manager_port,
     )
 
 
@@ -124,6 +132,236 @@ class TestSetup:
         scenario = _make_scenario()
         with pytest.raises(CarlaSimulationError):
             scenario.setup(object())
+
+
+class TestMotionAndBehaviors:
+    """同步模式下自车/参与者的运动与行为执行。"""
+
+    def test_ego_initial_speed_passed_to_traffic_manager(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {"ego_vehicle": {**_BASE_CONFIG["ego_vehicle"], "initial_speed_ms": 8.0}},
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        ego = scenario.ego_actor
+        assert ego is not None
+        assert tm.desired_speeds[ego.id] == pytest.approx(8.0)
+
+    def test_ego_autopilot_uses_configured_tm_port(self) -> None:
+        scenario = _make_scenario(traffic_manager=MockTrafficManager(), traffic_manager_port=9123)
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        # 自车 autopilot 使用的端口来自实例 TM 端口（而不是硬编码 8000）
+        assert scenario._traffic_manager_port == 9123  # noqa: SLF001
+
+    def test_non_static_vehicle_participant_gets_desired_speed(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "constant_speed",
+                        "speed_ms": 7.0,
+                    }
+                ]
+            },
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+        assert vehicle._autopilot is True
+        assert tm.desired_speeds[vehicle.id] == pytest.approx(7.0)
+
+    def test_decelerate_behavior_reduces_desired_speed_over_ticks(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "decelerate",
+                        "speed_ms": 10.0,
+                    }
+                ]
+            },
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+        scenario.setup(world)
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+        assert tm.desired_speeds[vehicle.id] == pytest.approx(10.0)
+
+        scenario.tick(world, 1.0, 1.0)
+        assert tm.desired_speeds[vehicle.id] == pytest.approx(8.0)
+
+        scenario.tick(world, 2.0, 1.0)
+        assert tm.desired_speeds[vehicle.id] == pytest.approx(6.0)
+
+    def test_cut_in_forces_lane_change_only_once(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "cut_in",
+                        "speed_ms": 6.0,
+                    }
+                ]
+            },
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+        scenario.setup(world)
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+
+        scenario.tick(world, 1.0, 0.02)
+        scenario.tick(world, 2.0, 0.02)
+
+        # 自车在参与者右侧（ego y=2 > participant y=0）→ direction=True（向右）
+        assert tm.lane_changes == [(vehicle.id, True)]
+
+    def test_cut_in_changes_left_when_ego_is_on_left(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {
+                "ego_vehicle": {
+                    **_BASE_CONFIG["ego_vehicle"],
+                    "spawn_point": {"x": 1.0, "y": -2.0},
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "cut_in",
+                        "speed_ms": 6.0,
+                    }
+                ],
+            },
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+        scenario.setup(world)
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+
+        scenario.tick(world, 1.0, 0.02)
+
+        # 自车在左侧（ego y=-2）→ direction=False（向左）
+        assert tm.lane_changes == [(vehicle.id, False)]
+
+    def test_cut_out_changes_to_opposite_side_of_ego(self) -> None:
+        tm = MockTrafficManager()
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "cut_out",
+                        "speed_ms": 6.0,
+                    }
+                ]
+            },
+            traffic_manager=tm,
+        )
+        world = MockWorld()
+        scenario.setup(world)
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+
+        scenario.tick(world, 1.0, 0.02)
+
+        # 自车在右侧 → 切出应向左（direction=False）
+        assert tm.lane_changes == [(vehicle.id, False)]
+
+    def test_static_vehicle_is_braked(self) -> None:
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "car-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 10.0, "y": 0.0},
+                        "behavior": "static",
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        vehicle = next(
+            a for a in world.get_actors() if a.type_id == "vehicle.tesla.model3"
+        )
+        assert vehicle._autopilot is False
+        assert vehicle._control is not None
+        assert vehicle._control.brake == pytest.approx(1.0)
+
+    def test_walker_crossing_uses_ai_controller(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda *args, **kwargs: MockTransform(),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+        )
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "walker-1",
+                        "actor_type": "walker",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 20.0, "y": 0.0},
+                        "behavior": "pedestrian_cross",
+                        "speed_ms": 1.2,
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        assert len(scenario._walker_controllers) == 1  # noqa: SLF001
+        controller = scenario._walker_ai_controllers[0]  # noqa: SLF001
+        assert controller._started is True
+        assert controller.destination is not None
+        assert controller.max_speed == pytest.approx(1.2)
 
 
 class TestEgoFallback:
