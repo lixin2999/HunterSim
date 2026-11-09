@@ -527,11 +527,17 @@ class SceneRunnerService:
                 time.sleep(sleep_time)
 
         # 终态补发：运行循环 break 后平台需收到最终状态（而非停在最后一条 RUNNING）
+        # V3.4.4：收尾每一步都落 INFO——CARLA 原生 fail-fast 会让进程直接退出，
+        # 只能靠最后一条日志定位卡在哪一步（现场曾出现 completed 后无声退出）
+        logger.info("Scene loop exited: publishing terminal status")
         self._publish_terminal_status()
         # 先恢复异步再清理：同步模式下销毁 Actor/传感器会阻塞等待 tick
         # （没有后续 tick 时即表现为 CARLA 卡死）；异步模式下销毁不依赖 tick
+        logger.info("Scene loop: restoring async world mode")
         self._restore_async()
+        logger.info("Scene loop: cleaning up scenario resources")
         self._cleanup()
+        logger.info("Scene loop: cleanup finished, thread exiting")
 
     def _restore_async(self) -> None:
         """把世界与 Traffic Manager 恢复为异步模式（幂等、失败不抛）。"""
@@ -571,10 +577,13 @@ class SceneRunnerService:
         if scenario is None or self._scenario_cleaned:
             return
         self._scenario_cleaned = True
+        scene_id = self._config.scene_id if self._config else "unknown"
         try:
             scenario.cleanup(self._world)
         except Exception as exc:
             logger.warning(f"Scenario cleanup error: {exc}")
+        else:
+            logger.info(f"Scenario cleanup done: {scene_id}")
 
     def _stop_if_running(self, timeout_s: float = 5.0) -> None:
         """若有场景循环线程在跑，先停掉（不修改公开状态机，供重新下发场景使用）。"""
@@ -818,12 +827,16 @@ class SceneRunnerService:
             self._warn_ego_state("actor_missing", None)
             return {}
         try:
-            loc = vehicle.get_location()
-            rot = vehicle.get_rotation()
+            # CARLA Actor 没有 get_rotation()：位姿（位置 + 姿态）统一从
+            # get_transform() 读取。V3.4.3 误用 get_rotation() 使整个读取块
+            # 每帧抛 AttributeError，面板整场显示「—」（旧版则写零值）。
+            pose = vehicle.get_transform()
+            loc = pose.location
+            rot = pose.rotation
             vel = vehicle.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             ctrl = vehicle.get_control()
-            yaw = round(math.radians(rot.yaw), 6)
+            yaw = round(math.radians(float(getattr(rot, "yaw", 0.0))), 6)
             state = {
                 "x": round(loc.x, 4),
                 "y": round(loc.y, 4),

@@ -3040,4 +3040,82 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 真机需重点确认：1920x1080@10fps + JPEG 90 的 MJPEG 带宽（约 2~4 MB/s 每客户端）在平台网络下的表现；带宽吃紧时可把 `overview_camera` 降到 1280x720（仍是原生编码，不再降采样）。
 - 「儿童追球」目前映射为行人横穿（`child_chase_ball` → `PEDESTRIAN_CROSS`），球道具与追球跑位尚未建模，需要平台下发道具 Actor 后再补。
 - 脚本化行人兜底用 `set_transform` 直行，不含步态动画；AI 控制器可用时走原生导航。
-- 行人横穿目的地为「横穿自车车道 8~18 m」，复杂路口仍建议平台提供路径点。
+- 行人横穿目的地为「横穿自车车道 8~18 m」，复杂路口仍建议平台提供路径点。       
+
+
+## V3.4.4 — 自车状态取数修复 + 主视区流畅度 + 参与者映射可诊断 + 场景收尾防原生崩溃
+
+**发布日期**：2026-11-09
+**版本定位**：V3.4.3 实机（`D:\python\HunterSim`）二次验收的 **patch** 修复。现场四项问题：下发场景仿真过程中主视区卡顿；「鬼探头」场景看不到行人横穿；自车状态整场「—」；场景结束后日志报错并以 `code=3221226505`（0xC0000409 fail-fast）退出。
+
+### 问题背景（现场日志证据）
+
+1. **自车状态取数踩到不存在的 API**：每帧打印 `Ego state unavailable (stage=read): AttributeError: 'Vehicle' object has no attribute 'get_rotation' (+1211 suppressed)`。CARLA `Actor` 位姿只能由 `get_transform()` 读出（`.location` / `.rotation`）——V3.4.3 的 `get_transform` → `get_rotation` 混合写法使整个读取块每帧抛异常，面板全「—」。
+2. **卡顿来自编码侧 CPU 打满**：`overview` 固定 1920x1080 + JPEG 90，且编码前先 `bgra_to_rgb`（numpy 花式拷贝 6.2 MB）再 `Image.fromarray`（再拷 6.2 MB）。传感器实测帧率掉到 rgb 8.7 Hz / depth 6.8 Hz（配置 10 Hz），说明主视区编码已吃满 CPU。
+3. **参与者不可见属「平台没下发」+「字段不匹配」双重可能**：现场 `Builtin scenario ... ready: ego=877, actors=1/1` 表明本次 `scene_config` 中只有 1 个 `constant_speed` 车辆，没有行人；而映射器只读 `actors` 一个键，平台若把行人放在 `traffic_participants`/`pedestrians` 等别名键下会被静默丢掉，且日志不留任何线索。
+4. **场景结束后的原生崩溃**：`Phase RUNNING → COMPLETED` 之后没有任何后续 INFO，进程直接以 0xC0000409 退出。CARLA 的 fail-fast 不会给 Python traceback，只能靠「最后一条日志」定位到具体销毁阶段。
+
+### 修复内容
+
+**一、自车状态真实取数（`scene_runner/scene_runner_service.py`、`engine/hunter_se_vehicle.py`）**
+
+- `SceneRunnerService._get_ego_state()`：`vehicle.get_rotation()` → `pose = vehicle.get_transform()`，`yaw` 取 `pose.rotation.yaw` 并转弧度。
+- `engine/hunter_se_vehicle.py`：蓝图协议里的 `get_rotation` 改为 `get_transform`；新增模块级 `_read_pose()`（优先 `get_transform`，回退 `get_location` + `get_rotation`），两处 `get_state()` 统一走它，避免同类误用在 VIL 控制器里复现。
+- 单测桩同步为真机形态：`tests/test_scene_runner_service.py::_vehicle()` 与 `tests/test_hunter_se_vehicle.py::_StubActor` 不再提供 `get_rotation`，只提供 `get_transform()`——桩比真机「更宽容」正是该 bug 逃过 V3.4.3 单测的原因。
+
+**二、主视区流畅度（`sensor_sim/image_codec.py`、`scene_runner/builtin_scenario.py`）**
+
+- 新增 `encode_bgra_jpeg()`：用 `Image.frombuffer("RGBA", ..., "raw", "BGRA")` 零拷贝读 CARLA 原始缓冲区，直接 `convert("RGB")` 编码 JPEG，省掉 numpy 侧两次整帧拷贝（1080p 每帧约 12 MB 的内存带宽热点）；`encode_rgb_frame()` 在「不降采样」时优先走该快路径，异常自动回落原有慢路径。
+- 环视 JPEG 质量 90 → 85（`_OVERVIEW_JPEG_QUALITY`）：分辨率不变，单帧体积与编码耗时降约 20%~30%。
+- 环视编码线程改为「追最新帧」：编码前先清空队列里积压的旧帧，慢编码后不会把延迟越积越大。
+- 新增慢编码诊断：单帧耗时超 120 ms 时限频（60 s 窗口）WARNING `Overview encode slow: ... ms/frame (> ... ms budget), main view may stutter`，把「卡顿」变成日志里可量化的证据。
+- 顺带清理 Pillow 13 移除的 `mode=` 参数（`Image.fromarray(rgb)` / `Image.fromarray(gray)`），避免升级 Pillow 后编码直接失败。
+
+**三、参与者映射可诊断且兼容别名键（`platform_adapter/scene_mapper.py`）**
+
+- 参与者容器改为合并读取：`actors` / `traffic_participants` / `participants` / `pedestrians` / `road_users` / `figures`；支持 `{"items": [...]}` / `{"list": [...]}` 等嵌套包装；跨键完全相同的条目去重，避免同时下发两个键时重复生成。
+- 新增映射汇总日志：`Scene participants mapped: count=... sources=[actors=1] types={...} behaviors={...} detail=[...]`；count=0 时升为 WARNING 并打印 `scene_config keys=[...]` 与已检索的键，一次日志即可判定是「平台没下发行人」还是「字段名不匹配」；无任何 walker 时额外提示核对 `type` 字段。
+- 行人行为兜底：行为是横穿类（`pedestrian_crossing`/`sudden_cross`/`child_chase_ball`/`occluded_dash`）但平台未声明 `type` 时按 `walker` 映射，不再生成「横穿马路的特斯拉」。
+
+**四、场景收尾防原生崩溃（`scene_runner/scene_runner_service.py`、`scene_runner/builtin_scenario.py`）**
+
+- `_run_loop` 收尾四步各落一条 INFO：`publishing terminal status` → `restoring async world mode` → `cleaning up scenario resources` → `cleanup finished, thread exiting`。
+- `BuiltinScenario.cleanup()` 分阶段日志（含待销毁数量）：`cleanup begin: sensors=.., overview=.., participants=.., ego=..` → `stopping encoder threads` → `stopping participant controllers` → `destroying sensors` → `destroying actors` → `cleanup done`。崩溃后由最后一条日志即可定位到具体阶段（编码线程 / 控制器 / 传感器 / Actor）。
+- 编码线程 join 超时不再静默：`is_alive()` 为真时 WARNING（`did not stop within 1.0s`），说明有线程卡在编码/写盘。
+- 时序确认：执行器的 `_await_completion()` 以 `runner.is_running`（tick 线程存活）为退出条件，清理完成前不会 `plane.release()`，因此不存在「清理中世界被拆掉」的竞态。
+
+### 向后兼容
+
+- 平台契约不变：`ego_state` 字段、`sim_status` / `sim_telemetry` 结构均未改动，仅修复读取来源。
+- 参与者读取新增别名键与嵌套包装，原有 `actors` 载荷行为完全一致；重复条目去重只在「跨键完全相同」时触发。
+- 行为映射表未增删；行人兜底仅在 `type` 缺失且行为为横穿类时生效。
+- 新增日志均为 INFO/WARNING，不改变任何返回结构；环视质量 90 → 85 只影响画质参数，可用 `_OVERVIEW_JPEG_QUALITY` 调回。
+
+### 验证
+
+- `pytest -q` 全量：**1316 passed**（新增 `tests/test_image_codec.py` 6 项；`tests/test_platform_adapter_mapper.py` 新增 `TestActorContainers` 6 项；更新 `tests/test_scene_runner_service.py`、`tests/test_hunter_se_vehicle.py`）。
+- `mypy src/hunter_sim`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 真机 CARLA 端到端验证待执行（开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.4.4`；
+2. 重启 `huntersim up`；
+3. 下发任一 SIL 场景，预期「自车状态」面板的位置/航向/速度/转角/加速度随车变化，且日志不再出现 `stage=read` 的 `get_rotation` 报错；
+4. 主视区观察流畅度：日志出现 `Overview encode slow` 说明编码仍超预算（此时把 `configs/sensor_configs.json` 的 `overview_camera` 降到 1280x720）；无该告警且画面连贯即优化生效；
+5. 下发「鬼探头」场景，先看一条 `Scene participants mapped: ...`：
+   - `count=0` → 平台未下发行人/行人，请核对场景模板；
+   - `count>=1` 但 `types` 里没有 `walker` → 平台 `type` 字段写错（已按行为兜底为 walker，日志会提示）；
+   - 有 `walker` → 主视区应可见行人横穿，日志另有 `Walker '...' crossing at ...` 或脚本化兜底说明；
+6. 场景结束（`COMPLETED`）后按 `Scenario cleanup: ...` 逐阶段日志确认走到 `Scenario cleanup done` / `Scene loop: cleanup finished, thread exiting`；若进程仍异常退出，最后一条 `Scenario cleanup:` 即为崩溃阶段。
+
+### 分发
+
+镜像 tag `hunter-sim:3.4.4`；`pyproject.toml` 版本 `3.4.4`；wheel / 容器版本号一致。
+
+### 待办 / 已知边界
+
+- 若现场 `Scene participants mapped: count=0` 反复出现，需要平台侧补齐 `actors`（或约定别名键）并包含 `type: pedestrian` + `behavior_type: pedestrian_crossing`。
+- 0xC0000409 属 CARLA 原生 fail-fast，本次只做到「分阶段定位 + 线程守卫」，若日志停在 `destroying actors` 仍需在 CARLA 侧排查（如 `destroy()` 与传感器回调竞争、跨实例 client 复用等既有已知问题）。
+- 主视区仍为 1920x1080 原生编码；单客户端 MJPEG 带宽约 2~3 MB/s，多客户端同时观看时受机器磁盘/CPU 限制，必要时降低 `overview_camera` 分辨率。
+- 「儿童追球」仍映射为行人横穿，球道具与追球跑位需平台下发道具 Actor 后再补。

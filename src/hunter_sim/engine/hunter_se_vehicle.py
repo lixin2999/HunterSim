@@ -73,6 +73,28 @@ class HunterSEParameters(BaseModel):
 # ─── 蓝图库协议 ───────────────────────────────────────────────────────────────
 
 
+def _read_pose(actor: Any) -> tuple[Any, Any]:
+    """读取 Actor 的位置与姿态。
+
+    CARLA 的 ``Actor`` **没有** ``get_rotation()``：位置与姿态由
+    ``get_transform()`` 一次性返回（``transform.location`` / ``transform.rotation``）。
+    V3.4.3 曾按 ``get_rotation()`` 取姿态，真机每帧抛 ``AttributeError``，
+    自车状态因此整场取不到值。
+
+    Args:
+        actor: CARLA Vehicle Actor（或单测桩）。
+
+    Returns:
+        ``(location, rotation)``；缺少 ``get_transform()`` 的旧桩回退到
+        ``get_location()`` + ``get_rotation()``。
+    """
+    getter = getattr(actor, "get_transform", None)
+    if callable(getter):
+        transform = getter()
+        return transform.location, transform.rotation
+    return actor.get_location(), actor.get_rotation()
+
+
 class BlueprintLibraryProtocol(Protocol):
     """CARLA BlueprintLibrary 协议。"""
 
@@ -89,7 +111,7 @@ class CarlaVehicleActorProtocol(Protocol):
     def apply_control(self, control: Any) -> None: ...
     def get_velocity(self) -> Any: ...
     def get_location(self) -> Any: ...
-    def get_rotation(self) -> Any: ...
+    def get_transform(self) -> Any: ...
     def destroy(self) -> None: ...
 
 
@@ -204,8 +226,7 @@ class HunterSEVehicleController:
         """
         self._check_alive()
         try:
-            loc = self._actor.get_location()
-            rot = self._actor.get_rotation()
+            loc, rot = _read_pose(self._actor)
             vel = self._actor.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             return VehicleState(
@@ -275,8 +296,7 @@ class HunterSESILController:
         """从仿真 Actor 读取当前状态。"""
         self._check_alive()
         try:
-            loc = self._actor.get_location()
-            rot = self._actor.get_rotation()
+            loc, rot = _read_pose(self._actor)
             vel = self._actor.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             return VehicleState(

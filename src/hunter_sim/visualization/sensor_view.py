@@ -178,7 +178,8 @@ def depth_png(frame: Frame, max_width: int = 480) -> Optional[bytes]:
         from PIL import Image  # noqa: PLC0415  仅缩放分支使用
     except Exception:  # noqa: BLE001  Pillow 缺失 → 标准库编码
         return _encode_gray_png(gray.tobytes(), width, height)
-    image = Image.fromarray(gray, mode="L")
+    # 不传 mode：Pillow 13 已移除该参数，二维 uint8 会自动推断为灰度
+    image = Image.fromarray(gray)
     if (image.width, image.height) != (width, height):
         # Pillow 10+ 重采样常量正式住在 Image.Resampling（顶层别名仅供旧代码）
         image = image.resize((width, height), Image.Resampling.NEAREST)

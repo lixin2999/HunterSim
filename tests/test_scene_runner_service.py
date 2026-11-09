@@ -362,9 +362,16 @@ class TestRunLoopThrottling:
 
 
 def _vehicle() -> Any:
+    """真机形态的车辆替身：位姿只由 ``get_transform()`` 提供。
+
+    CARLA ``Actor`` 没有 ``get_rotation()``（V3.4.3 现场回归）；桩里刻意不提供，
+    避免再次出现「单测通过、真机每帧 AttributeError」的盲区。
+    """
     return SimpleNamespace(
-        get_location=lambda: SimpleNamespace(x=12.5, y=-3.0, z=0.5),
-        get_rotation=lambda: SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
+        get_transform=lambda: SimpleNamespace(
+            location=SimpleNamespace(x=12.5, y=-3.0, z=0.5),
+            rotation=SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
+        ),
         get_velocity=lambda: SimpleNamespace(x=10.0, y=0.0, z=0.0),
         get_acceleration=lambda: SimpleNamespace(x=0.0, y=0.0, z=9.81),
         get_control=lambda: SimpleNamespace(steer=-0.25, throttle=0.6, brake=0.0),

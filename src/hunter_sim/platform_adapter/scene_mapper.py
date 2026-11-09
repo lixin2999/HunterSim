@@ -17,6 +17,7 @@ import math
 from typing import Any, Optional
 
 from hunter_sim.common.models import QualityLevel, SimMode
+from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.coordinate_converter import CalibrationParams
 from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
@@ -31,6 +32,8 @@ from hunter_sim.scene_runner.scene_config import (
     TriggerType,
     WeatherConfig,
 )
+
+logger = get_logger(__name__)
 
 _MODE_MAP: dict[str, SimMode] = {
     "sil": SimMode.SIL,
@@ -103,6 +106,19 @@ _CONDITION_TYPE_MAP: dict[str, TriggerType] = {
 
 _FAILURE_EVENT_TYPES = frozenset(
     {SceneEventType.COLLISION, SceneEventType.EMERGENCY_BRAKE}
+)
+
+#: 平台参与者容器键（按优先级）。平台不同版本/不同场景模板会把交通参与者放在
+#: ``actors`` 之外的别名键下（如 ``traffic_participants``）；只读 ``actors`` 会让
+#: 「平台下发了行人、仿真端只有自车」这类问题无从定位，故合并读取并在日志里
+#: 打印命中来源。
+_ACTOR_CONTAINER_KEYS: tuple[str, ...] = (
+    "actors",
+    "traffic_participants",
+    "participants",
+    "pedestrians",
+    "road_users",
+    "figures",
 )
 
 
@@ -184,10 +200,11 @@ def map_scene_config(
             f"duration={duration}s 超过上限 {max_duration_seconds}s",
         )
 
+    actor_sections, actor_sources = _collect_actor_sections(platform_config)
     participants = [
-        _map_actor(actor, index)
-        for index, actor in enumerate(_as_list(platform_config.get("actors")))
+        _map_actor(actor, index) for index, actor in enumerate(actor_sections)
     ]
+    _log_participants(platform_config, participants, actor_sources)
     events = [
         _map_event(event, index)
         for index, event in enumerate(_as_list(platform_config.get("events")))
@@ -263,11 +280,95 @@ def map_calibration(vil: Optional[dict[str, Any]]) -> Optional[CalibrationParams
 # ── 内部映射 ─────────────────────────────────────────────────────────────────
 
 
+def _actor_entries(raw: Any) -> list[Any]:
+    """把参与者容器取值展开为条目列表（容错平台的多层包装）。"""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for nested in ("items", "list", "actors", "participants"):
+            inner = raw.get(nested)
+            if isinstance(inner, list):
+                return inner
+    return []
+
+
+def _collect_actor_sections(
+    platform_config: dict[str, Any],
+) -> tuple[list[Any], list[str]]:
+    """汇总全部参与者条目（兼容 ``_ACTOR_CONTAINER_KEYS`` 别名键）。
+
+    同一条目（完全相同）在多个别名键重复出现时只取一次，避免平台同时下发
+    ``actors`` 与 ``traffic_participants`` 时重复生成参与者。
+
+    Args:
+        platform_config: 平台 ``scene_config``。
+
+    Returns:
+        ``(条目列表, 命中来源摘要)``；来源摘要形如 ``["actors=1", "pedestrians=2"]``。
+    """
+    sections: list[Any] = []
+    sources: list[str] = []
+    seen: set[str] = set()
+    for key in _ACTOR_CONTAINER_KEYS:
+        items = _actor_entries(platform_config.get(key))
+        if not items:
+            continue
+        sources.append(f"{key}={len(items)}")
+        for item in items:
+            fingerprint = repr(item)
+            if fingerprint in seen:
+                logger.warning(
+                    f"Duplicate participant entry in scene_config ignored (key={key})"
+                )
+                continue
+            seen.add(fingerprint)
+            sections.append(item)
+    return sections, sources
+
+
+def _log_participants(
+    platform_config: dict[str, Any],
+    participants: list[TrafficParticipantConfig],
+    sources: list[str],
+) -> None:
+    """输出参与者映射汇总，现场可直接判定「平台没下发」还是「字段不匹配」。"""
+    if not participants:
+        logger.warning(
+            "Scene participants mapped: count=0; searched keys="
+            f"{list(_ACTOR_CONTAINER_KEYS)} scene_config keys="
+            f"{sorted(platform_config.keys())}；平台未下发任何交通参与者"
+        )
+        return
+    type_counts: dict[str, int] = {}
+    behavior_counts: dict[str, int] = {}
+    detail: list[str] = []
+    for participant in participants:
+        type_counts[participant.actor_type] = type_counts.get(participant.actor_type, 0) + 1
+        behavior = str(getattr(participant.behavior, "value", participant.behavior))
+        behavior_counts[behavior] = behavior_counts.get(behavior, 0) + 1
+        detail.append(f"{participant.participant_id}[{participant.actor_type}/{behavior}]")
+    logger.info(
+        f"Scene participants mapped: count={len(participants)} "
+        f"sources={sources or ['none']} types={type_counts} "
+        f"behaviors={behavior_counts} detail={detail}"
+    )
+    if "walker" not in type_counts:
+        logger.warning(
+            "Scene participants mapped: 没有任何行人（walker）参与者；"
+            "鬼探头/儿童追球类场景看不到行人横穿请核对平台下发的 type 字段"
+        )
+
+
 def _map_actor(actor: Any, index: int) -> TrafficParticipantConfig:
-    """映射单个交通参与者。"""
+    """映射单个交通参与者。
+
+    平台未声明 ``type`` 但行为是行人横穿类（鬼探头/儿童追球等）时，按 ``walker``
+    处理：否则会生成一辆「横穿马路的特斯拉」，可视化里看不到行人。
+    """
     section = _as_dict(actor)
     actor_id = str(section.get("actor_id") or f"actor-{index}")
-    actor_type = _actor_type(section.get("type"))
+    raw_type = str(section.get("type") or "").strip()
+    actor_type = _actor_type(raw_type)
     behavior_section = _as_dict(section.get("behavior"))
     behavior_type = str(behavior_section.get("behavior_type") or "static").strip()
     behavior = _BEHAVIOR_MAP.get(behavior_type)
@@ -275,6 +376,12 @@ def _map_actor(actor: Any, index: int) -> TrafficParticipantConfig:
         raise SceneMappingError(
             f"unsupported_behavior:{behavior_type}",
             f"参与者 {actor_id} 的行为不受支持",
+        )
+    if behavior is ScenarioBehaviorType.PEDESTRIAN_CROSS and not raw_type:
+        actor_type = "walker"
+        logger.info(
+            f"Participant {actor_id} has pedestrian behavior '{behavior_type}' "
+            f"but no type; mapped as walker"
         )
     parameters = _as_dict(behavior_section.get("parameters"))
     speed = _first_float(

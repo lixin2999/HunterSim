@@ -130,6 +130,66 @@ class TestMapSceneConfig:
         assert config.duration_seconds == pytest.approx(45.0)
 
 
+class TestActorContainers:
+    """参与者容器兼容（现场「鬼探头看不到行人」的定位/兼容路径）。"""
+
+    @staticmethod
+    def _pedestrian() -> dict[str, Any]:
+        return {
+            "actor_id": "ped-1",
+            "type": "pedestrian",
+            "spawn_point": {"x": 12.0, "y": 3.0},
+            "behavior": {
+                "behavior_type": "pedestrian_crossing",
+                "parameters": {"speed": 1.2},
+            },
+        }
+
+    def test_alias_key_is_read_when_actors_missing(self) -> None:
+        payload = scene_config()
+        payload.pop("actors")
+        payload["pedestrians"] = [self._pedestrian()]
+        config = map_scene_config(payload, scene_id="scene-1")
+        assert len(config.traffic_participants) == 1
+        participant = config.traffic_participants[0]
+        assert participant.participant_id == "ped-1"
+        assert participant.actor_type == "walker"
+        assert participant.behavior.value == "pedestrian_cross"
+
+    def test_alias_keys_are_merged(self) -> None:
+        payload = scene_config()
+        payload["traffic_participants"] = [self._pedestrian()]
+        config = map_scene_config(payload, scene_id="scene-1")
+        assert len(config.traffic_participants) == 2
+        assert [p.actor_type for p in config.traffic_participants] == ["vehicle", "walker"]
+
+    def test_duplicate_entries_across_keys_are_deduped(self) -> None:
+        payload = scene_config()
+        payload["traffic_participants"] = payload["actors"]
+        config = map_scene_config(payload, scene_id="scene-1")
+        assert len(config.traffic_participants) == 1
+
+    def test_nested_container_is_unwrapped(self) -> None:
+        payload = scene_config(actors={"items": [self._pedestrian()]})
+        config = map_scene_config(payload, scene_id="scene-1")
+        assert len(config.traffic_participants) == 1
+        assert config.traffic_participants[0].actor_type == "walker"
+
+    def test_pedestrian_behavior_without_type_maps_to_walker(self) -> None:
+        payload = scene_config()
+        payload["actors"] = [
+            {
+                "actor_id": "ghost-1",
+                "spawn_point": {"x": 12.0, "y": 3.0},
+                "behavior": {"behavior_type": "pedestrian_crossing"},
+            }
+        ]
+        config = map_scene_config(payload, scene_id="scene-1")
+        participant = config.traffic_participants[0]
+        assert participant.actor_type == "walker"
+        assert participant.blueprint.startswith("walker.")
+
+
 class TestMapCalibration:
     def test_calibration_formula(self) -> None:
         calibration = map_calibration(

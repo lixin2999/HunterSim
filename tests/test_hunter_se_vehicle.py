@@ -37,7 +37,11 @@ class _Rot:
 
 
 class _StubActor:
-    """具备 get_location/get_rotation/get_velocity 的车辆替身。"""
+    """具备 get_transform/get_velocity 的车辆替身（与真机 CARLA API 一致）。
+
+    CARLA ``Actor`` 只提供 ``get_transform()``（内含 location/rotation），
+    没有 ``get_rotation()``。
+    """
 
     def __init__(self, speed: float = 0.0) -> None:
         self.destroyed = False
@@ -69,11 +73,8 @@ class _StubActor:
             raise RuntimeError("destroyed")
         self.last_control = ctrl
 
-    def get_location(self) -> Any:
-        return self._loc
-
-    def get_rotation(self) -> Any:
-        return self._rot
+    def get_transform(self) -> Any:
+        return types.SimpleNamespace(location=self._loc, rotation=self._rot)
 
     def get_velocity(self) -> Any:
         return self._vel
@@ -171,7 +172,7 @@ class TestVILController:
 
     def test_get_state_error_wrapped(self) -> None:
         actor = _StubActor()
-        actor.get_location = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+        actor.get_transform = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
         ctrl = HunterSEVehicleController(actor)
         with pytest.raises(CarlaSimulationError):
             ctrl.get_state()

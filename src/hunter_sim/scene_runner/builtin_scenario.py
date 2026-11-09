@@ -98,8 +98,16 @@ _OVERVIEW_MOUNT_ID = "overview_camera"
 _OVERVIEW_QUEUE_MAXSIZE = 4
 
 #: 环视主视区 JPEG 质量下限：主视区是验收画面的唯一来源，不再套用数据流质量
-#: （数据流默认 75 只保证传输，主视区需要看清行人与车辆轮廓）
-_OVERVIEW_JPEG_QUALITY = 90
+#: （数据流默认 75 只保证传输）。V3.4.3 现场反馈 1080p + 质量 90 编码耗时偏长
+#: （满 10Hz 编码吃 CPU，画面发脏/发顿），降到 85：分辨率不变，画质肉眼看不出
+#: 差异，单帧体积和编码耗时降约 20%~30%。
+_OVERVIEW_JPEG_QUALITY = 85
+
+#: 环视单帧编码耗时告警阈值（秒）：1080p@10Hz 的单帧预算约 100 ms，
+#: 超过该值说明编码跟不上下集，画面会表现为卡顿，需要在日志里直接可见
+_OVERVIEW_SLOW_ENCODE_S = 0.12
+#: 环视慢编码告警限频窗口（秒）
+_OVERVIEW_SLOW_LOG_INTERVAL_S = 60.0
 
 #: 交通参与者「可视距离」告警阈值（米）：超出该距离时环视相机基本拍不到，
 #: 日志给出 WARNING 便于定位「参与者生成了但画面里看不到」
@@ -257,6 +265,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._overview_worker: Optional[threading.Thread] = None
         self._overview_worker_lock = threading.Lock()
         self._overview_stop = threading.Event()
+        # 慢编码告警限频状态（仅环视编码线程访问）
+        self._overview_slow_at = 0.0
+        self._overview_slow_suppressed = 0
         # 场景化行为控制：参与者 ID → 控制器；行人 AI 控制器单独登记
         self._participant_controllers: list[ScriptedActorController] = []
         self._walker_controllers: list[WalkerControllerWrapper] = []
@@ -359,17 +370,33 @@ class BuiltinScenario(CustomScenarioBase):
         return self.elapsed_seconds >= self._config.duration_seconds
 
     def cleanup(self, world: Any) -> None:
-        """销毁本场景生成的全部 Actor 与传感器（幂等）。"""
+        """销毁本场景生成的全部 Actor 与传感器（幂等）。
+
+        V3.4.4 起每个阶段都有 INFO 日志（含待销毁数量）：CARLA 原生销毁偶发
+        fail-fast（进程直接退出，traceback 无法落盘），崩溃后可以由最后一条日志
+        定位到具体阶段，避免再“场景结束后无声退出”。
+        """
         if self._cleaned:
             return
         self._cleaned = True
 
+        logger.info(
+            "Scenario cleanup begin: sensors=%d, overview=%s, participants=%d, "
+            "ego=%s",
+            len(self._sensors),
+            self._overview_sensor is not None,
+            len(self._actors),
+            self._ego is not None,
+        )
+
         # 先关回调入口并排空编码队列，再销毁传感器（避免后续帧写已关闭的录制器）
         self._frame_accepting = False
+        logger.info("Scenario cleanup: stopping encoder threads")
         self._stop_frame_worker()
         self._stop_overview_worker()
 
         # 停止行人导航/控制器
+        logger.info("Scenario cleanup: stopping participant controllers")
         for wrapper in self._walker_controllers:
             try:
                 wrapper.stop_navigation()
@@ -391,6 +418,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._participant_controllers.clear()
         self._cut_in_done.clear()
 
+        logger.info("Scenario cleanup: destroying sensors")
         for sensor in (
             ([self._overview_sensor] if self._overview_sensor is not None else [])
             + self._sensors
@@ -407,6 +435,11 @@ class BuiltinScenario(CustomScenarioBase):
         self._sensors.clear()
         self._overview_sensor = None
 
+        logger.info(
+            "Scenario cleanup: destroying actors (ego=%s, participants=%d)",
+            self._ego is not None,
+            len(self._actors),
+        )
         for actor in ([self._ego] if self._ego is not None else []) + self._actors:
             try:
                 actor.destroy()
@@ -415,6 +448,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego = None
         self._ego_spawn = None
         self._actors.clear()
+        logger.info("Scenario cleanup done")
 
     # ── 内部实现 ─────────────────────────────────────────────────────────
 
@@ -1338,6 +1372,13 @@ class BuiltinScenario(CustomScenarioBase):
         self.drain_sensor_frames()
         self._frame_stop.set()
         worker.join(timeout=_SENSOR_WORKER_JOIN_TIMEOUT_S)
+        if worker.is_alive():
+            # 不在此处强杀线程：join 超时说明正在编码大帧，继续等下一帧即可
+            logger.warning(
+                "Sensor encoder thread still alive after %.1fs; leaving it to exit "
+                "(frames will be dropped)",
+                _SENSOR_WORKER_JOIN_TIMEOUT_S,
+            )
         # 丢弃残留帧并复位计数：避免下一场景的 worker 重放旧帧 / 计数漂移
         while True:
             try:
@@ -1386,10 +1427,40 @@ class BuiltinScenario(CustomScenarioBase):
                 frame = self._overview_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            # 队列里已有更新帧时丢弃当前帧：编码落后时直接追到最新画面，
+            # 而不是把积压帧逐帧编完（后者会让画面延迟持续增长 = 卡顿）
+            while True:
+                try:
+                    frame = self._overview_queue.get_nowait()
+                except queue.Empty:
+                    break
+            started = time.perf_counter()
             try:
                 self._dispatch_sensor_data(frame.stream, frame.as_measurement())
             except Exception as exc:  # noqa: BLE001
                 self._warn_frame_error("overview", frame.stream, exc)
+            finally:
+                self._warn_overview_slow(time.perf_counter() - started)
+
+    def _warn_overview_slow(self, cost_s: float) -> None:
+        """环视单帧编码耗时过长告警（限频，附带被抑制条数）。"""
+        if cost_s <= _OVERVIEW_SLOW_ENCODE_S:
+            return
+        now = time.monotonic()
+        if self._overview_slow_at and now - self._overview_slow_at < _OVERVIEW_SLOW_LOG_INTERVAL_S:
+            self._overview_slow_suppressed += 1
+            return
+        suppressed = self._overview_slow_suppressed
+        self._overview_slow_at = now
+        self._overview_slow_suppressed = 0
+        suffix = f" (+{suppressed} suppressed)" if suppressed else ""
+        logger.warning(
+            "Overview encode slow: %.0f ms/frame (> %.0f ms budget), "
+            "main view may stutter%s",
+            cost_s * 1000.0,
+            _OVERVIEW_SLOW_ENCODE_S * 1000.0,
+            suffix,
+        )
 
     def _stop_overview_worker(self) -> None:
         """停止环视编码线程并清空队列（幂等）。"""
@@ -1399,6 +1470,11 @@ class BuiltinScenario(CustomScenarioBase):
             return
         self._overview_stop.set()
         worker.join(timeout=_SENSOR_WORKER_JOIN_TIMEOUT_S)
+        if worker.is_alive():
+            logger.warning(
+                "Overview encoder thread still alive after %.1fs; frames will be dropped",
+                _SENSOR_WORKER_JOIN_TIMEOUT_S,
+            )
         while True:
             try:
                 self._overview_queue.get_nowait()

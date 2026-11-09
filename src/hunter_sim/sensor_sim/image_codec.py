@@ -167,9 +167,52 @@ def encode_jpeg(rgb: RgbImage, quality: int = 75) -> Optional[bytes]:
     from io import BytesIO  # noqa: PLC0415
 
     buffer = BytesIO()
-    Image.fromarray(rgb, mode="RGB").save(
+    # 不传 mode：Pillow 13 已移除该参数，(H, W, 3) uint8 会自动推断为 RGB
+    Image.fromarray(rgb).save(
         buffer, format="JPEG", quality=max(1, min(95, quality))
     )
+    return buffer.getvalue()
+
+
+def encode_bgra_jpeg(
+    pixels: bytes,
+    width: int,
+    height: int,
+    quality: int = 75,
+) -> Optional[bytes]:
+    """把 CARLA 的 BGRA 字节**直接**编码为 JPEG（不经过 numpy，主视区快路径）。
+
+    不降采样的帧如果走 ``bgra_to_rgb`` → ``Image.fromarray``，会在 Python 侧
+    多出两次整帧拷贝（1080p 每帧约 6 MB）；而主视区需要 10 Hz 持续编码，这两次
+    拷贝会成为 CPU/内存带宽热点，表现为画面卡顿。这里用 ``Image.frombuffer``
+    零拷贝读原缓冲区，``convert("RGB")`` 在 C 层丢 alpha。
+
+    Args:
+        pixels: BGRA 排列的原始字节（长度 = width*height*4）。
+        width: 图像宽度。
+        height: 图像高度。
+        quality: JPEG 质量（1-95）。
+
+    Returns:
+        JPEG 字节串；Pillow 不可用或尺寸不匹配时返回 None（调用方回退慢路径）。
+    """
+    if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
+        return None
+    try:
+        from PIL import Image  # noqa: PLC0415  可选依赖，缺失时降级 PNG
+    except ImportError:
+        return None
+    from io import BytesIO  # noqa: PLC0415
+
+    buffer = BytesIO()
+    try:
+        image = Image.frombuffer(
+            "RGBA", (width, height), pixels, "raw", "BGRA", 0, 1
+        ).convert("RGB")
+        image.save(buffer, format="JPEG", quality=max(1, min(95, quality)))
+    except Exception as exc:  # noqa: BLE001  Pillow 版本差异时回退通用路径
+        logger.debug(f"BGRA direct JPEG encode failed: {exc}")
+        return None
     return buffer.getvalue()
 
 
@@ -193,6 +236,11 @@ def encode_rgb_frame(
     Returns:
         编码结果（JPEG 优先，PNG 兜底）。
     """
+    if max_width <= 0 or width <= max_width:
+        # 不降采样（主视区）：直接从 BGRA 缓冲区编码，省掉 numpy 侧两次整帧拷贝
+        direct = encode_bgra_jpeg(pixels, width, height, quality)
+        if direct is not None:
+            return EncodedImage(direct, CONTENT_TYPE_JPEG, width, height, "jpeg")
     rgb = _downscale(bgra_to_rgb(pixels, width, height), max_width)
     out_h, out_w = rgb.shape[0], rgb.shape[1]
     jpeg = encode_jpeg(rgb, quality)
@@ -210,6 +258,7 @@ __all__ = [
     "bgra_to_rgb",
     "depth_bgra_to_meters",
     "encode_jpeg",
+    "encode_bgra_jpeg",
     "encode_png",
     "encode_rgb_frame",
 ]
