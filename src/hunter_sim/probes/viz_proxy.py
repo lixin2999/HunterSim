@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -39,6 +40,61 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "host", "connection", "transfer-encoding", "keep-alive",
     "proxy-authenticate", "proxy-authorization", "te", "upgrade",
 })
+
+#: 长连接正常结束类异常：浏览器关闭页面、上游主动断流都会抛出这里
+#: （``httpx.ReadError`` 的 ``str()`` 为空，旧版日志只留下一行莫名其妙的
+#: ``ReadError:``，现归为正常断流，按 DEBUG 计数 + 限频 INFO 汇总）
+_STREAM_END_ERRORS = (
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.StreamClosed,
+)
+
+#: 同类告警的最小间隔（秒）：浏览器频繁重连时避免刷屏
+_WARN_INTERVAL_S = 60.0
+
+#: 限频状态：key -> (上次输出时刻, 窗口内被抑制次数)
+_warn_state: dict[str, list[float]] = {}
+
+#: 断流汇总：(上次输出时刻, 累计次数)
+_stream_end_state: list[float] = [0.0, 0.0]
+
+
+def _describe_exc(exc: BaseException) -> str:
+    """异常可读描述：httpx 部分异常 ``str()`` 为空串，不能直接拼到日志里。"""
+    name = type(exc).__name__
+    text = str(exc).strip()
+    return f"{name}: {text}" if text else name
+
+
+def _rate_limited_warning(key: str, message: str) -> None:
+    """按 ``key`` 限频告警：首次立即输出，窗口内只计数，超窗时带上次数。"""
+    now = time.monotonic()
+    state = _warn_state.setdefault(key, [0.0, 0.0])
+    if now - state[0] < _WARN_INTERVAL_S:
+        state[1] += 1
+        return
+    if state[0] and state[1]:
+        message = f"{message}（同类告警 {int(state[1]) + 1} 次/{now - state[0]:.0f}s）"
+    state[0], state[1] = now, 0.0
+    logger.warning(message)
+
+
+def _note_stream_end(exc: BaseException, path: str) -> None:
+    """记录流式响应正常结束：逐条 DEBUG，每分钟一条 INFO 汇总。"""
+    logger.debug(f"Viz proxy stream ended: {_describe_exc(exc)} path={path}")
+    now = time.monotonic()
+    _stream_end_state[1] += 1
+    if _stream_end_state[0] == 0.0:
+        _stream_end_state[0] = now
+        return
+    if now - _stream_end_state[0] >= _WARN_INTERVAL_S:
+        logger.info(
+            "Viz proxy 长连接断开汇总：近 %.0fs 共 %d 次（页面关闭/上游重连，属正常）",
+            now - _stream_end_state[0],
+            int(_stream_end_state[1]),
+        )
+        _stream_end_state[0], _stream_end_state[1] = now, 0.0
 
 
 def build_ssl_kwargs(settings: "HunterSimSettings") -> dict[str, Any]:
@@ -109,16 +165,30 @@ async def proxy_request(
     try:
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.TimeoutException as exc:
-        logger.warning(f"Viz proxy timeout: {type(exc).__name__}: {exc}")
+        _rate_limited_warning(
+            "timeout", f"Viz proxy timeout: {_describe_exc(exc)} url={url}"
+        )
         return _proxy_error(504, "upstream timeout")
+    except _STREAM_END_ERRORS as exc:
+        # 上游已连接但握手/首包前断开：典型为管理面重启或浏览器取消请求，
+        # 回环内自愈，限频告警即可（旧版每秒一条 WARNING 且异常体为空）
+        _rate_limited_warning(
+            "upstream_disconnect",
+            f"Viz proxy upstream disconnected: {_describe_exc(exc)} url={url}"
+            "（管理面重启/连接被中断，已返回 502）",
+        )
+        return _proxy_error(502, "upstream unavailable")
     except httpx.HTTPError as exc:
-        # ConnectError / ReadError / RemoteProtocolError 均属 HTTPError 子类。
-        # 上游（管理面）重启/断连是正常运维事件，必须映射为 502：
+        # ConnectError 等其余传输错误：上游不可达，必须映射为 502：
         # 早期只捕 ConnectError，ReadError 会冒泡成 500 + ASGI traceback。
-        logger.warning(f"Viz proxy upstream error: {type(exc).__name__}: {exc}")
+        _rate_limited_warning(
+            "upstream_error", f"Viz proxy upstream error: {_describe_exc(exc)} url={url}"
+        )
         return _proxy_error(502, "upstream unavailable")
     except Exception as exc:  # noqa: BLE001  代理层兜底：上游任何异常都不得变成 500
-        logger.warning(f"Viz proxy unexpected error: {type(exc).__name__}: {exc}")
+        _rate_limited_warning(
+            "unexpected", f"Viz proxy unexpected error: {_describe_exc(exc)} url={url}"
+        )
         return _proxy_error(502, "upstream error")
 
     content_type = upstream_response.headers.get("content-type", "")
@@ -132,11 +202,14 @@ async def proxy_request(
                 # SSE 回放与小尺寸 MJPEG 帧被整段拖住。
                 async for chunk in upstream_response.aiter_raw():
                     yield chunk
+            except _STREAM_END_ERRORS as exc:
+                # 客户端关页 / 上游主动断流：MJPEG・SSE 的正常生命周期，
+                # 已发出的帧不受影响，只计数不告警
+                _note_stream_end(exc, path)
             except Exception as exc:  # noqa: BLE001  响应头已下发，无法再改状态码
-                # MJPEG/SSE 上游中途断开（管理面重启/客户端关闭）：已发出的帧
-                # 不受影响，这里只记录并结束本次流，不让异常冒到 ASGI 层
-                logger.warning(
-                    f"Viz proxy stream interrupted: {type(exc).__name__}: {exc}"
+                _rate_limited_warning(
+                    "stream_error",
+                    f"Viz proxy stream interrupted: {_describe_exc(exc)} path={path}",
                 )
             finally:
                 await _safe_aclose(upstream_response)
@@ -157,8 +230,9 @@ async def proxy_request(
     try:
         content = await upstream_response.aread()
     except Exception as exc:  # noqa: BLE001  读体阶段断连同样不得变成 500
-        logger.warning(
-            f"Viz proxy body read failed: {type(exc).__name__}: {exc}"
+        _rate_limited_warning(
+            "body_read",
+            f"Viz proxy body read failed: {_describe_exc(exc)} path={path}",
         )
         return _proxy_error(502, "upstream read error")
     finally:

@@ -3325,3 +3325,83 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - `visible` 为按环视相机位姿与 FOV 的几何粗估，未做遮挡判断；自车正前方被大车遮挡时可能「标记可见但实际被挡」。
 
 ---
+
+## V3.5.3 — 跟车场景仍然跑不起来：V3.5.2 的旋转基准取自「未同步的实时位姿」
+
+**发布日期**：2026-11-10
+**版本定位**：patch 修复。V3.5.2 修正了「相对偏移未旋转」，但**旋转所绕的基准点仍不可信**，同一跟车场景在真机上依旧失败。实例 `inst-87ef52e5104444fb8bb4d6052f72adb5`，场景 `SCN-0176-FOL-LVV-L1-LVV-1a1e-lead`（ID `85bf2b73-be71-45a3-bf48-f9f4a057e5a8`），两次下发（13:47 / 13:50）现象完全一致。
+
+### 现象与「平台场景 ↔ 仿真端实际场景」对账
+
+| 项目 | 平台下发（场景编辑页） | 仿真端实际落地（日志 / `/viz`） | 判定 |
+| --- | --- | --- | --- |
+| 自车出生点 | 占位原点 `(0,0,0,yaw=0)`（平台不给自车坐标） | `ego_spawn_replaced ... after=(392.47,212.90,0.30,yaw=90.0) candidates=16` | ✅ 符合契约（仿真端按地图替换） |
+| `lead-1` 偏移 | `relative_to_ego`，`x=18.47 m / y=0`（正前方）、行为 `lane_follow` | `spawn resolve: ... base=(0.0,0.0,0.0,yaw=0) world=(18.5,0.0,0.0,yaw=0)` | ❌ **基准取了占位原点**，前车被放到世界 `(18.5, 0)` |
+| 相对方位 | 期望「自车前方 18.5 m」 | `spawned: ... ego=(0.0,0.0,yaw=0)`（自车已在 392/213）；面板实测 `距自车 435.4 m（后 241.6 / 左 362.2）`、视区外 | ❌ 相距数百米且**不在路面上** |
+| 运动状态 | 自车 8.2 m/s（TM 期望）、前车 `lane_follow` | 自车实测 2.27 m/s、前车实测 0.9 m/s | ❌ TM 指令未生效 |
+| 事件 | `time_headway < 2.0 s` | 场景事件 **0 条**，日志无任何归因 | ❌ 前车不在前方 → `lead_gap=None` |
+| 日志 | — | 8 条 `Viz proxy stream interrupted: ReadError:` / `Viz proxy upstream error: ReadError:`（WARNING，消息体为空） | ⚠️ 非故障，长连接正常断开 |
+
+### 根因
+
+1. **旋转基准取自未同步的实时位姿（核心）**。`_participant_base()` 在 V3.5.2 改为优先读自车 `get_transform()`，但日志第 203 行的 `World switched to synchronous mode (50Hz)` 发生在场景 `setup()` **之前**：CARLA 同步模式下，`world.tick()` 之前新生成的 Actor `get_transform()` 仍返回世界原点 `(0,0,0)`。于是「按自车航向旋转」作用在**占位原点**上，`offset=(18.5,0)` 原封不动变成世界坐标 `(18.5,0)` —— 与自车真实出生点相距 `√((392.47-18.5)² + 212.90²) ≈ 435 m`，且该点不在任何车道上。
+2. **方位「一会在前、一会在后」是上一条的必然结果**。前车被钉死在世界 `(18.5,0)`，自车则沿 `yaw=90` 的车道行驶，两者连线与自车航向的夹角每帧都在变，`ahead/left` 自然在正负之间漂移，跟车行为无从验证。
+3. **Traffic Manager 指令在首 tick 前下发被静默丢弃**。`set_autopilot` / `set_desired_speed` 都在 `setup()` 里调用（首 tick 之前），TM 当时尚未掌握这些 Actor，故自车只以 2.27 m/s 爬行、路面外的前车 0.9 m/s 抖动。
+4. **可观测性仍有缺口**：`lead_gap=None` 时不产生任何日志，「场景事件 0 条」无从归因；`Scene expectations` 把车体系偏移印成 `lead-1[.../@(18.5,0.0)]`，极易被误读成世界坐标。
+5. `ReadError:` 空消息：`httpx.ReadError` 的 `str()` 为空串，`f"{type}: {exc}"` 只剩前缀；且把浏览器关页这类正常断连按 WARNING 逐条刷屏。
+
+### 修复
+
+**一、基准改为确定性出生点（`scene_runner/builtin_scenario.py`）**
+
+- `_participant_base()`：**优先返回 `self._ego_spawn`**（原点替换/兜底后真正生效的出生位姿），其次才是实时位姿，最后回落配置值 —— 相对偏移从此绕「自车实际所在车道」旋转，且同一场景重复下发布局可复现。
+- 新增 `_ego_live_pose()` / `_reference_pose()` 与模块级 `_pose_not_synced(pose, reference)`：以「读数为占位原点、而已知预期位置不是」为判据识别未同步读数；运行期相对方位走 `_reference_pose()`（实时位姿优先，未同步时回落出生点），保证面板既跟手又不骗人。
+- `_actual_ego_spawn()`：实时位姿判为未同步时**保留候选出生点**并 WARNING `ego_transform_not_synced`，不再让 `(0,0,0)` 顶掉真实出生点。
+- `participant_states()`：参与者位姿同样做未同步判定，未同步时回落到已登记的出生点（面板不再显示 `(0,0)` 假位置）。
+
+**二、让车真正跑起来**
+
+- 新增 `_reapply_post_spawn_controls_once()`，由 `tick()` 在**首个 tick 之后**补发一次：自车与所有 TM 托管参与者的 `set_autopilot` + `set_desired_speed`，并输出 `post_tick_controls_reapplied: ego=[autopilot speed=8.2m/s] tm_participants=1`（只执行一次）。`_enable_autopilot()` 顺带登记 `(actor, speed_ms)` 到 `_tm_managed`。
+- 新增 `_snap_to_driving_lane()`：车辆类参与者解析后的坐标若**不在行车道上**（`get_waypoint(project_to_road=False, lane_type=Driving) is None`），投影到最近行车道中心并取车道航向，输出 `participant_spawn_snapped`；已在车道内的坐标一律不动，保留平台意图。避免「前车生成在路肩/隔离带 → TM 不接管 → 原地抖动」。
+
+**三、可观测性与日志口径**
+
+- 新增 `_warn_follow_condition_unmet()`：场景声明了 `time_headway` / `time_to_collision` 但自车前方找不到目标车时，30 s 限频 WARNING `follow_condition_unmet`，并附各参与者当前 `ahead/left` 布局（旧版此处完全静默）。
+- `Scene expectations` 改为 `id[type/behavior speed=8.0m/s offset=(18.5,0.0) world=(392.5,231.4,yaw=90)]`：车体系偏移与叠加结果同时给出，一次对账即可定责。
+- `probes/viz_proxy.py`：新增 `_describe_exc()`（异常 `str()` 为空时只输出类型名，不再留 `ReadError:` 空消息）；`httpx.ReadError` / `RemoteProtocolError` / `StreamClosed` 归类为**长连接正常断开** —— 流式路径降为 DEBUG 并每 60 s 汇总一条 INFO，建连路径保留 502 但改为 60 s 限频（`_rate_limited_warning`）；`TimeoutException → 504`、其余 `httpx.HTTPError → 502` 的映射不变。
+
+### 向后兼容与行为变化（需公告）
+
+- **`relative_to_ego` 场景的参与者落点会变**：凡「同步模式 + 自车 `yaw≠0`」的已下发场景，V3.5.2 生成的参与者位置是错的，本版起才会真正落在自车车体系偏移处；`absolute` 语义场景不受影响。
+- **TM 参与者的运动状态变化**：首 tick 后补发指令，此前「爬行/静止」的自车与背景车将按场景速度行驶，平台侧的事件数量与耗时基线会变。
+- **生成坐标可能被车道投影改写**：仅当解析结果不在行车道上时触发，并有 `participant_spawn_snapped` 日志可追溯；行人/骑行者/prop 不参与投影。
+- **日志级别**：viz 反代断连由「每条一警」变为 DEBUG + 限频汇总，依赖该类 WARNING 做告警的规则需改盯 `Viz proxy 长连接断开汇总`。
+
+### 验证
+
+- `pytest -q` 全量：**1419 passed**（新增 `tests/test_builtin_scenario.py::TestSyncModeEgoBase` 5 项、`::TestDrivingLaneSnap` 2 项；含同步模式 Mock `_SyncMockWorld`：首 `tick()` 前 Actor 位姿保持世界原点）。
+- 关键回归断言：`base=(392.47,212.90,yaw=90)`、`world=(392.5,231.4,yaw=90)`、`ahead_m≈18.5 / left_m≈0.0`（未同步与已同步两种情况均成立）。
+- `mypy src`：**90 source files, Success: no issues found**；`flake8`（改动文件）：无告警。
+- 真机 CARLA 0.9.16 端到端复测待执行（开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.3`；
+2. 重启 `huntersim up`，重新下发该跟车场景，日志应依次出现：`ego_spawn_replaced ... after=(392.47,212.90,0.30,yaw=90.0)` → `Participant 'lead-1' spawn resolve: ... base=(392.5,212.9,0.3,yaw=90) world=(392.5,231.4,0.3,yaw=90)` → `Participant 'lead-1' spawned: ... ego=(392.5,212.9,yaw=90) relative=(ahead=18.5m, left=0.0m)`，且**无**「落在环视主视区外」WARNING；
+3. 启动后第一个 tick 应出现 `post_tick_controls_reapplied: ego=[autopilot speed=8.2m/s] tm_participants=1`，随后自车与前车速度都应接近场景速度（不再是个位数 m/s）；
+4. `/viz`（Ctrl+F5）「参与者」面板：`相对自车 ≈ 前 18.5 m / 左 0.0 m` 且随行驶**始终为正**（不再前后跳变），`环视主视区=可见`；跟车距离进入阈值后应产生 `time_headway` 事件；
+5. 若仍出现 `follow_condition_unmet`，按其中打印的 `ahead/left` 直接核对平台偏移符号约定（x 前向为正）；若出现 `participant_spawn_snapped`，说明平台偏移把车放到了车道外，需修正场景；
+6. viz 页面反复开关后，日志应只剩周期性的 `Viz proxy 长连接断开汇总`，不再出现空消息 `ReadError:`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.3`；`pyproject.toml` 版本 `3.5.3`；wheel / 容器版本号一致。
+
+### 待办 / 已知边界
+
+- **VIL 模式不适用本补发逻辑**：自车由实车状态驱动时，`set_autopilot` 会被 VIL 同步覆盖；跟车类场景仍建议在 SIL/autopilot 模式下验证。
+- 前车 `speed` 平台未下发时仍取默认 `8.0 m/s`（`scene_mapper._DEFAULT_SPEED`）；若平台期望「与前车同速」需显式下发，映射侧不告警。
+- 补发只做一次（首 tick 后）：若 CARLA server 在运行中重启，Actor 引用与 TM 注册同时失效，属实例重建范畴，不在本版本处理。
+- `/viz` 实例列表的「参与者」计数与参与者面板的「声明」口径尚未统一（前者含 prop/自车等），待下一版对齐。
+
+---

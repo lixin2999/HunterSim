@@ -46,6 +46,7 @@ from hunter_sim.scene_runner.scene_config import (
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
 from hunter_sim.scene_runner.spawn_resolver import (
+    is_placeholder_origin,
     relative_offset_from_ego,
     resolve_actor_spawn,
     resolve_ego_spawn_candidates,
@@ -298,6 +299,12 @@ class BuiltinScenario(CustomScenarioBase):
         # 「生成了但拍不到」排障都靠它按 ID 回查
         self._actor_by_participant: dict[str, Any] = {}
         self._participant_spawns: dict[str, SpawnPoint] = {}
+        # TM 托管的参与者 (actor, 期望速度)：同步模式下首 tick 前下发的
+        # set_autopilot / set_desired_speed 会被 TM 静默丢弃，需首 tick 后补发
+        self._tm_managed: list[tuple[Any, float]] = []
+        self._post_tick_done = False
+        # 「跟车条件不成立」告警限频时间戳
+        self._no_lead_warned_at = 0.0
         self._cleaned = False
 
     @property
@@ -329,13 +336,16 @@ class BuiltinScenario(CustomScenarioBase):
         仅由 tick 线程调用（读取 CARLA Actor 位姿属 RPC，非线程安全），结果由
         ``SceneRunnerService`` 缓存后供 executor / HTTP 线程读取。
         """
-        base = self._participant_base()
+        base = self._reference_pose()
         states: list[dict[str, Any]] = []
         for participant in self._config.traffic_participants:
             actor = self._actor_by_participant.get(participant.participant_id)
+            spawned = self._participant_spawns.get(participant.participant_id)
             pose = self._actor_spawn_point(actor)
+            if pose is not None and _pose_not_synced(pose, spawned):
+                pose = None  # 首 tick 前的占位读数，不是参与者真实位置
             if pose is None:
-                pose = self._participant_spawns.get(participant.participant_id)
+                pose = spawned
             state: dict[str, Any] = {
                 "id": participant.participant_id,
                 "actor_type": participant.actor_type,
@@ -393,6 +403,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
         self._participant_spawns.clear()
+        self._tm_managed.clear()
+        self._post_tick_done = False
+        self._no_lead_warned_at = 0.0
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
@@ -433,13 +446,25 @@ class BuiltinScenario(CustomScenarioBase):
         平台事件上的 ``action_type``（如「前车紧急制动」）当前只做期望留档，
         不驱动仿真（见 ``SceneEventDefinition.action_type``）。现场看到「期望
         刹车但前车没减速」时，可以从这行日志直接确认属契约范围而非执行失败。
+
+        同时打车体系 ``offset`` 与叠加后的 ``world``：只打一个时无法区分「下发错」
+        与「算错」，旧版把 offset 印成 ``@(18.5,0.0)`` 更易被误读成世界坐标。
         """
-        participants = [
-            f"{item.participant_id}[{item.actor_type}/"
-            f"{getattr(item.behavior, 'value', item.behavior)}"
-            f"@({item.spawn_point.x:.1f},{item.spawn_point.y:.1f})]"
-            for item in self._config.traffic_participants
-        ]
+        participants: list[str] = []
+        for item in self._config.traffic_participants:
+            spawn = self._participant_spawns.get(item.participant_id)
+            world_text = (
+                f"world=({spawn.x:.1f},{spawn.y:.1f},yaw={spawn.yaw_deg:.0f})"
+                if spawn is not None
+                else "world=未生成"
+            )
+            participants.append(
+                f"{item.participant_id}[{item.actor_type}/"
+                f"{getattr(item.behavior, 'value', item.behavior)}"
+                f" speed={item.speed_ms:.1f}m/s"
+                f" offset=({item.spawn_point.x:.1f},{item.spawn_point.y:.1f})"
+                f" {world_text}]"
+            )
         logger.info(
             "Scene expectations: participants=%d %s",
             len(participants),
@@ -465,6 +490,7 @@ class BuiltinScenario(CustomScenarioBase):
         把场景化行为（减速 / 切入 / 停车等）翻译成 TM 期望速度或手动控制，
         使可视化里自车与参与者真正按场景设置运动。行人由 AI 控制器导航。
         """
+        self._reapply_post_spawn_controls_once()
         self._apply_ego_manual_speed(delta_seconds)
         self._advance_scripted_walkers(delta_seconds)
         self._update_traveled_distance(delta_seconds)
@@ -679,16 +705,40 @@ class BuiltinScenario(CustomScenarioBase):
         return actor
 
     def _participant_base(self) -> SpawnPoint:
-        """参与者相对偏移的基准：优先自车实时位姿，其次生成位姿 / 配置位姿。
+        """参与者相对偏移的基准：自车**确定性出生位姿** ``_ego_spawn``。
 
-        V3.4.5 起不再固定用 ``_ego_spawn``：自车被 Traffic Manager / VIL 驾驶后
-        位置持续变化，固定用出生点会让「相对偏移」在运行中逐渐失真（回查日志时
-        也会把「参与者位置计算错」误判成「偏移下发错」）。
+        平台把参与者 ``(x, y)`` 定义为「相对自车」的车体系偏移（x 前向 / y 左向），
+        语义锚点是自车出生点，因此这里必须用生成时确定的位姿而不是运行时快照：
+
+        - CARLA 同步模式（本服务默认 50Hz）下，``world.tick()`` 之前新生成的
+          Actor ``get_transform()`` 仍返回世界原点 ``(0,0,0)``。V3.4.5~V3.5.2 在此
+          优先读实时位姿，于是旋转叠加作用在占位原点上：``offset=(18.5, 0)`` 被
+          算成世界坐标 ``(18.5, 0)``，而自车实际出生在 ``(392.5, 212.9, yaw=90)``
+          —— 前车落到数百米外且不在路面上，跟车场景完全跑不起来（V3.5.3 修复）。
+        - 以出生点为基准还保证同一场景重复下发时参与者布局可复现。
+
+        运行期的相对方位（可视化面板 / 生成日志）用 :meth:`_reference_pose`。
         """
-        pose = self._actor_spawn_point(self._ego)
+        if self._ego_spawn is not None:
+            return self._ego_spawn
+        pose = self._ego_live_pose()
+        return pose or self._config.ego_vehicle.spawn_point
+
+    def _reference_pose(self) -> SpawnPoint:
+        """运行期自车参照位姿：优先实时位姿（未同步时忽略），其次出生点 / 配置。"""
+        pose = self._ego_live_pose()
         if pose is not None:
             return pose
         return self._ego_spawn or self._config.ego_vehicle.spawn_point
+
+    def _ego_live_pose(self) -> Optional[SpawnPoint]:
+        """自车实时位姿；同步模式首 tick 前的占位读数按「未同步」忽略。"""
+        pose = self._actor_spawn_point(self._ego)
+        if pose is None:
+            return None
+        if _pose_not_synced(pose, self._ego_spawn):
+            return None
+        return pose
 
     @staticmethod
     def _actor_spawn_point(actor: Any) -> Optional[SpawnPoint]:
@@ -756,6 +806,12 @@ class BuiltinScenario(CustomScenarioBase):
                 f"Participant '{participant.participant_id}' spawn skipped: {exc}"
             )
             return False
+        if participant.actor_type == "vehicle":
+            # 平台只给相对偏移，不知道自车会落在哪个车道：叠加后可能贴到
+            # 路肩/隔离带，那种位置的车辆 TM 无法接管（前车不动）
+            spawn_point = self._snap_to_driving_lane(
+                world, spawn_point, participant.participant_id
+            )
         # 平台偏移（车体系）与叠加后的世界坐标一起落日志：只打其中一个时，
         # 现场无法区分「平台偏移下发错」与「仿真端基准/旋转算错」。
         logger.info(
@@ -833,6 +889,53 @@ class BuiltinScenario(CustomScenarioBase):
                 f"Participant '{participant.participant_id}' motion setup failed: {exc}"
             )
         return True
+
+    def _snap_to_driving_lane(
+        self, world: Any, spawn_point: SpawnPoint, participant_id: str
+    ) -> SpawnPoint:
+        """车辆类参与者落在非行车道时，投影到最近行车道中心线。
+
+        已在行车道内的坐标一律不动（保留平台意图）；只有原点不在行车道上时才
+        投影：落在路肩/中央隔离带的车辆会被 Traffic Manager 忽略，现场表现为
+        「前车以不到 1 m/s 抖动甚至完全不动」，跟车场景因此无法验证。
+        """
+        try:
+            carla_map = world.get_map()
+            get_waypoint = getattr(carla_map, "get_waypoint", None)
+            if not callable(get_waypoint):
+                return spawn_point
+            import carla  # noqa: PLC0415  仅在真实 CARLA 环境下需要
+
+            location = carla.Location(x=spawn_point.x, y=spawn_point.y, z=spawn_point.z)
+            driving = carla.LaneType.Driving
+            if (
+                get_waypoint(location, project_to_road=False, lane_type=driving)
+                is not None
+            ):
+                return spawn_point
+            waypoint = get_waypoint(location, project_to_road=True, lane_type=driving)
+        except Exception as exc:  # noqa: BLE001  无 SDK / 地图接口差异时不改写坐标
+            logger.debug(f"participant lane snap skipped for {participant_id}: {exc}")
+            return spawn_point
+        if waypoint is None:
+            return spawn_point
+        lane_pose = transform_to_spawn_point(waypoint.transform)
+        distance = math.hypot(lane_pose.x - spawn_point.x, lane_pose.y - spawn_point.y)
+        logger.info(
+            "participant_spawn_snapped: participant=%s 原坐标 (%.1f,%.1f,yaw=%.0f) 不在"
+            "行车道上（投影偏移 %.1fm），改用行车道中心 (%.1f,%.1f,yaw=%.0f)",
+            participant_id,
+            spawn_point.x,
+            spawn_point.y,
+            spawn_point.yaw_deg,
+            distance,
+            lane_pose.x,
+            lane_pose.y,
+            lane_pose.yaw_deg,
+        )
+        return spawn_point.model_copy(
+            update={"x": lane_pose.x, "y": lane_pose.y, "yaw_deg": lane_pose.yaw_deg}
+        )
 
     def _park_actor(self, actor: Any) -> None:
         """把车辆类 Actor 显式驻车（含手刹），避免被重力/TM 带着滑动。"""
@@ -1034,6 +1137,47 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_manual_speed = speed
         logger.info(f"Ego initial speed set via manual control: {speed:.1f} m/s")
 
+    def _reapply_post_spawn_controls_once(self) -> None:
+        """首个 tick 之后补发一次 autopilot / 期望速度指令。
+
+        ``setup()`` 在 ``world.tick()`` 之前执行，此时 Traffic Manager 尚未掌握
+        该 Actor 的位置/路由信息，下发的 ``set_autopilot`` / ``set_desired_speed``
+        会被静默丢弃：现场表现为自车只以 2 m/s 爬行、前车基本不动，跟车行为无法
+        产生。首 tick 后补发一次成本极低，且只执行一次。
+        """
+        if self._post_tick_done:
+            return
+        self._post_tick_done = True
+        ego_cmds: list[str] = []
+        ego_cfg = self._config.ego_vehicle
+        if self._ego is not None and ego_cfg.autopilot:
+            set_autopilot = getattr(self._ego, "set_autopilot", None)
+            if callable(set_autopilot):
+                try:
+                    set_autopilot(True, self._traffic_manager_port)
+                    ego_cmds.append("autopilot")
+                except Exception as exc:  # noqa: BLE001  TM 未就绪时保持原有降级路径
+                    logger.debug(f"post-tick ego autopilot failed: {exc}")
+            speed = float(ego_cfg.initial_speed_ms)
+            if speed > 0 and self._set_desired_speed(self._ego, speed):
+                ego_cmds.append(f"speed={speed:.1f}m/s")
+        participant_count = 0
+        for actor, speed_ms in self._tm_managed:
+            set_autopilot = getattr(actor, "set_autopilot", None)
+            if callable(set_autopilot):
+                try:
+                    set_autopilot(True, self._traffic_manager_port)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"post-tick participant autopilot failed: {exc}")
+                    continue
+            self._set_desired_speed(actor, speed_ms)
+            participant_count += 1
+        logger.info(
+            "post_tick_controls_reapplied: ego=[%s] tm_participants=%d",
+            " ".join(ego_cmds) if ego_cmds else "无",
+            participant_count,
+        )
+
     def _enable_autopilot(
         self, actor: Any, participant: TrafficParticipantConfig
     ) -> None:
@@ -1054,6 +1198,8 @@ class BuiltinScenario(CustomScenarioBase):
                         f"Participant '{participant.participant_id}' autopilot failed: {exc}"
                     )
         self._set_desired_speed(actor, participant.speed_ms)
+        # 登记供首 tick 后补发：setup 阶段的 TM 指令会被静默丢弃
+        self._tm_managed.append((actor, float(participant.speed_ms)))
 
     def _set_desired_speed(self, actor: Any, speed_ms: float) -> bool:
         """设置 TM 期望速度（m/s），返回是否成功。"""
@@ -1267,12 +1413,50 @@ class BuiltinScenario(CustomScenarioBase):
 
         distances, lead_gap, lead_speed = self._relative_gaps()
         metrics.relative_distance_m = distances
-        if lead_gap is not None:
-            metrics.time_headway_s = lead_gap / max(0.1, metrics.speed_ms)
-            closing = metrics.speed_ms - (lead_speed or 0.0)
-            if closing > 0.1:
-                metrics.time_to_collision_s = lead_gap / closing
+        if lead_gap is None:
+            self._warn_follow_condition_unmet()
+            return metrics
+        metrics.time_headway_s = lead_gap / max(0.1, metrics.speed_ms)
+        closing = metrics.speed_ms - (lead_speed or 0.0)
+        if closing > 0.1:
+            metrics.time_to_collision_s = lead_gap / closing
         return metrics
+
+    def _warn_follow_condition_unmet(self) -> None:
+        """跟车类事件永远不可能触发时限频告警（补上「0 条事件」的归因缺环）。
+
+        ``time_headway`` / ``time_to_collision`` 只统计自车**前方**的车，前车
+        被算到后方或生成在路面之外时，事件永远不触发，而旧版日志里看不出任何
+        线索（现场只能看到「场景事件 0 条」）。限频 30s，避免逐 tick 刷屏。
+        """
+        watched = (TriggerType.TIME_HEADWAY, TriggerType.TIME_TO_COLLISION)
+        declared = " ".join(
+            event.event_id
+            for event in self._config.scene_events
+            if event.trigger.trigger_type in watched
+        )
+        if not declared:
+            return
+        now = time.time()
+        if self._no_lead_warned_at and now - self._no_lead_warned_at < 30.0:
+            return
+        self._no_lead_warned_at = now
+        base = self._reference_pose()
+        layout: list[str] = []
+        for participant_id, actor in list(self._actor_by_participant.items())[:5]:
+            pose = self._actor_spawn_point(actor) or self._participant_spawns.get(
+                participant_id
+            )
+            if pose is None:
+                continue
+            ahead, left = relative_offset_from_ego(base, pose)
+            layout.append(f"{participant_id}(ahead={ahead:.1f}m,left={left:.1f}m)")
+        logger.warning(
+            "follow_condition_unmet: 场景声明跟车事件 [%s]，但自车前方找不到目标车"
+            "（当前布局：%s）：请核对平台下发的相对偏移（x 前向为正）与仿真端偏移基准",
+            declared,
+            " ".join(layout) if layout else "无已生成参与者",
+        )
 
     def _relative_gaps(
         self,
@@ -2255,13 +2439,30 @@ class BuiltinScenario(CustomScenarioBase):
 
     @staticmethod
     def _actual_ego_spawn(actor: Any, fallback: Optional[SpawnPoint]) -> Optional[SpawnPoint]:
-        """读取自车实际 transform 作为参与者偏移基准（取不到时用候选点）。"""
+        """读取自车实际 transform 作为参与者偏移基准。
+
+        同步模式下首个 tick 之前该读数是世界原点 ``(0,0,0)`` 而不是真实出生位姿，
+        直接采信会把参与者相对偏移叠加到占位原点上（V3.5.3 根因）；此处按未同步
+        判据回退到实际生效的候选出生点。
+        """
         getter = getattr(actor, "get_transform", None)
         if callable(getter):
             try:
-                return transform_to_spawn_point(getter())
+                pose = transform_to_spawn_point(getter())
             except Exception as exc:  # noqa: BLE001  读取失败退回候选点，不阻断场景
                 logger.debug(f"ego_transform_unavailable: {exc}")
+                return fallback
+            if _pose_not_synced(pose, fallback):
+                logger.warning(
+                    "ego_transform_not_synced: 自车首 tick 前 get_transform() 返回占位原点，"
+                    "改用出生点 (%.2f,%.2f,%.2f,yaw=%.1f) 作为参与者偏移基准",
+                    fallback.x if fallback else 0.0,
+                    fallback.y if fallback else 0.0,
+                    fallback.z if fallback else 0.0,
+                    fallback.yaw_deg if fallback else 0.0,
+                )
+                return fallback
+            return pose
         return fallback
 
     def _make_transform(self, world: Any, spawn_point: SpawnPoint) -> Any:
@@ -2371,6 +2572,19 @@ def _vec3(value: Any) -> tuple[float, float, float]:
     if len(values) < 3:
         return (0.0, 0.0, 0.0)
     return (values[0], values[1], values[2])
+
+
+def _pose_not_synced(
+    pose: Optional[SpawnPoint], reference: Optional[SpawnPoint]
+) -> bool:
+    """实时位姿是否为「同步模式首 tick 前的未同步占位读数」。
+
+    判据：读数落在世界原点，而已知的预期位置不在原点 —— Actor 不可能在两个
+    tick 之间瞬移到 ``(0,0,0)``，此时读数是未同步的占位值而非真实位姿。
+    """
+    if pose is None or reference is None or not is_placeholder_origin(pose):
+        return False
+    return not is_placeholder_origin(reference)
 
 
 def _safe_find(library: Any, blueprint_id: str) -> Any:

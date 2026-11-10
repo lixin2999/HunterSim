@@ -16,13 +16,14 @@ import pytest
 from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
 from hunter_sim.scene_runner.event_detector import EventDetector
-from hunter_sim.scene_runner.scene_config import SceneConfig
+from hunter_sim.scene_runner.scene_config import SceneConfig, SpawnPoint
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
 from hunter_sim.scene_runner.spawn_resolver import is_placeholder_origin
 from tests.mocks.carla_mocks import (
     MockActor,
     MockBlueprint,
     MockLocation,
+    MockRotation,
     MockTrafficManager,
     MockTransform,
     MockVector3D,
@@ -893,3 +894,267 @@ class TestSemanticsV126Execution:
         assert len(events) == 1
         assert events[0].event_type == "trigger_reached"
         assert events[0].event_id == "ev-time"
+
+
+# ── V3.5.3：同步模式下的跟车场景出生点基准 ──────────────────────────────────────
+
+
+class _SyncMockMap:
+    """只含一个合法出生点的地图 Mock（使自车替换结果可预期）。"""
+
+    def __init__(self, spawn_points: list[MockTransform]) -> None:
+        self._spawn_points = spawn_points
+
+    def get_spawn_points(self) -> list[MockTransform]:
+        return list(self._spawn_points)
+
+
+class _SyncMockWorld(MockWorld):
+    """CARLA 同步模式 Mock：首 ``tick()`` 之前 Actor 位姿停在世界原点。
+
+    线上跟车场景的失败条件正是这个：``setup()`` 在「World switched to
+    synchronous mode」之后、首个 tick 之前执行，此时新 spawn 的 Actor
+    ``get_transform()`` 仍返回 ``(0,0,0)``，旧实现把它当自车实时位姿用作
+    参与者偏移基准，旋转叠加因此作用在占位原点上。
+    """
+
+    def __init__(self, spawn_points: list[MockTransform] | None = None) -> None:
+        super().__init__()
+        if spawn_points is not None:
+            self._map = _SyncMockMap(spawn_points)  # type: ignore[assignment]
+        self._pending: list[tuple[MockActor, MockTransform]] = []
+
+    def spawn_actor(
+        self,
+        blueprint: MockBlueprint,
+        transform: MockTransform,
+        attach_to: MockActor | None = None,
+    ) -> MockActor:
+        actor = super().spawn_actor(blueprint, transform, attach_to)
+        actor._transform = MockTransform()  # noqa: SLF001  未同步：世界原点
+        self._pending.append((actor, transform))
+        return actor
+
+    def tick(self) -> int:
+        count = super().tick()
+        for actor, transform in self._pending:
+            actor._transform = transform  # noqa: SLF001
+        self._pending.clear()
+        return count
+
+
+_TOWN_SPAWN = MockTransform(MockLocation(392.47, 212.90, 0.30), MockRotation(yaw=90.0))
+
+_LEAD_FOLLOW_CONFIG: dict[str, Any] = {
+    "scene_id": "SCN-0176-FOL-LVV-L1-LVV-1a1e-lead",
+    "map_id": "Town01",
+    "map_type": "carla_town",
+    "spawn_semantics": "relative_to_ego",
+    "duration_seconds": 60.0,
+    "ego_vehicle": {
+        "vehicle_blueprint": "hunter_se",
+        # 平台下发的占位原点：由仿真端替换为地图出生点（yaw=90）
+        "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0},
+        "autopilot": True,
+        "initial_speed_ms": 8.2,
+    },
+    "traffic_participants": [
+        {
+            "participant_id": "lead-1",
+            "actor_type": "vehicle",
+            "blueprint": "vehicle.tesla.model3",
+            # 车体系偏移：自车正前方 18.5m
+            "spawn_point": {"x": 18.5, "y": 0.0, "z": 0.0, "yaw_deg": 0.0},
+            "behavior": "constant_speed",
+            "speed_ms": 8.0,
+        }
+    ],
+    "scene_events": [
+        {
+            "event_id": "ev-headway",
+            "event_type": "custom",
+            "trigger": {"trigger_type": "time_headway", "value": 2.0, "comparator": "<"},
+        }
+    ],
+}
+
+
+def _make_follow_scenario(
+    *, participant_x: float = 18.5, traffic_manager: Any = None
+) -> BuiltinScenario:
+    """构造跟车场景（与线上失败场景同构：占位原点 + relative_to_ego）。"""
+    config = SceneConfig(**_LEAD_FOLLOW_CONFIG)
+    config.traffic_participants[0].spawn_point.x = participant_x
+    return BuiltinScenario(
+        config,
+        SceneStateManager(config.scene_id),
+        EventDetector(config.scene_events),
+        transform_factory=lambda _world, sp: MockTransform(
+            MockLocation(sp.x, sp.y, sp.z or 0.5), MockRotation(yaw=sp.yaw_deg)
+        ),
+        traffic_manager=traffic_manager,
+    )
+
+
+class TestSyncModeEgoBase:
+    """回归：同步模式首 tick 前位姿未同步时，参与者基准必须是自车出生点。"""
+
+    def test_ego_spawn_kept_when_transform_unsynced(self) -> None:
+        """自车实时位姿为占位原点时不得覆盖出生点（旧版取到 (0,0,0)）。"""
+        scenario = _make_follow_scenario()
+        world = _SyncMockWorld([_TOWN_SPAWN])
+
+        scenario.setup(world)
+
+        ego = scenario.ego_actor
+        assert ego is not None
+        location = ego.get_transform().location
+        assert (location.x, location.y) == (0.0, 0.0)  # 首 tick 前读数仍在原点
+        base = scenario._participant_base()  # noqa: SLF001
+        assert base.x == pytest.approx(392.47, abs=0.01)
+        assert base.y == pytest.approx(212.90, abs=0.01)
+        assert base.yaw_deg == pytest.approx(90.0, abs=0.01)
+
+    def test_lead_vehicle_lands_ahead_of_ego_not_at_world_origin(self) -> None:
+        """前车必须落在自车前方 18.5m（沿自车航向旋转），而非世界 (18.5, 0)。"""
+        scenario = _make_follow_scenario()
+        world = _SyncMockWorld([_TOWN_SPAWN])
+
+        scenario.setup(world)
+
+        spawn = scenario._participant_spawns["lead-1"]  # noqa: SLF001
+        assert spawn.x == pytest.approx(392.47, abs=0.6)  # yaw=90 → 前向沿 +y
+        assert spawn.y == pytest.approx(212.90 + 18.5, abs=0.6)
+        assert spawn.yaw_deg == pytest.approx(90.0, abs=0.1)
+
+        # 首 tick 之前（位姿未同步）与之后都必须给出同样的车体系偏移
+        unsynced = scenario.participant_states()[0]
+        assert unsynced["ahead_m"] == pytest.approx(18.5, abs=0.6)
+        assert unsynced["left_m"] == pytest.approx(0.0, abs=0.6)
+
+        world.tick()  # 位姿同步到真实出生点
+        synced = scenario.participant_states()[0]
+        assert synced["spawned"] is True
+        assert synced["ahead_m"] == pytest.approx(18.5, abs=0.6)
+        assert synced["left_m"] == pytest.approx(0.0, abs=0.6)
+        assert synced["visible"] is True
+
+    def test_tm_controls_reapplied_on_first_tick_only(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """首 tick 后补发 TM 指令；后续 tick 不重复补发。"""
+        tm = MockTrafficManager()
+        scenario = _make_follow_scenario(traffic_manager=tm)
+        world = _SyncMockWorld([_TOWN_SPAWN])
+        scenario.setup(world)
+        lead_id = scenario._actor_by_participant["lead-1"].id  # noqa: SLF001
+        ego_id = scenario.ego_actor.id
+        assert tm.desired_speeds[lead_id] == pytest.approx(8.0)
+        tm.desired_speeds.clear()
+
+        with caplog.at_level("INFO", logger="hunter_sim.scene_runner.builtin_scenario"):
+            scenario.tick(world, 0.02, 0.02)
+            assert "post_tick_controls_reapplied" in caplog.text
+            assert tm.desired_speeds[lead_id] == pytest.approx(8.0)
+            assert tm.desired_speeds[ego_id] == pytest.approx(8.2)
+
+            tm.desired_speeds.clear()
+            caplog.clear()
+            scenario.tick(world, 0.04, 0.02)
+            assert "post_tick_controls_reapplied" not in caplog.text
+
+    def test_follow_condition_warns_when_lead_is_behind(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """声明了跟车事件但前方无车：必须限频告警，不再只留「0 条事件」。"""
+        scenario = _make_follow_scenario(participant_x=-18.5)
+        world = _SyncMockWorld([_TOWN_SPAWN])
+        scenario.setup(world)
+        world.tick()
+
+        with caplog.at_level("WARNING", logger="hunter_sim.scene_runner.builtin_scenario"):
+            scenario.tick(world, 0.02, 0.02)
+            warnings = [
+                r.getMessage()
+                for r in caplog.records
+                if "follow_condition_unmet" in r.getMessage()
+            ]
+            assert len(warnings) == 1, warnings
+            assert "lead-1" in warnings[0]
+            scenario.tick(world, 0.04, 0.02)
+
+    def test_scene_expectations_log_offsets_and_world_coords(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """期望日志同时给 offset 与 world，避免把车体系偏移读成世界坐标。"""
+        scenario = _make_follow_scenario()
+        world = _SyncMockWorld([_TOWN_SPAWN])
+
+        with caplog.at_level("INFO", logger="hunter_sim.scene_runner.builtin_scenario"):
+            scenario.setup(world)
+
+        line = next(
+            record.getMessage()
+            for record in caplog.records
+            if "Scene expectations" in record.getMessage()
+        )
+        assert "offset=(18.5,0.0)" in line
+        assert "speed=8.0m/s" in line
+        assert "world=(392.5,231.4,yaw=90)" in line
+
+
+class TestDrivingLaneSnap:
+    """车辆类参与者落在非行车道时投影到车道中心（否则 TM 无法接管）。"""
+
+    @staticmethod
+    def _fake_carla(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(
+            sys.modules,
+            "carla",
+            types.SimpleNamespace(
+                Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+                LaneType=types.SimpleNamespace(Driving="driving"),
+            ),
+        )
+
+    def test_off_lane_point_snaps_to_lane_center(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._fake_carla(monkeypatch)
+        lane = MockTransform(MockLocation(100.0, 200.0, 0.3), MockRotation(yaw=90.0))
+        calls: list[bool] = []
+
+        class _Map:
+            @staticmethod
+            def get_waypoint(_location, project_to_road=True, lane_type=None):  # noqa: ANN001
+                calls.append(project_to_road)
+                if not project_to_road:
+                    return None  # 原点不在行车道上
+                return types.SimpleNamespace(transform=lane)
+
+        world = types.SimpleNamespace(get_map=lambda: _Map())
+        scenario = _make_scenario()
+
+        snapped = scenario._snap_to_driving_lane(  # noqa: SLF001
+            world, SpawnPoint(x=100.0, y=201.6, z=0.0, yaw_deg=0.0), "lead-1"
+        )
+
+        assert (snapped.x, snapped.y) == (100.0, 200.0)
+        assert snapped.yaw_deg == pytest.approx(90.0)
+        assert calls == [False, True]
+
+    def test_point_already_on_driving_lane_is_left_untouched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._fake_carla(monkeypatch)
+
+        class _Map:
+            @staticmethod
+            def get_waypoint(location, project_to_road=True, lane_type=None):  # noqa: ANN001
+                return types.SimpleNamespace(
+                    transform=MockTransform(MockLocation(location.x, location.y, 0.3))
+                )
+
+        world = types.SimpleNamespace(get_map=lambda: _Map())
+        scenario = _make_scenario()
+        requested = SpawnPoint(x=30.0, y=5.0, z=0.0, yaw_deg=45.0)
+
+        assert scenario._snap_to_driving_lane(world, requested, "car-1") is requested  # noqa: SLF001
