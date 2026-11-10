@@ -28,6 +28,23 @@ class ExecutionUnavailable(RuntimeError):
     """执行面不可用（引擎被占用、端点无客户端或地图加载失败）。"""
 
 
+def _tick_thread_owns_world(runner: Any) -> bool:
+    """运行器的 tick 线程是否仍在持有 world（True = 本线程不得再发 CARLA 请求）。
+
+    V3.5.6 ①：`destroy()` 只等待有限时间，返回后线程若仍存活，说明场景清理
+    （传感器/Actor 销毁）尚未结束。此时释放线程再去 ``world.apply_settings``
+    或 ``traffic_manager.set_synchronous_mode``，就是两个线程并发操作同一个
+    CARLA Client 连接（非线程安全），现场表现为进程无 traceback 原生退出
+    （0xC0000409 / 0xC00000FD）。读不到状态时按「不持有」处理，不阻断释放。
+    """
+    if runner is None:
+        return False
+    try:
+        return bool(getattr(runner, "is_running", False))
+    except Exception:  # noqa: BLE001  桩对象属性异常不影响释放主流程
+        return False
+
+
 def _world_map_id(world: Any, fallback: str) -> str:
     """读取世界实际地图 ID（CARLA 返回 ``/Game/Maps/Town03`` 取末段）。
 
@@ -272,6 +289,16 @@ class ExecutionPlane:
                     runner.destroy()
                 except Exception as exc:  # noqa: BLE001  释放失败不应阻塞实例销毁
                     logger.warning(f"Scene runtime release failed for instance {instance_id}: {exc}")
+            if _tick_thread_owns_world(runner):
+                # 运行循环退出前已自行把世界恢复异步（_run_loop 的收尾第一步），
+                # 因此这里跳过世界操作不会把 CARLA 留在同步模式等待 tick
+                self._forget_cleanup_info(instance_id)
+                logger.warning(
+                    "Execution plane release deferred: instance=%s, "
+                    "world left to scene tick thread (no concurrent CARLA calls)",
+                    instance_id,
+                )
+                return
             # runner.destroy() 已 join tick 线程；此时把世界/TM 恢复异步模式，
             # 否则端点上的 CARLA 会停在同步模式等待永远不会到来的 tick
             self._restore_world_async(instance_id)
@@ -466,6 +493,14 @@ class ExecutionPlane:
         except Exception as exc:  # noqa: BLE001  TM 同步失败不阻断场景装配
             logger.warning(f"Cannot enable Traffic Manager synchronous mode: {exc}")
         return traffic_manager
+
+    def _forget_cleanup_info(self, instance_id: str) -> None:
+        """丢弃实例的世界/TM 句柄（**不向 world 发任何请求**）。
+
+        tick 线程仍持有世界时，释放线程不得再用缓存句柄；但登记必须清掉，
+        否则会把已失效的 world/traffic_manager 长期握在字典里（内存与连接泄漏）。
+        """
+        self._cleanup_info.pop(instance_id, None)
 
     def _restore_world_async(self, instance_id: str) -> None:
         """把实例对应的世界与 Traffic Manager 恢复为异步模式。

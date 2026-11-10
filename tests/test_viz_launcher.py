@@ -30,6 +30,7 @@ from hunter_sim.visualization.launcher import (
     Launcher,
     ServiceSpec,
     build_service_specs,
+    describe_exit_code,
     http_ok,
 )
 
@@ -363,7 +364,51 @@ class TestGuardAutoRestart:
         assert len(launched) == 3  # manager + probes + 重启后的 manager
         assert probes_alive_at_restart == [True]  # 控制面崩溃不牵连探针面
         assert any("异常退出" in line and "自动重启" in line for line in emitted)
+        assert any(
+            "0xC0000409" in line and "fail-fast" in line for line in emitted
+        ), "原生崩溃码未翻译成现场可读原因"
         assert any("已重启并就绪" in line and "carla-manager" in line for line in emitted)
+
+    @pytest.mark.parametrize(
+        ("code", "hex_text", "needle"),
+        [
+            (3221226505, "0xC0000409", "fail-fast"),  # 并发操作同一 Client 连接
+            (3221225725, "0xC00000FD", "栈溢出"),  # 异常世界状态下深层递归
+            (3221225477, "0xC0000005", "已销毁"),  # 引用已销毁 Actor
+        ],
+    )
+    def test_crash_hint_is_appended_per_exit_code(
+        self, code: int, hex_text: str, needle: str
+    ) -> None:
+        """现场两种崩溃码都要在 ``[up]`` 行里直接读到原因（不靠查表）。
+
+        回归：日志里只有「异常退出（code=3221226505）」，拿着十进制大数无从下手。
+        """
+        emitted: list[str] = []
+        manager = _Process(codes=[None, code])
+        launcher = Launcher(
+            popen=lambda argv: manager,
+            probe=_probe_starts_cold(ports=(":8090",)),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+            restart_on_failure=False,
+        )
+
+        launcher.run([_manager()], _VIZ_URL)
+
+        assert any(hex_text in line and needle in line for line in emitted), emitted
+
+    def test_clean_exit_gets_no_crash_hint(self) -> None:
+        """退出码 0 / 未知码不得编造崩溃原因。"""
+        assert describe_exit_code(0) == ""
+        assert describe_exit_code(1) == ""
+        assert describe_exit_code("n/a") == ""
+
+    def test_two_complement_form_maps_to_same_code(self) -> None:
+        """经 shell 转发为补码负数时，仍译成同一个码。"""
+        assert describe_exit_code(-1073740791) == describe_exit_code(3221226505)
+        assert "0xC0000409" in describe_exit_code(-1073740791)
 
     def test_restarted_manager_keeps_waiting_for_next_scene(self) -> None:
         emitted: list[str] = []

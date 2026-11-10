@@ -191,6 +191,22 @@ class TestProbesAppRoutes:
 # ── proxy_request 转发 ──────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _reset_proxy_module_state() -> Any:
+    """用例前后清空模块级熔断/限频状态。
+
+    ``_down_state`` 是跨请求全局：一个用例开启窗口后，下一个用例的
+    ``proxy_request`` 会直接熔断快速失败（不发上游请求），断言会跨用例串味。
+    """
+    from hunter_sim.probes import viz_proxy
+
+    viz_proxy._down_state[:] = [0.0, 0.0]  # noqa: SLF001
+    viz_proxy._warn_state.clear()  # noqa: SLF001
+    yield
+    viz_proxy._down_state[:] = [0.0, 0.0]  # noqa: SLF001
+    viz_proxy._warn_state.clear()  # noqa: SLF001
+
+
 class TestProxyRequest:
     """代理请求转发逻辑。"""
 
@@ -268,9 +284,20 @@ class TestProxyRequest:
         assert response.status_code == 200
         assert b'"status"' in response.body
 
+    @staticmethod
+    def _api_request(path: str = "/viz/api/status") -> Any:
+        """普通 JSON 接口请求桩。"""
+        mock_request = MagicMock()
+        mock_request.method = "GET"
+        mock_request.url.path = path
+        mock_request.url.query = ""
+        mock_request.headers = {}
+        mock_request.body = AsyncMock(return_value=b"")
+        return mock_request
+
     @pytest.mark.asyncio
-    async def test_connect_error_returns_502(self) -> None:
-        """上游不可达返回 502。"""
+    async def test_connect_error_returns_503_with_retry_after(self) -> None:
+        """上游不可达 = 「暂时不在」而非「网关收到无效响应」：503 + Retry-After。"""
         import httpx
 
         from hunter_sim.probes.viz_proxy import proxy_request
@@ -279,15 +306,83 @@ class TestProxyRequest:
         mock_client.build_request = MagicMock(return_value=MagicMock())
         mock_client.send = AsyncMock(side_effect=httpx.ConnectError("refused"))
 
-        mock_request = MagicMock()
-        mock_request.method = "GET"
-        mock_request.url.path = "/api/v1/instances"
-        mock_request.url.query = ""
-        mock_request.headers = {}
-        mock_request.body = AsyncMock(return_value=b"")
+        response = await proxy_request(
+            self._api_request(), mock_client, "https://127.0.0.1:8090"
+        )
 
-        response = await proxy_request(mock_request, mock_client, "https://127.0.0.1:8090")
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "2"
+        assert b"unavailable" in response.body
+
+    @pytest.mark.asyncio
+    async def test_down_window_fast_fails_without_touching_upstream(self) -> None:
+        """熔断窗口内不再逐个撞已断开的端口（现场「大量 502」刷屏的源头）。
+
+        控制面原生崩溃到重启有 10~20s，/viz 有 8 个独立轮询都在这个窗口里发
+        请求；旧实现每个都去建一次连接再失败，日志里就是一片 502 报警。
+        """
+        import httpx
+
+        from hunter_sim.probes.viz_proxy import proxy_request
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=MagicMock())
+        mock_client.send = AsyncMock(side_effect=httpx.ReadError(""))
+
+        first = await proxy_request(self._api_request(), mock_client, "http://upstream")
+        assert first.status_code == 503
+        assert mock_client.send.await_count == 1
+
+        second = await proxy_request(
+            self._api_request("/viz/api/instances"), mock_client, "http://upstream"
+        )
+
+        assert second.status_code == 503
+        assert second.headers["Retry-After"] == "2"
+        assert mock_client.send.await_count == 1, "熔断窗口内仍向已断开的上游发请求"
+
+    @pytest.mark.asyncio
+    async def test_upstream_response_closes_down_window(self) -> None:
+        """窗口到期后的首次成功应答必须彻底关窗（不留残余时间戳）。
+
+        否则控制面恢复后下一轮偶发断连会在一个“已过期”的窗口上续期，
+        退避时长与现场实际情况脱节。
+        """
+        from hunter_sim.probes import viz_proxy
+        from hunter_sim.probes.viz_proxy import proxy_request
+
+        viz_proxy._open_down_window("test")  # noqa: SLF001
+        assert viz_proxy._in_down_window() is True  # noqa: SLF001
+        viz_proxy._down_state[0] -= 5.0  # noqa: SLF001  模拟窗口到期，放行一次探测
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.aread = AsyncMock(return_value=b'{"status": "ok"}')
+        mock_response.aclose = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=MagicMock())
+        mock_client.send = AsyncMock(return_value=mock_response)
+
+        response = await proxy_request(self._api_request(), mock_client, "http://upstream")
+
+        assert response.status_code == 200
+        assert viz_proxy._down_state == [0.0, 0.0]  # noqa: SLF001
+        assert viz_proxy._in_down_window() is False  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_unexpected_error_still_returns_502(self) -> None:
+        """非传输类异常仍归 502：不能把代码缺陷伪装成「服务不可用」。"""
+        from hunter_sim.probes.viz_proxy import proxy_request
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=MagicMock())
+        mock_client.send = AsyncMock(side_effect=RuntimeError("bug"))
+
+        response = await proxy_request(self._api_request(), mock_client, "http://upstream")
+
         assert response.status_code == 502
+        assert "Retry-After" not in response.headers
 
 
 # ── _fetch_upstream TLS 感知 ─────────────────────────────────────────────────

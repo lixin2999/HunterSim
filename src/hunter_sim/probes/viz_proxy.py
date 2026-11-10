@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -53,11 +53,55 @@ _STREAM_END_ERRORS = (
 #: 同类告警的最小间隔（秒）：浏览器频繁重连时避免刷屏
 _WARN_INTERVAL_S = 60.0
 
+#: 上游不可用熔断窗口（秒）。V3.5.6：控制面重启的 10~20s 窗口内，/viz 有
+#: 8 个独立轮询在反复发起请求，旧实现逐个去撞已断开的端口并逐个回 502
+#: （现场日志即“大量 502 报警”）。窗口内直接快速失败，不再撞端口。
+_DOWN_COOLDOWN_S = 2.0
+
+#: 上游不可用时的统一提示（与真正的“网关收到无效响应”区分开）
+_UNAVAILABLE_DETAIL = "control plane unavailable (restarting)"
+
 #: 限频状态：key -> (上次输出时刻, 窗口内被抑制次数)
 _warn_state: dict[str, list[float]] = {}
 
 #: 断流汇总：(上次输出时刻, 累计次数)
 _stream_end_state: list[float] = [0.0, 0.0]
+
+#: 熔断窗口：[窗口到期时刻, 窗口内快速失败次数]
+_down_state: list[float] = [0.0, 0.0]
+
+
+def _in_down_window() -> bool:
+    """是否处于上游不可用熔断窗口内（到期即关闭并汇总抑制次数）。"""
+    now = time.monotonic()
+    expiry = _down_state[0]
+    if expiry == 0.0 or now >= expiry:
+        if expiry > 0.0 and _down_state[1]:
+            logger.info(
+                "Viz proxy 熔断窗口关闭：窗口内快速失败 %d 次（未再逐个撞已断开的上游）",
+                int(_down_state[1]),
+            )
+        _down_state[0] = 0.0
+        _down_state[1] = 0.0
+        return False
+    _down_state[1] += 1
+    return True
+
+
+def _open_down_window(reason: str) -> None:
+    """打开/续期熔断窗口，同类告警按 ``_WARN_INTERVAL_S`` 限频只留一条。"""
+    now = time.monotonic()
+    _down_state[0] = max(_down_state[0], now) + _DOWN_COOLDOWN_S
+    _rate_limited_warning(
+        "upstream_down",
+        f"{reason}（已熔断 {_DOWN_COOLDOWN_S:.0f}s：窗口内直接返回 503，不再逐个撞已断开的端口）",
+    )
+
+
+def _close_down_window() -> None:
+    """上游已正常应答：关闭熔断窗口（不计数、不打日志）。"""
+    _down_state[0] = 0.0
+    _down_state[1] = 0.0
 
 
 def _describe_exc(exc: BaseException) -> str:
@@ -155,6 +199,11 @@ async def proxy_request(
 
     body = await request.body()
 
+    # 上游刚被判不可用：短窗口内直接快速失败，不再逐个轮询去撞已断开的端口
+    # （熔断只影响“能否拿到数据”，不改变任何业务语义；窗口到点自动重试）
+    if _in_down_window():
+        return _proxy_error(503, _UNAVAILABLE_DETAIL, retry_after_s=_DOWN_COOLDOWN_S)
+
     # 发送请求（stream=True 以支持流式转发）
     upstream_request = client.build_request(
         method=request.method,
@@ -170,27 +219,29 @@ async def proxy_request(
         )
         return _proxy_error(504, "upstream timeout")
     except _STREAM_END_ERRORS as exc:
-        # 上游已连接但握手/首包前断开：典型为管理面重启或浏览器取消请求，
-        # 回环内自愈，限频告警即可（旧版每秒一条 WARNING 且异常体为空）
-        _rate_limited_warning(
-            "upstream_disconnect",
+        # 上游已连接但握手/首包前断开：典型为管理面崩溃/重启或浏览器取消请求。
+        # V3.5.6：不再报 502（那不是“网关收到无效响应”而是“上游暂时不在”），
+        # 改 503 + Retry-After 并开启熔断窗口，平台/面板据此退避重试即可
+        _open_down_window(
             f"Viz proxy upstream disconnected: {_describe_exc(exc)} url={url}"
-            "（管理面重启/连接被中断，已返回 502；huntersim up 会自动拉起控制面）",
+            "（管理面重启/连接被中断，已返回 503；huntersim up 会自动拉起控制面）"
         )
-        return _proxy_error(502, "upstream unavailable")
+        return _proxy_error(503, _UNAVAILABLE_DETAIL, retry_after_s=_DOWN_COOLDOWN_S)
     except httpx.HTTPError as exc:
-        # ConnectError 等其余传输错误：上游不可达，必须映射为 502：
-        # 早期只捕 ConnectError，ReadError 会冒泡成 500 + ASGI traceback。
-        _rate_limited_warning(
-            "upstream_error", f"Viz proxy upstream error: {_describe_exc(exc)} url={url}"
+        # ConnectError 等其余传输错误：上游不可达。早期只捕 ConnectError，
+        # ReadError 会冒泡成 500 + ASGI traceback；V3.5.6 起统一为 503 + 熔断
+        _open_down_window(
+            f"Viz proxy upstream error: {_describe_exc(exc)} url={url}"
         )
-        return _proxy_error(502, "upstream unavailable")
+        return _proxy_error(503, _UNAVAILABLE_DETAIL, retry_after_s=_DOWN_COOLDOWN_S)
     except Exception as exc:  # noqa: BLE001  代理层兜底：上游任何异常都不得变成 500
         _rate_limited_warning(
             "unexpected", f"Viz proxy unexpected error: {_describe_exc(exc)} url={url}"
         )
         return _proxy_error(502, "upstream error")
 
+    # 上游已应答：关闭熔断窗口（后续请求恢复正常转发）
+    _close_down_window()
     content_type = upstream_response.headers.get("content-type", "")
 
     # 判断是否需要流式转发
@@ -230,11 +281,10 @@ async def proxy_request(
     try:
         content = await upstream_response.aread()
     except Exception as exc:  # noqa: BLE001  读体阶段断连同样不得变成 500
-        _rate_limited_warning(
-            "body_read",
-            f"Viz proxy body read failed: {_describe_exc(exc)} path={path}",
+        _open_down_window(
+            f"Viz proxy body read failed: {_describe_exc(exc)} path={path}"
         )
-        return _proxy_error(502, "upstream read error")
+        return _proxy_error(503, _UNAVAILABLE_DETAIL, retry_after_s=_DOWN_COOLDOWN_S)
     finally:
         await _safe_aclose(upstream_response)
 
@@ -250,11 +300,21 @@ async def proxy_request(
     )
 
 
-def _proxy_error(status_code: int, detail: str) -> Response:
-    """构造代理错误响应（JSON；不抛异常）。"""
+def _proxy_error(
+    status_code: int, detail: str, *, retry_after_s: Optional[float] = None
+) -> Response:
+    """构造代理错误响应（JSON；不抛异常）。
+
+    ``retry_after_s`` 不为空时下发 ``Retry-After``：让前端/平台按提示退避，
+    而不是把“上游暂时不在”当成失败报警刷进日志。
+    """
+    headers: dict[str, str] = {}
+    if retry_after_s is not None:
+        headers["Retry-After"] = str(max(1, int(round(retry_after_s))))
     return Response(
         content=f'{{"detail": "{detail}"}}',
         status_code=status_code,
+        headers=headers,
         media_type="application/json",
     )
 

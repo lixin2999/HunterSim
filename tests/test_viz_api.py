@@ -171,14 +171,41 @@ class TestPageAndAssets:
         assert "if (!state.instanceId || isTerminalInstance() || !isRunningInstance())" in script
         # 传感器帧统计与事件列表的定时轮询也必须走同一短路（不能直挂 setInterval）
         for name in ("refreshSensors", "refreshEvents"):
-            assert f"setInterval(function () {{\n      if (!isTerminalInstance()) {{\n        {name}();" in script
+            assert (
+                f"setInterval(gate(function () {{\n"
+                f"      if (!isTerminalInstance()) {{\n"
+                f"        {name}();"
+            ) in script
         assert (
-            "setInterval(function () {\n"
+            "setInterval(gate(function () {\n"
             "      if (!isTerminalInstance() && isRunningInstance()) {\n"
             "        refreshPreviews();"
         ) in script
         # 终态后仍需一次收尾加载，否则传感器/事件面板停在旧值
         assert "state.terminalSynced = true" in script
+
+    def test_upstream_backoff_gates_readonly_polling(self, client: TestClient) -> None:
+        """控制面不可用时，只读轮询必须整体退避（V3.5.6）。
+
+        回归现场：控制面原生崩溃到重启的 10~20s 里，本页 8 个独立轮询逐个撞
+        已断开的端口，代理端刷屏式回 502/503，真正的报警被淹没。
+        现在任一请求读到 50x 即按 ``Retry-After`` 暂停全部只读轮询。
+        """
+        script = client.get("/viz/assets/app.js").text
+
+        assert "function isUpstreamDown(response)" in script
+        assert "response.status === 502 || response.status === 503 || response.status === 504" in script
+        # Retry-After 优先，无该头时回落到固定退避窗口
+        assert 'response.headers.get("Retry-After")' in script
+        assert "var UPSTREAM_BACKOFF_MS = " in script
+        # 统一闸门：所有周期轮询都必须走 gate（共 7 处 setInterval）
+        assert script.count("setInterval(gate(") == 7
+        # 用户控制动作不能被静默，只能提示 + 退避
+        assert "if (!response.ok) {" in script
+        assert "控制失败：" in script
+        # 单帧轮询在退避窗口内仍要续排下一轮，否则控制面恢复后画面永久停住
+        assert "控制面不可用，已暂停轮询（自动恢复）" in script
+        assert "// 退避窗口内不发请求，但要续排下一轮" in script
 
     def test_mjpeg_fallback_is_not_terminal(self, client: TestClient) -> None:
         """落到单帧轮询后必须能自己回到 MJPEG 图像流（V3.5.5）。

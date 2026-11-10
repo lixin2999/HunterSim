@@ -50,6 +50,12 @@ _EGO_ROLE_NAME = "hero"
 #: 每次刷新都要读每个 Actor 的位姿（CARLA RPC），太高会把 tick 线程拖慢。
 _ACTOR_STATE_REFRESH_TICKS = 10
 
+#: 等待 tick 线程退出的上限（秒）。V3.5.6：旧值 5s 在现场实测「销毁 4 个传感器
+#: + 自车 + 3 个参与者」耗时 ~7s 的情况下会提前返回，释放线程随后对同一个 world
+#: 下发 ``apply_settings``，与 tick 线程的 ``actor.destroy()`` 并发 → CARLA Client
+#: 非线程安全，进程无 traceback 原生退出（0xC0000409）。多等 15s 远比崩溃便宜。
+_RUNNER_JOIN_TIMEOUT_S = 20.0
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -287,7 +293,14 @@ class SceneRunnerService:
             )
 
         # 运行中重新下发：先停机（join 在锁外执行，避免与 _run_loop 互等）
-        self._stop_if_running()
+        if self._stop_if_running():
+            # V3.5.6：tick 线程还在销毁上一个场景的 Actor，此时继续 setup 就是
+            # 两个线程并发读写同一个 world（与崩溃同源）。宁可把本次下发判为
+            # FAILED 让平台重发，也不能拿进程崩溃当代价。
+            raise CarlaSimulationError(
+                "scene_reload",
+                "上一场景清理未完成（tick 线程仍在销毁 Actor），已拒绝重下发；请重新提交场景",
+            )
         # 运行循环退出时会把世界恢复为异步（便于安全清理），重下发后需要
         # 重新切回同步，否则下一轮 world.tick() 不再驱动仿真
         thread = self._thread
@@ -383,16 +396,20 @@ class SceneRunnerService:
             self._state_mgr.transition_to(SceneStatus.RUNNING)
         logger.info("Scene resumed")
 
-    def stop(self, timeout_s: float = 5.0) -> None:
+    def stop(self, timeout_s: float = _RUNNER_JOIN_TIMEOUT_S) -> bool:
         """停止场景运行并清理资源。状态 → COMPLETED。
 
         注意：若 tick 线程在超时内未能退出，**不会**在这里并发清理场景资源
         （CARLA 客户端非线程安全，跨线程销毁 Actor 会让 LibCarla 原生断言）；
         运行循环退出时会自行执行 ``_cleanup()``。
+
+        Returns:
+            ``False`` 表示已停稳并完成清理；``True`` 表示 tick 线程仍在持有
+            world（清理由该线程收尾），调用方在此期间不得再发任何 CARLA 请求。
         """
         with self._lock:
             if self._state_mgr is None:
-                return
+                return False
             if self._state_mgr.status in (SceneStatus.RUNNING, SceneStatus.PAUSED):
                 self._state_mgr.transition_to(SceneStatus.COMPLETED)
 
@@ -405,26 +422,31 @@ class SceneRunnerService:
                     f"Scene loop did not stop within {timeout_s:.0f}s; "
                     "deferring cleanup to the tick thread"
                 )
-                return
+                return True
 
         self._restore_async()
         self._cleanup()
         logger.info("Scene stopped and cleaned up")
+        return False
 
-    def destroy(self) -> None:
-        """销毁场景，释放所有资源。"""
-        self.stop()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            # 运行循环仍在 world.tick() 内：保留场景引用，退出时会自行清理
+    def destroy(self, timeout_s: float = _RUNNER_JOIN_TIMEOUT_S) -> bool:
+        """销毁场景，释放所有资源。
+
+        Returns:
+            ``True`` 表示清理被 tick 线程接走（本线程未做任何 CARLA 收尾）。
+        """
+        deferred = self.stop(timeout_s=timeout_s)
+        if deferred:
+            # 运行循环仍在 world.tick()/Actor 销毁内：保留场景引用，退出时会自行清理
             logger.warning("Scene destroy deferred: tick thread still alive")
-            return
+            return True
         with self._lock:
             self._config = None
             self._state_mgr = None
             self._event_detector = None
             self._scenario = None
         logger.info("Scene destroyed")
+        return False
 
     @property
     def detected_events(self) -> list[DetectedEvent]:
@@ -630,15 +652,22 @@ class SceneRunnerService:
         # 场景已销毁：清掉参与者快照，避免面板继续显示已经不存在的车
         self._actor_state_cache = []
 
-    def _stop_if_running(self, timeout_s: float = 5.0) -> None:
-        """若有场景循环线程在跑，先停掉（不修改公开状态机，供重新下发场景使用）。"""
+    def _stop_if_running(self, timeout_s: float = _RUNNER_JOIN_TIMEOUT_S) -> bool:
+        """若有场景循环线程在跑，先停掉（不修改公开状态机，供重新下发场景使用）。
+
+        Returns:
+            ``True`` 表示超时后 tick 线程仍存活（仍在持有 world），调用方不得
+            在本线程继续任何 CARLA 操作。
+        """
         thread = self._thread
         if thread is None or not thread.is_alive():
-            return
+            return False
         self._stop_event.set()
         thread.join(timeout=timeout_s)
         if thread.is_alive():
             logger.warning(f"Scene loop did not stop within {timeout_s:.0f}s during reload")
+            return True
+        return False
 
     def _apply_scene_weather(self, config: SceneConfig) -> None:
         """把场景配置中的天气下发到 world（预设名优先，否则自定义参数）。"""
@@ -847,8 +876,18 @@ class SceneRunnerService:
 
         返回 tick 线程缓存的最近一次快照，避免 executor 线程直接调用 CARLA
         RPC（非线程安全），从而消除因跨线程读取导致的零值问题。
+
+        V3.5.6：缓存尚未写入时返回 **空字典**，不再退回 ``_get_ego_state()``。
+        那个兜底是原生崩溃源头：首个成功 tick 之前缓存为空（现场日志的
+        ``Ego state unavailable (stage=actor_missing)`` 即该窗口），executor 线程
+        的 0.5s 进度轮询会直接落到 ``world.get_actors()`` / ``get_transform()``，
+        与 tick 线程的 ``spawn_actor`` / ``actor.destroy()`` 并发操作同一个
+        Client 连接，表现为进程无 traceback 退出（0xC00000FD / 0xC0000409）。
+        进度字段允许缺席，不允许用崩溃换读数。
         """
-        return dict(self._ego_state_cache) if self._ego_state_cache else self._get_ego_state()
+        if self._ego_state_cache:
+            return dict(self._ego_state_cache)
+        return {}
 
     def _get_ego_state(self) -> dict[str, Any]:
         """获取自车状态字典（仅由 tick 线程调用）。

@@ -29,6 +29,11 @@
   };
   var LOG_MAX_LINES = 1500;
   var VIDEO_WATCHDOG_MS = 6000;
+  // 控制面不可用退避窗口（V3.5.6，毫秒）：控制面崩溃/重启的十几秒里，本页有
+  // 8 个独立轮询在反复发请求，代理端逐个回 502/503，日志里就是一片“502 报警”。
+  // 任一请求读到 502/503/504 就把所有只读轮询暂停一个窗口（默认按 Retry-After），
+  // 窗口到点只放行一次探测；服务恢复后自动回到正常节奏。
+  var UPSTREAM_BACKOFF_MS = 2000;
   // 降级后的回探节奏（V3.5.5）：旧版一旦落到单帧轮询就永不回头，画面长期停在
   // ~1.4 fps。现在先做不干扰画面的响应头探测，探到可用立即回到 MJPEG 流。
   var MJPEG_REPROBE_BASE_MS = 10000;
@@ -192,12 +197,58 @@
     return parts.length ? parts.join(" · ") : "—";
   }
 
+  // ── 控制面不可用退避（只读轮询统一闸门） ────────────────────────────
+
+  var upstreamBackoffUntil = 0;
+
+  function isUpstreamDown(response) {
+    if (!response) {
+      return false;
+    }
+    return response.status === 502 || response.status === 503 || response.status === 504;
+  }
+
+  function retryAfterMs(response) {
+    var raw = response && response.headers ? response.headers.get("Retry-After") : null;
+    var seconds = raw === null ? NaN : parseFloat(raw);
+    return isFinite(seconds) && seconds > 0 ? seconds * 1000 : UPSTREAM_BACKOFF_MS;
+  }
+
+  function noteUpstreamUnavailable(response) {
+    upstreamBackoffUntil = Date.now() + Math.max(500, retryAfterMs(response));
+  }
+
+  function clearUpstreamBackoff() {
+    upstreamBackoffUntil = 0;
+  }
+
+  function inUpstreamBackoff() {
+    return Date.now() < upstreamBackoffUntil;
+  }
+
+  function gate(task) {
+    return function () {
+      if (inUpstreamBackoff()) {
+        return;
+      }
+      task();
+    };
+  }
+
   async function fetchJSON(url, options) {
+    if (inUpstreamBackoff()) {
+      return null;
+    }
     try {
       var response = await fetch(url, Object.assign({ cache: "no-store" }, options || {}));
+      if (isUpstreamDown(response)) {
+        noteUpstreamUnavailable(response);
+        return null;
+      }
       if (!response.ok) {
         return null;
       }
+      clearUpstreamBackoff();
       return await response.json();
     } catch (err) {
       return null;
@@ -398,7 +449,14 @@
     try {
       var response = await fetch(instancePath("/" + action), { method: "POST" });
       if (!response.ok) {
+        // 用户动作不进闸门（不能把“暂停”按钮静默掉），但上游不可用仍需退避，
+        // 避免后面几十个轮询继续撞已断开的端口
+        if (isUpstreamDown(response)) {
+          noteUpstreamUnavailable(response);
+        }
         setNote("stream-state", "控制失败：" + action + " → HTTP " + response.status);
+      } else {
+        clearUpstreamBackoff();
       }
     } catch (err) {
       setNote("stream-state", "控制失败：" + action + " → 网络异常");
@@ -633,6 +691,9 @@
         instancePath("/stream.mjpg?stream=overview&t=" + Date.now(), instanceId),
         { cache: "no-store", signal: controller ? controller.signal : undefined }
       );
+      if (isUpstreamDown(response)) {
+        noteUpstreamUnavailable(response);
+      }
       var contentType = String(response.headers.get("content-type") || "");
       usable = response.ok && contentType.indexOf("multipart") >= 0;
     } catch (err) {
@@ -660,6 +721,13 @@
     if (state.videoInstance !== instanceId || state.videoMode !== "screenshot") {
       return;
     }
+    if (inUpstreamBackoff()) {
+      // 退避窗口内不发请求，但要续排下一轮（否则控制面恢复后画面永久停住）
+      state.videoTimer = setTimeout(function () {
+        pollScreenshot(instanceId);
+      }, POLL_MS.screenshot);
+      return;
+    }
     var img = $("video");
     var stage = img.parentElement;
     try {
@@ -676,13 +744,17 @@
         setNote("video-meta", "无画面");
       } else if (!response.ok) {
         stage.classList.remove("live");
-        if (response.status === 409) {
+        if (isUpstreamDown(response)) {
+          noteUpstreamUnavailable(response);
+          setNote("video-empty", "控制面不可用，已暂停轮询（自动恢复）");
+        } else if (response.status === 409) {
           setNote("video-empty", "相机未挂载（场景未加载或实例已结束）");
         } else {
           setNote("video-empty", "截图请求失败（HTTP " + response.status + "）");
         }
         setNote("video-meta", "无画面");
       } else {
+        clearUpstreamBackoff();
         var blob = await response.blob();
         var url = URL.createObjectURL(blob);
         img.src = url;
@@ -1214,25 +1286,25 @@
     refreshStatus();
     refreshInstances().then(refreshDetail);
     startLogs();
-    setInterval(refreshStatus, POLL_MS.status);
-    setInterval(refreshInstances, POLL_MS.instances);
-    setInterval(refreshDetail, POLL_MS.detail);
-    setInterval(function () {
+    setInterval(gate(refreshStatus), POLL_MS.status);
+    setInterval(gate(refreshInstances), POLL_MS.instances);
+    setInterval(gate(refreshDetail), POLL_MS.detail);
+    setInterval(gate(function () {
       if (!isTerminalInstance()) {
         refreshSensors();
       }
-    }, POLL_MS.sensors);
-    setInterval(function () {
+    }), POLL_MS.sensors);
+    setInterval(gate(function () {
       if (!isTerminalInstance()) {
         refreshEvents();
       }
-    }, POLL_MS.events);
-    setInterval(refreshActors, POLL_MS.actors);
-    setInterval(function () {
+    }), POLL_MS.events);
+    setInterval(gate(refreshActors), POLL_MS.actors);
+    setInterval(gate(function () {
       if (!isTerminalInstance() && isRunningInstance()) {
         refreshPreviews();
       }
-    }, POLL_MS.preview);
+    }), POLL_MS.preview);
   }
 
   document.addEventListener("DOMContentLoaded", bootstrap);

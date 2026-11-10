@@ -3585,3 +3585,94 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 沿用 V3.5.4 待办（原生 fail-fast 调用点未定位、自愈只在 `up` 层）与 V3.5.3 待办（VIL 模式不适用首 tick 补发、前车默认 8.0 m/s）。
 
 ---
+
+## V3.5.6 — 502 风暴根治：两处「跨线程并发操作同一 CARLA Client」原生崩溃 + 代理/前端退避治理
+
+**发布日期**：2026-11-10
+**版本定位**：问题修复——现场日志里的 41 条 `502 Bad Gateway` 不是网关故障，而是**控制面进程两次原生崩溃**的症状。本版消除两条已定位的跨线程并发路径（场景收尾期与首个 tick 之前的进度轮询），并把「上游暂时不在」与「网关收到无效响应」在语义、状态码、退避行为上彻底分开。接口面、平台契约、录制与上行链路零改动。
+
+### 现场（685 行日志读数）
+
+| 时刻 | 读数 | 结论 |
+|------|------|------|
+| 16:14:26 → 16:14:33 | 下发 `inst-51e5…`（Town07 / 3 名 cyclist）→ `running`，轮询全 200 | 正常 |
+| 16:14:33 | `Ego state unavailable (stage=actor_missing)` | 首个成功 tick 之前的窗口被命中（崩溃② 的入口条件） |
+| 16:15:04 | `state: running → completed` → `restoring async world mode` → `Scenario cleanup begin: sensors=4, overview=True, participants=3, ego=True` → `stopping encoder threads` → **同秒** executor 插入 `Execution plane releasing: instance=…, runner=yes` → tick 线程继续 `stopping participant controllers` → `destroying sensors` → `destroying actors` | 释放线程与 tick 线程**同时**在动 world |
+| 16:15:04 之后 | `Scenario cleanup done` **0 次**、`Execution plane released` **0 次**（`Execution plane releasing` 1 次） | 收尾被截断，进程崩在销毁 Actor 中途 |
+| 16:15:11 | `Viz proxy upstream disconnected: ReadError url=https://127.0.0.1:8090/…/stop（…已返回 502…）` + 41 条 `502 Bad Gateway`（含 `POST /stop`）+ `[up] carla-manager 异常退出（code=3221226505），3s 后自动重启（第 1/4 次）` | 崩溃①：`0xC0000409` STATUS_STACK_BUFFER_OVERRUN（fail-fast） |
+| 16:15:26 → 16:15:33 | 重启后就绪 → 下发 `inst-7606…`（Town06 / 2 名 walker）→ 又一轮 `stage=actor_missing` → blueprint fallback → `crossing_pedestrian-1 spawned` → **紧接一片 502** → `[up] … 异常退出（code=3221225725）… （第 2/4 次）` | 崩溃②：`0xC00000FD` STATUS_STACK_OVERFLOW |
+| 16:15:48 | `Marked 1 non-terminal instance(s) as failed: adapter restarted` | 平台侧看到的只是「场景莫名失败」 |
+
+16:15:04 → 16:15:11 的 7 s 与「旧 `join(5.0)` 超时返回 + tick 线程继续销毁」的耗时完全吻合。
+
+### 根因（两条独立因果链，同一类错误）
+
+carla-manager 被 CARLA/LibCarla **原生**带走时不会留下 Python traceback，`try/except`、看门狗、`up` 自愈都只能「事后拉起」，接不住现场。两条链的共同点是：**两个线程并发操作同一个 `carla.Client` 连接**（LibCarla 客户端非线程安全）。
+
+1. **崩溃①（`0xC0000409`）— 释放路径在清理期内改世界**
+   `ExecutionPlane._destroy()` 里 `runner.destroy()` → `stop()` 的 `join` 上限是 **5 s**，而现场销毁「4 个传感器 + 自车 + 3 名参与者」实测约 7 s → `destroy()` 走 deferred 分支提前返回（注释已声明「清理交给 tick 线程」），但 `release()` 随后**无条件**执行 `_restore_world_async()`：`world.apply_settings()` + `traffic_manager.set_synchronous_mode(False)` 与 tick 线程正在进行的 `actor.destroy()` 撞在同一个连接上 → fail-fast。
+2. **崩溃②（`0xC00000FD`）— 非 tick 线程直读 CARLA**
+   `SceneRunnerService.get_ego_state()` 的实现是 `return dict(cache) if cache else self._get_ego_state()`。缓存在**首个成功 tick** 之前是空的（日志 `stage=actor_missing` 即该窗口），于是 executor worker 线程按 `_PROGRESS_MIN_INTERVAL_S = 0.5` 的节奏直接落到 `world.get_actors()` / `get_transform()` / `get_velocity()` / `get_control()`，与 tick 线程的 `spawn_actor`（行人 + `controller.ai.walker` 的 `attach_to`）并发 → 栈溢出。
+3. **症状层放大器**：崩溃到 `up` 重启完成的 10~20 s 里，`/viz` 一个页面就有 **7 路 `setInterval` 定时轮询**（状态 / 实例 / 详情 / 传感器 / 事件 / 参与者 / 预览）加上单帧截图的 `setTimeout` 续排，继续逐个撞已断开的 8090 端口，代理逐个回 502（且 502 语义本身是错的：那是「上游暂时不在」，不是「网关收到无效响应」），真正的报警被 41 条 502 淹没。
+
+### 修复内容
+
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`（① join 上限 + deferred 语义外显）**：新增模块常量 `_RUNNER_JOIN_TIMEOUT_S = 20.0`（旧值 5 s 会在真实销毁未完时提前返回，直接制造了并发）；`stop(timeout_s=…)`、`destroy(timeout_s=…)`、`_stop_if_running(timeout_s=…)` 由 `None` 改为**返回 `bool`**（`True` = tick 线程仍持有 world，本线程不得再发任何 CARLA 请求），`destroy()` 去掉原先重复的 `thread.is_alive()` 判定；`load_scene()` 在 `_stop_if_running()` 返回 `True` 时抛 `CarlaSimulationError("scene_reload", "上一场景清理未完成（tick 线程仍在销毁 Actor），已拒绝重下发；请重新提交场景")`，不再带着未结束的销毁流程继续 `scenario.setup()`。
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`（② ego 只读缓存）**：`get_ego_state()` 删除 `else self._get_ego_state()` 兜底，缓存未写入时返回 `{}`。docstring 写明这是原生崩溃源头，并确立口径：**进度字段允许缺席，不允许用崩溃换读数**。
+- **`src/hunter_sim/execution/plane.py`（① 释放期绝不碰 world）**：新增模块级 `_tick_thread_owns_world(runner)`（只读 `is_running`，属性异常按「不持有」处理，不阻断释放）；`_destroy()` 在 `runner.destroy()` 之后若 tick 线程仍存活 → `self._forget_cleanup_info(instance_id)` + WARNING `Execution plane release deferred: instance=%s, world left to scene tick thread (no concurrent CARLA calls)` 后 `return`，**跳过** `_restore_world_async()`（运行循环退出前已自行把世界恢复异步，不会把 CARLA 留在同步模式等 tick）；新增 `_forget_cleanup_info()`：丢弃实例的 world/TM 句柄但不发任何请求（登记必须清掉，否则长期握着失效句柄）。
+- **`src/hunter_sim/probes/viz_proxy.py`（③ 状态码语义 + 熔断）**：上游「暂时不在」的三类路径（握手/首包前断开 `ReadError` 等、`ConnectError`、读响应体失败）由 **502 改 503 + `Retry-After`**；新增 `_DOWN_COOLDOWN_S = 2.0` 熔断窗口与 `_in_down_window()` / `_open_down_window()` / `_close_down_window()`（`_down_state = [到期时刻, 窗口内快速失败次数]`）：窗口内**直接快速失败，不再逐个撞已断开的端口**，窗口到期时 INFO 汇总「熔断窗口关闭：窗口内快速失败 N 次」；上游成功应答即 `_close_down_window()`；非传输类异常（代码缺陷）仍返回 502 以保留真报警；`_proxy_error()` 新增 `retry_after_s` 关键字参数下发 `Retry-After` 头。
+- **`src/hunter_sim/visualization/assets/app.js`（③ 前端统一退避闸门）**：新增 `UPSTREAM_BACKOFF_MS = 2000`、`upstreamBackoffUntil` 与 `isUpstreamDown()` / `retryAfterMs()`（优先读 `Retry-After`）/ `noteUpstreamUnavailable()` / `clearUpstreamBackoff()` / `inUpstreamBackoff()` / `gate(task)`；`fetchJSON` 入口加闸门、读到 502/503/504 即进入退避、成功即清零；`bootstrap` 的 7 处 `setInterval` 全部改为 `setInterval(gate(...), …)`（共 8 个轮询入口，`startLogs` 自带 SSE 重连不重复计）；`postControl` 遇 50x 只提示 + 开启退避而**不把自己的请求静默掉**（用户动作不能被吞）；`reprobeMjpeg` 同步识别 50x；`pollScreenshot` 顶部在退避期内**仍续排 `setTimeout`**（否则控制面恢复后画面永久停住），并提示「控制面不可用，已暂停轮询（自动恢复）」。
+- **`src/hunter_sim/visualization/launcher.py`（④ 可观测）**：新增 `_NATIVE_EXIT_HINTS`（`0xC0000409` 原生 fail-fast、`0xC00000FD` 栈溢出、`0xC0000005` 访问违例、`0xC000013A` CTRL+C）与 `describe_exit_code(code)`（按 32 位无符号掩码，兼容 Windows 正整数与 shell 转发的补码负数，**未知码返回空串不编造原因**）；接入 `_guard` 的三条退出提示（`异常退出` / `已退出` / 触顶「停止守护」），现场不必再对着 `code=3221226505` 查 Windows 异常码表。
+
+### 向后兼容与行为变化
+
+- **代理状态码语义变化（对外可见）**：控制面重启/断连期间 `/viz` 代理由 `502` 改 `503` + `Retry-After: 2`。按 502 判「网关故障」告警的平台侧规则需一并匹配 503；上游自身返回的状态码（含它自己的 5xx）仍原样透传，代理自己冒 `502`（`detail=upstream error`）只剩最后兜底分支捕获的未预期异常这一条路径。
+- **`SceneRunnerService.stop()/destroy()/_stop_if_running()` 返回值由 `None` 改 `bool`**（新增 deferred 告知）。仓内唯一调用方 `ExecutionPlane` 已按新语义处理；外部自定义运行器包装若忽略返回值，行为不变（向后兼容的签名扩展）。
+- **进度里的 `ego_state` 可能短暂无值**（首个成功 tick 之前、或 tick 线程尚未写入缓存）：不再退回跨线程直读。平台侧「车辆是否在动」的判读需容忍该窗口缺席（原本就是空值/零值不可信）。
+- **同实例「运行中重下发」可能被拒**：上一场景 tick 线程仍在销毁 Actor 时，本次下发直接判 `failed`（`CarlaSimulationError`，operation=`scene_reload`），平台重发即可；旧版本此处会「接受下发」并在数秒内崩掉整个控制面。
+- **前端在控制面不可用时会暂停只读轮询**（最长一个 `Retry-After` 窗口，默认 2 s），页面读数短暂停滞后自动恢复；用户点击类控制动作不受闸门影响。
+- 无接口/配置项增删；`pyproject.toml` 版本 `3.5.5` → `3.5.6`（修复/完善按第三位递增）。
+
+### 风险
+
+- **join 上限 5 s → 20 s**：`release()` 最长可能阻塞 20 s（在同一引擎锁内），期间同端点的新场景下发会排队。取舍明确：**排队远比崩溃便宜**；正常收尾实测约 7 s，20 s 只是上限而非常态。
+- **崩溃② 的「直接触发者」可能仍在 CARLA 侧**：`0xC00000FD` 的栈溢出发生在 LibCarla/导航内部，本版消除的是**我们能控制的前提**（并发操作同一连接）。置信度：跨线程并发是必要诱因（两次崩溃都紧贴 `stage=actor_missing` 或 `destroying actors` 窗口），但无法排除服务端另有独立缺陷；若修复后仍崩，`describe_exit_code` 给出的码 + 本版新增 WARNING 尾锚即为下一轮定位入口。
+- **熔断窗口会短暂放大失败率**：窗口内的请求直接 503 而不尝试转发（最长 2 s）。这是刻意取舍——把「7 路轮询（+ 截图续排）× 20 s」的 41 条报警压成 1 条 WARNING + 1 条 INFO。
+- **`_tick_thread_owns_world()` 读不到状态时按「不持有」处理**：宁可保留旧行为（恢复异步）也不让释放卡死；此时并发风险退化为原有水平，不会更差。
+
+### 验证
+
+- `pytest -q` 全量：**1468 passed**（较 V3.5.5 +16），覆盖率门禁达标；`mypy src/hunter_sim`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 新增/改动测试：
+  - `tests/test_execution_plane_lifecycle.py::TestRelease::test_release_defers_world_restore_while_tick_thread_is_cleaning`：`destroy()` 被 tick 线程接走时**必须** `world.apply_settings` 计数不变、TM 不再收 `set_synchronous_mode(False)`、`_cleanup_info` 已丢弃、实例已摘除；替身 `_Runner.destroy()` 补上真实语义（正常返回即线程已 join 退出，`destroy_deferred` 复现超时窗口）；
+  - `tests/test_scene_runner_service.py::TestEgoState`：新增 `test_public_get_ego_state_never_touches_world`（`world.get_actors` 换成会抛断言的 mock，公开入口必须返回 `{}` 且一次都不触达 world）、`test_public_get_ego_state_returns_cache_copy`（返回副本，不污染 tick 线程快照）；5 项「tick 线程取数」用例改调 `_get_ego_state()`（语义归位，不再依赖崩溃路径）；
+  - `tests/test_scene_runner_service.py::TestStopDestroyDeferral`（4 例）：`stop()`/`destroy()` deferred 时返回 `True` 且**不写世界设置**、`destroy()` 提前丢场景引用被禁止、`_RUNNER_JOIN_TIMEOUT_S ≥ 15 s` 的常量护栏、`load_scene()` 在 tick 线程存活时抛 `CarlaSimulationError(scene_reload)`；
+  - `tests/test_probes_viz_proxy.py`：`test_connect_error_returns_502` → `test_connect_error_returns_503_with_retry_after`（503 + `Retry-After: 2`）、`test_down_window_fast_fails_without_touching_upstream`（`client.send` 只被 await 一次）、`test_upstream_response_closes_down_window`（窗口到期后首次成功应答彻底关窗、不留残余时间戳）、`test_unexpected_error_still_returns_502`（代码缺陷不得伪装成服务不可用）；新增模块级 autouse fixture 复位 `_down_state` / `_warn_state`；
+  - `tests/test_viz_launcher.py`：`TestGuardAutoRestart` 断言崩溃行必须带 `0xC0000409` + `fail-fast`，新增 `test_crash_hint_is_appended_per_exit_code`（三种码 × 现场 `已退出`/`异常退出` 两条路径）、`test_clean_exit_gets_no_crash_hint`（0/未知码/非数字都不得编造原因）、`test_two_complement_form_maps_to_same_code`（补码负数同一译法）；`launcher._guard` 的「已退出」分支同步补上译码（`--no-restart` 时也要能读懂）；
+  - `tests/test_viz_api.py`：新增 `test_upstream_backoff_gates_readonly_polling`（app.js 源码契约：`isUpstreamDown` 三码判定、`Retry-After` 优先、**7 处 `setInterval(gate(`**、控制动作不静默、单帧轮询退避期仍续排）；`test_terminal_instance_stops_frame_polling` 的 setInterval 断言随 `gate()` 包裹同步更新。
+- 真机复测待执行：开发环境 `.venv` 未安装 `carla` 模块，原生 fail-fast / 栈溢出无法本地复现；本版按「日志锚点 + 单测护栏」定位与收口。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.6`（`/viz` 左上角 `v3.5.6`，浏览器需 Ctrl+F5）；
+2. 下发一个带参与者的场景并等其自然结束，日志尾部必须**按顺序**出现：`Scenario cleanup done` → `Execution plane releasing: instance=…, runner=yes` → `Execution plane released: instance=…` → `World restored to asynchronous mode`（或 `Scene stopped and cleaned up`）→ `Manager idle: waiting for next scene`；
+3. 若销毁确实超过 20 s，应看到 `Scene loop did not stop within 20s; deferring cleanup to the tick thread` + **`Execution plane release deferred: instance=…, world left to scene tick thread`**，随后进程**不得退出**（这是本版新增的安全出口，出现即说明崩溃① 的路径已被绕开）；
+4. 重启后立刻再下发场景：若命中 `上一场景清理未完成（tick 线程仍在销毁 Actor），已拒绝重下发`，属预期（该实例判 `failed`），**等 2~3 s 重发即可**，不得再出现进程退出；
+5. 人为把 carla-manager 停掉（或让控制面重启）观察 `/viz`：代理日志应只有 **1 条** WARNING（`…（已熔断 2s：窗口内直接返回 503，不再逐个撞已断开的端口）`）+ 1 条 INFO（`Viz proxy 熔断窗口关闭：窗口内快速失败 N 次`），**不再有几十条 502**；页面读数暂停 ≤2 s 后自动恢复，画面提示「控制面不可用，已暂停轮询（自动恢复）」并自行回到正常轮询；
+6. 若仍有原生崩溃，`[up]` 行现在应直接给出 `异常退出（code=3221226505）（0xC0000409 原生 fail-fast，多为两个线程并发操作同一 CARLA Client 连接）`——把这一行连同**最后 20 行 INFO** 一起回传即可继续定位。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.6`；`pyproject.toml` 版本 `3.5.6`；wheel 与镜像 tag 按此命名手工构建。
+
+> 注意：仓库内的 `docker/docker-compose.yml`（`hunter-sim:3.4.0`）、`docker-compose.windows.yml`（`hunter-sim:3.3.5`）与 `Makefile` 的 `IMAGE_TAG`（`3.4.0`）仍按历史值固定，**不随版本自动同步**（V3.4.x 以来一直如此）。直接 `docker compose up` 拉到的是旧镜像；本地起新版需 `docker build -f docker/Dockerfile -t hunter-sim:3.5.6 .` 并同步修正上述三处 tag（改动会直接影响现有部署，因此本版不擅自修改，仅备案）。文档四件套（`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md`）已同步。
+
+### 待办 / 已知边界
+
+- **原生崩溃仍只能「事后自愈」**：`up` 层的重启兜底 + 本版两条并发路径消除是**必要不充分**；彻底解法需要把 CARLA 客户端访问收敛为单线程信箱（所有 RPC 经 tick 线程串行派发），属架构级改动（需递增次版本号）。
+- **不做「崩溃后自动接着跑完上一个实例」**：重启后遗留实例标 `failed`、等平台重下发，是既有恢复语义。
+- **平台侧告警规则需同步**：若有按 `502` 关键字匹配的规则，应改为 `50[234]` 或直接改用 `/health` 探针；本版把「上游暂时不在」归入 503。
+- **compose / Makefile 镜像 tag 长期滞后**：`docker-compose.yml`、`docker-compose.windows.yml`、`Makefile` 三处仍指旧 tag（见上方「分发」），下一版建议统一改用 `${HUNTERSIM_IMAGE}` 变量或由 `pyproject` 版本注入，避开人工同步漏改。
+- 沿用 V3.5.5 待办（未接入 NVENC 硬编码、自适应只降 JPEG 质量）与 V3.5.4 待办（自愈只在 `up` 层；本版已把「原生 fail-fast 调用点」从「未定位」收敛为「两条已定位路径」）。
+
+---

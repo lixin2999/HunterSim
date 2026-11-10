@@ -406,7 +406,7 @@ class TestEgoState:
         runner = _make_runner()
         runner._scenario = _BuiltinLikeScenario(_vehicle())  # noqa: SLF001
 
-        state = runner.get_ego_state()
+        state = runner._get_ego_state()  # noqa: SLF001  tick 线程专用入口
 
         assert state["x"] == pytest.approx(12.5)
         assert state["y"] == pytest.approx(-3.0)
@@ -424,14 +424,14 @@ class TestEgoState:
         runner._scenario = _BuiltinLikeScenario(actor)  # noqa: SLF001
 
         assert runner.ego_vehicle is actor
-        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+        assert runner._get_ego_state()["x"] == pytest.approx(12.5)  # noqa: SLF001
 
     def test_ego_state_supports_legacy_getter(self) -> None:
         """向后兼容：旧 scenario 仍可通过 ``get_ego_vehicle()`` 取到状态。"""
         runner = _make_runner()
         runner._scenario = _LegacyScenario(_vehicle())  # noqa: SLF001
 
-        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+        assert runner._get_ego_state()["x"] == pytest.approx(12.5)  # noqa: SLF001
 
     def test_ego_state_without_scenario_returns_empty(self) -> None:
         """无场景时返回空字典（而不是零值），避免把「无自车」写成真实位姿。"""
@@ -452,7 +452,7 @@ class TestEgoState:
         )
         runner = _make_runner(world=world)
 
-        assert runner.get_ego_state()["x"] == pytest.approx(12.5)
+        assert runner._get_ego_state()["x"] == pytest.approx(12.5)  # noqa: SLF001
 
     def test_ego_state_falls_back_to_single_vehicle(self) -> None:
         """世界里没有 hero 标签但只有一辆车时，仍应取到该车状态。"""
@@ -463,7 +463,7 @@ class TestEgoState:
         )
         runner = _make_runner(world=world)
 
-        assert runner.get_ego_state()["velocity"] == pytest.approx(10.0)
+        assert runner._get_ego_state()["velocity"] == pytest.approx(10.0)  # noqa: SLF001
 
     def test_status_payload_carries_nonzero_ego_state(self) -> None:
         """上行 sim_status 的 ego_state 不能恒零（平台侧据此判断车辆在动）。"""
@@ -481,6 +481,98 @@ class TestEgoState:
         msg = producer.status_calls[-1]
         assert msg["payload"]["ego_state"]["x"] == pytest.approx(12.5)
         assert msg["payload"]["ego_state"]["velocity"] == pytest.approx(10.0)
+
+    def test_public_get_ego_state_never_touches_world(self) -> None:
+        """V3.5.6 ②：公开入口只读缓存，缓存未写入时不得退回直读 CARLA。
+
+        回归现场（大量 502 的另一条根因链）：首个成功 tick 之前缓存为空（日志
+        ``Ego state unavailable (stage=actor_missing)`` 即该窗口），executor 线程的
+        0.5s 进度轮询会落到 ``world.get_actors()`` / ``get_transform()``，与 tick
+        线程的 ``spawn_actor`` / ``actor.destroy()`` 并发操作同一个 Client 连接
+        → 进程无 traceback 原生退出（0xC00000FD）。
+        """
+        world = _FakeWorld()
+        world.get_actors = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("非 tick 线程不得直读 CARLA")
+        )
+        runner = _make_runner(world=world)
+
+        assert runner.get_ego_state() == {}
+        world.get_actors.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_public_get_ego_state_returns_cache_copy(self) -> None:
+        """有缓存时返回副本：调用方改写不得污染 tick 线程写入的快照。"""
+        runner = _make_runner()
+        runner._ego_state_cache = {"x": 1.0}  # noqa: SLF001
+
+        snapshot = runner.get_ego_state()
+        snapshot["x"] = 99.0
+
+        assert runner._ego_state_cache == {"x": 1.0}  # noqa: SLF001
+
+
+class _AliveThread:
+    """永不退出的 tick 线程替身：join 超时后 ``is_alive()`` 仍为 True。"""
+
+    def __init__(self) -> None:
+        self.join_timeouts: list[float] = []
+
+    def is_alive(self) -> bool:
+        return True
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(float(timeout or 0.0))
+
+
+class TestStopDestroyDeferral:
+    """V3.5.6 ①：join 超时必须把「tick 线程仍持有 world」告知调用方。"""
+
+    def _running_runner(self, world: _FakeWorld) -> SceneRunnerService:
+        runner = _make_runner(world=world)
+        runner._state_mgr = MagicMock()  # noqa: SLF001
+        runner._state_mgr.status = SceneStatus.RUNNING  # noqa: SLF001
+        runner._thread = _AliveThread()  # noqa: SLF001
+        return runner
+
+    def test_stop_returns_deferred_and_skips_world_writes(self) -> None:
+        world = _FakeWorld()
+        runner = self._running_runner(world)
+
+        assert runner.stop(timeout_s=0.01) is True
+
+        assert world.apply_calls == 0, "tick 线程仍在跑，本线程不得修改世界设置"
+
+    def test_destroy_returns_deferred_and_keeps_scenario(self) -> None:
+        """被接走的清理不得提前丢场景引用（否则 tick 线程收尾时无 Actor 可销）。"""
+        world = _FakeWorld()
+        runner = self._running_runner(world)
+        runner._scenario = _BuiltinLikeScenario(_vehicle())  # noqa: SLF001
+
+        assert runner.destroy(timeout_s=0.01) is True
+
+        assert runner._scenario is not None  # noqa: SLF001
+        assert world.apply_calls == 0
+
+    def test_join_timeout_allows_real_cleanup_duration(self) -> None:
+        """join 上限必须覆盖真实销毁耗时（现场 4 传感器+自车+3 参与者约 7s）。
+
+        旧值 5s 会在清理未完时提前返回，直接制造了释放线程与 tick 线程并发。
+        """
+        from hunter_sim.scene_runner import scene_runner_service as module
+
+        assert module._RUNNER_JOIN_TIMEOUT_S >= 15.0  # noqa: SLF001
+
+    def test_load_scene_rejects_reload_while_tick_thread_alive(self) -> None:
+        """上一场景还在销毁时重下发必须被拒（宁 FAILED 不可崩溃）。"""
+        from hunter_sim.common.exceptions import CarlaSimulationError
+
+        world = _FakeWorld()
+        runner = self._running_runner(world)
+
+        with pytest.raises(CarlaSimulationError, match="scene_reload"):
+            runner.load_scene(_minimal_config())
+
+        assert world.apply_calls == 0
 
 
 class TestRestoreAsync:

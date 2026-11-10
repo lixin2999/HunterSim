@@ -51,6 +51,35 @@ _RESTART_MAX_ATTEMPTS = 4
 #: 子进程连续存活多久算“已稳定”（秒）：稳定后再崩则重新计一次重启额度
 SERVICE_STABLE_SECONDS = 30.0
 
+#: Windows NTSTATUS 原生崩溃码 → 现场可读含义（V3.5.6）。
+#: 管理面被 CARLA/LibCarla 原生带走时**不会留下 Python traceback**，日志里只剩
+#: 最后一行 INFO，现场对着一个十进制大数无从下手。这里把常见码直接译出来，
+#: 拿到日志就能判断“崩在哪一类”，而不用先去查 Windows 异常码表。
+_NATIVE_EXIT_HINTS: dict[int, str] = {
+    0xC0000409: "原生 fail-fast，多为两个线程并发操作同一 CARLA Client 连接",
+    0xC00000FD: "原生栈溢出，多为 CARLA 侧在异常世界状态下深层递归/重试",
+    0xC0000005: "访问违例，多为引用了已销毁的 Actor/传感器",
+    0xC000013A: "CTRL+C 终止（人为中断，不属崩溃）",
+}
+
+
+def describe_exit_code(code: Any) -> str:
+    """把退出码译成现场可执行的提示；未知码返回空串（不编造原因）。
+
+    兼容两种进位：Windows 下 ``Popen.returncode`` 为正整数（3221226505），
+    经某些 shell 转发时为补码负数（-1073740791），统一按 32 位无符号比较。
+    """
+    try:
+        numeric = int(code)
+    except (TypeError, ValueError):
+        return ""
+    hint = _NATIVE_EXIT_HINTS.get(numeric & 0xFFFFFFFF, "")
+    if hint:
+        return f"（0x{numeric & 0xFFFFFFFF:08X} {hint}）"
+    if numeric < 0:
+        return f"（信号退出 {numeric}）"
+    return ""
+
 
 @dataclass(frozen=True)
 class ServiceSpec:
@@ -343,18 +372,20 @@ class Launcher:
                     attempts = 0
                 alive_seconds[index] = 0.0
                 if code == 0 or self._stopping or not self._restart_on_failure:
-                    self._emit(f"[up] {spec.name} 已退出（code={code}）")
+                    # 关掉自愈时也要译出退出码：否则现场只剩一个十进制大数
+                    self._emit(f"[up] {spec.name} 已退出（code={code}）{describe_exit_code(code)}")
                     return int(code or 0)
                 if attempts >= _RESTART_MAX_ATTEMPTS:
                     self._emit(
-                        f"[up] {spec.name} 连续 {attempts} 次重启后仍未稳定（code={code}），停止守护；"
+                        f"[up] {spec.name} 连续 {attempts} 次重启后仍未稳定（code={code}）"
+                        f"{describe_exit_code(code)}，停止守护；"
                         "请先确认 CARLA 引擎（CarlaUE4.exe / :2000）与端口占用，再重跑 huntersim up"
                     )
                     return int(code)
                 attempts += 1
                 backoff = _RESTART_BACKOFF_S[min(attempts - 1, len(_RESTART_BACKOFF_S) - 1)]
                 self._emit(
-                    f"[up] {spec.name} 异常退出（code={code}），"
+                    f"[up] {spec.name} 异常退出（code={code}）{describe_exit_code(code)}，"
                     f"{backoff:.0f}s 后自动重启（第 {attempts}/{_RESTART_MAX_ATTEMPTS} 次），"
                     "其余服务保持运行"
                 )

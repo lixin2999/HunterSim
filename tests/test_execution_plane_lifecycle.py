@@ -97,7 +97,12 @@ class _TrafficManager:
 
 
 class _Runner:
-    """SceneRunnerService 替身。"""
+    """SceneRunnerService 替身。
+
+    ``is_running`` 模仿真实语义（tick 线程是否存活）：``destroy()`` 正常返回即
+    代表 join 成功、线程已退出，本替身才会把 ``is_running`` 置 False；
+    ``destroy_deferred`` 用于复现「join 超时、清理被 tick 线程接走」的窗口。
+    """
 
     def __init__(self, world: Any, **kwargs: Any) -> None:
         self.world = world
@@ -105,11 +110,14 @@ class _Runner:
         self.destroyed = 0
         self.is_running = True
         self.destroy_error: Optional[Exception] = None
+        self.destroy_deferred = False
 
     def destroy(self) -> None:
         self.destroyed += 1
         if self.destroy_error is not None:
             raise self.destroy_error
+        if not self.destroy_deferred:
+            self.is_running = False
 
 
 class _ExplodingBool:
@@ -360,6 +368,33 @@ class TestRelease:
         assert world.settings.synchronous_mode is False
         assert world.settings.fixed_delta_seconds == pytest.approx(0.0)
         assert traffic_manager.sync_calls == [True, False]
+
+    def test_release_defers_world_restore_while_tick_thread_is_cleaning(self) -> None:
+        """V3.5.6 ①：tick 线程仍在销毁 Actor 时，释放线程不得再碰 world / TM。
+
+        回归现场（大量 502 的真正根因）：场景结束后 ``runner.destroy()`` 因 join
+        超时返回，释放线程随后仍无条件 ``apply_settings`` +
+        ``tm.set_synchronous_mode(False)``，与 tick 线程的 ``actor.destroy()`` 并发
+        操作同一个 CARLA Client 连接 → 进程无 traceback 原生退出（0xC0000409），
+        紧接着一片 502。
+        """
+        world = _World()
+        traffic_manager = _TrafficManager()
+        manager = _MapManager(world, traffic_manager=traffic_manager)
+        runners: list[_Runner] = []
+        plane = _plane(manager=manager, runners=runners)
+        plane.ensure_runner(_instance())
+        runners[0].destroy_deferred = True
+
+        assert plane.release("inst-1") is True
+
+        assert runners[0].destroyed == 1
+        assert world.applied == 1, "释放线程在 tick 线程清理期内又改写了世界设置"
+        assert world.settings.synchronous_mode is True
+        assert traffic_manager.sync_calls == [True], "释放线程在清理期内触碰了 Traffic Manager"
+        # 句柄不得继续握在字典里，但要留给 tick 线程收尾，故只登记不操作
+        assert plane._cleanup_info == {}  # noqa: SLF001
+        assert plane.get_runner("inst-1") is None
 
     def test_release_restores_async_even_without_tm(self) -> None:
         world = _World()
