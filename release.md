@@ -3488,3 +3488,100 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 沿用 V3.5.3 待办（VIL 模式不适用首 tick 补发、前车默认 8.0 m/s、补发仅一次、`/viz` 参与者计数口径）与 V3.3.3 待办（自签 CA 未导入导致上行静默丢失、HUNTER_SE 蓝图缺失回落 model3）。
 
 ---
+
+## V3.5.5 — 主视区「幻灯片化」专项：降级不可逆 + 推流名额滞留 + 深度预览抢编码核（按 i7-14700KF / RTX 4070 校准到 1080p@20fps）
+
+**发布日期**：2026-11-10
+**版本定位**：性能修复——消除三类会把可视化画面长期锁在 ~1.4 fps 的路径，并按仿真端机器配置（Intel i7-14700KF 3.40 GHz / 32 GB / NVIDIA RTX 4070 12 GB）把主视区帧率上限从 10 fps 提到 20 fps，同时保留高清分辨率。接口面、平台契约、录制与上行链路零改动。
+
+### 现场
+
+平台下发场景后 `/viz` 主视区严重卡顿（页面版本 v3.5.3·dev）：
+
+| 读数 | 值 | 结论 |
+|------|----|------|
+| 画面模式提示 | `单帧轮询（MJPEG 不可用（相机未挂载或推流已达上限））` | 画面走 `pollScreenshot`，`POLL_MS.screenshot = 700 ms` → **上限 ~1.4 fps**，与分辨率/带宽无关 |
+| overview 流 | 1707 帧 / 10.0 Hz / 1920×1080 / 单帧 218 KB | 相机已挂载且稳定出帧 → 排除「相机未挂载」，只剩**名额已满**或首帧 6 s 看门狗超时 |
+| depth 流 | 1280×720 32FC1 / 9.6 Hz | 单帧原始 3.69 MB（3.52 MiB），且深度预览勾选后**每个请求**都要重算一次 |
+| 参与者 | 3 名 cyclist 均在车后 138~151 m | 主视区看不到它们属场景偏移（V3.5.3 已处理），与卡顿无关 |
+
+### 逐条对账
+
+1. **降级是单向永久门**：`switchToScreenshot()` 把 `state.videoMode` 置为 `screenshot` 后，代码里**没有任何回到 MJPEG 的路径**，页面挂得越久越卡，只能人工刷新。
+2. **推流名额会滞留**：路由先 `await anext(frames)` 拉首帧，异常路径不关闭生成器，名额释放只发生在 `finally`，而异步生成器回收要等事件循环空闲。反复刷新/代理掉线会把 `stream_max_clients=8` 吃满 → 之后 MJPEG 永远 503 → 前端永久降级（正好解释读数 1）。
+3. **深度预览抢的是编码核**：`/sensors/depth` 旧实现对 921,600 个 float32 先 `nan_to_num` + 归一化 + ×255 + PNG，**再**跨步抽样——单次请求的运算量与输出尺寸无关。这些运算与环视编码挤在同一个核（JPEG 编码单线程 + GIL），一勾深度预览环视就跟不上下集。
+4. **帧率天花板是 10 fps**：`overview_camera.fps=10` 与 `ADAPTER_STREAM_FPS=10` 取小者，即使 MJPEG 正常也只有 10 fps，肉眼看仍是不流畅。
+5. **现场无法定性**：名额占用数、上限、当前帧率、当前画质档在页面上全都看不到，只能猜「相机未挂载还是名额满」。
+
+### 机器配置校准（为什么选 1080p@20fps 而不是 720p@30fps）
+
+| 项 | 依据与取值 |
+|----|------------|
+| CPU i7-14700KF（3.40 GHz，强单核） | JPEG 编码是**单线程 + GIL**，多核补不上，只能压单帧成本；1080p q85 单帧约 25~45 ms，20 fps 占一个核的 40~70%，仍留余量给 CARLA 主循环与监督线程 |
+| RAM 32 GB | 环视独立队列 `maxsize=4` + drop-stale，20 fps 下积压上限 <1 s，增量 <10 MB，不构成约束 |
+| RTX 4070 12 GB | 渲染侧产出 1080p 环视 + 数据传感器充足，瓶颈在 CPU 编码不在 GPU；故保持 `1920×1080` 不降分辨率 |
+| 内网带宽 | 218 KB × 20 fps ≈ 4.4 MB/s/客户端，8 客户端 ≈ 35 MB/s，千兆（125 MB/s）可承受 |
+
+结论：取 **1920×1080 @ 20 fps**（高清优先），用抽样先行 + 并发闸 + 自适应降质三重限制兜住跑不动的情形；弱机一个环境变量即可回退（见「行为变化」）。
+
+### 修复内容
+
+- **`src/hunter_sim/visualization/assets/app.js`（① 降级可逆）**：新增 `scheduleMjpegReprobe()` / `reprobeMjpeg()` / `reprobeDelayMs()` / `clearReprobe()` 与 `state.videoReprobe` / `state.mjpegFailures`。降级到单帧轮询后按 **10 → 20 → 40 → 80 s 封顶**的递增退避回探；探测用 `fetch` + `AbortController` **只读响应头**（判 `multipart` 可用性、拿到即断），不打断当前单帧画面、不长占推流名额；探到即 `startVideo()` 并提示「图像流已可用，切回 MJPEG」，首帧 `img.onload` 到手才复位退避。回探前复查 `videoMode === "screenshot"`、实例未进终态且仍在运行，`stopVideo()` 拆掉待触发定时器。
+- **`src/hunter_sim/visualization/sensor_view.py`（② 深度预览降载）**：`depth_png` 拆为 `_depth_render`（校验 + 缓存/并发闸）与 `_encode_depth`（抽样 + 归一化 + 编码）。**抽样先行**：先按目标宽度跨步取稀再参与运算，1280×720 + `max_width=480`（step=3）下参与运算的元素从 921,600 降到 102,480（约 1/9）；**并发闸** `_DEPTH_COMPUTE_GATE` 非阻塞获取，编码不排队，已有在算则复用上一帧（无上一帧返回 None → 路由 503）；**上一帧缓存** `_DEPTH_CACHE` 按 `宽x高@目标宽` 分键，同一 `seq` 重复请求零重算（前端 1.5 s 轮询快于深度出帧）。
+- **`src/hunter_sim/platform_adapter/service.py`（③ 名额租约）**：`_stream_slots`（token → 最近活跃时刻）+ `_stream_slot_seq` 取代裸计数；`stream_frames` 每次出帧 `_touch_stream_slot()`，`_acquire_stream_slot()` 申请前先 `_sweep_stale_stream_slots()` 回收闲置 > `_STREAM_SLOT_STALE_S`（30 s）的僵尸租约并打 WARNING `Stream slots reclaimed as stale`；`_release_stream_slot()` 用 `pop` 保证不重复减计数（Gauge 仍 `inc()/dec()`，保留多实例叠加语义）。新增 `_stream_view()`，`health_snapshot()` 与 `runtime_status()` 各输出 `stream.{clients,limit,fps}`。
+- **`src/hunter_sim/platform_adapter/app.py`（③ 异常归还）**：`stream.mjpg` 拉首帧的 `try` 补 `except BaseException: await frames.aclose(); raise`——首帧等待期间客户端断开/被取消时，本次迭代已占用的名额必须立即归还，不再只靠事件循环空闲时的异步生成器回收兜底。
+- **`src/hunter_sim/visualization/routes.py`（③ 可观测）**：`/viz/api/status` 默认 payload 补 `"stream": {"clients": 0, "limit": 0, "fps": 0.0}`，服务无 `runtime_status` 时面板显示「—」而不报错。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`（④ 自适应降质）**：新增阶梯 `_OVERVIEW_QUALITY_LADDER = (85, 78, 72)`、`_OVERVIEW_SLOW_STREAK = 8`、`_OVERVIEW_FAST_STREAK = 150` 与 `_overview_quality()` / `_track_overview_encode_cost()` / `_adapt_overview_quality()` / `_warn_overview_floor()`。环视编码线程逐帧计时：连续 8 帧超预算（>120 ms）逐档降质、连续 150 帧宽裕升回；**逐档推进到生效值真的变化才落日志**（被 `screenshot_quality` 夹住的档位不报假变化），触底则限频提示改 `overview_camera` 分辨率/帧率（需重建传感器，不自动做）。编码使用当前档并把 `quality` 推进 FrameHub meta；挂载日志改为 `jpeg 85→78→72 adaptive, no downscale`。V3.4.4 的 `Overview encode slow` 告警保留。
+- **配置（⑤ 帧率校准）**：`configs/sensor_configs.json` `overview_camera.fps` 10.0 → **20.0**（description 补「fps 与 `ADAPTER_STREAM_FPS` 需一致，否则取两者较小值」）；`platform_adapter/config.py` `stream_fps` 默认 10.0 → **20.0**。
+
+### 向后兼容与行为变化
+
+- **主视区默认帧率 10 → 20 fps**（`overview_camera.fps` 与 `ADAPTER_STREAM_FPS` 两处都要动，实际取小者）。弱机回退：`ADAPTER_STREAM_FPS=10` 且 `overview_camera.fps` 改回 `10.0`，其余修复与帧率无关可全部保留。
+- **降级不再是终点**：落到单帧轮询后会自动回探 MJPEG（10/20/40/80 s），提示语补「· 稍后自动重试图像流」，成功切回时显示「图像流已可用，切回 MJPEG」。
+- **推流名额租约化**：客户端异常断开留下的名额最长滞留 30 s，下一次申请时自动回收并告警；`StreamLimitExceeded` → 503 语义不变。
+- **画质可自动变化**：持续超预算时 JPEG 质量 85 → 78 → 72（**不降分辨率**），长期宽裕升回；面板元信息新增 `q85`/`q78`，不静默。
+- **新增可观测**：`/health`（探针代理）与 `runtime_status`、`/viz/api/status` 新增 `stream.{clients,limit,fps}`；`/viz` 模块信息新增「推流客户端 n / 8（20 fps）」行。
+- 无接口/配置项增删（仅两处默认值调整）；`pyproject.toml` 版本 `3.5.4` → `3.5.5`（修复/完善按第三位递增）。
+
+### 风险
+
+- 20 fps 使编码线程负载翻倍：若同时开深度预览，弱机可能反而更卡——由抽样先行、并发闸让路、自适应降质三重限制；仍不够时按触底提示降分辨率/帧率。
+- 回探会额外发起 MJPEG 请求：拿到响应头即 `abort()`，不消费流；服务端首帧异常路径立即归还名额，最坏滞留 30 s 后被 sweep 回收。
+- 画质降到 78/72 档块效应可见，但只在持续超预算时发生且会自行升回，面板 `q` 值可读。
+- 租约闲置判定基于 `time.time()`（与同模块 `_STREAM_IDLE_TIMEOUT_S` 同源）：系统时钟大幅回拨可能提前回收名额，后果仅为一次画面重连。
+- 深度预览「忙时给上一帧」会让画面短暂滞后一帧（<1.5 s），换取不阻塞编码线程；刻意取舍，已在 docstring 写明。
+
+### 验证
+
+- `pytest -q` 全量：**1452 passed**（较 V3.5.4 +24），覆盖率门禁达标。
+- 新增/改动测试：
+  - **`tests/test_viz_sensor_view.py`（新文件，12 例）**：抽样必须发生在逐像素运算之前（1280×720 + `max_width=480` → `nan_to_num` 入参只能是 `240×427`）、PNG 头尺寸即抽样结果、`max_width=0` 不抽样、payload/meta 异常返回 None、同 `seq` 重复请求零重算、新 `seq` 必重算、并发让路拿上一帧 / 无缓存返回 None、缓存按尺寸分键、`render_stream` 走同一实现；
+  - **`tests/test_adapter_stream.py::TestStreamSlotLease`（4 例）**：首帧拉取异常必须 `aclose()` 并归还名额（路由层，`raise_server_exceptions=False`）、僵尸租约在下一次申请前回收且**不重复减计数**、活跃连接每帧 touch 不被误回收、`health_snapshot`/`runtime_status` 的 `stream` 三字段随连接变化；既有 4 项名额契约（`active_streams`/Gauge 增减、`StreamLimitExceeded.limit`、503 `stream_limit_reached`）全部保持；
+  - **`tests/test_builtin_scenario_sensors.py::TestOverviewQuality`（7 例）**：默认档仍 85（不为「优化」先降质）、单帧抖动不跳档、连续 8 帧超预算降 78 并落日志、`meta.quality` 随档位变化且分辨率不变、150 帧宽裕升回 85、被 `screenshot_quality=80` 夹住的档不报假变化（只报 `85→80`）、触底提示限频（60 s 内一条）；
+  - **`tests/test_viz_api.py`**：新增 `test_mjpeg_fallback_is_not_terminal`（app.js 源码契约：回探调度、递增退避、探测只读响应头、成功复位、名额与 `q` 档可读），`/viz/api/status` 的 `stream` 字段与缺 `runtime_status` 时的零值降级；
+  - **`tests/test_settings_env.py`**：`stream_fps` 默认值断言 10.0 → 20.0。
+- `mypy src`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 真机（CARLA 0.9.16 + 该台 14700KF/4070）复测待执行：开发环境 `.venv` 未安装 `carla` 模块，20 fps 编码耗时、回探实际节奏与画面流畅度需上机核对。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.5`（页面左上角应显示 `v3.5.5`）；
+2. `huntersim up` 后下发场景，日志应出现 `Overview camera attached: ... jpeg 85→78→72 adaptive, no downscale`；传感器面板 overview 行应为 **20.0 Hz** 量级；
+3. `/viz`（Ctrl+F5）模块信息应出现「推流客户端 1 / 8（20 fps）」；画面提示应为「图像流（MJPEG 实时）」，元信息带 `q85`；
+4. 反复刷新页面 5~6 次（模拟异常断开）后：名额读数应回落，最迟下一次申请时日志出现 `Stream slots reclaimed as stale: count=N, idle>30s`，画面不得永久停在「单帧轮询」；
+5. 若确实落到单帧轮询，提示应带「· 稍后自动重试图像流」，并在 ≤80 s 内自动切回「图像流已可用，切回 MJPEG」（不必人工刷新）；
+6. 勾选深度预览连续观察 2 min：环视不应再出现 `Overview encode slow`；若出现且随后有 `Overview encode adapted: jpeg quality 85→78`，说明自适应生效；若已有 `still slow at lowest jpeg quality` 提示，则按提示下调 `overview_camera` 分辨率/帧率（或用 `ADAPTER_STREAM_FPS=10` 回退）并重启。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.5`；`pyproject.toml` 版本 `3.5.5`；wheel / 容器版本号一致。文档四件套（`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md`）已同步。
+
+### 待办 / 已知边界
+
+- **未启用 GPU/硬编码路径**：RTX 4070 的 NVENC 与 `imagecodecs` 类加速未接入（会引入 CUDA 依赖与容器差异）。本版本只压单帧成本与抢核路径；若 20 fps 仍不达标，硬编码是下一候选（属功能级变更，需递增次版本号）。
+- **自适应只降 JPEG 质量，不自动降分辨率/帧率**：后者需重建传感器、会打断画面与录制链路，故只给日志提示，不自动做。
+- 回探依赖代理不把首个 `multipart` 块整体缓冲；被缓冲时探测走异常分支继续退避，画面不受影响（仍是单帧轮询）。
+- 主视区、深度预览与日志 SSE 共用浏览器同源连接上限（HTTP/1.1 每主机 6 条）；三者同时开启时仍可能排队，属客户端限制，未在本版本处理。
+- 沿用 V3.5.4 待办（原生 fail-fast 调用点未定位、自愈只在 `up` 层）与 V3.5.3 待办（VIL 模式不适用首 tick 补发、前车默认 8.0 m/s）。
+
+---

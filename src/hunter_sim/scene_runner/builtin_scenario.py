@@ -105,6 +105,17 @@ _OVERVIEW_QUEUE_MAXSIZE = 4
 #: 差异，单帧体积和编码耗时降约 20%~30%。
 _OVERVIEW_JPEG_QUALITY = 85
 
+#: 环视主视区 JPEG 质量阶梯（V3.5.5）：编码持续超预算逐档下探，长期富余则升回。
+#: 首档就是 ``_OVERVIEW_JPEG_QUALITY``，因此默认画质与 V3.4.4 起完全一致，
+#: 只在真跑不动时才牺牲画质换帧率（JPEG 编码单线程 + GIL 受限，多核补不了）。
+#: 注：生效值不低于 ``screenshot_quality``（主视区画质不低于数据流），被夹住的
+#: 档位会被跳过，日志只报真实变化。
+_OVERVIEW_QUALITY_LADDER: tuple[int, ...] = (_OVERVIEW_JPEG_QUALITY, 78, 72)
+#: 连续多少帧超预算才降一档：单帧抖动（GC / 其他线程抢 CPU）不动画质，避免来回跳变
+_OVERVIEW_SLOW_STREAK = 8
+#: 降档后连续多少帧在预算内则升回一档（机器空下来了画质要能自己回来）
+_OVERVIEW_FAST_STREAK = 150
+
 #: 环视单帧编码耗时告警阈值（秒）：1080p@10Hz 的单帧预算约 100 ms，
 #: 超过该值说明编码跟不上下集，画面会表现为卡顿，需要在日志里直接可见
 _OVERVIEW_SLOW_ENCODE_S = 0.12
@@ -281,6 +292,11 @@ class BuiltinScenario(CustomScenarioBase):
         # 慢编码告警限频状态（仅环视编码线程访问）
         self._overview_slow_at = 0.0
         self._overview_slow_suppressed = 0
+        # 编码自适应降质状态（仅环视编码线程读写，不需加锁）
+        self._overview_quality_index = 0
+        self._overview_slow_streak = 0
+        self._overview_fast_streak = 0
+        self._overview_floor_at = 0.0
         # 场景化行为控制：参与者 ID → 控制器；行人 AI 控制器单独登记
         self._participant_controllers: list[ScriptedActorController] = []
         self._walker_controllers: list[WalkerControllerWrapper] = []
@@ -2001,12 +2017,12 @@ class BuiltinScenario(CustomScenarioBase):
         self._overview_sensor = sensor
         logger.info(
             "Overview camera attached: mount=%s fov=%.0f size=%dx%d "
-            "(native encode, jpeg>=%d, no downscale)",
+            "(native encode, jpeg %s adaptive, no downscale)",
             _OVERVIEW_MOUNT_ID,
             camera_config.fov_deg,
             camera_config.width,
             camera_config.height,
-            _OVERVIEW_JPEG_QUALITY,
+            "→".join(str(item) for item in _OVERVIEW_QUALITY_LADDER),
         )
 
     def _listen_sensor(self, sensor: Any, stream: str) -> None:
@@ -2168,7 +2184,83 @@ class BuiltinScenario(CustomScenarioBase):
             except Exception as exc:  # noqa: BLE001
                 self._warn_frame_error("overview", frame.stream, exc)
             finally:
-                self._warn_overview_slow(time.perf_counter() - started)
+                self._track_overview_encode_cost(time.perf_counter() - started)
+
+    def _overview_quality(self) -> int:
+        """当前环视 JPEG 质量（自适应阶梯当前档位，不低于数据流质量）。"""
+        ladder = _OVERVIEW_QUALITY_LADDER
+        index = min(max(self._overview_quality_index, 0), len(ladder) - 1)
+        return max(int(self._screenshot_quality), int(ladder[index]))
+
+    def _track_overview_encode_cost(self, cost_s: float) -> None:
+        """统计环视单帧编码耗时：持续超预算逐档降质，持续宽裕升回（V3.5.5）。
+
+        旧版只告警不处置（V3.4.4），结果是现场看到 ``Overview encode slow`` 后
+        必须人工改配置重启；而卡顿的唯一自动缓解手段（丢积压帧）已在队列侧做掉，
+        编码本身跟不上目标帧率时只能降单帧成本。
+        """
+        self._warn_overview_slow(cost_s)
+        if cost_s > _OVERVIEW_SLOW_ENCODE_S:
+            self._overview_fast_streak = 0
+            self._overview_slow_streak += 1
+            if self._overview_slow_streak >= _OVERVIEW_SLOW_STREAK:
+                self._overview_slow_streak = 0
+                self._adapt_overview_quality(down=True, cost_s=cost_s)
+            return
+        self._overview_slow_streak = 0
+        self._overview_fast_streak += 1
+        if self._overview_fast_streak >= _OVERVIEW_FAST_STREAK:
+            self._overview_fast_streak = 0
+            self._adapt_overview_quality(down=False, cost_s=cost_s)
+
+    def _adapt_overview_quality(self, *, down: bool, cost_s: float) -> None:
+        """按阶梯升降档，直到实际生效质量真的变化（V3.5.5）。
+
+        阶梯值可能被 ``screenshot_quality`` 夹住（主视区画质不低于数据流是有意
+        策略），因此逐档推进到生效值真的改变为止，避免日志报了一档、实际没变；
+        已到端点仍无变化则：降档给限频提示，升档静默返回。
+        """
+        ladder = _OVERVIEW_QUALITY_LADDER
+        floor = int(self._screenshot_quality)
+        previous = self._overview_quality()
+        index = min(max(self._overview_quality_index, 0), len(ladder) - 1)
+        effective = previous
+        for _ in range(len(ladder)):
+            index += 1 if down else -1
+            if index < 0 or index >= len(ladder):
+                if down:
+                    self._warn_overview_floor(previous, cost_s)
+                return
+            effective = max(floor, int(ladder[index]))
+            if effective != previous:
+                break
+        self._overview_quality_index = index
+        logger.warning(
+            "Overview encode adapted: jpeg quality %d→%d (%.0f ms/frame, "
+            "budget %.0f ms, %s after %d consecutive %s frames)",
+            previous,
+            effective,
+            cost_s * 1000.0,
+            _OVERVIEW_SLOW_ENCODE_S * 1000.0,
+            "downgrade" if down else "restore",
+            _OVERVIEW_SLOW_STREAK if down else _OVERVIEW_FAST_STREAK,
+            "slow" if down else "fast",
+        )
+
+    def _warn_overview_floor(self, quality: int, cost_s: float) -> None:
+        """已到最低档仍超预算：限频提示需改分辨率/帧率（需重建传感器，不自动做）。"""
+        now = time.monotonic()
+        if self._overview_floor_at and now - self._overview_floor_at < _OVERVIEW_SLOW_LOG_INTERVAL_S:
+            return
+        self._overview_floor_at = now
+        logger.warning(
+            "Overview encode still slow at lowest jpeg quality %d (%.0f ms/frame > "
+            "%.0f ms budget): lower configs/sensor_configs.json overview_camera "
+            "width/height or fps (and ADAPTER_STREAM_FPS) for a smoother main view",
+            quality,
+            cost_s * 1000.0,
+            _OVERVIEW_SLOW_ENCODE_S * 1000.0,
+        )
 
     def _warn_overview_slow(self, cost_s: float) -> None:
         """环视单帧编码耗时过长告警（限频，附带被抑制条数）。"""
@@ -2240,13 +2332,14 @@ class BuiltinScenario(CustomScenarioBase):
             # 仅可视化：推 FrameHub 供主视区取帧，不录 mcap、不发 ROS。
             # 主视区必须看到 CARLA 原生画面：不再套用数据流的 stream_max_width
             # 降采样（默认 640 会把 1920x1080 压成 640 宽，主视区明显模糊），
-            # JPEG 质量下限提到 _OVERVIEW_JPEG_QUALITY。
+            # JPEG 质量由自适应阶梯给出（默认档 = _OVERVIEW_JPEG_QUALITY）。
             raw, width, height = self._raw_image(data)
+            quality = self._overview_quality()
             encoded = encode_rgb_frame(
                 raw,
                 width,
                 height,
-                quality=max(self._screenshot_quality, _OVERVIEW_JPEG_QUALITY),
+                quality=quality,
                 max_width=0,
             )
             if self._frame_hub is not None:
@@ -2259,6 +2352,7 @@ class BuiltinScenario(CustomScenarioBase):
                         "format": encoded.format,
                         "width": encoded.width,
                         "height": encoded.height,
+                        "quality": quality,
                     },
                 )
             return

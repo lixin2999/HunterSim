@@ -3,6 +3,7 @@
 覆盖挂在控制面 ``/viz`` 下的只读视图：
 
 - 页面与静态资产白名单（路径穿越/未登记名字一律 404）；
+- 画面降级链（V3.5.5：落到单帧轮询后自动回探 MJPEG，不得单向永久降级）；
 - ``/viz/api/status`` 汇总运行态，且服务替身缺少 ``runtime_status`` 时能降级；
 - 事件/传感器/单流帧（RGB 原样、深度 PNG、点云与 IMU JSON）与错误码；
 - 日志快照过滤与 SSE 增量（``text/event-stream``）；
@@ -116,6 +117,8 @@ class _FakeService(_ReadOnlyService):
             "carla": {"endpoint": "127.0.0.1:2000", "connected": True},
             "platform": {"enabled": False, "gateway_url": "", "kafka_bootstrap": "localhost:9092"},
             "sensor": self.sensor_body,
+            # V3.5.5：推流名额/上限/帧率（面板用它把「MJPEG 不可用」从推测变成可读）
+            "stream": {"clients": 3, "limit": 8, "fps": 20.0},
             "ros": self.ros_body,
         }
 
@@ -177,6 +180,34 @@ class TestPageAndAssets:
         # 终态后仍需一次收尾加载，否则传感器/事件面板停在旧值
         assert "state.terminalSynced = true" in script
 
+    def test_mjpeg_fallback_is_not_terminal(self, client: TestClient) -> None:
+        """落到单帧轮询后必须能自己回到 MJPEG 图像流（V3.5.5）。
+
+        回归背景：旧版 ``switchToScreenshot`` 是单向永久降级 —— 推流名额被僵尸
+        连接吃满、或首帧 6s 看门狗超时一次，页面就长期停在 ~1.4 fps 的幻灯片上
+        （``POLL_MS.screenshot=700ms``），越挂越卡且只能刷新页面才能恢复。
+        """
+        script = client.get("/viz/assets/app.js").text
+
+        assert "function scheduleMjpegReprobe(" in script
+        assert "async function reprobeMjpeg(" in script
+        # 降级即计数并调度回探
+        assert "state.mjpegFailures += 1" in script
+        assert "pollScreenshot(instanceId);\n    scheduleMjpegReprobe(instanceId);" in script
+        # 探测只读响应头、拿到即断（不打断当前画面，也不长占推流名额）
+        assert "signal: controller ? controller.signal : undefined" in script
+        assert 'contentType.indexOf("multipart") >= 0' in script
+        # 递增退避（10s 起、上限 80s），探不中要接着排下一次
+        assert "MJPEG_REPROBE_BASE_MS * Math.pow(2, step)" in script
+        assert "MJPEG_REPROBE_MAX_MS" in script
+        assert script.count("scheduleMjpegReprobe(instanceId);") >= 2
+        # 首帧真正到手才算成功：复位退避并拆掉待触发的回探
+        assert "state.mjpegFailures = 0" in script
+        assert script.count("clearReprobe()") >= 3
+        # 名额占用与当前画质档必须可读（卡顿可定性）
+        assert '"推流客户端"' in script
+        assert 'parts.push("q" + meta.quality)' in script
+
     def test_viz_is_not_in_openapi(self, client: TestClient) -> None:
         """可视化端点不进入平台 OpenAPI 契约（单一控制面口径）。"""
         paths = client.get("/openapi.json").json()["paths"]
@@ -194,6 +225,8 @@ class TestStatus:
         assert body["carla"]["connected"] is True
         assert body["instances"] == {"total": 1, "active": 1}
         assert body["sensor"]["attached"] is True
+        # 推流名额一眼可读：clients 贴近 limit 就是「MJPEG 不可用」的直接成因
+        assert body["stream"] == {"clients": 3, "limit": 8, "fps": 20.0}
         assert body["log"]["capacity"] > 0
         assert isinstance(body["uptime_s"], (int, float))
 
@@ -204,6 +237,8 @@ class TestStatus:
         assert body["instances"] == {"total": 1, "active": 1}
         assert body["active_instance"]["instance_id"] == "inst-1"
         assert body["carla"]["connected"] is None
+        # 服务替身没有 runtime_status 时给零值（面板显示“—”，不能因缺字段报错）
+        assert body["stream"] == {"clients": 0, "limit": 0, "fps": 0.0}
 
 
 class TestEvents:

@@ -43,6 +43,9 @@ _DEFAULT_DURATION_S = 60.0
 _QUALITY_KEY = "quality"
 # MJPEG 无帧容忍时长（秒）：超过即结束响应，避免客户端无限等空流
 _STREAM_IDLE_TIMEOUT_S = 5.0
+#: 推流名额租约的闲置判定（秒）：活客户端每 1/stream_fps touch 一次，
+#: 超过该值没动静即为客户端未正常断开（浏览器刷新/代理掉线），名额必须回收
+_STREAM_SLOT_STALE_S = 30.0
 # 事件列表类型别名：类内已有同名方法 ``list``，直接写 ``list[...]`` 会被遮蔽
 EventItems = list[dict[str, Any]]
 # 实例 ID 列表类型别名（同上：规避类内 ``list`` 方法遮蔽内置类型）
@@ -97,6 +100,10 @@ class AdapterService:
         # MJPEG 并发客户端计数（与 Prometheus Gauge 同步增减）
         self._stream_lock = threading.Lock()
         self._stream_clients = 0
+        # 名额租约（token → 最近活跃时刻）：客户端异常断开时异步生成器可能不被
+        # 及时关闭，仅靠 finally 归还会让名额长期滞留，“推流已达上限”就是这么来的
+        self._stream_slots: dict[int, float] = {}
+        self._stream_slot_seq = 0
 
     # ── 创建 / 下发 ─────────────────────────────────────────────────────────
 
@@ -287,6 +294,7 @@ class AdapterService:
                 "recording_bytes": int(current.recording_bytes) if current is not None else 0,
                 "streams": streams,
             },
+            "stream": self._stream_view(),
             "cloud": {"enabled": bool(self._settings.cloud.enabled)},
         }
 
@@ -424,6 +432,7 @@ class AdapterService:
             },
             "sensor": sensor,
             "ros": ros,
+            "stream": self._stream_view(),
         }
 
     @property
@@ -431,6 +440,19 @@ class AdapterService:
         """当前在线的 MJPEG 客户端数（与 ``huntersim_stream_clients`` 同源）。"""
         with self._stream_lock:
             return self._stream_clients
+
+    def _stream_view(self) -> dict[str, Any]:
+        """推流现状（V3.5.5）：名额占用/上限/帧率。
+
+        存在的意义是把「MJPEG 不可用」从推测变成可读：名额吃紧时
+        ``clients`` 会贴近 ``limit``，无需再看服务端日志就能定性是并发上限
+        还是相机未挂载（后者表现为 ``sensor.streams.overview`` 为 0）。
+        """
+        return {
+            "clients": self.active_streams,
+            "limit": int(self._adapter.stream_max_clients),
+            "fps": float(self._adapter.stream_fps),
+        }
 
     async def stream_frames(
         self, instance_id: str, fps: Optional[float] = None, stream: Optional[str] = None
@@ -454,7 +476,7 @@ class AdapterService:
         """
         rate = float(fps if fps is not None else self._adapter.stream_fps)
         interval = 1.0 / max(0.5, rate)
-        self._acquire_stream_slot()
+        token = self._acquire_stream_slot()
         last_frame: Optional[Frame] = None
         last_seen_at = time.time()
         try:
@@ -468,27 +490,66 @@ class AdapterService:
                     last_seen_at = time.time()
                 elif time.time() - last_seen_at > _STREAM_IDLE_TIMEOUT_S:
                     return
+                self._touch_stream_slot(token)
                 if last_frame is not None:
                     yield last_frame
                 await asyncio.sleep(interval)
         finally:
-            self._release_stream_slot()
+            self._release_stream_slot(token)
 
-    def _acquire_stream_slot(self) -> None:
-        """占用一个推流名额（超限抛 ``StreamLimitExceeded``，由路由转 503）。"""
+    def _acquire_stream_slot(self) -> int:
+        """占用一个推流名额并返回租约 token。
+
+        超限抛 ``StreamLimitExceeded``（由路由转 503）；占用前先回收闲置租约，
+        避免长期运行后名额被僵尸连接吃满。
+        """
         limit = int(self._adapter.stream_max_clients)
+        self._sweep_stale_stream_slots()
         with self._stream_lock:
-            if limit > 0 and self._stream_clients >= limit:
+            if limit > 0 and len(self._stream_slots) >= limit:
                 raise StreamLimitExceeded(limit)
-            self._stream_clients += 1
+            self._stream_slot_seq += 1
+            token = self._stream_slot_seq
+            self._stream_slots[token] = time.time()
+            self._stream_clients = len(self._stream_slots)
         STREAM_CLIENTS.inc()
+        return token
 
-    def _release_stream_slot(self) -> None:
-        """释放推流名额（与 ``_acquire_stream_slot`` 成对调用）。"""
+    def _touch_stream_slot(self, token: int) -> None:
+        """刷新租约活跃时刻（每出帧一次，供闲置回收判定）。"""
         with self._stream_lock:
-            if self._stream_clients > 0:
-                self._stream_clients -= 1
+            if token in self._stream_slots:
+                self._stream_slots[token] = time.time()
+
+    def _release_stream_slot(self, token: int) -> None:
+        """归还推流名额（与 ``_acquire_stream_slot`` 成对调用）。
+
+        计数不得为负也不得重复减：Prometheus Gauge 与进程内计数同源，-count
+        一旦跑偏就会永久偏小（后续名额看起来永远够用，但实际会莫名 503）。
+        """
+        with self._stream_lock:
+            if self._stream_slots.pop(token, None) is None:
+                return
+            self._stream_clients = len(self._stream_slots)
         STREAM_CLIENTS.dec()
+
+    def _sweep_stale_stream_slots(self) -> int:
+        """回收闲置超时的名额（客户端未正常断开时的兜底）。"""
+        deadline = time.time() - _STREAM_SLOT_STALE_S
+        with self._stream_lock:
+            stale = [token for token, seen in self._stream_slots.items() if seen < deadline]
+            for token in stale:
+                self._stream_slots.pop(token, None)
+            self._stream_clients = len(self._stream_slots)
+        for _ in stale:
+            STREAM_CLIENTS.dec()
+        if stale:
+            logger.warning(
+                f"Stream slots reclaimed as stale: count={len(stale)}, "
+                f"idle>{_STREAM_SLOT_STALE_S:.0f}s "
+                "(client disconnected without closing the MJPEG response)"
+            )
+        return len(stale)
 
 
 def _disk_usage_ratio(path: str) -> Optional[float]:

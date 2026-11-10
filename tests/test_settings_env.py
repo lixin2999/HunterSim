@@ -141,7 +141,8 @@ def test_cloud_adapter_and_probe_defaults(tmp_path: Path) -> None:
     assert settings.cloud.kafka_bootstrap == "192.168.31.35:9092"
     assert settings.cloud.sensor_data_topic_template == "carla.{sim_id}.sensor_data"
     assert settings.adapter.port == 8090
-    assert settings.adapter.stream_fps == 10.0
+    # V3.5.5：主视区帧率默认 10→20（弱机用 ADAPTER_STREAM_FPS=10 回退）
+    assert settings.adapter.stream_fps == 20.0
     assert settings.probe.port == 8080
     assert settings.probe.adapter_url == "http://127.0.0.1:8090"
 

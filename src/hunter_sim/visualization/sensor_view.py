@@ -13,6 +13,14 @@ IMU 的 ``repr`` 文本），浏览器无法直接使用，因此在这一层做
 可选依赖（numpy / Pillow）缺失或 payload 长度不符时一律返回 ``None``，
 由路由层降级为 503/409，绝不因为可视化把控制面拖崩；深度图在 Pillow
 缺失时改为标准库 PNG 编码，功能不因图像库缺失而消失。
+
+深度预览的两个约束（V3.5.5，主视区卡顿归因）：
+
+- **抽样先行**：1280x720 32FC1 一帧有 92 万个 float32，旧实现先对全量做
+  ``nan_to_num`` + 归一化、再跨步抽样，单次请求的 numpy 运算量与输出尺寸无关；
+  现改为先按目标宽度跨步抽样再归一化，参与运算的元素降到约 (目标/原始)²。
+- **并发闸 + 上一帧缓存**：编码不排队（排队会把 anyio 工作线程和 GIL 一起占住，
+  直接拖慢环视编码线程）；已有计算在跑时，后来请求直接复用上一张 PNG。
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from __future__ import annotations
 import ast
 import io
 import struct
+import threading
 import zlib
 from typing import Any, Optional
 
@@ -42,6 +51,13 @@ _DEPTH_FAR_M = 50.0
 _LIDAR_POINT_BYTES = 12
 # IMU 文本快照的最大长度（防异常 payload 撑爆响应）
 _IMU_TEXT_MAX = 512
+
+#: 深度预览并发闸：同一时刻只允许一张在算（非阻塞获取，拿不到就走缓存）
+_DEPTH_COMPUTE_GATE = threading.Lock()
+#: 保护 ``_DEPTH_CACHE`` 的短临界区锁（只护字典读写，不护编码）
+_DEPTH_CACHE_LOCK = threading.Lock()
+#: 上一张深度预览（``key`` 为 ``宽x高@目标宽``，尺寸变化时自动失效）
+_DEPTH_CACHE: dict[str, Any] = {"key": "", "seq": -1, "png": b""}
 
 
 def frame_summary(frame: Frame, now: float) -> dict[str, Any]:
@@ -134,18 +150,24 @@ def imu_values(frame: Frame) -> dict[str, Any]:
 
 
 def depth_png(frame: Frame, max_width: int = 480) -> Optional[bytes]:
-    """把 32FC1 米制深度渲染为 8bit 灰度 PNG。
+    """把 32FC1 米制深度渲染为 8bit 灰度 PNG（抽样先行 + 并发闸）。
 
     Args:
         frame: ``depth`` 流帧（meta 需带 ``width`` / ``height``）。
         max_width: 输出最大宽度（0 表示不缩放）。
 
     Returns:
-        PNG 字节；numpy 缺失或尺寸不符时返回 None。
+        PNG 字节；numpy 缺失或尺寸不符时返回 None；并发让路时返回上一张
+        缓存（首张尚无缓存则返回 None，由路由转 503）。
 
-    Pillow 仅用于缩放，缺失时回落到标准库编码（``_encode_gray_png``），
-    因此深度预览不额外依赖图像库。
+    缩放靠跨步（stride）抽样完成（不依赖 Pillow），因此深度预览在 Pillow 缺失时
+    仍走标准库 PNG 编码，功能不因图像库缺失而消失。
     """
+    return _depth_render(frame, max_width)
+
+
+def _depth_render(frame: Frame, max_width: int) -> Optional[bytes]:
+    """校验 + 缓存/并发闸，必要时才真正编码。"""
     try:
         width = int(frame.meta.get("width") or 0)
         height = int(frame.meta.get("height") or 0)
@@ -164,28 +186,60 @@ def depth_png(frame: Frame, max_width: int = 480) -> Optional[bytes]:
     except Exception as exc:  # noqa: BLE001  可选依赖缺失降级
         logger.debug(f"Depth preview disabled (numpy unavailable): {exc}")
         return None
-    meters = np.frombuffer(frame.payload[:expected], dtype=np.float32).reshape(height, width)
+    key = f"{width}x{height}@{max_width}"
+    with _DEPTH_CACHE_LOCK:
+        same_size = _DEPTH_CACHE["key"] == key
+        cached = bytes(_DEPTH_CACHE["png"]) if same_size else b""
+        # 同一帧重复请求（前端 1.5s 轮询快于深度出帧）：直接复用，不重算
+        if same_size and int(_DEPTH_CACHE["seq"]) == frame.seq and cached:
+            return cached
+    if not _DEPTH_COMPUTE_GATE.acquire(blocking=False):
+        # 已有一张在算：不排队、不阻塞，拿上一帧顶住（无上一帧时由路由转 503）
+        logger.debug(f"Depth preview busy, served cached frame for {key}")
+        return cached or None
+    try:
+        return _encode_depth(np, frame, width, height, max_width, key)
+    finally:
+        _DEPTH_COMPUTE_GATE.release()
+
+
+def _encode_depth(
+    np: Any,
+    frame: Frame,
+    width: int,
+    height: int,
+    max_width: int,
+    key: str,
+) -> Optional[bytes]:
+    """抽样 + 归一化 + PNG 编码，并更新上一帧缓存。"""
+    meters = np.frombuffer(
+        frame.payload[: width * height * 4], dtype=np.float32
+    ).reshape(height, width)
+    # 抽样先行（V3.5.5）：先把大图跨步取稀再参与运算，而不是算完再缩
+    step = 1
+    if max_width > 0 and width > max_width:
+        step = max(1, -(-width // max_width))  # 上取整，避免步长过小
+    if step > 1:
+        meters = meters[::step, ::step]
+        height, width = int(meters.shape[0]), int(meters.shape[1])
     # nan/inf 在 CARLA 深度图里可能出现（天空/无回波），先清洗再归一化
     clean = np.nan_to_num(meters, nan=_DEPTH_FAR_M, posinf=_DEPTH_FAR_M, neginf=_DEPTH_NEAR_M)
     span = max(1e-6, _DEPTH_FAR_M - _DEPTH_NEAR_M)
     ratio = np.clip((clean - _DEPTH_NEAR_M) / span, 0.0, 1.0)
     gray = ((1.0 - ratio) * 255.0).astype(np.uint8)
-    if max_width > 0 and width > max_width:
-        step = max(1, -(-width // max_width))  # 上取整，避免步长过小
-        gray = gray[::step, ::step]
-        height, width = int(gray.shape[0]), int(gray.shape[1])
     try:
-        from PIL import Image  # noqa: PLC0415  仅缩放分支使用
+        from PIL import Image  # noqa: PLC0415  仅编码分支使用
     except Exception:  # noqa: BLE001  Pillow 缺失 → 标准库编码
-        return _encode_gray_png(gray.tobytes(), width, height)
-    # 不传 mode：Pillow 13 已移除该参数，二维 uint8 会自动推断为灰度
-    image = Image.fromarray(gray)
-    if (image.width, image.height) != (width, height):
-        # Pillow 10+ 重采样常量正式住在 Image.Resampling（顶层别名仅供旧代码）
-        image = image.resize((width, height), Image.Resampling.NEAREST)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=False)
-    return buffer.getvalue()
+        png = _encode_gray_png(gray.tobytes(), width, height)
+    else:
+        buffer = io.BytesIO()
+        # 不传 mode：Pillow 13 已移除该参数，二维 uint8 会自动推断为灰度
+        Image.fromarray(gray).save(buffer, format="PNG", optimize=False)
+        png = buffer.getvalue()
+    if png:
+        with _DEPTH_CACHE_LOCK:
+            _DEPTH_CACHE.update({"key": key, "seq": frame.seq, "png": png})
+    return png
 
 
 def _encode_gray_png(rows: bytes, width: int, height: int) -> Optional[bytes]:

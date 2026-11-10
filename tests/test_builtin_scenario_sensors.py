@@ -1,7 +1,8 @@
 """BuiltinScenario 仿真传感器挂载与数据分发单测（V3.0.0）。
 
 覆盖：按 ``config.sensors`` 剖面挂载/跳过、蓝图缺失不阻断、cleanup 销毁、
-回调 → FrameHub/McapRecorder/ROS2 三路分发、格式与降采样参数。
+回调 → FrameHub/McapRecorder/ROS2 三路分发、格式与降采样参数，以及环视编码
+自适应降质阶梯（V3.5.5：只在持续超预算时降画质，不降分辨率）。
 """
 
 from __future__ import annotations
@@ -13,7 +14,11 @@ from typing import Any
 
 import pytest
 
-from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
+from hunter_sim.scene_runner.builtin_scenario import (
+    _OVERVIEW_FAST_STREAK,
+    _OVERVIEW_SLOW_STREAK,
+    BuiltinScenario,
+)
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig, SensorSpec
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
@@ -849,3 +854,104 @@ class TestRealCarlaMeasurementShapes:
         assert any("Sensor frame" in rec.getMessage() for rec in caplog.records), (
             "取数/编码失败只写 DEBUG，真机表现为无数据且无任何线索"
         )
+
+
+# ─── 环视编码自适应降质（V3.5.5） ─────────────────────────────────────────────
+
+_LOGGER = "hunter_sim.scene_runner.builtin_scenario"
+_OVER_BUDGET = 0.5  # 单帧预算 0.12s：远超，用于驱动降档
+_OVER_FAST = 0.001  # 预算内：用于驱动升回
+
+
+class TestOverviewQuality:
+    """编码跟不上下集时降单帧成本，机器空下来再升回（而不是把卡顿留给现场）。"""
+
+    @staticmethod
+    def _feed(scenario: BuiltinScenario, cost_s: float, times: int) -> None:
+        for _ in range(times):
+            scenario._track_overview_encode_cost(cost_s)  # noqa: SLF001
+
+    def test_default_tier_keeps_v344_quality(self) -> None:
+        """首档不变：默认画质与 V3.4.4 起完全一致，不会为「优化」先降质。"""
+        scenario = _make_scenario()
+
+        assert scenario._overview_quality() == 85  # noqa: SLF001
+
+    def test_single_slow_frame_does_not_switch_tier(self) -> None:
+        """抖动（GC / 其他线程抢 CPU）不动画质，避免画面来回跳变。"""
+        scenario = _make_scenario()
+
+        self._feed(scenario, _OVER_BUDGET, _OVERVIEW_SLOW_STREAK - 1)
+
+        assert scenario._overview_quality() == 85  # noqa: SLF001
+
+    def test_sustained_slow_encode_downgrades(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            scenario = _make_scenario()
+            self._feed(scenario, _OVER_BUDGET, _OVERVIEW_SLOW_STREAK)
+
+        assert scenario._overview_quality() == 78  # noqa: SLF001
+        assert "Overview encode adapted: jpeg quality 85→78" in caplog.text
+        assert "downgrade" in caplog.text
+
+    def test_effective_quality_is_reported_in_meta(self) -> None:
+        """降档必须真的落到编码器，且 meta 带 quality（面板可读 q78）。"""
+        from hunter_sim.sensor_sim.frame_hub import FrameHub
+
+        hub = FrameHub()
+        scenario = _make_scenario(frame_hub=hub)
+
+        scenario._dispatch_sensor_data(  # noqa: SLF001
+            STREAM_OVERVIEW, _image_data(width=8, height=4)
+        )
+        frame = hub.latest(STREAM_OVERVIEW)
+        assert frame is not None and frame.meta["quality"] == 85
+
+        self._feed(scenario, _OVER_BUDGET, _OVERVIEW_SLOW_STREAK)
+        scenario._dispatch_sensor_data(  # noqa: SLF001
+            STREAM_OVERVIEW, _image_data(width=8, height=4)
+        )
+        frame = hub.latest(STREAM_OVERVIEW)
+
+        assert frame is not None and frame.meta["quality"] == 78
+        assert frame.meta["width"] == 8, "主视区降质不得同时降分辨率"
+
+    def test_long_headroom_restores_top_tier(self, caplog: pytest.LogCaptureFixture) -> None:
+        scenario = _make_scenario()
+        self._feed(scenario, _OVER_BUDGET, _OVERVIEW_SLOW_STREAK)
+        assert scenario._overview_quality() == 78  # noqa: SLF001
+
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            self._feed(scenario, _OVER_FAST, _OVERVIEW_FAST_STREAK)
+
+        assert scenario._overview_quality() == 85  # noqa: SLF001
+        assert "jpeg quality 78→85" in caplog.text
+        assert "restore" in caplog.text
+
+    def test_clamped_tier_is_not_reported_as_downgrade(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """被 ``screenshot_quality`` 夹住的档位不得报假变化（日志与实际必须一致）。"""
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            scenario = _make_scenario(screenshot_quality=80)
+            self._feed(scenario, _OVER_BUDGET, 2 * _OVERVIEW_SLOW_STREAK)
+
+        # 85→80 是真变化；78/72 被下限夹住，不能再声称降到了那里
+        assert scenario._overview_quality() == 80  # noqa: SLF001
+        assert "jpeg quality 85→80" in caplog.text
+        assert "78→" not in caplog.text and "85→78" not in caplog.text
+        assert "still slow at lowest jpeg quality 80" in caplog.text
+
+    def test_floor_hint_is_rate_limited(self, caplog: pytest.LogCaptureFixture) -> None:
+        """触底后只给限频提示：改分辨率/帧率需重建传感器，不自动做。"""
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            scenario = _make_scenario(screenshot_quality=1)
+            self._feed(scenario, _OVER_BUDGET, 3 * _OVERVIEW_SLOW_STREAK)
+            assert scenario._overview_quality() == 72  # noqa: SLF001
+            assert caplog.text.count("still slow at lowest jpeg quality") == 1
+            assert "lower configs/sensor_configs.json overview_camera" in caplog.text
+
+            caplog.clear()
+            self._feed(scenario, _OVER_BUDGET, _OVERVIEW_SLOW_STREAK)
+
+        assert caplog.text.count("still slow at lowest jpeg quality") == 0

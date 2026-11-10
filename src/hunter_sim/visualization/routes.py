@@ -128,6 +128,7 @@ def register_viz_routes(app: FastAPI) -> None:
             "carla": {"endpoint": "", "connected": None},
             "platform": {"enabled": False, "gateway_url": "", "kafka_bootstrap": ""},
             "sensor": {"attached": False, "counts": {}, "streams": {}},
+            "stream": {"clients": 0, "limit": 0, "fps": 0.0},
             "ros": {"enabled": False, "topics": {}, "mappings": []},
         }
         snapshot = getattr(service, "runtime_status", None)

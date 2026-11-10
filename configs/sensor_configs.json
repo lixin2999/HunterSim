@@ -113,12 +113,12 @@
     }
   },
   "overview_camera": {
-    "description": "仅可视化环视主视区相机（不录 mcap / 不发 ROS）",
+    "description": "仅可视化环视主视区相机（不录 mcap / 不发 ROS）；fps 与 ADAPTER_STREAM_FPS 需一致，否则取两者较小值",
     "enabled": true,
     "width": 1920,
     "height": 1080,
     "fov_deg": 100.0,
-    "fps": 10.0
+    "fps": 20.0
   },
   "topics": {
     "lidar": {

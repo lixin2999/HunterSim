@@ -9,7 +9,7 @@
  *   /viz/api/instances/{id}/sensors/{stream} 单流最新帧（深度 PNG / 点云 JSON / IMU JSON）
  *   /viz/api/logs、/viz/api/logs/stream     仿真日志（SSE 增量，断线降级为轮询）
  *   /api/v1/instances[/{id}]                实例列表/进度（平台既有契约）
- *   /api/v1/instances/{id}/stream.mjpg      实时画面（MJPEG，失败降级单帧轮询）
+ *   /api/v1/instances/{id}/stream.mjpg      实时画面（MJPEG，失败降级单帧轮询并定期回探）
  *
  * 该脚本只读运行态，除暂停/恢复/停止三个既有控制端点外不触发任何副作用。
  */
@@ -29,6 +29,10 @@
   };
   var LOG_MAX_LINES = 1500;
   var VIDEO_WATCHDOG_MS = 6000;
+  // 降级后的回探节奏（V3.5.5）：旧版一旦落到单帧轮询就永不回头，画面长期停在
+  // ~1.4 fps。现在先做不干扰画面的响应头探测，探到可用立即回到 MJPEG 流。
+  var MJPEG_REPROBE_BASE_MS = 10000;
+  var MJPEG_REPROBE_MAX_MS = 80000;
   var TERMINAL = ["succeeded", "failed", "canceled"];
   var STREAM_ORDER = ["overview", "rgb", "depth", "lidar", "imu"];
 
@@ -44,6 +48,8 @@
     videoTimer: 0,
     videoWatchdog: 0,
     videoObjectUrl: "",
+    videoReprobe: 0,
+    mjpegFailures: 0,
     depthOn: true,
     depthUrl: "",
     logSource: null,
@@ -173,6 +179,10 @@
     if (meta.width && meta.height) {
       parts.push(meta.width + "×" + meta.height);
     }
+    if (meta.quality) {
+      // 自适应降质后能直接从页面读出当前档（V3.5.5）
+      parts.push("q" + meta.quality);
+    }
     if (meta.points) {
       parts.push(meta.points + " 点");
     }
@@ -217,6 +227,7 @@
     var sensor = payload.sensor || {};
     var log = payload.log || {};
     var instances = payload.instances || {};
+    var stream = payload.stream || {};
     var active = payload.active_instance;
 
     setNote(
@@ -249,6 +260,14 @@
       ["平台网关", platform.enabled ? platform.gateway_url : "未启用"],
       ["Kafka", platform.kafka_bootstrap || "—"],
       ["传感器", sensor.attached ? "已挂载" : "未挂载"],
+      // 推流名额一眼可读：clients 贴近 limit 就是“MJPEG 不可用”的直接成因（V3.5.5）
+      [
+        "推流客户端",
+        stream.clients === undefined
+          ? "—"
+          : stream.clients + " / " + (stream.limit > 0 ? stream.limit : "不限") +
+            "（" + num(stream.fps, 0) + " fps）"
+      ],
       ["ROS 话题", ros.enabled ? published.length + " 路有数据" : "未启用"],
       ["日志缓冲", (log.records || 0) + " / " + (log.capacity || 0)]
     ]);
@@ -510,6 +529,9 @@
         return;
       }
       stage.classList.add("live");
+      // 首帧真正到手才算成功：复位回探退避，并停掉可能在跑的单帧轮询
+      state.mjpegFailures = 0;
+      clearReprobe();
       setNote("stream-state", "图像流（MJPEG 实时）");
     };
     img.onerror = function () {
@@ -537,6 +559,7 @@
       clearTimeout(state.videoWatchdog);
       state.videoWatchdog = 0;
     }
+    clearReprobe();
     if (state.videoTimer) {
       clearTimeout(state.videoTimer);
       state.videoTimer = 0;
@@ -559,6 +582,7 @@
       return;
     }
     state.videoMode = "screenshot";
+    state.mjpegFailures += 1;
     if (state.videoWatchdog) {
       clearTimeout(state.videoWatchdog);
       state.videoWatchdog = 0;
@@ -567,8 +591,69 @@
     img.onload = null;
     img.onerror = null;
     img.removeAttribute("src");
-    setNote("stream-state", "单帧轮询（" + reason + "）");
+    setNote("stream-state", "单帧轮询（" + reason + "）· 稍后自动重试图像流");
     pollScreenshot(instanceId);
+    scheduleMjpegReprobe(instanceId);
+  }
+
+  function clearReprobe() {
+    if (state.videoReprobe) {
+      clearTimeout(state.videoReprobe);
+      state.videoReprobe = 0;
+    }
+  }
+
+  function reprobeDelayMs() {
+    var step = Math.max(0, state.mjpegFailures - 1);
+    return Math.min(MJPEG_REPROBE_BASE_MS * Math.pow(2, step), MJPEG_REPROBE_MAX_MS);
+  }
+
+  function scheduleMjpegReprobe(instanceId) {
+    clearReprobe();
+    var delay = reprobeDelayMs();
+    state.videoReprobe = window.setTimeout(function () {
+      state.videoReprobe = 0;
+      if (state.videoInstance !== instanceId || state.videoMode !== "screenshot") {
+        return;
+      }
+      if (isTerminalInstance() || !isRunningInstance()) {
+        return;
+      }
+      reprobeMjpeg(instanceId);
+    }, delay);
+  }
+
+  // 只读响应头、拿到即断：不断画面当前的单帧轮询，也不长占推流名额
+  // （服务端在首帧异常路径会立即归还名额，V3.5.5）
+  async function reprobeMjpeg(instanceId) {
+    var controller = window.AbortController ? new AbortController() : null;
+    var usable = false;
+    try {
+      var response = await fetch(
+        instancePath("/stream.mjpg?stream=overview&t=" + Date.now(), instanceId),
+        { cache: "no-store", signal: controller ? controller.signal : undefined }
+      );
+      var contentType = String(response.headers.get("content-type") || "");
+      usable = response.ok && contentType.indexOf("multipart") >= 0;
+    } catch (err) {
+      usable = false;
+    }
+    if (controller) {
+      try {
+        controller.abort();
+      } catch (err) {
+        // 已结束的请求再 abort 会抛错，忽略即可
+      }
+    }
+    if (state.videoInstance !== instanceId || state.videoMode !== "screenshot") {
+      return;
+    }
+    if (usable) {
+      setNote("stream-state", "图像流已可用，切回 MJPEG");
+      startVideo(instanceId);
+      return;
+    }
+    scheduleMjpegReprobe(instanceId);
   }
 
   async function pollScreenshot(instanceId) {

@@ -464,6 +464,13 @@ def _register_routes(app: FastAPI) -> None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
         except StreamLimitExceeded as exc:
             raise HTTPException(status_code=503, detail="stream_limit_reached") from exc
+        except BaseException:
+            # 首帧等待期间客户端断开/被取消：本次迭代已占用的名额必须立即归还。
+            # 旧版此处不关闭生成器，只靠 asyncio 的异步生成器回收兜底，
+            # 而它需要事件循环空闲时才跑：反复刷新页面会把 stream_max_clients
+            # 吃满，后续 MJPEG 永远 503，前端从此永久降级到单帧轮询（V3.5.5 现场）。
+            await frames.aclose()
+            raise
         return StreamingResponse(
             _mjpeg_chunks(frames, first),
             media_type="multipart/x-mixed-replace; boundary=frame",
