@@ -6,6 +6,8 @@
 - 服务清单：控制面必启、探针面可选，地址取自配置；
 - 就绪等待：子进程提前退出即失败，必需服务不就绪返回 1，可选服务失败只提示；
 - 生命周期：任一同管子进程退出返回其退出码，Ctrl+C 统一 terminate（必要时 kill）；
+- 崩溃自愈（V3.5.4）：子进程非零退出按退避自动重启且不牵连其余服务，
+  正常退出（code=0）/ Ctrl+C / ``--no-restart`` 均不重启，连续崩溃触顶后停止守护；
 - 就绪回调：``on_ready`` 在服务全部就绪后执行一次，抛异常只提示；``up --demo`` 用它建冒烟场景；
 - CLI：``up`` 参数默认值、预检 fail 中止、``--force`` / ``--no-browser`` / ``--no-probes`` / ``--demo``。
 """
@@ -48,6 +50,16 @@ def _manager() -> ServiceSpec:
         host="0.0.0.0",
         port=8090,
         argv=("python", "-m", "hunter_sim.cli.main", "carla-manager"),
+    )
+
+
+def _probes() -> ServiceSpec:
+    return ServiceSpec(
+        name="probes",
+        host="127.0.0.1",
+        port=8080,
+        argv=("python", "-m", "hunter_sim.cli.main", "probes"),
+        required=False,
     )
 
 
@@ -99,6 +111,20 @@ def _launcher(
 def _interrupt(_: float) -> None:
     """守护循环里的「Ctrl+C」。"""
     raise KeyboardInterrupt
+
+
+def _probe_starts_cold(ports: Sequence[str] = (":8090", ":8080")) -> Callable[[str], bool]:
+    """每个端口的首次预探测返回「未运行」（触发拉起），之后一律视为就绪。"""
+    cold: set[str] = set(ports)
+
+    def probe(url: str) -> bool:
+        for port in list(cold):
+            if port in url:
+                cold.discard(port)
+                return False
+        return True
+
+    return probe
 
 
 class _BytesResponse:
@@ -302,6 +328,147 @@ class TestRunLifecycle:
         assert any(_VIZ_URL in line for line in emitted)
 
 
+class TestGuardAutoRestart:
+    """崩溃自愈（V3.5.4）：场景跑完不得把整个仿真端一起带走。
+
+    退出码 3221226505 = 0xC0000409，是 CARLA 原生 fail-fast 带走 ``carla-manager``
+    的现场特征：它不是 Python 异常，管理面内部接不住，只能由 ``up`` 在外层自愈。
+    """
+
+    CRASH = 3221226505
+
+    def test_native_crash_restarts_manager_without_touching_probes(self) -> None:
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        manager = _Process(codes=[None, self.CRASH])
+        probes = _Process(codes=[None])
+        reborn = _Process(codes=[0])
+        pool = iter([manager, probes, reborn])
+        probes_alive_at_restart: list[bool] = []
+
+        def emit(line: str) -> None:
+            emitted.append(line)
+            if "自动重启" in line:
+                probes_alive_at_restart.append(not probes.terminated)
+
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), next(pool))[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emit,
+        )
+
+        assert launcher.run([_manager(), _probes()], _VIZ_URL) == 0
+        assert len(launched) == 3  # manager + probes + 重启后的 manager
+        assert probes_alive_at_restart == [True]  # 控制面崩溃不牵连探针面
+        assert any("异常退出" in line and "自动重启" in line for line in emitted)
+        assert any("已重启并就绪" in line and "carla-manager" in line for line in emitted)
+
+    def test_restarted_manager_keeps_waiting_for_next_scene(self) -> None:
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        pool = iter([_Process(codes=[None, self.CRASH]), _Process(codes=[0])])
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), next(pool))[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL) == 0
+        # 重启后回到守护循环，继续等下一个场景（而不是直接退出 up）
+        assert any("继续等待平台下发场景" in line for line in emitted)
+        assert len(launched) == 2
+
+    def test_clean_exit_is_not_restarted(self) -> None:
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        process = _Process(codes=[None, 0])
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), process)[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL) == 0
+        assert len(launched) == 1
+        assert any("已退出（code=0）" in line for line in emitted)
+
+    def test_restart_can_be_disabled(self) -> None:
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        process = _Process(codes=[None, self.CRASH])
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), process)[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+            restart_on_failure=False,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL) == self.CRASH
+        assert len(launched) == 1
+        assert any("已退出" in line for line in emitted)
+        assert not any("自动重启" in line for line in emitted)
+
+    def test_repeated_crashes_eventually_stop_guarding(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(launcher_module, "_RESTART_MAX_ATTEMPTS", 2)
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        pool = iter(
+            [
+                _Process(codes=[None, self.CRASH]),
+                _Process(codes=[self.CRASH]),
+                _Process(codes=[self.CRASH]),
+            ]
+        )
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), next(pool))[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+        )
+
+        assert launcher.run([_manager()], _VIZ_URL) == self.CRASH
+        assert len(launched) == 3  # 首次 + 两次重启后触顶
+        assert any("停止守护" in line and "CarlaUE4" in line for line in emitted)
+
+    def test_stable_service_gets_fresh_restart_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(launcher_module, "_RESTART_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(launcher_module, "SERVICE_STABLE_SECONDS", 2.0)
+        emitted: list[str] = []
+        launched: list[list[str]] = []
+        pool = iter(
+            [
+                _Process(codes=[None] * 5 + [self.CRASH]),
+                _Process(codes=[None] * 5 + [self.CRASH]),
+                _Process(codes=[0]),
+            ]
+        )
+        launcher = Launcher(
+            popen=lambda argv: (launched.append(list(argv)), next(pool))[1],
+            probe=_probe_starts_cold(),
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+        )
+
+        # 两次崩溃都发生在「已稳定」之后，因此不应被当作重启风暴而停止守护
+        assert launcher.run([_manager()], _VIZ_URL) == 0
+        assert len(launched) == 3
+        assert not any("停止守护" in line for line in emitted)
+
+
 class TestRunOnReady:
     """就绪回调：``up --demo`` 依赖它在就绪后提交冒烟场景。"""
 
@@ -357,6 +524,9 @@ class _FakeLauncher:
 
     recorded: dict[str, Any] = {}
 
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).recorded_kwargs = kwargs
+
     def run(
         self,
         specs: Sequence[ServiceSpec],
@@ -389,6 +559,7 @@ class TestUpCommand:
             False,
             False,
         )
+        assert args.no_restart is False
         assert args.demo is False
 
     def test_aborts_when_doctor_fails(
@@ -467,6 +638,25 @@ class TestUpCommand:
 
         assert main(["up", "--skip-doctor", "--no-browser"]) == 0
         assert _FakeLauncher.recorded["on_ready"] is None
+
+    def test_crash_restart_is_on_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _FakeLauncher.recorded = {}
+        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+        monkeypatch.setattr(launcher_module, "Launcher", _FakeLauncher)
+
+        assert main(["up", "--skip-doctor", "--no-browser"]) == 0
+        assert _FakeLauncher.recorded_kwargs["restart_on_failure"] is True
+
+    def test_no_restart_disables_crash_self_healing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _FakeLauncher.recorded = {}
+        monkeypatch.setattr(cli, "_load_settings", lambda: (_settings(), None))
+        monkeypatch.setattr(launcher_module, "Launcher", _FakeLauncher)
+
+        assert main(["up", "--skip-doctor", "--no-browser", "--no-restart"]) == 0
+        assert _FakeLauncher.recorded_kwargs["restart_on_failure"] is False
+        assert "--no-restart" in capsys.readouterr().out
 
 
 class TestDemoScene:

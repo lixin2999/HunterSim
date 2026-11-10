@@ -175,7 +175,7 @@ async def proxy_request(
         _rate_limited_warning(
             "upstream_disconnect",
             f"Viz proxy upstream disconnected: {_describe_exc(exc)} url={url}"
-            "（管理面重启/连接被中断，已返回 502）",
+            "（管理面重启/连接被中断，已返回 502；huntersim up 会自动拉起控制面）",
         )
         return _proxy_error(502, "upstream unavailable")
     except httpx.HTTPError as exc:

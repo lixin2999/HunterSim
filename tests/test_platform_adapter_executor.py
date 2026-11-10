@@ -272,6 +272,32 @@ class TestExecution:
         assert "sample_sink" in hooks  # SIL 也要采样
         assert "pose_driver" not in hooks
 
+    def test_finished_scene_leaves_manager_idle(
+        self,
+        executor: SimulationExecutor,
+        store: InstanceStore,
+        plane: _FakePlane,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """场景结束后管理面必须停在「空闲等待下发」，日志要有定位锚点。
+
+        V3.5.4 现场：``completed`` 后进程被 CARLA 原生 fail-fast 带走，日志尾巴
+        全丢，无法判定崩在收尾哪一步；这一行是「收尾完成、仍在等任务」的凭证。
+        """
+        with caplog.at_level("INFO", logger="hunter_sim.platform_adapter.executor"):
+            record = _new_record(store)
+            executor.start()
+            executor.submit(record)
+            _wait_terminal(store, record.instance_id)
+            assert _wait_until(lambda: plane.released == [record.instance_id])
+        idle_lines = [
+            item.getMessage()
+            for item in caplog.records
+            if "Manager idle: waiting for next scene" in item.getMessage()
+        ]
+        assert len(idle_lines) == 1
+        assert record.instance_id in idle_lines[0]
+
     def test_failed_snapshot_marks_failed(
         self,
         executor: SimulationExecutor,

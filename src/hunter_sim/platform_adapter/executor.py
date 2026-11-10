@@ -490,6 +490,9 @@ class SimulationExecutor:
                 self._plane.release(instance_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Release failed for {instance_id}: {exc}")
+            # 管理面必须停在「空闲等待下发」而不是退出：日志里没有这一行而
+            # 进程随后消失，说明收尾路径把进程带崩了（CARLA 原生 fail-fast）
+            logger.info(f"Manager idle: waiting for next scene (instance={instance_id})")
 
     def _stop_reason_of(self, instance_id: str) -> str:
         """当前实例的中断原因（无则空串）。"""

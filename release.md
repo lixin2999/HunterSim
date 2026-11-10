@@ -3405,3 +3405,86 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - `/viz` 实例列表的「参与者」计数与参与者面板的「声明」口径尚未统一（前者含 prop/自车等），待下一版对齐。
 
 ---
+
+## V3.5.4 — 场景跑完 `carla-manager` 被原生 fail-fast 带走，`up` 顺手停掉 probes：仿真端整体下线
+
+**发布日期**：2026-11-10
+**版本定位**：可靠性修复——`huntersim up` 具备崩溃自愈能力，子进程异常退出不再牵连其余服务，仿真端跑完一个场景后继续常驻等待下一个任务。
+
+### 现场
+
+单实例 SIL 场景（`inst-9cde30160c1d42029a064806b496d14e`，Town06，3 名骑车人参与者）在真机 CARLA 0.9.16 上完整跑完，随后整个仿真端消失：
+
+| 时刻 | 事件 |
+|------|------|
+| 14:45:25 | `ego_spawn_replaced ... after=(-99.96,145.85,0.30,yaw=-179.9)`、`ego_transform_not_synced` WARNING、`Participant 'cyclist-1' spawn resolve: ... base=(-100.0,145.8,0.3,yaw=-180) world=(-143.7,144.7,...)`（V3.5.3 修复在真机已生效） |
+| 14:45:26 | `post_tick_controls_reapplied: ego=[autopilot speed=13.7m/s] tm_participants=3`（首 tick 补发生效，自车不再停在个位数 m/s） |
+| 14:48:53 | `running → completed` → `Scene loop exited: publishing terminal status` → `restoring async world mode` → `cleaning up scenario resources` → `Scenario cleanup begin/…` |
+| 14:48:54 | `Scenario cleanup done`；**其后 `Scene loop: cleanup finished`、`Instance completed`、`Execution plane released` 三条全部缺失** |
+| 14:48:59 | probes：`Viz proxy upstream disconnected: ReadError ... （管理面重启/连接被中断，已返回 502）`，同一秒 `/api/v1/instances/{id}`、`/viz/api/.../actors`、`/viz/api/status` 集体 502 |
+| 收尾 | `[up] carla-manager 已退出（code=3221226505）` → `[up] 已停止 probes` → 回到 PowerShell 提示符 |
+
+### 逐条对账
+
+1. **日志里的「报错」（502）不是代理 bug，而是症状**：`httpx.ReadError` 是「已建连、连接被强行中断」（服务拒连会是 `ConnectError`），说明控制面进程当场消失，`/viz` 只能回 502；`http_ok` TCP 探测也失败 → 页面「控制面 离线」。
+2. **`carla-manager` 不是「主动退出」**：退出码 `3221226505` = `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN / fastfail），与 V3.3.3 记录的 `Assertion failed: _episode != nullptr`（LibCarla `Simulator.h`）同类。**它在 C++ 侧 `abort()`，Python 的 `try/except`、看门狗、`finally` 都接不住**，因此不可能靠「场景结束后别退」这个开关阻止。
+3. **一次原生崩溃被放大为整个仿真端下线**：旧 `_guard` 语义是「任一子进程退出 → 返回其退出码 → `finally` 回收其余子进程」。本例只有控制面崩了，probes 也被带走，平台侧看不到任何可轮询的仿真端节点（心跳中断）。
+4. **本次不是 V3.3.3 那个变量**：本轮日志只有一个实例、也没第二次 `load_world`，仍然崩在「收尾/空闲」窗口，说明触发面不止跨实例复用连接。具体原生调用点无法从日志定位（三条收尾锚点全丢），本版本不臆测，而是「外层自愈 + 补齐锚点」。
+
+### 修复内容
+
+- **`src/hunter_sim/visualization/launcher.py`（核心）**：`_guard()` 重写为自愈守护循环。
+  - 子进程**非零退出**时不再返回退出码，而是按退避（`_RESTART_BACKOFF_S = 3/5/10/30s`，末位重复）重新拉起同一命令行（`_relaunch()`），并等待就绪；其余子进程**保持运行不受牵连**；
+  - 计数口径：`SERVICE_STABLE_SECONDS`（默认 30 s）内算「未稳定」，连续未稳定重启达 `_RESTART_MAX_ATTEMPTS`（默认 4）次则停止守护，并给出「先确认 CarlaUE4.exe / :2000 与端口占用再重跑 `huntersim up`」的明确指引；已稳定后再崩则重新计一次额度（避免长跑偶尔崩一次就耗尽额度）；
+  - **不重启的情形**：`code == 0`（正常停止）、已收到 Ctrl+C（`self._stopping`）、`restart_on_failure=False`；
+  - 重启成功提示：`[up] carla-manager 已重启并就绪（https://127.0.0.1:8090），继续等待平台下发场景`；
+  - `Launcher(..., restart_on_failure: bool = True)` 新增开关，类/模块 docstring 同步补「崩溃自愈」要点。
+- **`src/hunter_sim/cli/main.py`**：`up` 新增 `--no-restart`（保留旧行为）；启动计划后一行打印自愈声明，便于现场知道默认已变。
+- **`src/hunter_sim/platform_adapter/executor.py`**：实例收尾后新增 INFO `Manager idle: waiting for next scene (instance=...)`——「没退、在等下一个场景」的凭证，也是下次定位崩溃点的尾锚。
+- **`src/hunter_sim/execution/plane.py`**：`release()` 开头新增 INFO `Execution plane releasing: instance=..., runner=yes/no`，把「崩在释放前还是释放中」区分开（沿 V3.4.4「收尾每一步都落 INFO」的做法）。
+- **`src/hunter_sim/probes/viz_proxy.py`**：502 提示补全为「管理面重启/连接被中断，已返回 502；huntersim up 会自动拉起控制面」，避免现场把 502 误读为代理自身故障。
+
+### 向后兼容与行为变化
+
+- **有意的默认行为变化**：`huntersim up` 不再因单个子进程异常退出而整体下线，而是自动拉起并继续守护；Ctrl+C 与正常停止路径不变（仍统一回收全部子进程）。
+- 控制面重启后，上次遗留的非终态实例仍由既有 `mark_restarted_instances_failed` 标为 `failed`，平台需重新下发该场景（本轮实例已 `succeeded`，不受影响）；节点注册/心跳为启动即重建，重启窗口（退避 3 s）远小于 `lease_seconds=90`，平台侧不会判定节点掉线。
+- **仅适用于 `up` 托管路径**：直接跑 `huntersim carla-manager`（systemd / Docker / K8s）时自愈不生效，重启仍由编排器（`restart: always` / `restartPolicy`）负责，本版本未改动其语义。
+- 无接口/配置/平台契约变更；`pyproject.toml` 版本 `3.5.3` → `3.5.4`（修复/完善按第三位递增）。
+
+### 风险
+
+- 自动重启可能「隐藏」反复崩溃：已用退避 + 上限 + 计数日志三重限制，触顶后不静默退出而是给出排查指引；`--no-restart` 可回到旧行为。
+- 重启期间（退避 3 s + 启动约 2 s）平台下发会碰到 502/拒连；属预期，重试即可（平台侧已有重连语义）。
+- 新增两条 INFO 只增加日志量（每实例各一条），不影响行为。
+
+### 验证
+
+- `pytest -q` 全量：**1428 passed**（较 V3.5.3 +9），覆盖率门禁达标。
+- 新增回归测试：
+  - `tests/test_viz_launcher.py::TestGuardAutoRestart`（6 例）：原生崩溃码 `3221226505` 触发重启且**兄弟 probes 未被牵连 terminate**、重启后回到守护循环继续等下一个场景、`code=0` 不重启、`restart_on_failure=False` 保留旧行为、连续未稳定触顶后「停止守护」并提示 CarlaUE4、稳定后再崩重新计额度；
+  - `tests/test_viz_launcher.py::TestUpCommand`（+2 例）：默认开启自愈、`--no-restart` 关闭并打印提示；`test_parser_defaults` 补 `args.no_restart` 默认值断言；
+  - `tests/test_platform_adapter_executor.py::TestExecution.test_finished_scene_leaves_manager_idle`：实例终态后恰好一条 `Manager idle: waiting for next scene` 且带 instance id。
+- `mypy src`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 真机复测待执行（开发环境 `.venv` 未安装 `carla` 模块，原生 fail-fast 无法在本地复现）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.4`；
+2. `huntersim up`（启动计划后应多一行「子进程异常退出将自动重启，并继续等待平台下发仿真场景」）；
+3. 下发场景并等其跑完：日志尾部必须出现 `Scenario cleanup done` → `Execution plane releasing: instance=..., runner=yes` → `Execution plane released` → `Instance completed ... passed=...` → **`Manager idle: waiting for next scene (instance=...)`**；若仍缺尾部行且进程消失，则说明崩在更早一步，按缺哪一行定位；
+4. 如果仍发生原生崩溃，控制台必须只出现 `[up] carla-manager 异常退出（code=3221226505），3s 后自动重启（第 1/4 次），其余服务保持运行` → `[up] carla-manager 已重启并就绪（https://127.0.0.1:8090），继续等待平台下发场景`，**不得再出现 `[up] 已停止 probes`**；`/viz` 应短暂 502 后自动恢复；
+5. 重启后向同一节点重新下发场景，应正常 `pending → loading → running`（控制面启动时会把上次遗留的非终态实例标 `failed`，属既有行为）；
+6. 需要旧语义（子进程退出就退出 `up`，便于外部监控接管）时，用 `huntersim up --no-restart`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.4`；`pyproject.toml` 版本 `3.5.4`；wheel / 容器版本号一致。文档四件套（`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md`）已同步。
+
+### 待办 / 已知边界
+
+- **原生 fail-fast 的确切调用点仍未定位**：V3.3.3 消除了「跨实例复用 `carla.Client`」，本轮日志证明「单实例收尾/空闲」也会崩。下一步靠本版新增的尾锚（`Execution plane releasing` / `Manager idle`）二分：尾锚齐全 = 崩在释放后的空闲期（候选：`carla.Client`/`world` 引用被 GC）；缺尾锚 = 崩在评估/发布/录制收尾中。
+- **自愈只在 `huntersim up` 层**：`carla-manager` 自身无法接住原生 `abort()`；非 `up` 托管部署需由 systemd/Docker/K8s 的 restart 策略承担（文档已写明）。
+- **不做「崩溃后自动接着跑完上一个实例」**：重启后遗留实例标 `failed`、等平台重下发，是既有重启恢复语义；自动续跑属功能级变更（需递增次版本号）。
+- 沿用 V3.5.3 待办（VIL 模式不适用首 tick 补发、前车默认 8.0 m/s、补发仅一次、`/viz` 参与者计数口径）与 V3.3.3 待办（自签 CA 未导入导致上行静默丢失、HUNTER_SE 蓝图缺失回落 model3）。
+
+---

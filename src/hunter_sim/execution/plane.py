@@ -252,6 +252,12 @@ class ExecutionPlane:
             engine_key = self._runner_engines.pop(instance_id, None)
             released = self._pool.release(instance_id)
             engine_lock = self._engine_locks.get(engine_key) if engine_key else None
+        # 收尾每一步都落 INFO：CARLA 原生 fail-fast 会让进程直接退出，
+        # 只能靠最后一条日志判定崩在释放前还是释放中（V3.5.4 现场即如此）
+        logger.info(
+            f"Execution plane releasing: instance={instance_id}, "
+            f"runner={'yes' if runner is not None else 'no'}"
+        )
         self._close_producer_for_instance(instance_id)
         # 装配在途时由 ensure_runner 的取消路径在引擎锁内完成销毁/异步恢复，
         # 避免这里无锁操作仍在使用中的 world

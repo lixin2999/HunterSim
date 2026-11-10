@@ -852,7 +852,15 @@ def _cmd_up(args: argparse.Namespace) -> int:
     if open_browser:
         print("启动完成后将自动打开浏览器；可用 --no-browser 关闭。")
     on_ready = (lambda: _run_demo(settings)) if args.demo else None
-    return Launcher().run(specs, url, open_browser=open_browser, on_ready=on_ready)
+    restart = not args.no_restart
+    print(
+        "子进程异常退出将自动重启，并继续等待平台下发仿真场景（关闭：--no-restart）。"
+        if restart
+        else "已关闭异常退出自动重启（--no-restart）：任一子进程退出即停止守护并回收。"
+    )
+    return Launcher(restart_on_failure=restart).run(
+        specs, url, open_browser=open_browser, on_ready=on_ready
+    )
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -1025,6 +1033,12 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--force", action="store_true", help="预检有 fail 项时仍继续启动")
     up.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     up.add_argument("--no-probes", action="store_true", help="不拉起只读探针面（:8080）")
+    up.add_argument(
+        "--no-restart",
+        action="store_true",
+        dest="no_restart",
+        help="子进程异常退出（如 CARLA 原生 fail-fast 带走 carla-manager）时不自动重启",
+    )
     up.add_argument(
         "--demo",
         action="store_true",
