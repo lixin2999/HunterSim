@@ -671,3 +671,64 @@ class TestSnapshotAndWorld:
 
 def _raising() -> Any:
     raise RuntimeError("no map")
+
+
+class TestEndpointMailboxSerialization:
+    """V3.6.0：装配/收尾的 CARLA 调用走端点信箱，被占时降级而不并发。
+
+    引擎锁只能串行化 plane 自己的调用，盖不到场景 tick 线程；现场崩溃正是
+    ``load_world`` 与上一场景 tick 循环并发操作同一个 ``carla.Client``。
+    本组用例验证「宁失败、不崩溃」的新行为。
+    """
+
+    def _held(self) -> Any:
+        from hunter_sim.engine.carla_mailbox import get_mailbox
+
+        return get_mailbox("127.0.0.1:2000")
+
+    def test_assembly_fails_while_previous_tick_thread_owns_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.mocks.carla_thread_mocks import held_endpoint_owner
+
+        monkeypatch.setattr("hunter_sim.execution.plane._ASSEMBLY_MAILBOX_TIMEOUT_S", 0.2)
+        manager = _MapManager()
+        plane = _plane(manager=manager)
+
+        with held_endpoint_owner(self._held()):
+            with pytest.raises(ExecutionUnavailable, match="Failed to assemble"):
+                plane.ensure_runner(_instance())
+
+        assert manager.loaded == [], "端点被占时不得并发 load_world"
+        assert plane.pool.get("inst-1") is None, "失败装配必须释放租约"
+
+    def test_runner_gets_endpoint_key_for_shared_mailbox(self) -> None:
+        """运行器必须拿到与端点一致的 engine_key，否则两边用不同信箱。"""
+        runners: list[_Runner] = []
+        plane = _plane(runners=runners)
+
+        plane.ensure_runner(_instance())
+
+        assert runners[0].kwargs["engine_key"] == "127.0.0.1:2000"
+
+    def test_restore_world_async_is_executed_by_owner_thread(self) -> None:
+        """释放线程拿不到端点时，收尾投递给 owner 代执行（不在本线程发 RPC）。"""
+        import time
+
+        from tests.mocks.carla_thread_mocks import held_endpoint_owner
+
+        world = _World()
+        traffic_manager = _TrafficManager()
+        plane = _plane(world=world)
+        plane._cleanup_info["inst-1"] = (world, traffic_manager)  # noqa: SLF001
+        plane._cleanup_engines["inst-1"] = "127.0.0.1:2000"  # noqa: SLF001
+
+        with held_endpoint_owner(self._held(), drain=True) as owner:
+            plane._restore_world_async("inst-1")  # noqa: SLF001
+            assert owner.executed >= 1
+            deadline = time.monotonic() + 5.0
+            while world.applied == 0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+        assert world.applied == 1
+        assert traffic_manager.sync_calls == [False]

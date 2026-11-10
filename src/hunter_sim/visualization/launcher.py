@@ -229,6 +229,8 @@ class Launcher:
         popen: 创建子进程的工厂（默认 ``subprocess.Popen``）。
         opener: 打开浏览器的函数（默认 ``webbrowser.open``）。
         probe: 就绪探测函数（默认 ``http_ok``）。
+        port_probe: TCP 端口占用探测（默认 :func:`tcp_port_ok`，V3.6.0 残留
+            进程判定用）。
         sleeper: 等待函数（默认 ``time.sleep``）。
         emit: 输出函数（默认逐行刷新的 ``print``）。
         restart_on_failure: 子进程异常退出（非零码）时是否自动重启（V3.5.4）。
@@ -240,6 +242,7 @@ class Launcher:
         popen: Callable[[Sequence[str]], Any] = subprocess.Popen,
         opener: Callable[[str], Any] = webbrowser.open,
         probe: Callable[[str], bool] = http_ok,
+        port_probe: Callable[[str, int], bool] = tcp_port_ok,
         sleeper: Callable[[float], None] = time.sleep,
         emit: Callable[[str], None] = _print_line,
         restart_on_failure: bool = True,
@@ -247,6 +250,7 @@ class Launcher:
         self._popen = popen
         self._opener = opener
         self._probe = probe
+        self._port_probe = port_probe
         self._sleeper = sleeper
         self._emit = emit
         self._restart_on_failure = bool(restart_on_failure)
@@ -405,7 +409,13 @@ class Launcher:
         started: list[tuple[ServiceSpec, Any]],
         ready_timeout_s: float,
     ) -> bool:
-        """重新拉起一个已退出的子进程，返回是否已就绪（不就绪则由守护循环重试）。"""
+        """重新拉起一个已退出的子进程，返回是否已就绪（不就绪则由守护循环重试）。
+
+        V3.6.0：重启失败且新进程已退出时，区分「还在慢启动」与「端口被残留
+        进程占住」——Windows 下父进程被杀不会带走 CARLA Server 孙进程，端口
+        占用会让后续每次重启都卡在就绪阶段，不给出可执行提示就只能看到
+        「连续 N 次重启仍未稳定」。
+        """
         try:
             process = self._popen(list(spec.argv))
         except Exception as exc:  # noqa: BLE001  拉起失败只影响本次重启尝试
@@ -414,8 +424,30 @@ class Launcher:
         started[index] = (spec, process)
         if self._wait_ready(spec, process, ready_timeout_s):
             return True
+        if process.poll() is not None:
+            conflict = self._port_conflict_hint(spec)
+            if conflict is not None:
+                self._emit(conflict)
+                return False
         self._emit(f"[up] {spec.name} 重启后未在 {ready_timeout_s:.0f}s 内就绪，继续重试")
         return False
+
+    def _port_conflict_hint(self, spec: ServiceSpec) -> Optional[str]:
+        """端口已有人监听但服务不健康时给出可执行提示（否则返回 None）。
+
+        仅适用于非 TLS 服务：TLS 侧只有 TCP 端口这一个信号，无法区分残留进程
+        和正确的服务（误报反而会把可用的服务判死）。
+        """
+        if spec.tls:
+            return None
+        if not self._port_probe(spec.probe_host, spec.port):
+            return None
+        return (
+            f"[up] {spec.name} 端口 {spec.probe_host}:{spec.port} 已被占用但健康探测不通，"
+            "疑为上一轮残留进程未退出；请先结束占用该端口的进程再重跑 up"
+            f"（查占用：Get-NetTCPConnection -LocalPort {spec.port} | "
+            "Select-Object OwningProcess）"
+        )
 
     def _stop(self, started: Sequence[tuple[ServiceSpec, Any]]) -> None:
         """回收子进程（先 terminate，超时再 kill；幂等）。"""

@@ -12,8 +12,10 @@ import logging
 import logging.handlers
 import math
 import os
+import re
 import sys
 import threading
+import time
 from collections import deque
 from typing import Any, Generic, Optional, TypeVar
 
@@ -46,11 +48,92 @@ class _RequestIdFilter(logging.Filter):
 
 
 def _make_text_formatter() -> logging.Formatter:
-    """可读文本格式：[时间][级别][模块名][rid] 消息。"""
+    """可读文本格式：[时间][级别][模块名][线程名][rid] 消息。
+
+    V3.6.0：格式内建 **线程名**。CARLA 客户端非线程安全，现场排查原生崩溃时必须
+    从日志判定「这条调用出自哪个线程」；旧格式只有模块名，tick 线程与 HTTP 线程
+    的输出长得一模一样，无法定位跨线程并发。前端日志面板（LogBus）本就携带线程名。
+    """
     return logging.Formatter(
-        fmt="[%(asctime)s][%(levelname)s][%(name)s][%(request_id)s] %(message)s",
+        fmt=(
+            "[%(asctime)s][%(levelname)s][%(name)s][%(threadName)s][%(request_id)s] "
+            "%(message)s"
+        ),
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+#: 保留轮询类访问日志的环境变量名（设为 1/true 时不再降噪）
+ACCESS_LOG_POLLING_ENV = "HUNTER_SIM_LOG_ACCESS_POLLING"
+
+#: 视为「面板轮询」的路径前缀（GET 且状态码 <400 时降噪）
+_POLLING_PATH_PREFIXES: tuple[str, ...] = (
+    "/viz/",
+    "/api/v1/instances",
+    "/api/v1/scenes",
+    "/api/v1/execution",
+    "/health",
+    "/metrics",
+    "/ws",
+)
+
+
+class _AccessLogNoiseFilter(logging.Filter):
+    """轮询访问日志降噪（V3.6.0）。
+
+    两个可视化标签页×7 路定时轮询在崩溃现场日志里能占比 60%以上，把真正有用的
+    业务/崩溃痕迹淹没。**错误一律保留**（非 2xx/3xx、非 GET 全部输出），
+    只把成功轮询降为计数；每分钟输出一次汇总，避免「降噪」变成「丢信息」。
+    """
+
+    _LINE_RE = re.compile(r'"(?P<method>[A-Z]+)\s+(?P<path>[^"]*?)\s+HTTP/[\d.]+"\s+(?P<status>\d{3})')
+
+    def __init__(self, summary_interval_s: float = 60.0) -> None:
+        super().__init__()
+        self._summary_interval_s = max(1.0, float(summary_interval_s))
+        self._suppressed = 0
+        self._next_summary_at = time.monotonic() + self._summary_interval_s
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if os.environ.get(ACCESS_LOG_POLLING_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return True
+        if record.levelno >= logging.WARNING:
+            return True
+        match = self._LINE_RE.search(record.getMessage())
+        if match is None:
+            return True
+        status = int(match.group("status"))
+        path = match.group("path")
+        question = path.find("?")
+        clean = path[:question] if question >= 0 else path
+        if (
+            match.group("method") == "GET"
+            and status < 400
+            and clean.startswith(_POLLING_PATH_PREFIXES)
+        ):
+            self._suppressed += 1
+            self._maybe_summarize()
+            return False
+        return True
+
+    def _maybe_summarize(self) -> None:
+        """周期性输出抑制条数（汇总行本身走 root，不经本过滤器）。"""
+        now = time.monotonic()
+        if now < self._next_summary_at:
+            return
+        suppressed, self._suppressed = self._suppressed, 0
+        self._next_summary_at = now + self._summary_interval_s
+        if suppressed:
+            logging.getLogger("uvicorn.access").info(
+                f"access log 降噪：过去 {self._summary_interval_s:.0f}s 抑制 "
+                f"{suppressed} 条面板轮询请求（错误与非轮询请求均保留；"
+                f"设 {ACCESS_LOG_POLLING_ENV}=1 可全部输出）"
+            )
 
 
 def bind_request_id(request_id: str) -> None:
@@ -155,8 +238,54 @@ def configure_logging(
         parent.addHandler(file_handler)
 
     parent.setLevel(level)
+    _install_third_party_logging(level)
+    _install_access_log_policy(level)
     _LOG_CONFIGURED = True
     return level
+
+
+#: 需纳入统一出口的第三方 logger 树（V3.6.0）
+_THIRD_PARTY_LOGGERS: tuple[str, ...] = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def _install_third_party_logging(level: int) -> None:
+    """把 uvicorn 原生日志接进统一出口（V3.6.0，幂等）。
+
+    uvicorn 默认用自带 dictConfig 输出 ``INFO:     Uvicorn running on ...``、
+    ``INFO:     127.0.0.1:53124 - "GET ..." 200 OK`` 这类**无时间戳、无线程名**的
+    行，与业务日志混排后既不能按时间轴定位崩溃瞬间，也无法套用访问日志降噪规则。
+    这里摘除 uvicorn logger 自有 handler，改挂 ``hunter_sim`` 父 logger 的同一组
+    出口：``uvicorn`` 作为汇聚点（``propagate=False`` 防重复），``uvicorn.error`` /
+    ``uvicorn.access`` 保留向父级传播。须配合 ``uvicorn.run(..., log_config=None)``
+    使用——否则 uvicorn 会在启动时重新装回它自己的 handler。
+    """
+    parent = logging.getLogger("hunter_sim")
+    for name in _THIRD_PARTY_LOGGERS:
+        third = logging.getLogger(name)
+        for handler in list(third.handlers):
+            third.removeHandler(handler)
+        third.setLevel(level)
+        if name == "uvicorn":
+            for handler in parent.handlers:
+                third.addHandler(handler)
+            third.propagate = False
+        else:
+            third.propagate = True
+
+
+def _install_access_log_policy(level: int) -> None:
+    """接入访问日志降噪过滤器（V3.6.0，幂等）。
+
+    uvicorn 的 access logger 不在 ``hunter_sim`` 子树下，需单独处理；DEBUG 级
+    别不降噪（排障时要看到完整请求序列）。
+    """
+    access = logging.getLogger("uvicorn.access")
+    for existing in access.filters:
+        if isinstance(existing, _AccessLogNoiseFilter):
+            return
+    if level <= logging.DEBUG:
+        return
+    access.addFilter(_AccessLogNoiseFilter())
 
 
 def set_default_log_level(level: str | int) -> int:

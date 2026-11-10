@@ -108,6 +108,20 @@ CARLA_RPC_ERRORS_TOTAL = Counter(
     "CARLA RPC connectivity probe failures.",
 )
 
+# V3.6.0 单线程信箱：任务派发结果 result=ok|queued|timeout|dropped
+CARLA_MAILBOX_TASKS_TOTAL = Counter(
+    "huntersim_carla_mailbox_tasks_total",
+    "CARLA mailbox task outcomes (result=ok|queued|timeout|dropped) per engine endpoint.",
+    labelnames=("engine", "op", "result"),
+)
+
+# V3.6.0 单线程信箱：绕过信箱、在非 owner 线程上直接访问 CARLA 的次数（必须为 0）
+CARLA_OFFOWNER_RPC_TOTAL = Counter(
+    "huntersim_carla_offowner_rpc_total",
+    "Off-owner-thread CARLA accesses detected by the mailbox guard (must stay 0).",
+    labelnames=("engine", "op"),
+)
+
 KAFKA_CONSUME_ERRORS_TOTAL = Counter(
     "huntersim_kafka_consume_errors_total",
     "Kafka consumer poll errors (VIL telemetry chain).",
@@ -410,6 +424,8 @@ def metric_exists(name: str) -> bool:
 
 
 __all__ = [
+    "CARLA_MAILBOX_TASKS_TOTAL",
+    "CARLA_OFFOWNER_RPC_TOTAL",
     "CARLA_RPC_ERRORS_TOTAL",
     "CARLA_SUPERVISOR_EVENTS_TOTAL",
     "CLOUD_DLQ_PUBLISHED_TOTAL",

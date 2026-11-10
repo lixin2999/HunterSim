@@ -97,6 +97,50 @@ def _load_settings() -> tuple[Optional[HunterSimSettings], Optional[str]]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+#: ``--log-level``（uvicorn 风格小写）→ logging 级别名（V3.6.0）
+_LOG_LEVEL_NAMES: dict[str, str] = {
+    "critical": "CRITICAL",
+    "error": "ERROR",
+    "warning": "WARNING",
+    "info": "INFO",
+    "debug": "DEBUG",
+    "trace": "DEBUG",  # stdlib logging 无 TRACE，降为 DEBUG
+}
+
+
+def _apply_logging_config(
+    args: argparse.Namespace, settings: Optional[HunterSimSettings] = None
+) -> None:
+    """服务类入口的统一日志装配（V3.6.0）。
+
+    此前 ``configure_logging`` 从未被任何入口调用，导致 ``HUNTER_SIM_LOG_JSON`` /
+    ``HUNTER_SIM_LOG_FILE`` / ``HUNTER_SIM_LOG_LEVEL`` 以及线程名、访问日志降噪
+    等能力实际上不生效（各模块 logger 各自挂 stdout handler）。同时 uvicorn 用自带
+    dictConfig 输出无前缀的 ``INFO:     ...`` 行，与业务日志不同格式、无法对齐时间轴，
+    因此这里以 ``log_config=None`` 禁用其日志配置，统一走 ``configure_logging`` 出口。
+
+    优先级：显式 ``--log-level debug`` > ``HUNTER_SIM_LOG_LEVEL``（``--log-level``
+    默认 info 时不覆盖环境变量）。
+    """
+    from hunter_sim.common.utils import configure_logging  # noqa: PLC0415
+
+    level = _LOG_LEVEL_NAMES.get(str(getattr(args, "log_level", "info")).lower(), "INFO")
+    if settings is None:
+        settings, _error = _load_settings()
+    if settings is None:
+        configure_logging(level)
+        return
+    if level == "INFO" and settings.log_level != "INFO":
+        level = settings.log_level
+    configure_logging(
+        level,
+        json_logs=settings.log_json,
+        log_file=settings.log_file,
+        log_max_bytes=settings.log_max_bytes,
+        log_backup_count=settings.log_backup_count,
+    )
+
+
 def _check_python() -> CheckResult:
     """Python 运行时版本（服务要求 ≥3.12）。"""
     version = sys.version_info
@@ -572,6 +616,8 @@ def _cmd_carla_manager(args: argparse.Namespace) -> int:
     from hunter_sim.platform_adapter.app import create_app
     from hunter_sim.platform_adapter.config import AdapterSettings
 
+    _apply_logging_config(args)
+
     overrides: dict[str, Any] = {}
     if args.host:
         overrides["host"] = args.host
@@ -588,6 +634,8 @@ def _cmd_carla_manager(args: argparse.Namespace) -> int:
         "host": adapter.host,
         "port": adapter.port,
         "log_level": args.log_level,
+        # 日志出口由 configure_logging 统一接管（V3.6.0）
+        "log_config": None,
     }
     if adapter.tls_enabled:
         uvicorn_kwargs["ssl_certfile"] = adapter.ssl_certfile
@@ -636,9 +684,12 @@ def _cmd_probes(args: argparse.Namespace) -> int:
     else:
         settings = settings.model_copy(update={"probe": probe})
 
+    _apply_logging_config(args, settings)
     app = create_probes_app(settings)
     print(f"HunterSim probes listening on http://{probe.host}:{probe.port}")
-    uvicorn.run(app, host=probe.host, port=probe.port, log_level=args.log_level)
+    uvicorn.run(
+        app, host=probe.host, port=probe.port, log_level=args.log_level, log_config=None
+    )
     return EXIT_OK
 
 

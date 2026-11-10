@@ -3676,3 +3676,122 @@ carla-manager 被 CARLA/LibCarla **原生**带走时不会留下 Python tracebac
 - 沿用 V3.5.5 待办（未接入 NVENC 硬编码、自适应只降 JPEG 质量）与 V3.5.4 待办（自愈只在 `up` 层；本版已把「原生 fail-fast 调用点」从「未定位」收敛为「两条已定位路径」）。
 
 ---
+
+## V3.6.0 — 原生崩溃根治：CARLA 客户端访问收敛为单线程信箱（全部 RPC 经 tick 线程串行派发）
+
+**发布日期**：2026-11-10
+**版本定位**：架构级变更（按发版规则递增次版本号）。V3.5.x 一直在做「事后自愈」——逐个消除已定位的并发路径＋`up` 层重启兜底，**必要不充分**：本版把「同一时刻只有一个线程碰 `carla.Client`」从**人肉约定**变成**结构性约束**：新增 `engine/carla_mailbox.py`，每个 CARLA 端点（`host:rpc_port`）有且只有一个 owner 线程（场景 tick 线程），其余线程的 RPC 只能投递给 owner 代执行或**直接降级**，拿不到执行机会就明确失败，绝不并发操作同一连接。同时审计并堵住了剩余跨线程入口（VIL 同步循环、进度读数、天气/传感器读数的后台调用），并补齐日志与进程级可观测。
+
+### 现场（本次 139 行日志，已是 V3.5.6 构建）
+
+| 时刻 | 读数 | 结论 |
+|------|------|------|
+| 17:25:32 | 下发 `inst-e003…`（Town04 / 6 名 walker：5 名 `pedestrian_cross` + 1 名 `static`） | 行人密集场景，正是崩溃高发的「多个 `spawn_actor` + 控制器 `attach_to`」窗口 |
+| 17:25:32→42 | `Loading map: Town04` → `Map 'Town04' loaded in 5615ms` → `World switched to synchronous mode (50Hz)` → `Traffic Manager switched to synchronous mode` → `Execution plane assembled: engine=127.0.0.1:2000` | 装配阶段就共存着大量面板轮询请求（第 10~47 行） |
+| 17:25:42 | `Ego state unavailable (stage=actor_missing)` → `ego_transform_not_synced` → `Participant 'crossing_pedestrian-1' spawned: actor=2514` | 与 V3.5.6 日志中的崩溃前序完全一致 |
+| 17:25:47 | `Viz proxy upstream disconnected: ReadError …（已返回 503…）（已熔断 2s…）` + 20 条 `503` | 上游连接当场断开（503 口径已生效，证明构建版本确实是 V3.5.6） |
+| 17:25:47 | `[up] carla-manager 异常退出（code=3221225725）（0xC00000FD 原生栈溢出…），3s 后自动重启（第 1/4 次）` | **V3.5.6 两条路径消除后仍崩**——「必要不充分」的实证 |
+| 17:25:51 | `Marked 1 non-terminal instance(s) as failed: adapter restarted` → `已重启并就绪` | 自愈只能「事后拉起」，接不住现场 |
+
+关键一点：崩溃窗口内 tick 线程正在 `spawn_actor`，而 HTTP/executor 线程在同一连接上轮询读数。V3.5.6 只封死了两条**已知**路径，但只要「任何线程都能直接拿 `World`/`Actor` 对象发 RPC」这个能力存在，下一个入口就还会出现。
+
+此外日志本身也报了两个问题：① 所有 `INFO:     …` 行（uvicorn 自带 dictConfig）没有时间戳/线程名，无法与业务日志对齐时间轴；② 旧格式根本没有线程名字段，即使怀疑跨线程也无法取证。
+
+### 根因与设计
+
+LibCarla 的 Python `Client`/`World`/`Actor` 均非线程安全：两个线程同时对同一连接发请求会在原生侧直接挂掉（无 traceback，只有 NTSTATUS 退出码）。因此本版的目标不是「少并发」，而是**不保留并发能力**：
+
+```
+owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一批
+其他线程    ：mailbox.run(...) → 入队 → 等 owner drain（默认 2s）→ 超时返回 fallback
+装配长事务  ：run_required(..., allow_queue=False) → 只能内联抢锁，抢不到就报错
+只读降级    ：can_access_directly(op) → False 时调用方必须退到缓存/空值
+```
+
+不变式（本版逐步落实到代码，均由单测护栏固定）：
+
+1. **一个端点一个 owner**：`claim()` 后 owner **持续持有端点锁**直到 `relinquish()`；上一个场景的 tick 线程还在推世界时，不允许对同一个 `world` 发 `load_world`/`apply_settings`。
+2. **装配不排队**：`load_world` / `configure_world` / `configure_traffic_manager` / `scene_load` 均 `allow_queue=False`——绝不能把这些长事务排进**另一个场景的 tick 循环**里执行（否则两个场景生命周期互相交错）。
+3. **告警不能阻止崩溃**：有缓存可退的读数路径一律用 `can_access_directly()` **直接降级**（返回 `None`/缓存快照），而不是发一条 WARNING 后继续硬撞。
+4. **每 tick 消费信箱**：`_run_loop_body()` 开头与暂停分支都调 `drain()`（单批上限 `_DRAIN_BATCH=8`）。只在循环退出时 `drain()` 是错的：场景可跑几十分钟，期间排进来的调用会全部超时，信箱退化为「只能降级」。
+5. **死亡 owner 可接管**：自研 `_EndpointLock`（按线程 ident 计数）在 `acquire` 时发现持有线程已死就地接管并告警；`threading.RLock` 被已退出线程持有时会永不释放， tick 线程异常退出后端点将**永久降级**。
+6. **加锁顺序固定为引擎锁 → 信箱**，反向不得嵌套（避免死锁）。
+
+### 修复内容
+
+- **新增 `src/hunter_sim/engine/carla_mailbox.py`（架构主体）**：`CarlaMailbox`（`claim/relinquish/run/run_required/submit/drain/stats/owner_name/is_claimed/is_owner/pending`）、`can_access_directly(op)`（降级型守护）与 `require_owner(op)`（断言型守护，用于 setup/teardown/apply_settings）、`_EndpointLock`（可重入、可接管死亡持有者，busy 提示里带持有线程名）、端点级注册表 `get_mailbox(key)` / `reset_mailboxes()`、异常 `CarlaMailboxTimeout` / `CarlaThreadViolation`；严格模式 `CARLA_MAILBOX_STRICT=1|true|yes|on`（违例直接抛异常，把「进程无声消失」换成「一条 Python 异常 + 栈」）；违例告警按操作名 30s 限频并累加被抑制条数；`stats` 区分 `inline/queued/executed/timeout/dropped`（旧实现 `queued` 在入队与执行两处重复计数，会误读为「并发仍存活」）；`_inline` 抢锁超时必须返回**调用方哨兵** `fallback` 而不是 `None`（`scene_stop`/`restore_world_async` 靠它区分「没执行」与「执行了但返回空」）。
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：构造函数新增 `engine_key`（同端点共用一个信箱）与只读属性 `mailbox`；`load_scene()` 的 setup 走 `run_required(name="scene_load", timeout=_SETUP_MAILBOX_TIMEOUT_S=120.0, allow_queue=False)`，`CarlaMailboxTimeout` 包装为 `CarlaSimulationError("scene_load")`；`_run_loop()` 先 `claim(thread_name, timeout=_OWNER_CLAIM_TIMEOUT_S=10.0)`，抢不到则 ERROR `Scene loop refused to start: CARLA engine '…' is still owned by thread '…'` 并判实例失败（**不开第二个 tick 循环**），退出时按顺序 `_publish_terminal_status()` → `drain(max_tasks=32)` → `_restore_async()` → `_cleanup()` → `relinquish()`，全部落 INFO 锚点；`stop()` 拿不到端点时改为 `mailbox.submit(_teardown_world, name="scene_stop")` 交给 owner 代执行并返回 `True`（deferred）；`_actor_from_world()` / `_get_actor_count()` / `_get_ego_state()` 三个后台可达入口改用 `can_access_directly()` 降级（分别返回 `None` / `_actors_count_cache` / `dict(_ego_state_cache)`）；`_publish_sim_status()` 只读缓存不再发 RPC。
+- **`src/hunter_sim/execution/plane.py`**：装配三处 CARLA 长事务全部经 `get_mailbox(lease.endpoint.key).run_required(..., timeout=_ASSEMBLY_MAILBOX_TIMEOUT_S=30.0, allow_queue=False)`；失败落入现有 `except Exception` → `ExecutionUnavailable("Failed to assemble scene runtime on engine …")` 并**释放租约**（旧行为：带着未结束的并发继续往下走）；`runner_kwargs` 默认注入 `engine_key=lease.endpoint.key`；`_restore_world_async()` 改为 `mailbox.run(..., fallback=_NOT_EXECUTED)`，未执行则 `mailbox.submit()` 投递给 owner（成功日志 `Restore world async queued for CARLA owner thread`）。
+- **`src/hunter_sim/platform_adapter/executor.py`**：`_runner_ego_state()` 删除对私有 `_get_ego_state` 的回退（那条回退会从 HTTP/watchdog 线程直接对 `world`/`actor` 发 RPC）；字段允许缺席，不允许用崩溃换读数。
+- **`src/hunter_sim/vil_mapper/vil_sync_service.py` + `src/hunter_sim/platform_adapter/vil.py`**：`VILSyncService` 新增 `mailbox` 参数（由 `vil.py` 传 `getattr(runner, "mailbox", None)`）；`apply_once()` 第 0 步：异线程调用直接返回 `"skipped"`（位姿缺席可恢复，并发写 `set_transform` 不可恢复）；`start_sync_loop()` 在端点已被占时抛 `CarlaSimulationError("vil_sync_loop", …)`，**结构性拒绝第二个 `world.tick()` 循环**（旧版只靠文档约束）。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：`setup()` 逐阶段落 INFO 锚点（`stage=blueprints` / `stage=participant_begin index=i/N id=… type=… behavior=…` / `stage=sensors spawned=i/N` / `stage=motion`）。原生崩溃不留 traceback，只能靠「最后一条日志是什么」判定崩在哪一次 `spawn_actor`；旧版只在生成**成功后**打日志。
+- **`src/hunter_sim/common/metrics.py`**：新增 `huntersim_carla_mailbox_tasks_total{engine,op,result=ok|queued|timeout|dropped}` 与 `huntersim_carla_offowner_rpc_total{engine,op}`（后者**长期为 0 是本版正确性断言**，非 0 即说明还有未收口直连入口）。
+- **日志（`src/hunter_sim/common/utils.py` + `src/hunter_sim/cli/main.py`）**：文本格式新增 **线程名** `[%(threadName)s]`；`_AccessLogNoiseFilter` 只降级「GET + 状态码 <400 + 面板轮询路径」并每 60s 输出一条汇总（错误、非 GET、非轮询一律保留，`HUNTER_SIM_LOG_ACCESS_POLLING=1` 可关，DEBUG 级不降噪）；新增 `_install_third_party_logging()` 把 `uvicorn` / `uvicorn.error` / `uvicorn.access` 接到统一出口（`uvicorn` 为汇聚点 `propagate=False`，子 logger 靠传播去重，并摘除旧 dictConfig 残留 handler）；**修正一个长期存在的配置缺口**：`configure_logging()` 此前从未被任何入口调用，导致 `HUNTER_SIM_LOG_LEVEL` / `HUNTER_SIM_LOG_JSON` / `HUNTER_SIM_LOG_FILE` / `HUNTER_SIM_LOG_MAX_BYTES` 与线程名、降噪规则在真实进程里全不生效——现由 `cli/main.py::_apply_logging_config()` 在 `carla-manager` / `probes` 两个服务入口调用，并以 `uvicorn.run(..., log_config=None)` 禁用 uvicorn 自带日志配置；优先级：显式 `--log-level debug` > `HUNTER_SIM_LOG_LEVEL`。
+- **`src/hunter_sim/visualization/launcher.py`（进程级）**：`Launcher` 新增可注入 `port_probe`；`_relaunch()` 在 `_wait_ready()` 失败**且新进程已退出**时用 `_port_conflict_hint()` 区分「慢启动」与「残留进程占住端口」（Windows 下父进程被杀不会带走 `CarlaUE4` 孙进程），命中则输出可直接执行的 `Get-NetTCPConnection -LocalPort <port> | Select-Object OwningProcess` 提示并停止无效重试；TLS 场景不探测明文端口（避免假阳性）。
+- **测试替身 `tests/mocks/carla_thread_mocks.py`（新增）**：`held_endpoint_owner(mailbox, *, name, drain)` 上下文管理器（真实线程 `claim` 后阻塞、退出前 `drain` + `relinquish`，暴露 `executed`/`claim_ok`）与 `endpoint_owner_thread_died_without_release`，供四个测试模块复用，避免每个模块各写一套“假 owner”。
+
+### 向后兼容与行为变化
+
+- **失败面变大（刻意）**：同一引擎上「旧场景未收尾 + 新场景下发」不再排队交错，而是直接判失败：装配报 `Failed to assemble scene runtime on engine …`（日志 `CARLA engine '…' is busy (call '…' not started within 30.0s; endpoint held by thread '…')`），tick 循环报 `Scene loop refused to start`。**平台重发即可**，代价从「整控制面带崩」降为「一次任务失败」。
+- **进度字段可能短暂无值**：`actors_count` / `ego_state` 在端点被 owner 占用且尚未首帧时返回缓存快照（可能为空/旧值）；`VILSyncService.apply_once()` 异线程返回 `"skipped"`。
+- **日志格式对外可见变更**：文本行新增线程名段（`[时间][级别][模块][线程][rid] 消息`）；解析日志行的外部脚本需适配。uvicorn 的 `INFO:     …` 行现在带完整前缀（不再裸输出），面板轮询成功请求会被降噪。
+- **新增环境变量**：`CARLA_MAILBOX_STRICT`（严格模式，测试/排查专用）、`HUNTER_SIM_LOG_ACCESS_POLLING`（关闭访问日志降噪）；`HUNTER_SIM_LOG_JSON` / `HUNTER_SIM_LOG_FILE` / `HUNTER_SIM_LOG_MAX_BYTES` / `HUNTER_SIM_LOG_BACKUP_COUNT` 自本版起**真正生效**（之前无入口调用 `configure_logging`）。
+- **`SceneRunnerService.__init__` 新增 `engine_key` 关键字参数**（缺省 `"default"`，单线程测试路径无 owner 时行为与旧版一致）；`VILSyncService.__init__` 新增 `mailbox`（默认 `None` 不拦截）。
+- 无接口/平台契约变更；`pyproject.toml` 版本 `3.5.6` → `3.6.0`（架构级/功能新增按次位递增）。
+
+### 风险
+
+- **owner 挂锁期间同端点事务会排队或失败**：owner 在持有期间一直占端点锁，其他线程的长调用只能排队（默认 2s）或直接超时。取舍明确：**宁失败不崩溃**；`_SETUP_MAILBOX_TIMEOUT_S=120.0` 专为首次导航网格构建等长尾留了宽裕。
+- **`drain()` 引入尾延迟**：每 tick 最多代执行 8 条排队调用（典型为读状态/收尾），单条超慢会吃掉该帧预算。面板轮询已全部改为读缓存，预期排队量接近 0；`stats["queued"]`/`stats["executed"]` 非零即为需继续收敛的信号。
+- **严格模式会改变故障形态**：`CARLA_MAILBOX_STRICT=1` 下违例抛 `CarlaThreadViolation`（表现为任务失败而非降级），只用于排查，不得在产线常开。
+- **死亡 owner 接管并非无损**：`_EndpointLock` 只能证明持有线程已不在 `threading.enumerate()` 里；若 owner 是在 C 层卡住（未退出但不可用），接管仍会等锁超时——这正是需要的保守行为。
+- **本版不能保证「绝对不再崩」**：若崩溃源于 CARLA 服务端自身缺陷（如同步模式下深层递归），信箱只能保证**客户端访问串行**这个前提不再由我们破坏；届时 `huntersim_carla_offowner_rpc_total` 为 0 + 阶段锚点就是下一轮定位的入口。
+
+### 验证
+
+- `pytest -q -p no:randomly` 全量：**1536 passed**（较 V3.5.6 +68），覆盖率门禁达标；`mypy src/hunter_sim`：**91 source files, Success: no issues found**；`flake8 src tests`：exit 0（无告警）。
+- 新增/改动测试：
+  - `tests/test_carla_mailbox.py`（新增 24 例）：owner 内联不排队、非 owner 排队后由 `drain()` 代执行、超时回退到**调用方哨兵**、`allow_queue=False` 拒绝排队（`pytest.raises(CarlaMailboxTimeout, match="is busy")` 与 `match="held by thread 'Assembler'"`）、`submit()` 抢不到锁时不得谎报已投递、死亡 owner 就地接管、`require_owner`/`can_access_directly` 告警限频与严格模式抛错、注册表按端点隔离与 `stats` 语义（`queued` 与 `executed` 分开计数）；
+  - `tests/test_scene_runner_service.py::TestOffOwnerReadsDegradeToCache`（6 例）：owner 占用期间 `world.get_actors` 换成会抛断言的 mock，`ego_vehicle`/`_get_actor_count`/`_get_ego_state`/`_publish_sim_status` 必须降级到缓存且**零 RPC**；`test_teardown_is_deferred_while_owner_holds_endpoint`（with 块内 0 次、owner 退出后代执行 1 次）；`test_owner_thread_still_reads_world_directly` 确保不把正常 tick 路径堵死；`TestTickLoopDrainsMailbox`（2 例）：真实 tick 线程运行中，其他线程 `mailbox.run(...)` 必须在一个帧周期内被代执行（结果等于 owner 线程名），暂停分支同样消费；
+  - `tests/test_execution_plane_lifecycle.py::TestEndpointMailboxSerialization`（3 例，`_ASSEMBLY_MAILBOX_TIMEOUT_S` 压到 0.2s）：端点被占时装配明确失败并**释放租约**；`engine_key` 与端点一致；收尾在未执行时投递给 owner；
+  - `tests/test_vil_sync_service.py::TestMailboxThreadGuards`（3 例）：异线程 `apply_once()` 返回 `"skipped"` 且不碰 Actor；端点被占时 `start_sync_loop()` 抛 `CarlaSimulationError("vil_sync_loop")`；owner 线程自身不受限；
+  - `tests/test_common_utils.py`：`TestLogFormatterCarriesThreadName`（2）、`TestAccessLogNoiseFilter`（7）、`TestUvicornLoggingRouting`（4：接管后带时间戳/线程名、只有树根持 handler、幂等、旧 dictConfig 残留 handler 被摘除）；
+  - `tests/test_cli_logging.py`（新增 12 例）：`--log-level debug` 优先于环境变量、默认 info 时让 `HUNTER_SIM_LOG_LEVEL` 生效、JSON/文件轮转参数透传、配置加载失败仍完成装配、级别别名表（含 `trace`→`DEBUG`）、两个服务子命令均以 `log_config=None` 启动 uvicorn；
+  - `tests/test_viz_launcher.py::TestRelaunchPortConflictDiagnosis`（3 例）：端口被占→给出 `Get-NetTCPConnection` 可执行提示并停止重试；端口空闲→仍按「慢启动」重试；TLS 不盲探。
+- 真机复测待执行：开发环境 `.venv` 未安装 `carla` 模块，`0xC00000FD` 无法本地复现；本版按「结构性约束 + 日志锚点 + 指标护栏」收口。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.6.0`（`/viz` 左上角 `v3.6.0`，浏览器 Ctrl+F5）；
+2. 确认日志新格式真的生效（本版才接上入口）：业务行应为 `[时间][INFO][hunter_sim.…][SceneRunner-…][-] …`，且 `Get-Content` 里**不再出现裸 `INFO:     ` 前缀**的 uvicorn 行；
+3. 重跑本版崩溃现场同款场景（Town04 / 6 名行人），必须看到 `CarlaMailbox[127.0.0.1:2000] owner claimed: SceneRunner-…` 与退出时的 `CarlaMailbox[…] owner released`；期间不断发 `/viz` 轮询也不得出现 `异常退出`；
+4. 跑 `curl -s http://127.0.0.1:8090/metrics | Select-String "carla_offowner_rpc"` 与 `carla_mailbox_tasks_total`：前者**必须长期为 0**（非 0 即说明还有未收口的直连入口，把 `op` 标签值回传即可定位）；后者 `result="timeout"`/`"dropped"` 持续非零则说明排队预算不够，需继续把调用点改成只读缓存；
+5. 人为在上一个场景未收尾时重下发：日志应只看到 `CARLA engine '…' is busy …` + `Failed to assemble scene runtime`，进程**不得退出**；
+6. 需要进一步定位时临时开严格模式：`$env:CARLA_MAILBOX_STRICT="1"` 后重启控制面（违例会直接抛 `CarlaThreadViolation` 带栈，排查完必须关掉）；
+7. 重启卡在就绪阶段且新进程已退出时，`[up]` 应直接给出 `Get-NetTCPConnection -LocalPort 2000 | Select-Object OwningProcess` 类提示（残留 `CarlaUE4` 占端口的场景）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.6.0`；`pyproject.toml` 版本 `3.6.0`；wheel 与镜像 tag 按此命名手工构建。
+
+> 注意：仓库内的 `docker/docker-compose.yml`（`hunter-sim:3.4.0`）、`docker-compose.windows.yml`（`hunter-sim:3.3.5`）与 `Makefile` 的 `IMAGE_TAG`（`3.4.0`）仍按历史值固定，**不随版本自动同步**（V3.4.x 以来一直如此）。本地起新版需 `docker build -f docker/Dockerfile -t hunter-sim:3.6.0 .` 并同步修正三处 tag（改动会直接影响现有部署，本版仍不擅自修改，仅备案）。文档四件套（`README.md`、`user_manual.md`、`deployment_and_operations.md`、`docs/单机部署指南.md`）已同步。
+
+### 文档同步明细
+
+- `README.md`：当前版本→`3.6.0` 与 V3.6.0 一句话叙述；新增「CARLA 访问线程模型」段；`engine/` 职责补 `carla_mailbox`；§7 监控新增两个指标与两个排查开关；§8 门禁基线改为 `1536 passed` / `91 个源文件`。
+- `user_manual.md`：版本头→V3.6.0；新增 **§2.6 CARLA 线程模型与日志**（owner / 非 owner / 装配三态行为表、可观测与开关、日志五段格式与降噪）；§3.3 补 `is busy` 重发口径、§3.4 补降级读缓存口径；§9.2 新增两指标行；§10 新增 `is busy` 失败行；§11 FAQ 新增三问（「V3.5.6 后仍崩怎么办」/「日志格式变了」/「重启卡在就绪」）。
+- `deployment_and_operations.md`：版本头→V3.6.0；§5.7 排障表新增 5 行；新增 **`### V3.5.6 → V3.6.0`** 升级章节（9 条，含升级六步核对）；§8 健康检查补信箱指标 curl。
+- `docs/单机部署指南.md`：版本头与演进段补 V3.5.6 / V3.6.0；§2 新增两条可选配置（日志与线程治理、`CARLA_MAILBOX_STRICT`）；§4 新增「原生崩溃结构性消除与重启就绪提示」段；§5 冒烟新增 V3.6.0 预期四条；§9 排障表新增 5 行。
+- `pyproject.toml`：`version` 3.5.6 → **3.6.0**。
+
+### 待办 / 已知边界
+
+- **LibCarla 原生 stdout 仍不经 formatter**：日志里的 `INFO:  Found the required file in cache! Carla/Maps/Nav/Town04.bin` 是 C++ 层直写进程 stdout，要统一格式需做 **fd 级输出泵**（子进程管道＋逐行重入 logging），风险高于收益，本版作为已知限制保留并写入文档，不擅自改动。
+- **未接入信箱的存量入口**：`traffic_sim/traffic_flow_manager.py`、`engine/vehicle_blueprint_generator.spawn_hunter_se`、`engine/hunter_se_vehicle.VehicleControllerFactory/apply_state` 在仓内**无生产调用点**（仅单测调用），因此本版未改造；一旦外部脚本或服务把它们接进 HTTP 线程，必须先走 `mailbox.run()`。
+- **传感器回调线程（LibCarla 自有线程）不进信箱**：`BuiltinScenario._on_sensor_data` 只做「一次性拷贝＋入有界队列」（不发 RPC，`EventDetector` 自带锁），因此不属于崩溃风险；若后续在回调里加任何 `world.*` 调用，本版守护会立即以 `carla_offowner_rpc_total` 报出。
+- **多引擎并行仍靠「一个端点一个 owner」**：不同 `host:rpc_port` 完全并行；同端点串行是预期行为。
+- **平台侧告警规则需同步**：沿用 V3.5.6（上游不在已改 503）；本版新增「装配 busy」失败形态，若平台按 `code` 匹配重试，建议对 `ExecutionUnavailable`/`scene_load` 失败做自动重发。
+- **compose / Makefile 镜像 tag 长期滞后**（见上方「分发」），下一版建议统一改用 `${HUNTERSIM_IMAGE}` 变量或由 `pyproject` 版本注入。
+- 沿用 V3.5.5 待办（未接入 NVENC 硬编码、自适应只降 JPEG 质量）。
+
+---

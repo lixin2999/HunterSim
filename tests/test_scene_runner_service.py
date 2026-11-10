@@ -12,13 +12,16 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hunter_sim.common.models import SceneStatus
+from hunter_sim.engine.carla_mailbox import reset_mailboxes
 from hunter_sim.scene_runner.event_detector import DetectedEvent
 from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
@@ -26,6 +29,7 @@ from hunter_sim.scene_runner.scene_config import (
     SpawnPoint,
 )
 from hunter_sim.scene_runner.scene_runner_service import SceneRunnerService
+from tests.mocks.carla_thread_mocks import held_endpoint_owner
 
 
 # ── Mock 基础设施 ───────────────────────────────────────────────────────────────
@@ -113,6 +117,7 @@ def _make_runner(
     *,
     world: Optional[_FakeWorld] = None,
     traffic_manager: Optional[Any] = None,
+    engine_key: str = "",
 ) -> SceneRunnerService:
     """构造带/不带 sim_data_producer 的 SceneRunnerService。"""
     world = world or _FakeWorld()
@@ -123,6 +128,7 @@ def _make_runner(
         vehicle_id="veh-test",
         scene_id="scene-test-001",
         traffic_manager=traffic_manager,
+        engine_key=engine_key,
     )
 
 
@@ -466,7 +472,11 @@ class TestEgoState:
         assert runner._get_ego_state()["velocity"] == pytest.approx(10.0)  # noqa: SLF001
 
     def test_status_payload_carries_nonzero_ego_state(self) -> None:
-        """上行 sim_status 的 ego_state 不能恒零（平台侧据此判断车辆在动）。"""
+        """上行 sim_status 的 ego_state 不能恒零（平台侧据此判断车辆在动）。
+
+        V3.6.0：``_publish_sim_status`` 只读 tick 线程写的缓存，不再自己发 RPC；
+        用例先用 ``_get_ego_state()`` 模拟一帧 tick 的取数，再验证上报内容。
+        """
         producer = _FakeProducer()
         runner = _make_runner(producer=producer)
         with patch.object(runner, "_apply_scene_weather"), \
@@ -476,6 +486,7 @@ class TestEgoState:
             runner.load_scene(_minimal_config())
         runner._scenario = _BuiltinLikeScenario(_vehicle())  # noqa: SLF001
 
+        runner._get_ego_state()  # noqa: SLF001  等价于 tick 线程每帧取数写缓存
         runner._publish_sim_status()  # noqa: SLF001
 
         msg = producer.status_calls[-1]
@@ -622,3 +633,204 @@ class TestRestoreAsync:
         assert world.settings.synchronous_mode is True
         assert world.settings.fixed_delta_seconds == pytest.approx(0.02)
         traffic_manager.set_synchronous_mode.assert_called_with(True)
+
+
+@pytest.fixture
+def _clean_mailboxes() -> Iterator[None]:
+    reset_mailboxes()
+    yield
+    reset_mailboxes()
+
+
+class TestOffOwnerReadsDegradeToCache:
+    """V3.6.0：端点被 tick 线程占住时，其他线程一律不得碰 CARLA。
+
+    原生崩溃的唯一成因就是「两个线程同时操作同一个 Client 连接」；这里的守护
+    不是日志告警，而是**直接拒接 RPC**并退回缓存/空值：读数允许缺席，
+    不允许用崩溃换读数。
+    """
+
+    def test_ego_state_read_returns_cache_without_rpc(self, _clean_mailboxes: None) -> None:
+        world = _FakeWorld()
+        world.get_actors = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("owner 占用期间不得直读 CARLA")
+        )
+        runner = _make_runner(world=world, engine_key="127.0.0.1:2071")
+        runner._ego_state_cache = {"x": 3.5, "velocity": 8.0}  # noqa: SLF001
+
+        with held_endpoint_owner(runner.mailbox):
+            state = runner._get_ego_state()  # noqa: SLF001
+
+        assert state == {"x": 3.5, "velocity": 8.0}
+        world.get_actors.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_actor_count_read_returns_cache_without_rpc(self, _clean_mailboxes: None) -> None:
+        world = _FakeWorld()
+        world.get_actors = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("owner 占用期间不得直读 CARLA")
+        )
+        runner = _make_runner(world=world, engine_key="127.0.0.1:2072")
+        runner._actors_count_cache = 7  # noqa: SLF001
+
+        with held_endpoint_owner(runner.mailbox):
+            assert runner._get_actor_count() == 7  # noqa: SLF001
+
+        world.get_actors.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_ego_vehicle_world_fallback_is_skipped(self, _clean_mailboxes: None) -> None:
+        """场景对象里没有自车时的「世界兜底查询」在异线程直接放弃。"""
+        world = _FakeWorld()
+        world.get_actors = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("owner 占用期间不得直读 CARLA")
+        )
+        runner = _make_runner(world=world, engine_key="127.0.0.1:2073")
+
+        with held_endpoint_owner(runner.mailbox):
+            assert runner.ego_vehicle is None
+
+        world.get_actors.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_sim_status_publish_carries_no_rpc_when_endpoint_busy(
+        self, _clean_mailboxes: None
+    ) -> None:
+        """周期性状态上报由异线程触发时，只能读缓存（现场 503/崩溃同源路径）。"""
+        producer = _FakeProducer()
+        world = _FakeWorld()
+        world.get_actors = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("owner 占用期间不得直读 CARLA")
+        )
+        runner = _make_runner(producer=producer, world=world, engine_key="127.0.0.1:2074")
+        runner._state_mgr = MagicMock()  # noqa: SLF001
+        runner._state_mgr.get_snapshot.return_value.status.value = "RUNNING"  # noqa: SLF001
+        runner._state_mgr.get_snapshot.return_value.elapsed_seconds = 1.0  # noqa: SLF001
+        runner._state_mgr.get_snapshot.return_value.progress = 0.5  # noqa: SLF001
+        runner._state_mgr.get_snapshot.return_value.error_message = None  # noqa: SLF001
+        runner._ego_state_cache = {"x": 1.0}  # noqa: SLF001
+        runner._actors_count_cache = 3  # noqa: SLF001
+
+        with held_endpoint_owner(runner.mailbox):
+            runner._publish_sim_status()  # noqa: SLF001
+
+        world.get_actors.assert_not_called()  # type: ignore[attr-defined]
+        payload = producer.status_calls[-1]["payload"]
+        assert payload["actors_count"] == 3
+        assert payload["ego_state"]["x"] == 1.0
+
+    def test_teardown_is_deferred_while_owner_holds_endpoint(
+        self, _clean_mailboxes: None
+    ) -> None:
+        """无 tick 线程但端点被他人占用：收尾走信箱排队，本线程不发 RPC。"""
+        world = _FakeWorld()
+        traffic_manager = MagicMock()
+        runner = _make_runner(
+            world=world, traffic_manager=traffic_manager, engine_key="127.0.0.1:2075"
+        )
+        runner._state_mgr = MagicMock()  # noqa: SLF001
+        runner._state_mgr.status = SceneStatus.RUNNING  # noqa: SLF001
+
+        with held_endpoint_owner(runner.mailbox) as owner:
+            deferred = runner.stop(timeout_s=0.1)
+            assert deferred is True
+            assert world.apply_calls == 0, "收尾不得由调用线程执行"
+
+        # owner 线程退出前代执行了排队的收尾：世界回到异步
+        assert owner.executed >= 1
+        assert world.apply_calls == 1
+        traffic_manager.set_synchronous_mode.assert_called_once_with(False)
+
+    def test_owner_thread_still_reads_world_directly(self, _clean_mailboxes: None) -> None:
+        """守护不能把正常 tick 路径也堵死：owner 线程照旧读数。"""
+        vehicle = _vehicle()
+        world = SimpleNamespace(
+            get_actors=lambda: SimpleNamespace(filter=lambda _pattern: [vehicle])
+        )
+        runner = _make_runner(world=world, engine_key="127.0.0.1:2076")  # type: ignore[arg-type]
+
+        assert runner.mailbox.claim("MainThread", timeout=0.0) is True
+        try:
+            assert runner._get_ego_state()["x"] == pytest.approx(12.5)  # noqa: SLF001
+            assert runner._actor_from_world() is vehicle  # noqa: SLF001
+        finally:
+            runner.mailbox.relinquish()
+
+
+class TestTickLoopDrainsMailbox:
+    """V3.6.0：tick 循环必须**每帧**消费信箱，而不是等整个场景跑完。
+
+    只在循环退出时 ``drain()`` 会让场景运行期间的排队调用全部超时降级（场景
+    可跑几十分钟），信箱退化为「只能降级」，收尾/读数拿不到任何结果。
+    """
+
+    def test_off_owner_call_is_executed_while_loop_runs(
+        self, _clean_mailboxes: None
+    ) -> None:
+        runner = _make_runner(engine_key="127.0.0.1:2090")
+        runner._config = _minimal_config()  # noqa: SLF001
+        runner._state_mgr = None  # noqa: SLF001  不走 PAUSED 分支
+        runner._get_ego_state = lambda: {}  # type: ignore[method-assign]  # noqa: SLF001
+        runner._refresh_actor_states = lambda: None  # type: ignore[assignment]  # noqa: SLF001
+        runner._refresh_actor_count = lambda: None  # type: ignore[assignment]  # noqa: SLF001
+
+        def _owner() -> None:
+            if not runner.mailbox.claim("Tick-Drain", timeout=1.0):
+                return
+            try:
+                runner._run_loop_body()  # noqa: SLF001
+            finally:
+                runner.mailbox.relinquish()
+
+        thread = threading.Thread(target=_owner, name="Tick-Drain", daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while runner.mailbox.owner_name != "Tick-Drain":
+                assert time.monotonic() < deadline, "owner 未被 tick 线程拿到"
+                time.sleep(0.01)
+
+            result = runner.mailbox.run(
+                lambda: threading.current_thread().name,
+                name="drained_op",
+                timeout=2.0,
+                fallback="not-executed",
+            )
+
+            assert result == "Tick-Drain", "排队调用必须由 owner 线程代执行"
+            assert runner.mailbox.stats["executed"] >= 1
+        finally:
+            runner._stop_event.set()  # noqa: SLF001
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+
+    def test_paused_loop_still_drains(self, _clean_mailboxes: None) -> None:
+        """暂停不等于停止：收尾任务不能被暂停分支卡到超时。"""
+        runner = _make_runner(engine_key="127.0.0.1:2091")
+        runner._config = _minimal_config()  # noqa: SLF001
+        runner._state_mgr = MagicMock()  # noqa: SLF001
+        runner._state_mgr.status = SceneStatus.PAUSED
+
+        def _owner() -> None:
+            if not runner.mailbox.claim("Tick-Paused", timeout=1.0):
+                return
+            try:
+                runner._run_loop_body()  # noqa: SLF001
+            finally:
+                runner.mailbox.relinquish()
+
+        thread = threading.Thread(target=_owner, name="Tick-Paused", daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while runner.mailbox.owner_name != "Tick-Paused":
+                assert time.monotonic() < deadline, "owner 未被 tick 线程拿到"
+                time.sleep(0.01)
+
+            assert (
+                runner.mailbox.run(
+                    lambda: 1, name="paused_drained", timeout=2.0, fallback=0
+                )
+                == 1
+            )
+        finally:
+            runner._stop_event.set()  # noqa: SLF001
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()

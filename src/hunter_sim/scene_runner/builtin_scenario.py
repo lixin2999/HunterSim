@@ -402,7 +402,12 @@ class BuiltinScenario(CustomScenarioBase):
     # ── CustomScenarioBase 实现 ───────────────────────────────────────────
 
     def setup(self, world: Any) -> None:
-        """生成自车、交通参与者、事件传感器与仿真传感器。"""
+        """生成自车、交通参与者、事件传感器与仿真传感器。
+
+        V3.6.0：逐阶段落 INFO 锚点。原生崩溃（``0xC00000FD``/``0xC0000409``）不留
+        traceback，只能靠「最后一条日志是什么」判定崩在哪一步；旧版只在生成
+        成功后打日志，崩溃时刚好看不到正在执行的那一次 ``spawn_actor``。
+        """
         if self._ego is not None:
             # 同一 runner 重复下发场景：先回收上一场景 Actor，避免残影
             self.cleanup(world)
@@ -424,15 +429,29 @@ class BuiltinScenario(CustomScenarioBase):
         self._no_lead_warned_at = 0.0
 
         library = self._blueprint_library(world)
+        logger.info(
+            f"scenario_setup stage=blueprints scene={self._config.scene_id} "
+            f"participants_declared={len(self._config.traffic_participants)}"
+        )
         self._ego = self._spawn_ego(world, library)
         self._collect_parked_spawns()
         requested = list(self._config.traffic_participants)
         spawned_ids: list[str] = []
-        for participant in requested:
+        for index, participant in enumerate(requested, start=1):
+            logger.info(
+                f"scenario_setup stage=participant_begin index={index}/{len(requested)} "
+                f"id={participant.participant_id} "
+                f"type={getattr(participant, 'actor_type', 'unknown')} "
+                f"behavior={getattr(participant, 'behavior', 'unknown')}"
+            )
             if self._spawn_participant(world, library, participant):
                 spawned_ids.append(participant.participant_id)
+        logger.info(
+            f"scenario_setup stage=sensors spawned={len(spawned_ids)}/{len(requested)}"
+        )
         self._attach_event_sensors(world, library)
         self._attach_sim_sensors(world, library)
+        logger.info("scenario_setup stage=motion")
         self._configure_ego_motion()
 
         logger.info(

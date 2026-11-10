@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.5.6`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 / V3.4.3 / V3.4.4 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.4.3 让主视区回归 CARLA 原生 1080p 画质（overview 不再套用 `ADAPTER_STREAM_MAX_WIDTH` 降采样）、深度图预览默认勾选、修复行人 AI 附着坐标错误并新增蓝图回退/出生点重试/脚本化兜底，自车状态取不到时改返回空值不再写零位姿，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索，V3.4.4 修复自车状态取数误用 `get_rotation` 导致整场无数据、主视区改为 BGRA 直编 JPEG 快路径并给出慢编码告警、参与者映射兼容 `traffic_participants` 等别名键并输出可诊断汇总、场景收尾按阶段落日志以便定位 CARLA 原生崩溃，V3.5.0 对齐 HunterCore V1.26.0 场景语义：actor 三分类（vehicle/walker/cyclist/prop）、行为/触发条件按真实数值执行、平台事件每 tick 触发并输出 `TRIGGER_REACHED`、新增 `mapping.json` 与 `huntersim scene-check` 离线校验，V3.5.1 修复大地图冷启动 `load_map` 误用 10s 普通 RPC 超时导致实例 `failed`（地图加载单独放宽到 `CARLA_MAP_LOAD_TIMEOUT_SECONDS`，默认 180s），V3.5.2 修复 `relative_to_ego` 参与者出生点未按自车航向旋转导致「主车前看不到目标车」（环视相机回退）、`/viz` 新增「参与者」面板与 `/viz/api/instances/{id}/actors`（声明数/已生成/主视区 + 相对自车前向·左向），并修复 Kafka producer 超时组合非法致上报静默降级 no-op、viz 反代读取异常由 500 改为 502/504；V3.5.3 进一步修复 V3.5.2 的旋转基准取自「同步模式首 tick 前未同步的实时位姿」（仍表现为目标车落在数百米外、方位前后跳变）：参与者偏移改绕自车确定性出生点旋转、首个 tick 后补发 Traffic Manager 指令、不在行车道上的车辆出生点投影到车道中心、新增 `follow_condition_unmet` 跟车条件归因日志，并将 viz 反代长连接正常断开由逐条 WARNING 改为限频汇总；V3.5.4 让 `huntersim up` 具备崩溃自愈：子进程异常退出（典型为 CARLA 原生 fail-fast `0xC0000409` 带走 `carla-manager`）按退避自动重启且不再牵连其余服务，场景跑完后仿真端继续常驻等待平台下发下一个任务（`--no-restart` 保留旧行为），并在实例收尾补 `Execution plane releasing` / `Manager idle` 两条定位锚点；V3.5.5 针对主视区「幻灯片化」做了四件事：落到单帧轮询后按 10/20/40/80 s 递增退避**自动回探 MJPEG**（探测只读响应头、不打断当前画面）、推流名额改**租约制**（闲置 >30 s 自动回收、首帧异常路径立即归还）并在 `/health`·`/viz/api/status`·`/viz` 顶栏暴露 `stream.{clients,limit,fps}`、深度预览改**抽样先行 + 并发闸 + 上一帧缓存**（不再抢编码核）、环视编码**自适应降质** 85→78→72（不降分辨率、宽裕时升回、面板可读 `q` 档），并按仿真端机器配置（i7-14700KF / 32 GB / RTX 4070）把主视区默认帧率 10→**20 fps**（弱机 `ADAPTER_STREAM_FPS=10` + `overview_camera.fps=10.0` 回退）；V3.5.6 根治「大量 502」：查明 41 条 502 只是症状，真因是控制面两次**原生崩溃**（`0xC0000409` / `0xC00000FD`），由此消除两条「两个线程并发操作同一 `carla.Client` 连接」的路径——场景收尾期 `join` 上限 5→**20 s** 且 tick 线程仍持有世界时释放线程**不再碰 world/TM**（日志 `Execution plane release deferred`）、`get_ego_state()` 只读 tick 线程缓存不再退回跨线程直读 CARLA；代理把「上游暂时不在」由 502 改 **503 + `Retry-After`** 并加 2 s 熔断窗口，`/viz` 8 路轮询统一走退避闸门（不再刷屏）；`huntersim up` 把 NTSTATUS 退出码直接译成中文原因））。
+- **当前版本**：`3.6.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 / V3.4.3 / V3.4.4 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.4.3 让主视区回归 CARLA 原生 1080p 画质（overview 不再套用 `ADAPTER_STREAM_MAX_WIDTH` 降采样）、深度图预览默认勾选、修复行人 AI 附着坐标错误并新增蓝图回退/出生点重试/脚本化兜底，自车状态取不到时改返回空值不再写零位姿，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索，V3.4.4 修复自车状态取数误用 `get_rotation` 导致整场无数据、主视区改为 BGRA 直编 JPEG 快路径并给出慢编码告警、参与者映射兼容 `traffic_participants` 等别名键并输出可诊断汇总、场景收尾按阶段落日志以便定位 CARLA 原生崩溃，V3.5.0 对齐 HunterCore V1.26.0 场景语义：actor 三分类（vehicle/walker/cyclist/prop）、行为/触发条件按真实数值执行、平台事件每 tick 触发并输出 `TRIGGER_REACHED`、新增 `mapping.json` 与 `huntersim scene-check` 离线校验，V3.5.1 修复大地图冷启动 `load_map` 误用 10s 普通 RPC 超时导致实例 `failed`（地图加载单独放宽到 `CARLA_MAP_LOAD_TIMEOUT_SECONDS`，默认 180s），V3.5.2 修复 `relative_to_ego` 参与者出生点未按自车航向旋转导致「主车前看不到目标车」（环视相机回退）、`/viz` 新增「参与者」面板与 `/viz/api/instances/{id}/actors`（声明数/已生成/主视区 + 相对自车前向·左向），并修复 Kafka producer 超时组合非法致上报静默降级 no-op、viz 反代读取异常由 500 改为 502/504；V3.5.3 进一步修复 V3.5.2 的旋转基准取自「同步模式首 tick 前未同步的实时位姿」（仍表现为目标车落在数百米外、方位前后跳变）：参与者偏移改绕自车确定性出生点旋转、首个 tick 后补发 Traffic Manager 指令、不在行车道上的车辆出生点投影到车道中心、新增 `follow_condition_unmet` 跟车条件归因日志，并将 viz 反代长连接正常断开由逐条 WARNING 改为限频汇总；V3.5.4 让 `huntersim up` 具备崩溃自愈：子进程异常退出（典型为 CARLA 原生 fail-fast `0xC0000409` 带走 `carla-manager`）按退避自动重启且不再牵连其余服务，场景跑完后仿真端继续常驻等待平台下发下一个任务（`--no-restart` 保留旧行为），并在实例收尾补 `Execution plane releasing` / `Manager idle` 两条定位锚点；V3.5.5 针对主视区「幻灯片化」做了四件事：落到单帧轮询后按 10/20/40/80 s 递增退避**自动回探 MJPEG**（探测只读响应头、不打断当前画面）、推流名额改**租约制**（闲置 >30 s 自动回收、首帧异常路径立即归还）并在 `/health`·`/viz/api/status`·`/viz` 顶栏暴露 `stream.{clients,limit,fps}`、深度预览改**抽样先行 + 并发闸 + 上一帧缓存**（不再抢编码核）、环视编码**自适应降质** 85→78→72（不降分辨率、宽裕时升回、面板可读 `q` 档），并按仿真端机器配置（i7-14700KF / 32 GB / RTX 4070）把主视区默认帧率 10→**20 fps**（弱机 `ADAPTER_STREAM_FPS=10` + `overview_camera.fps=10.0` 回退）；V3.5.6 根治「大量 502」：查明 41 条 502 只是症状，真因是控制面两次**原生崩溃**（`0xC0000409` / `0xC00000FD`），由此消除两条「两个线程并发操作同一 `carla.Client` 连接」的路径——场景收尾期 `join` 上限 5→**20 s** 且 tick 线程仍持有世界时释放线程**不再碰 world/TM**（日志 `Execution plane release deferred`）、`get_ego_state()` 只读 tick 线程缓存不再退回跨线程直读 CARLA；代理把「上游暂时不在」由 502 改 **503 + `Retry-After`** 并加 2 s 熔断窗口，`/viz` 8 路轮询统一走退避闸门（不再刷屏）；`huntersim up` 把 NTSTATUS 退出码直接译成中文原因；V3.6.0 把原生崩溃从「事后自愈」改为**结构性消除**：新增 `engine/carla_mailbox.py`，每个 CARLA 端点（`host:rpc_port`）只有一个 owner 线程（tick 线程），所有 CARLA 客户端访问收敛为**单线程信箱**——owner 内联执行、非 owner 入队由 owner **每 tick `drain()` 串行代执行**、拿不到结果才降级到缓存（返回调用方哨兵而非 `None`），装配类长事务不允许排队（`CARLA engine … is busy` 直接失败重发，宁失败不崩溃）；同时把 `configure_logging` 真正接进 `carla-manager` / `probes` 入口（此前为死配置），日志统一带线程名、uvicorn 原生输出并入同一出口、`/viz` 轮询访问日志降噪。自证入口：`huntersim_carla_offowner_rpc_total` 长期为 **0**））。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -40,6 +40,8 @@ huntersim up                     一键启动（V3.1.0：预检 → 两进程 �
 
 **画面出口**：`GET /api/v1/instances/{id}/stream.mjpg`（MJPEG，V3.5.5 起默认 20fps，受 `ADAPTER_STREAM_FPS` 与 `overview_camera.fps` 取小者约束）与 `/screenshot`（单帧 JPEG）；可视化客户端 `http://127.0.0.1:8090/viz` 直接复用这两个出口，不新增第二套业务面。画面降级（名额已满 / 首帧超时）后不再永久停在单帧轮询，会按计划回探并自动切回图像流。
 
+**CARLA 访问线程模型（V3.6.0）**：LibCarla 的 Python `Client / World / Actor` **不是线程安全的**，两个线程并发操作同一连接会直接把进程带进无 traceback 的原生退出（`0xC0000409` / `0xC00000FD` / `0xC0000005`）。因此本版本把访问收敛为**单线程信箱**（`engine/carla_mailbox.py`）：按端点 `host:rpc_port` 归一一个 **owner 线程**（即场景 tick 线程），owner 内联执行、其他线程入队由 owner **每 tick `drain()` 串行代执行**、等不到结果才降级读缓存，装配类长事务（`load_map` / `spawn` / 收尾）不允许排队而直接失败重试。详见 [`release.md`](release.md) 的 V3.6.0 章节。
+
 ---
 
 ## 2. 模块职责
@@ -51,7 +53,7 @@ huntersim up                     一键启动（V3.1.0：预检 → 两进程 �
 | `scene_runner/` | 场景契约与校验、状态机、事件检测、内置场景（含传感器挂载）、ScenarioRunner 适配 |
 | `sensor_sim/` | 传感型号剖面（`profiles.py`）、蓝图工厂、安装位、数据转换、`FrameHub` 帧汇聚、`McapRecorder` 录制、ROS2 桥接（可选） |
 | `traffic_sim/` | 交通流、Actor 行为、行为树、行人、触发条件 |
-| `engine/` | CARLA 原子能力：地图/天气/自车/蓝图/坐标/OpenDRIVE/控制器/服务端配置/本地进程自愈 |
+| `engine/` | CARLA 原子能力：地图/天气/自车/蓝图/坐标/OpenDRIVE/控制器/服务端配置/本地进程自愈；`carla_mailbox` 提供每端点唯一 owner 线程的单线程信箱（V3.6.0） |
 | `execution/` | 引擎端点库存与独占租约（`engine_pool`）、装配与释放（`plane`）、地图亲和选端、泄漏与僵尸租约回收 |
 | `cloud/` | `SimDataProducer`（有界队列 + DLQ）、`sim_data_mapper`、`vil_state_parser`、`BagUploader` |
 | `eval_service/` | 轨迹/舒适/安全/覆盖率四维评估与 S/A/B/C/D 评级 |
@@ -300,6 +302,15 @@ V3.0.0 新增指标：
 
 **502 / 503 口径（V3.5.6）**：`/viz` 反向代理在控制面重启或连接被中断时返回 **503 + `Retry-After: 2`**（`detail=control plane unavailable (restarting)`，即「上游暂时不在」，调用方据此退避重试）；`502`（`detail=upstream error`）现在只可能来自代理最后兜底分支捕获的真未知异常（旧版同场景会直接冒 500），读超时仍为 `504`（`upstream timeout`）。代理另带 2 s 熔断窗口，窗口内快速失败不再逐个撞已断开的端口（日志只留 1 条 WARNING + 1 条关窗汇总 INFO）。按 `502` 关键字匹配的平台侧告警规则需改为 `50[234]` 或直接改用 `/health`。
 
+V3.6.0 新增指标（CARLA 单线程信箱）：
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `huntersim_carla_mailbox_tasks_total{engine,op,result}` | Counter | 信箱任务终态：`ok`（owner 内联或排队后执行成功）/ `queued`（已入队等待）/ `timeout`（等不到结果降级）/ `dropped`（owner 已退出被丢弃）。`timeout` 持续增长说明 tick 线程长时间不消费信箱 |
+| `huntersim_carla_offowner_rpc_total{engine,op}` | Counter | **非 owner 线程直读 CARLA 的违规计数，长期为 `0` 是本版正确性断言**。非 0 即说明还有一条路径没收敛进信箱（正是原生崩溃的前置条件），排查入口 `CARLA RPC off owner thread` 日志行 |
+
+排查开关：`CARLA_MAILBOX_STRICT=1`（违规直接抛 `CarlaThreadViolation` 而不降级，适用于测试/回归环境）、`HUNTER_SIM_LOG_ACCESS_POLLING=1`（恢复 `/viz` 轮询访问日志逐条输出）。
+
 ---
 
 ## 8. 开发与测试
@@ -314,8 +325,8 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1468 passed`（单元 + 集成，V3.5.6 新增 16 项并发/退避回归守卫），全仓行覆盖 **82.7%**（门禁 ≥80%）。
-- **类型**：`mypy src/hunter_sim`（strict）**90 个源文件 0 错误**。
+- **测试**：`1536 passed`（单元 + 集成，V3.6.0 新增 68 项信箱/日志回归守卫），全仓行覆盖 **82.7%**（门禁 ≥80%）。
+- **类型**：`mypy src/hunter_sim`（strict）**91 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。
 - CARLA / ROS2 / mcap 未安装的机器上，测试通过 `sys.modules` 桩注入（`tests/mocks/carla_mocks.py`）无引擎运行。

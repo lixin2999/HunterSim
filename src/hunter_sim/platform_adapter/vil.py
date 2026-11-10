@@ -275,6 +275,9 @@ class VILRuntime:
                 if self._vil_settings.lights_enabled
                 else None
             ),
+            # V3.6.0：把端点信箱交给同步服务——异线程调 apply_once / 再起 tick
+            # 循环时会被直接拦下（写 Actor 位姿只能由持有端点的线程做）
+            mailbox=getattr(runner, "mailbox", None),
         )
         self._bound_vehicle = vehicle
         logger.info(f"VIL runtime bound to ego actor: sim_id={self._sim_id}")

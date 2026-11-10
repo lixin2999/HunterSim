@@ -16,6 +16,7 @@ from typing import Any, Optional, Protocol
 from hunter_sim.common.exceptions import CarlaSimulationError, SimTimeoutError
 from hunter_sim.common.models import Transform, VehicleState, VILSettings
 from hunter_sim.common.utils import get_logger
+from hunter_sim.engine.carla_mailbox import CarlaMailbox
 from hunter_sim.engine.coordinate_converter import CoordinateTransformer
 from hunter_sim.vil_mapper.data_health_monitor import DataHealthMonitor, DataHealthStatus
 from hunter_sim.vil_mapper.frame_aligner import AlignedFrame, FrameAligner
@@ -103,6 +104,9 @@ class VILSyncService:
         aligner: 帧对齐器；None 时按 ``settings`` 自建（V3.0.0）。
         overlay: 感知叠加渲染器；None 表示不绘制感知框。
         visualizer: 状态可视化器（灯光同步）；None 时灯光跳过。
+        mailbox: 端点 CARLA 单线程信箱（V3.6.0）；非 owner 线程调用时拒绝写
+            CARLA，且不允许再起第二个 ``world.tick()`` 循环。None 时不拦截
+            （单线程测试/旧调用方保持原行为）。
     """
 
     def __init__(
@@ -118,6 +122,7 @@ class VILSyncService:
         aligner: Optional[FrameAligner] = None,
         overlay: Optional[PerceptionOverlay] = None,
         visualizer: Optional[StateVisualizer] = None,
+        mailbox: Optional[CarlaMailbox] = None,
     ) -> None:
         self._settings = settings
         self._buffer = buffer
@@ -134,6 +139,7 @@ class VILSyncService:
         )
         self._overlay = overlay
         self._visualizer = visualizer
+        self._mailbox = mailbox
 
         self._running = threading.Event()
         self._lock = threading.Lock()
@@ -164,7 +170,22 @@ class VILSyncService:
             )
 
     def start_sync_loop(self) -> None:
-        """启动同步主循环（阻塞调用，应在独立线程中执行）。"""
+        """启动同步主循环（阻塞调用，应在独立线程中执行）。
+
+        V3.6.0：本循环会自己 ``world.tick()``。平台链路的 tick 由场景运行线程
+        独占（适配器只把 :meth:`apply_once` 挂在每 tick 钩子上），在这里再起一个
+        循环等于「两个线程同时 tick 同一个 world」：除了帧同步错乱，还直接制造
+        原生崩溃。因此端点已被其他线程占住时拒绝启动。
+        """
+        if self._mailbox is not None and not self._mailbox.can_access_directly(
+            "world.tick(vil_sync_loop)"
+        ):
+            raise CarlaSimulationError(
+                "vil_sync_loop",
+                f"CARLA engine is already owned by tick thread "
+                f"'{self._mailbox.owner_name}'; a second world.tick() loop is refused "
+                "(use apply_once() on the existing tick hook)",
+            )
         self._running.set()
         logger.info("VIL sync loop started (50Hz target)")
         delta_seconds = 0.02  # 50Hz
@@ -250,6 +271,14 @@ class VILSyncService:
         Returns:
             ``"applied"`` / ``"skipped"`` / ``"no_data"`` / ``"interrupted"``。
         """
+        # 0. 线程边界（V3.6.0）：本方法会写 CARLA Actor 状态（set_transform /
+        #    target_velocity / 灯光），只能在持有端点的 tick 线程上执行；异线程
+        #    调用直接跳过——位姿缺席可恢复，并发操作 Client 不可恢复
+        if self._mailbox is not None and not self._mailbox.can_access_directly(
+            "actor.set_transform(vil_apply)"
+        ):
+            return "skipped"
+
         # 1. 健康检查
         report = self._health.check()
         if report.status == DataHealthStatus.INTERRUPTED:

@@ -24,6 +24,11 @@ from hunter_sim.common.exceptions import (
 )
 from hunter_sim.common.models import SceneStatus
 from hunter_sim.common.utils import get_logger
+from hunter_sim.engine.carla_mailbox import (
+    CarlaMailbox,
+    CarlaMailboxTimeout,
+    get_mailbox,
+)
 from hunter_sim.engine.weather_manager import (
     PRESET_ENVIRONMENTS,
     WeatherManager,
@@ -56,6 +61,17 @@ _ACTOR_STATE_REFRESH_TICKS = 10
 #: 非线程安全，进程无 traceback 原生退出（0xC0000409）。多等 15s 远比崩溃便宜。
 _RUNNER_JOIN_TIMEOUT_S = 20.0
 
+#: 场景装配/收尾在信箱上排队等待的上限（秒）：``load_world`` + ``setup`` 现场实测
+#: 可达 10~30s（首次导航网格构建），必须比引擎锁宽松，否则正常装配会被判超时。
+_SETUP_MAILBOX_TIMEOUT_S = 120.0
+
+#: tick 线程等待前任 owner 归还端点的上限（秒）：超了就拒绝启动循环，
+#: 宁可场景 FAILED 让平台重下发，也不能两个线程并发 tick 同一个 world。
+_OWNER_CLAIM_TIMEOUT_S = 10.0
+
+#: ``mailbox.run`` 未执行时的哨兵 fallback（区分「执行了但返回 None」与「没执行」）
+_NOT_EXECUTED = object()
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -78,6 +94,10 @@ class SceneRunnerService:
         ros_bridge: ROS2 桥接器（可选出口）。
         screenshot_quality: 截图 JPEG 质量（Pillow 可用时生效）。
         stream_max_width: 回传画面最大宽度（0 表示不降采样）。
+        traffic_manager: 同步模式下的 Traffic Manager 实例。
+        traffic_manager_port: Traffic Manager 端口。
+        engine_key: CARLA 端点标识（``host:rpc_port``），决定使用哪个单线程信箱；
+            同端点的所有运行器共用一个信箱，因此 tick 线程与其他线程不会并发发 RPC。
     """
 
     def __init__(
@@ -101,6 +121,7 @@ class SceneRunnerService:
         stream_max_width: int = 0,
         traffic_manager: Optional[Any] = None,
         traffic_manager_port: int = 8000,
+        engine_key: str = "",
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -122,6 +143,9 @@ class SceneRunnerService:
         # Traffic Manager（同步模式下必须同步推进 autopilot 车辆）
         self._traffic_manager = traffic_manager
         self._traffic_manager_port = int(traffic_manager_port)
+        # V3.6.0 单线程信箱：本运行器的全部 CARLA 调用按端点串行派发
+        self._engine_key = str(engine_key or "default")
+        self._mailbox: CarlaMailbox = get_mailbox(self._engine_key)
 
         # 天气管理器：API 层天气控制（scenes.set_weather_impl）与渐变推进均使用此实例
         self._weather_manager = WeatherManager(world)
@@ -151,6 +175,8 @@ class SceneRunnerService:
         # 可视化「参与者」面板靠它看到「谁在跑、跑多快、在自车哪个方位」
         self._actor_state_cache: list[dict[str, Any]] = []
         self._actor_state_warn_at: float = 0.0
+        # Actor 数量缓存（tick 线程刷新）：sim_status 只能读缓存，读缓存不碰 CARLA
+        self._actors_count_cache: int = 0
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -171,6 +197,11 @@ class SceneRunnerService:
     def ego_vehicle(self) -> Any:
         """当前场景自车 Actor（未就绪时返回 None）。"""
         return self._resolve_ego_actor()
+
+    @property
+    def mailbox(self) -> CarlaMailbox:
+        """本运行器所属端点的 CARLA 单线程信箱（V3.6.0，排障/测试用）。"""
+        return self._mailbox
 
     def _resolve_ego_actor(self) -> Any:
         """解析自车 Actor：场景对象各形态访问器 → 世界兜底。
@@ -211,9 +242,17 @@ class SceneRunnerService:
         return None
 
     def _actor_from_world(self) -> Any:
-        """世界兜底寻找自车：``role_name=hero`` 优先，否则「唯一车辆」。"""
+        """世界兜底寻找自车：``role_name=hero`` 优先，否则「唯一车辆」。
+
+        会发 CARLA RPC（``world.get_actors()``），只允许 tick 线程/无 owner 时调用；
+        HTTP 线程走到这里就是跨线程并发 RPC 的现场，信箱守卫会打出可定位告警。
+        """
         world = self._world
         if world is None:
+            return None
+        # V3.6.0：非 owner 线程直接放弃兜底查找（告警不能阻止崩溃，只能降级）：
+        # 宁可自车引用缺席，也不能让 HTTP/executor 线程对着正在 tick 的连接发 RPC
+        if not self._mailbox.can_access_directly("world.get_actors(ego_fallback)"):
             return None
         try:
             actors = list(world.get_actors().filter("vehicle.*"))
@@ -305,15 +344,41 @@ class SceneRunnerService:
         # 重新切回同步，否则下一轮 world.tick() 不再驱动仿真
         thread = self._thread
         if thread is None or not thread.is_alive():
-            self._ensure_sync_mode()
+            self._mailbox.run(
+                self._ensure_sync_mode,
+                name="ensure_sync_mode",
+                timeout=_SETUP_MAILBOX_TIMEOUT_S,
+            )
 
+        try:
+            # V3.6.0：setup 全程在信箱内执行 → 同端点上任何其他线程的 CARLA 调用
+            # 只能排队或降级，不会与本方法并发操作同一个 Client 连接。
+            # allow_queue=False：反之（本端点被上一个场景的 tick 线程占住）时，
+            # 不把 setup 排进别人的循环，而是等锁超时后明确判失败重下发。
+            self._mailbox.run_required(
+                self._load_scene_impl,
+                config,
+                scenario,
+                name="scene_load",
+                timeout=_SETUP_MAILBOX_TIMEOUT_S,
+                allow_queue=False,
+            )
+        except CarlaMailboxTimeout as exc:
+            raise CarlaSimulationError("scene_load", str(exc)) from exc
+
+    def _load_scene_impl(
+        self, config: SceneConfig, scenario: Optional[CustomScenarioBase]
+    ) -> None:
+        """场景装配实体（只能经 ``load_scene`` 的信箱派发进入）。"""
         with self._lock:
             logger.info(f"Loading scene: {config.scene_id} ({config.mode.value} mode)")
 
             # 回收上一场景 Actor，避免重复下发后旧 Actor 残影
+            logger.info(f"Scene load stage=cleanup scene={config.scene_id}")
             self._cleanup()
 
             self._config = config
+            logger.info(f"Scene load stage=weather scene={config.scene_id}")
             self._apply_scene_weather(config)
             self._state_mgr = SceneStateManager(
                 scene_id=config.scene_id,
@@ -343,6 +408,10 @@ class SceneRunnerService:
                 )
             self._scenario = scenario
             self._scenario_cleaned = False
+            participants = len(getattr(config, "participants", ()) or ())
+            logger.info(
+                f"Scene load stage=setup scene={config.scene_id} participants={participants}"
+            )
 
             try:
                 scenario.setup(self._world)
@@ -353,7 +422,13 @@ class SceneRunnerService:
                 raise CarlaSimulationError("scene_setup", str(exc)) from exc
 
             self._state_mgr.transition_to(SceneStatus.READY)
-            logger.info(f"Scene '{config.scene_id}' ready to start")
+            # setup 在本线程的信箱临界区内完成，此时读 Actor 数是安全的（无并发）；
+            # 写入缓存后 sim_status 就只读缓存，不再因 HTTP 线程触发 RPC
+            self._actors_count_cache = self._get_actor_count()
+            logger.info(
+                f"Scene load stage=ready scene={config.scene_id} "
+                f"actors_cached={self._actors_count_cache}"
+            )
 
     def start(self) -> None:
         """启动场景运行（非阻塞，在独立线程中执行仿真循环）。
@@ -424,10 +499,31 @@ class SceneRunnerService:
                 )
                 return True
 
-        self._restore_async()
-        self._cleanup()
+        # V3.6.0：收尾（apply_settings + Actor 销毁）必须在信箱内执行：本线程是
+        # owner 或端点无 owner 时内联；否则排队交给 owner，排不上则投递后返回
+        # deferred，绝不自己对着正在使用的 Client 发 RPC。
+        if (
+            self._mailbox.run(
+                self._teardown_world,
+                name="scene_stop",
+                timeout=timeout_s,
+                fallback=_NOT_EXECUTED,
+            )
+            is _NOT_EXECUTED
+        ):
+            self._mailbox.submit(self._teardown_world, name="scene_stop")
+            logger.warning(
+                f"Scene stop teardown deferred to CARLA owner thread "
+                f"(engine={self._engine_key}, waited={timeout_s:.1f}s)"
+            )
+            return True
         logger.info("Scene stopped and cleaned up")
         return False
+
+    def _teardown_world(self) -> None:
+        """世界收尾：先恢复异步再清理场景资源（幂等，只经信箱派发进入）。"""
+        self._restore_async()
+        self._cleanup()
 
     def destroy(self, timeout_s: float = _RUNNER_JOIN_TIMEOUT_S) -> bool:
         """销毁场景，释放所有资源。
@@ -487,7 +583,49 @@ class SceneRunnerService:
         self._actor_state_cache = states
 
     def _run_loop(self) -> None:
-        """场景运行主循环（独立线程执行）。"""
+        """场景运行主循环入口：先抢 CARLA owner，退出时在本线程收尾并释放。
+
+        V3.6.0：本线程从此刻起是端点上唯一有权访问 CARLA 的线程；其他线程的
+        CARLA 调用只能经信箱排队由本线程 ``drain()`` 代执行。抢不到 owner（上一
+        个 tick 线程仍在收尾）时直接判场景失败，不开第二个并发循环。
+        """
+        if not self._mailbox.claim(
+            threading.current_thread().name, timeout=_OWNER_CLAIM_TIMEOUT_S
+        ):
+            holder = self._mailbox.owner_name
+            logger.error(
+                f"Scene loop refused to start: CARLA engine '{self._engine_key}' is "
+                f"still owned by thread '{holder}'"
+            )
+            with self._lock:
+                if self._state_mgr and self._state_mgr.status == SceneStatus.RUNNING:
+                    self._state_mgr.transition_to(
+                        SceneStatus.FAILED,
+                        "carla_engine_busy: previous tick thread still owns the world",
+                    )
+            self._publish_terminal_status()
+            return
+        try:
+            self._run_loop_body()
+        finally:
+            # 收尾必须在 owner 释放前完成：释放后再操作 world 就没有串行保证了
+            # V3.4.4：收尾每一步都落 INFO——CARLA 原生 fail-fast 会让进程直接退出，
+            # 只能靠最后一条日志定位卡在哪一步（现场曾出现 completed 后无声退出）
+            logger.info("Scene loop exited: publishing terminal status")
+            self._publish_terminal_status()
+            # 先放行其他线程排进来的收尾/读数任务，再做本线程自己的收尾
+            drained = self._mailbox.drain(max_tasks=32)
+            logger.info(
+                f"Scene loop: restoring async world mode (drained={drained} queued task(s))"
+            )
+            self._restore_async()
+            logger.info("Scene loop: cleaning up scenario resources")
+            self._cleanup()
+            logger.info("Scene loop: cleanup finished, releasing CARLA ownership")
+            self._mailbox.relinquish()
+
+    def _run_loop_body(self) -> None:
+        """仿真主循环本体（由 ``_run_loop`` 在 owner 身份下调用）。"""
         delta_seconds = 0.02  # 50Hz
         tick_count = 0
         timeout_time = (
@@ -498,6 +636,11 @@ class SceneRunnerService:
 
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
+
+            # V3.6.0：每 tick 先替其他线程消费信箱（一次最多 _DRAIN_BATCH 条）。
+            # 只在循环退出时 drain 是不够的：场景可跑几十分钟，期间 HTTP/executor
+            # 线程排进来的读数与收尾调用会全部等到循环结束，等价于「永远超时降级」。
+            self._mailbox.drain()
 
             # 超时检查
             if time.perf_counter() > timeout_time:
@@ -514,6 +657,8 @@ class SceneRunnerService:
                     if now - self._last_status_publish >= self._status_interval:
                         self._last_status_publish = now
                         self._publish_sim_status()
+                # 暂停期间同样要替其他线程执行排队调用（收尾不能被暂停卡住）
+                self._mailbox.drain()
                 time.sleep(0.1)
                 continue
 
@@ -554,6 +699,7 @@ class SceneRunnerService:
                 # 参与者状态缓存（5Hz）：可视化面板与「拍不到」排查都靠它
                 if tick_count % _ACTOR_STATE_REFRESH_TICKS == 0:
                     self._refresh_actor_states()
+                    self._refresh_actor_count()
 
                 # 评估/回传采样钩子（VIL 轨迹、指标计算用）
                 if self._sample_sink is not None:
@@ -591,21 +737,12 @@ class SceneRunnerService:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        # 终态补发：运行循环 break 后平台需收到最终状态（而非停在最后一条 RUNNING）
-        # V3.4.4：收尾每一步都落 INFO——CARLA 原生 fail-fast 会让进程直接退出，
-        # 只能靠最后一条日志定位卡在哪一步（现场曾出现 completed 后无声退出）
-        logger.info("Scene loop exited: publishing terminal status")
-        self._publish_terminal_status()
-        # 先恢复异步再清理：同步模式下销毁 Actor/传感器会阻塞等待 tick
-        # （没有后续 tick 时即表现为 CARLA 卡死）；异步模式下销毁不依赖 tick
-        logger.info("Scene loop: restoring async world mode")
-        self._restore_async()
-        logger.info("Scene loop: cleaning up scenario resources")
-        self._cleanup()
-        logger.info("Scene loop: cleanup finished, thread exiting")
-
     def _restore_async(self) -> None:
-        """把世界与 Traffic Manager 恢复为异步模式（幂等、失败不抛）。"""
+        """把世界与 Traffic Manager 恢复为异步模式（幂等、失败不抛）。
+
+        会发 CARLA RPC，只能由 owner 线程经信箱进入。
+        """
+        self._mailbox.require_owner("world.apply_settings(async)")
         if self._traffic_manager is not None:
             try:
                 self._traffic_manager.set_synchronous_mode(False)
@@ -622,6 +759,7 @@ class SceneRunnerService:
 
     def _ensure_sync_mode(self) -> None:
         """把世界与 Traffic Manager 切回同步模式（重下发场景时幂等、失败不抛）。"""
+        self._mailbox.require_owner("world.apply_settings(sync)")
         if self._traffic_manager is not None:
             try:
                 self._traffic_manager.set_synchronous_mode(True)
@@ -754,10 +892,10 @@ class SceneRunnerService:
                 progress_percent=round(snap.progress * 100.0, 2),
                 elapsed_time=round(snap.elapsed_seconds, 3),
                 total_time=self._config.duration_seconds if self._config else 60.0,
-                actors_count=self._get_actor_count(),
+                actors_count=self._actors_count_cache,
                 collisions=self._get_collision_count(),
                 lane_invasions=self._get_lane_invasion_count(),
-                ego_state=self._get_ego_state(),
+                ego_state=dict(self._ego_state_cache),
                 events_triggered=self._get_event_count(),
                 message=message,
                 updated_at=time.time(),
@@ -841,11 +979,21 @@ class SceneRunnerService:
             logger.debug(f"publish_event_to_platform failed: {exc}")
 
     def _get_actor_count(self) -> int:
-        """获取世界中当前 Actor 数量（失败时返回 0）。"""
+        """获取世界中当前 Actor 数量（失败时返回 0）。
+
+        会发 CARLA RPC，仅 owner/无 owner 线程可调；周期上报走
+        :meth:`_refresh_actor_count` 写的缓存。
+        """
+        if not self._mailbox.can_access_directly("world.get_actors(count)"):
+            return self._actors_count_cache
         try:
             return len(self._world.get_actors())
         except Exception:  # noqa: BLE001
             return 0
+
+    def _refresh_actor_count(self) -> None:
+        """刷新 Actor 数量缓存（仅 tick 线程调用，与参与者状态同频 5Hz）。"""
+        self._actors_count_cache = self._get_actor_count()
 
     def _get_collision_count(self) -> int:
         """获取碰撞计数（从事件检测器读）。"""
@@ -901,7 +1049,12 @@ class SceneRunnerService:
         避免 50Hz 下形成日志风暴。
 
         成功读取时同步更新 ``_ego_state_cache``，供 executor 线程无锁读取。
+
+        V3.6.0：非 owner 线程走到这里时返回缓存而不是发 RPC——历史上正是这条
+        路径（进度轮询/状态上报）与 tick 线程并发操作 Client 导致原生崩溃。
         """
+        if not self._mailbox.can_access_directly("actor.get_transform(ego_state)"):
+            return dict(self._ego_state_cache)
         try:
             vehicle = self.ego_vehicle
         except Exception as exc:  # noqa: BLE001  解析异常与读取异常分开定位

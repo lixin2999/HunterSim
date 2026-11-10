@@ -13,14 +13,24 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
+from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.common.models import VILSettings
+from hunter_sim.engine.carla_mailbox import CarlaMailbox, reset_mailboxes
 from hunter_sim.vil_mapper.data_health_monitor import DataHealthStatus
 from hunter_sim.vil_mapper.telemetry_buffer import TelemetryBuffer
 from hunter_sim.vil_mapper.vil_sync_service import VILSyncService
+from tests.mocks.carla_thread_mocks import held_endpoint_owner
+
+
+@pytest.fixture(autouse=True)
+def _clean_mailboxes() -> Iterator[None]:
+    reset_mailboxes()
+    yield
+    reset_mailboxes()
 
 
 # ── 桩件 ──────────────────────────────────────────────────────────────────────
@@ -152,3 +162,60 @@ class TestTimeoutLogThrottle:
         assert not thread.is_alive()
         assert svc.stats.sync_errors == 0
         assert svc.stats.total_syncs >= 1
+
+
+class TestMailboxThreadGuards:
+    """V3.6.0：注入端点信箱后，VIL 写 CARLA 只能在持有端点的线程上做。
+
+    ``apply_once`` 由场景 tick 线程调用（正常路径），但 ``start_sync_loop`` 会
+    自己 ``world.tick()``：一旦在 tick 线程已在跑时被拉起来，就是「两个线程
+    tick 同一个 world」——除帧同步错乱外还会触发原生崩溃。
+    """
+
+    @staticmethod
+    def _service_with(mailbox: CarlaMailbox) -> tuple[VILSyncService, _FakeVehicle, _FakeWorld]:
+        vehicle = _FakeVehicle()
+        world = _FakeWorld()
+        svc = VILSyncService(
+            settings=VILSettings(),
+            buffer=TelemetryBuffer(),
+            coord_transformer=_FakeCoord(),  # type: ignore[arg-type]
+            extrapolator=_FakeExtrapolator(),  # type: ignore[arg-type]
+            health_monitor=_FakeHealth(DataHealthStatus.OK),  # type: ignore[arg-type]
+            vehicle_actor=vehicle,  # type: ignore[arg-type]
+            world=world,  # type: ignore[arg-type]
+            mailbox=mailbox,
+        )
+        return svc, vehicle, world
+
+    def test_apply_once_skips_when_endpoint_owned_by_other_thread(self) -> None:
+        mailbox = CarlaMailbox("127.0.0.1:2091")
+        svc, vehicle, _world = self._service_with(mailbox)
+
+        with held_endpoint_owner(mailbox):
+            outcome = svc.apply_once()
+
+        assert outcome == "skipped"
+        assert vehicle.transforms == [], "非 owner 线程不得写 Actor 位姿"
+
+    def test_apply_once_still_writes_for_owner_thread(self) -> None:
+        """守护不能堵死正常 tick 路径：owner 线程照旧写位姿。"""
+        mailbox = CarlaMailbox("127.0.0.1:2092")
+        svc, vehicle, _world = self._service_with(mailbox)
+        assert mailbox.claim("MainThread", timeout=0.0)
+        try:
+            svc.apply_once()
+        finally:
+            mailbox.relinquish()
+
+        assert len(vehicle.transforms) <= 1  # 无新栅格时允许 skipped，但不得报错
+
+    def test_start_sync_loop_refused_while_tick_thread_owns_endpoint(self) -> None:
+        mailbox = CarlaMailbox("127.0.0.1:2093")
+        svc, _vehicle, world = self._service_with(mailbox)
+
+        with held_endpoint_owner(mailbox):
+            with pytest.raises(CarlaSimulationError, match="vil_sync_loop"):
+                svc.start_sync_loop()
+
+        assert world.ticks == 0, "不得在别的线程上 tick 同一个 world"

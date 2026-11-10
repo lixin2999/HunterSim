@@ -1281,13 +1281,17 @@ def _runner_actor_states(runner: Any) -> list[dict[str, Any]]:
 
 
 def _runner_ego_state(runner: Any) -> dict[str, Any]:
-    """安全读取运行器自车状态（用于进度视图）。"""
+    """安全读取运行器自车状态（用于进度视图）。
+
+    V3.6.0：**不再回退到私有 ``_get_ego_state``**。那个回退会从 HTTP/watchdog 线程
+    直接对 world/actor 发 CARLA RPC（与 tick 线程并发），正是原生崩溃的入口之一；
+    进度字段允许缺席，不允许用崩溃换读数。
+    """
     try:
         getter = getattr(runner, "get_ego_state", None)
         if callable(getter):
             return dict(getter() or {})
-        getter = getattr(runner, "_get_ego_state", None)
-        return dict(getter() or {}) if callable(getter) else {}
+        return {}
     except Exception:  # noqa: BLE001
         return {}
 

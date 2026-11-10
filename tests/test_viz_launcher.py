@@ -96,6 +96,7 @@ def _launcher(
     *,
     popen: Optional[Callable[[Sequence[str]], Any]] = None,
     probe: Optional[Callable[[str], bool]] = None,
+    port_probe: Optional[Callable[[str, int], bool]] = None,
     opener: Optional[Callable[[str], Any]] = None,
     sleeper: Optional[Callable[[float], None]] = None,
     emit: Optional[Callable[[str], None]] = None,
@@ -103,6 +104,8 @@ def _launcher(
     return Launcher(
         popen=popen if popen is not None else (lambda argv: _Process()),
         probe=probe if probe is not None else (lambda url: True),
+        # 端口占用探测不得碰真实网络（V3.6.0）：默认视为端口空闲
+        port_probe=port_probe if port_probe is not None else (lambda host, port: False),
         opener=opener if opener is not None else (lambda url: True),
         sleeper=sleeper if sleeper is not None else (lambda seconds: None),
         emit=emit if emit is not None else (lambda text: None),
@@ -512,6 +515,63 @@ class TestGuardAutoRestart:
         assert launcher.run([_manager()], _VIZ_URL) == 0
         assert len(launched) == 3
         assert not any("停止守护" in line for line in emitted)
+
+
+class TestRelaunchPortConflictDiagnosis:
+    """V3.6.0：重启失败时区分「慢启动」与「残留进程占住端口」。
+
+    Windows 下父进程被杀不会带走 CARLA Server 孙进程；端口被占时每次重启都只会
+    卡在就绪阶段，不给出可执行提示就只能看到「连续 N 次重启仍未稳定」。
+    """
+
+    CRASH = 3221226505
+
+    def _relaunch(
+        self,
+        emitted: list[str],
+        *,
+        port_ok: bool,
+        spec: Optional[ServiceSpec] = None,
+    ) -> bool:
+        target = spec if spec is not None else _manager()
+        stuck = _Process(codes=[self.CRASH])
+        launcher = Launcher(
+            popen=lambda argv: stuck,
+            probe=lambda url: False,
+            port_probe=lambda host, port: port_ok,
+            opener=lambda url: True,
+            sleeper=lambda seconds: None,
+            emit=emitted.append,
+        )
+        return launcher._relaunch(target, 0, [(target, stuck)], 0.01)  # noqa: SLF001
+
+    def test_orphan_holding_port_gets_actionable_hint(self) -> None:
+        emitted: list[str] = []
+
+        assert self._relaunch(emitted, port_ok=True) is False
+
+        assert any("已被占用但健康探测不通" in line for line in emitted)
+        assert any("Get-NetTCPConnection -LocalPort 8090" in line for line in emitted)
+        assert not any("继续重试" in line for line in emitted)
+
+    def test_free_port_keeps_plain_retry_message(self) -> None:
+        emitted: list[str] = []
+
+        assert self._relaunch(emitted, port_ok=False) is False
+
+        assert any("继续重试" in line for line in emitted)
+        assert not any("已被占用" in line for line in emitted)
+
+    def test_tls_service_never_reports_conflict(self) -> None:
+        """TLS 侧只有端口一个信号，误报会把可用服务判死 → 不给提示。"""
+        emitted: list[str] = []
+        tls_spec = ServiceSpec(
+            name="probes", host="127.0.0.1", port=8080, argv=("python", "-m", "x"), tls=True
+        )
+
+        assert self._relaunch(emitted, port_ok=True, spec=tls_spec) is False
+
+        assert not any("已被占用" in line for line in emitted)
 
 
 class TestRunOnReady:

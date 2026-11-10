@@ -12,6 +12,7 @@ import threading
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.utils import get_logger
+from hunter_sim.engine.carla_mailbox import get_mailbox
 from hunter_sim.execution.engine_pool import EngineEndpoint, EnginePool
 from hunter_sim.scene_runner.scene_runner_service import SceneRunnerService
 
@@ -20,8 +21,16 @@ logger = get_logger(__name__)
 # 场景运行循环帧间隔（50Hz）
 _DEFAULT_FIXED_DELTA_SECONDS = 0.02
 
+#: 装配/释放类长事务在信箱上等端点空闲的上限（秒）。超时即明确失败：
+#: 上一个场景的 tick 线程还在推世界时，绝不允许对同一个 world 发 ``load_world``
+#: （旧行为是两个线程并发操作同一个 Client 连接 → 原生崩溃）。
+_ASSEMBLY_MAILBOX_TIMEOUT_S = 30.0
+
 # MapManager 解析器：按引擎端点返回 MapManager（None 表示该端点不可用）
 MapManagerResolver = Callable[[EngineEndpoint], Optional[Any]]
+
+#: 信箱未能执行时的哨兵 fallback（区分「执行了但返回 None」与「根本没执行」）
+_NOT_EXECUTED = object()
 
 
 class ExecutionUnavailable(RuntimeError):
@@ -96,6 +105,8 @@ class ExecutionPlane:
         # 实例 → (world, traffic_manager)：释放时用于恢复异步模式，避免 CARLA
         # 停在同步模式等待 tick（场景结束后表现为模拟器卡死）
         self._cleanup_info: dict[str, tuple[Any, Any]] = {}
+        # 实例 → 端点 key：与 _cleanup_info 同命期，供收尾时定位应走哪个信箱
+        self._cleanup_engines: dict[str, str] = {}
         # 端点 key → 引擎级装配/销毁锁（在注册表锁内懒创建，避免建锁竞态）
         self._engine_locks: dict[str, threading.RLock] = {}
         # V2.9.0：在途装配计数与取消标记（解决"装配窗口内销毁实例"的泄漏竞态）
@@ -181,10 +192,36 @@ class ExecutionPlane:
                         f"No CARLA client available for engine '{lease.endpoint.key}' "
                         f"(target {lease.endpoint.host}:{lease.endpoint.rpc_port})"
                     )
-                world = map_manager.load_map(instance.map_id)
-                sync_enabled = self._configure_world(world)
+                # V3.6.0：load_world / apply_settings / TM 切换全部经端点信箱串行派发。
+                # 引擎锁只能串行化 plane 自己的调用，盖不到 tick 线程；信箱才补上这一块。
+                # allow_queue=False：装配是「独占端点的长事务」，宁可等锁超时失败，
+                # 也不能把 load_world 排进上一个场景 tick 循环里执行。
+                mailbox = get_mailbox(lease.endpoint.key)
+                world = mailbox.run_required(
+                    map_manager.load_map,
+                    instance.map_id,
+                    name="load_world",
+                    timeout=_ASSEMBLY_MAILBOX_TIMEOUT_S,
+                    allow_queue=False,
+                )
+                sync_enabled = bool(
+                    mailbox.run_required(
+                        self._configure_world,
+                        world,
+                        name="configure_world",
+                        timeout=_ASSEMBLY_MAILBOX_TIMEOUT_S,
+                        allow_queue=False,
+                    )
+                )
                 traffic_manager = (
-                    self._configure_traffic_manager(map_manager, lease.endpoint.tm_port)
+                    mailbox.run_required(
+                        self._configure_traffic_manager,
+                        map_manager,
+                        lease.endpoint.tm_port,
+                        name="configure_traffic_manager",
+                        timeout=_ASSEMBLY_MAILBOX_TIMEOUT_S,
+                        allow_queue=False,
+                    )
                     if sync_enabled
                     else None
                 )
@@ -193,9 +230,11 @@ class ExecutionPlane:
                     lease.endpoint.key, _world_map_id(world, instance.map_id)
                 )
                 self._cleanup_info[instance_id] = (world, traffic_manager)
+                self._cleanup_engines[instance_id] = lease.endpoint.key
                 runner_kwargs = self._runner_kwargs(instance, runner_hooks)
                 runner_kwargs.setdefault("traffic_manager", traffic_manager)
                 runner_kwargs.setdefault("traffic_manager_port", lease.endpoint.tm_port)
+                runner_kwargs.setdefault("engine_key", lease.endpoint.key)
                 runner = self._runner_factory(
                     world,
                     on_state_change=on_state_change,
@@ -501,31 +540,52 @@ class ExecutionPlane:
         否则会把已失效的 world/traffic_manager 长期握在字典里（内存与连接泄漏）。
         """
         self._cleanup_info.pop(instance_id, None)
+        self._cleanup_engines.pop(instance_id, None)
 
     def _restore_world_async(self, instance_id: str) -> None:
-        """把实例对应的世界与 Traffic Manager 恢复为异步模式。
+        """把实例对应的世界与 Traffic Manager 恢复为异步模式（经端点信箱）。
 
         场景结束后若世界仍停留在同步模式，CARLA 会等待 ``world.tick()``，
         表现为模拟器无响应（后续 ``load_map`` 超时）。释放路径必须恢复。
+
+        拿不到端点时不硬撞：投递给 owner 线程代执行，并留下 WARNING。
         """
         info = self._cleanup_info.pop(instance_id, None)
+        engine_key = self._cleanup_engines.pop(instance_id, "")
         if info is None:
             return
         world, traffic_manager = info
-        if traffic_manager is not None:
+
+        def _apply() -> None:
+            if traffic_manager is not None:
+                try:
+                    traffic_manager.set_synchronous_mode(False)
+                except Exception as exc:  # noqa: BLE001  TM 可能已随世界失效
+                    logger.debug(f"Restore Traffic Manager async failed: {exc}")
             try:
-                traffic_manager.set_synchronous_mode(False)
-            except Exception as exc:  # noqa: BLE001  TM 可能已随世界失效
-                logger.debug(f"Restore Traffic Manager async failed: {exc}")
-        try:
-            settings = world.get_settings()
-            if settings is not None:
-                settings.synchronous_mode = False
-                settings.fixed_delta_seconds = 0.0
-                world.apply_settings(settings)
-                logger.info(f"World restored to asynchronous mode: instance={instance_id}")
-        except Exception as exc:  # noqa: BLE001  世界可能已被重置/销毁
-            logger.debug(f"Restore world async failed for {instance_id}: {exc}")
+                settings = world.get_settings()
+                if settings is not None:
+                    settings.synchronous_mode = False
+                    settings.fixed_delta_seconds = 0.0
+                    world.apply_settings(settings)
+                    logger.info(f"World restored to asynchronous mode: instance={instance_id}")
+            except Exception as exc:  # noqa: BLE001  世界可能已被重置/销毁
+                logger.debug(f"Restore world async failed for {instance_id}: {exc}")
+
+        mailbox = get_mailbox(engine_key or "default")
+        executed = mailbox.run(
+            _apply, name="restore_world_async", fallback=_NOT_EXECUTED
+        )
+        if executed is _NOT_EXECUTED:
+            if mailbox.submit(_apply, name="restore_world_async"):
+                logger.info(
+                    f"Restore world async queued for CARLA owner thread: instance={instance_id}"
+                )
+            else:
+                logger.warning(
+                    f"Restore world async skipped (engine busy): instance={instance_id}; "
+                    "the world may stay in synchronous mode until the next assembly"
+                )
 
     # ── V2.10.0 平台发布工厂辅助 ──────────────────────────────────────
 
