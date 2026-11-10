@@ -25,6 +25,8 @@ class SpawnPoint(BaseModel):
         yaw_deg: 航向角（度，北向顺时针）。
         roll_deg: 横滚角（度）。
         pitch_deg: 俯仰角（度）。
+        lane_id: 平台车道号原值（可能是 ``"lane-1"`` 等占位字符串，仅透传）。
+        lane_index: 仅当 ``lane_id`` 可转整数时填充，供选道使用。
     """
 
     x: float
@@ -33,6 +35,8 @@ class SpawnPoint(BaseModel):
     yaw_deg: float = Field(0.0, ge=-360.0, le=360.0)
     roll_deg: float = Field(0.0, ge=-180.0, le=180.0)
     pitch_deg: float = Field(0.0, ge=-90.0, le=90.0)
+    lane_id: Optional[str] = None
+    lane_index: Optional[int] = None
 
     def to_transform(self) -> Transform:
         """转换为内部 Transform（弧度制）。"""
@@ -54,6 +58,7 @@ class EgoVehicleConfig(BaseModel):
         autopilot: 是否启用自动驾驶（SIL 模式用）。
         sensors: 需要挂载的传感器类型列表。
         initial_speed_ms: 初始速度（m/s）。
+        initial_steer: 初始转向（-1.0~1.0，平台 V1.26 新增）。
     """
 
     vehicle_blueprint: str = Field("hunter_se", description="车辆蓝图")
@@ -64,6 +69,7 @@ class EgoVehicleConfig(BaseModel):
         description="挂载传感器列表",
     )
     initial_speed_ms: float = Field(0.0, ge=0.0, le=50.0)
+    initial_steer: float = Field(0.0, ge=-1.0, le=1.0)
 
 
 class SensorSpec(BaseModel):
@@ -112,9 +118,15 @@ class TriggerType(str, Enum):
 
     TIME = "time"
     DISTANCE = "distance"
-    POSITION = "position"
+    POSITION = "position"  # 仅行为触发使用（带坐标）
     VELOCITY = "velocity"
-    EVENT = "event"
+    EVENT = "event"  # 仅供外部显式 fire 的旧行为 / 碰撞传感器
+    ACCELERATION = "acceleration"
+    OFFROAD = "offroad"
+    TRAVELED_DISTANCE = "traveled_distance"
+    TIME_HEADWAY = "time_headway"
+    TIME_TO_COLLISION = "time_to_collision"
+    DISABLED = "disabled"  # 未映射/缺条件，禁止参与评估
 
 
 class SceneEventTrigger(BaseModel):
@@ -122,13 +134,21 @@ class SceneEventTrigger(BaseModel):
 
     Attributes:
         trigger_type: 触发类型。
-        value: 触发阈值（时间秒/距离米/坐标/速度 m/s）。
+        value: 触发阈值（时间秒/距离米/速度 m/s/加速度 m/s²）。
         event_name: 关联的事件名称（trigger_type=EVENT 时使用）。
+        comparator: 比较方向，决定 ``actual <comparator> value``。
+        relation: 距离关系（longitudinal/lateral/euclidean/sightline）。
+        source_condition_type: 平台原始 ``condition_type``，供报告/排障。
+        is_approximate: 是否属于平台语义近似（如 reach_position）。
     """
 
     trigger_type: TriggerType
     value: float = Field(0.0, ge=0.0)
     event_name: str = ""
+    comparator: Literal[">", ">=", "<", "<=", "==", "!="] = ">"
+    relation: Literal["", "longitudinal", "lateral", "euclidean", "sightline"] = ""
+    source_condition_type: str = ""
+    is_approximate: bool = False
 
 
 class ScenarioBehaviorType(str, Enum):
@@ -156,16 +176,32 @@ class TrafficParticipantConfig(BaseModel):
         speed_ms: 目标速度（m/s）。
         behavior_trigger: 行为触发条件。
         is_essential: 是否为场景关键参与者（影响评估）。
+        source_actor_type: 平台原始 type（vehicle/pedestrian/other），报告用。
+        source_behavior_type: 平台原始 behavior_type。
+        object_kind: 静态物体种类（归一化后）。
+        vehicle_kind: 车辆种类（bicycle/car/truck/van 等）。
+        animal_kind: 动物种类（资产降级用）。
+        blueprint_candidates: 蓝图回退候选链。
+        behavior_params: 行为参数原样留存（target_lane 等）。
+        target_distance_m: creep.target_dist 等目标距离。
     """
 
     participant_id: str
-    actor_type: Literal["vehicle", "walker", "cyclist"] = "vehicle"
+    actor_type: Literal["vehicle", "walker", "cyclist", "prop"] = "vehicle"
     blueprint: str = "vehicle.tesla.model3"
     spawn_point: SpawnPoint
     behavior: ScenarioBehaviorType = ScenarioBehaviorType.CONSTANT_SPEED
     speed_ms: float = Field(5.0, ge=0.0, le=30.0)
     behavior_trigger: Optional[SceneEventTrigger] = None
     is_essential: bool = False
+    source_actor_type: str = ""
+    source_behavior_type: str = ""
+    object_kind: str = ""
+    vehicle_kind: str = ""
+    animal_kind: str = ""
+    blueprint_candidates: list[str] = Field(default_factory=list)
+    behavior_params: dict[str, Any] = Field(default_factory=dict)
+    target_distance_m: Optional[float] = None
 
 
 class SceneEventType(str, Enum):
@@ -180,6 +216,8 @@ class SceneEventType(str, Enum):
     TARGET_REACHED = "target_reached"
     SCENE_TIMEOUT = "scene_timeout"
     OBSTACLE_AVOID = "obstacle_avoid"
+    # 平台事件触发器命中标记：不是失败、不进入碰撞统计
+    TRIGGER_REACHED = "trigger_reached"
     CUSTOM = "custom"
 
 
@@ -192,6 +230,9 @@ class SceneEventDefinition(BaseModel):
         trigger: 触发条件。
         description: 事件描述字符串。
         is_failure_condition: 是否判定为失败事件。
+        action_type: 平台期望动作类型（仅留存，不执行）。
+        action_parameters: 平台期望动作参数。
+        is_runtime_evaluable: 是否参与运行时触发评估（DISABLED → False）。
     """
 
     event_id: str
@@ -199,6 +240,25 @@ class SceneEventDefinition(BaseModel):
     trigger: SceneEventTrigger
     description: str = ""
     is_failure_condition: bool = True
+    action_type: str = ""
+    action_parameters: dict[str, Any] = Field(default_factory=dict)
+    is_runtime_evaluable: bool = True
+
+
+class MappingWarning(BaseModel):
+    """场景映射告警（写入 ``SceneConfig.mapping_warnings``）。
+
+    Attributes:
+        code: 告警码（见实施方案附录 B）。
+        detail: 人可读细节。
+        participant_id: 关联参与者 ID。
+        event_id: 关联事件 ID。
+    """
+
+    code: str
+    detail: str = ""
+    participant_id: str = ""
+    event_id: str = ""
 
 
 class SceneConfig(BaseModel):
@@ -223,6 +283,7 @@ class SceneConfig(BaseModel):
         timeout_seconds: 超时自动结束时间（秒）。
         tags: 场景标签列表（用于分类检索）。
         extra_params: 扩展参数字典（自定义场景脚本可用）。
+        mapping_warnings: 平台 → 内部映射告警列表。
     """
 
     scene_id: str
@@ -249,6 +310,7 @@ class SceneConfig(BaseModel):
     timeout_seconds: float = Field(7200.0, gt=0.0)
     tags: list[str] = Field(default_factory=list)
     extra_params: dict[str, Any] = Field(default_factory=dict)
+    mapping_warnings: list[MappingWarning] = Field(default_factory=list)
 
     @field_validator("map_id")
     @classmethod

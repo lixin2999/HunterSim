@@ -1,7 +1,7 @@
 """触发条件定义（PROMPT-ENG-005-B）。
 
-5 种触发条件：时间触发、距离触发、位置触发、速度触发、事件触发。
-统一接口：check() -> bool
+支持时间 / 距离 / 位置 / 速度 / 加速度 / 越界 / 已行驶里程 / 车头时距 /
+碰撞时间 / 事件触发。统一接口：check() -> bool
 """
 
 from __future__ import annotations
@@ -80,20 +80,138 @@ class PositionTrigger(TriggerCondition):
 
 
 class VelocityTrigger(TriggerCondition):
-    """速度触发：自车或目标速度超过阈值时激活。"""
+    """速度触发：自车或目标速度达到/低于阈值时激活。"""
 
-    def __init__(self, speed_threshold_ms: float, use_ego: bool = True) -> None:
+    def __init__(
+        self,
+        speed_threshold_ms: float,
+        use_ego: bool = True,
+        comparator: str = ">=",
+    ) -> None:
         self._threshold = speed_threshold_ms
         self._use_ego = use_ego
+        self._comparator = comparator
 
     def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
         target = ego_vehicle if self._use_ego else actor
         try:
             vel = target.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
-            return speed >= self._threshold
+            return _compare(speed, self._comparator, self._threshold)
         except Exception:
             return False
+
+
+class AccelerationTrigger(TriggerCondition):
+    """加速度触发：读取加速度模长并按比较符判定。"""
+
+    def __init__(
+        self,
+        threshold_ms2: float,
+        comparator: str = ">",
+        use_ego: bool = True,
+    ) -> None:
+        self._threshold = threshold_ms2
+        self._comparator = comparator
+        self._use_ego = use_ego
+
+    def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
+        target = ego_vehicle if self._use_ego else actor
+        try:
+            accel = target.get_acceleration()
+            magnitude = math.sqrt(accel.x ** 2 + accel.y ** 2 + accel.z ** 2)
+        except Exception:
+            return False
+        return _compare(magnitude, self._comparator, self._threshold)
+
+
+class TraveledDistanceTrigger(TriggerCondition):
+    """已行驶里程触发：里程由执行端注入到 Actor 属性。"""
+
+    def __init__(self, threshold_m: float, comparator: str = ">") -> None:
+        self._threshold = threshold_m
+        self._comparator = comparator
+
+    def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
+        value = _read_metric(ego_vehicle or actor, ("traveled_distance_m",))
+        if value is None:
+            return False
+        return _compare(float(value), self._comparator, self._threshold)
+
+
+class OffroadTrigger(TriggerCondition):
+    """越界触发：读取 0/1 越界指标（无数据时返回 False）。"""
+
+    def __init__(self, threshold: float = 0.5, comparator: str = ">") -> None:
+        self._threshold = threshold
+        self._comparator = comparator
+
+    def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
+        value = _read_metric(ego_vehicle or actor, ("offroad", "is_offroad"))
+        if value is None:
+            return False
+        # bool 必须按真值转 0/1：isinstance(False, bool) 走 1.0 会误判为越界
+        numeric = 1.0 if value is True else 0.0 if value is False else float(value)
+        return _compare(numeric, self._comparator, self._threshold)
+
+
+class TimeHeadwayTrigger(TriggerCondition):
+    """车头时距触发（需执行端注入前车观测）。"""
+
+    def __init__(self, threshold_s: float, comparator: str = "<") -> None:
+        self._threshold = threshold_s
+        self._comparator = comparator
+
+    def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
+        value = _read_metric(ego_vehicle or actor, ("time_headway_s",))
+        if value is None:
+            return False
+        return _compare(float(value), self._comparator, self._threshold)
+
+
+class TimeToCollisionTrigger(TriggerCondition):
+    """碰撞时间触发（需执行端注入前车观测）。"""
+
+    def __init__(self, threshold_s: float, comparator: str = "<") -> None:
+        self._threshold = threshold_s
+        self._comparator = comparator
+
+    def check(self, elapsed_time: float, actor: Any, ego_vehicle: Any) -> bool:
+        value = _read_metric(ego_vehicle or actor, ("time_to_collision_s",))
+        if value is None:
+            return False
+        return _compare(float(value), self._comparator, self._threshold)
+
+
+def _read_metric(target: Any, names: tuple[str, ...]) -> Any:
+    """从目标对象读取属性或零参方法；缺失/异常返回 None。"""
+    for name in names:
+        value = getattr(target, name, None)
+        if callable(value):
+            try:
+                return value()
+            except Exception:
+                continue
+        if value is not None:
+            return value
+    return None
+
+
+def _compare(actual: float, comparator: str, threshold: float) -> bool:
+    """按比较符判定（未知比较符返回 False）。"""
+    if comparator == ">":
+        return actual > threshold
+    if comparator == ">=":
+        return actual >= threshold
+    if comparator == "<":
+        return actual < threshold
+    if comparator == "<=":
+        return actual <= threshold
+    if comparator == "==":
+        return abs(actual - threshold) < 1e-6
+    if comparator == "!=":
+        return abs(actual - threshold) >= 1e-6
+    return False
 
 
 class EventTrigger(TriggerCondition):
@@ -116,14 +234,18 @@ class EventTrigger(TriggerCondition):
 
 
 def create_trigger_from_config(config: dict[str, Any]) -> TriggerCondition:
-    """从触发配置字典创建触发条件实例（设计文档 §7.4.2 五种触发条件）。
+    """从触发配置字典创建触发条件实例（设计文档 §7.4.2）。
 
     Args:
         config: 触发配置，必含 'type' 字段：
             - time: {'type','value'} 场景运行到指定时间（秒）
             - distance: {'type','value'} 与自车距离小于阈值（米）
             - position: {'type','x','y','radius'?} 到达指定坐标范围
-            - velocity: {'type','value','use_ego'?} 速度达到阈值（m/s）
+            - velocity: {'type','value','use_ego'?,'comparator'?} 速度阈值
+            - acceleration: {'type','value','comparator'?} 加速度模长
+            - traveled_distance: {'type','value','comparator'?} 已行驶里程
+            - offroad: {'type','value','comparator'?} 0/1 越界指标
+            - time_headway / time_to_collision: {'type','value','comparator'?}
             - event: {'type','event_name'} 上一事件完成后触发
 
     Returns:
@@ -134,6 +256,8 @@ def create_trigger_from_config(config: dict[str, Any]) -> TriggerCondition:
     """
     ttype = str(config.get("type", ""))
     value = float(config.get("value", 0.0))
+    comparator = str(config.get("comparator") or ">")
+    use_ego = bool(config.get("use_ego", True))
     if ttype == "time":
         return TimeTrigger(trigger_time_s=value)
     if ttype == "distance":
@@ -147,8 +271,32 @@ def create_trigger_from_config(config: dict[str, Any]) -> TriggerCondition:
     if ttype == "velocity":
         return VelocityTrigger(
             speed_threshold_ms=value,
-            use_ego=bool(config.get("use_ego", True)),
+            use_ego=use_ego,
+            comparator=comparator,
         )
+    if ttype == "standstill":
+        return VelocityTrigger(
+            speed_threshold_ms=value if value > 0 else 0.1,
+            use_ego=use_ego,
+            comparator=config.get("comparator") or "<",
+        )
+    if ttype == "acceleration":
+        return AccelerationTrigger(
+            threshold_ms2=value,
+            comparator=comparator,
+            use_ego=use_ego,
+        )
+    if ttype == "traveled_distance":
+        return TraveledDistanceTrigger(threshold_m=value, comparator=comparator)
+    if ttype == "offroad":
+        return OffroadTrigger(
+            threshold=value if value > 0 else 0.5,
+            comparator=comparator,
+        )
+    if ttype == "time_headway":
+        return TimeHeadwayTrigger(threshold_s=value, comparator=comparator)
+    if ttype == "time_to_collision":
+        return TimeToCollisionTrigger(threshold_s=value, comparator=comparator)
     if ttype == "event":
         return EventTrigger(event_name=str(config.get("event_name", "")))
     raise ValueError(f"Unknown trigger type: '{ttype}'")

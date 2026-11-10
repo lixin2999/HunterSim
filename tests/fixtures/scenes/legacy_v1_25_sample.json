@@ -1,0 +1,98 @@
+{
+  "version": "1.25.0",
+  "note": "V1.25 旧载荷（V1.26 前产物）：无 condition_type、lane_id 为占位字符串、object_kind 为旧别名。用于向后兼容回归。",
+  "scenes": [
+    {
+      "scene_id": "legacy-pedestrian",
+      "scene_name": "旧载荷：行人横穿（cross_road + other）",
+      "scene_config": {
+        "map": {
+          "map_id": "Town03",
+          "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "lane_id": "lane-1"}
+        },
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 8.0},
+        "duration": 30.0,
+        "actors": [
+          {
+            "actor_id": "legacy-ped-1",
+            "type": "other",
+            "spawn_point": {"x": 18.0, "y": -4.0},
+            "behavior": {
+              "behavior_type": "cross_road",
+              "parameters": {"speed": "ped_speed", "target_dist": 8.0}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "legacy-ev-1",
+            "type": "pedestrian_crossing",
+            "description": "行人横穿",
+            "trigger": {"parameters": {"source": "batch"}}
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "legacy-parked",
+      "scene_name": "旧载荷：路边停放车（object_kind=parked）",
+      "scene_config": {
+        "map": {
+          "map_id": "Town03",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": "lane-1"}
+        },
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 5.0},
+        "duration": 20.0,
+        "actors": [
+          {
+            "actor_id": "legacy-parked-1",
+            "type": "other",
+            "spawn_point": {"x": 12.0, "y": 4.0, "yaw": 0.0},
+            "behavior": {
+              "behavior_type": "static",
+              "parameters": {"object_kind": "parked", "speed": 0.0}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "legacy-collision",
+            "type": "collision",
+            "description": "发生碰撞",
+            "trigger": {"parameters": {}}
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "legacy-fallen-load",
+      "scene_name": "旧载荷：散落物（object_kind=fallen_load）",
+      "scene_config": {
+        "map": {
+          "map_id": "Town05",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": "lane-1"}
+        },
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 6.0},
+        "duration": 25.0,
+        "actors": [
+          {
+            "actor_id": "legacy-load-1",
+            "type": "other",
+            "spawn_point": {"x": 20.0, "y": 0.5},
+            "behavior": {
+              "behavior_type": "static",
+              "parameters": {"object_kind": "fallen_load", "speed": 0.0}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "legacy-time",
+            "type": "custom",
+            "trigger": {"parameters": {"value": 10.0}}
+          }
+        ]
+      }
+    }
+  ]
+}

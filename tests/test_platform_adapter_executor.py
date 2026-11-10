@@ -258,6 +258,7 @@ class TestExecution:
         assert final.result is not None
         assert final.result["success"] is True
         assert [item["name"] for item in final.result["artifacts"]] == [
+            "mapping.json",
             "eval.json",
             "events.jsonl",
             "run.log",
@@ -360,8 +361,9 @@ class TestExecution:
         assert metrics["type"] == "sim_metrics"
         assert metrics["payload"]["passed"] is True
 
-        assert len(producer.artifacts) == 3
+        assert len(producer.artifacts) == 4
         assert {item["name"] for item in producer.artifacts} == {
+            "mapping.json",
             "eval.json",
             "events.jsonl",
             "run.log",

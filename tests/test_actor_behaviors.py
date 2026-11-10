@@ -114,9 +114,20 @@ class TestStaticBehavior:
 
 class TestPedestrianCrossBehavior:
     def test_speed_capped(self) -> None:
-        b = PedestrianCrossBehavior(speed_ms=3.0)  # max 1.4
+        b = PedestrianCrossBehavior(speed_ms=8.0)  # 物理上限 4.0 m/s
         action = b.update(0.0, None, None, 0.02)
-        assert action.target_speed_ms <= 1.4
+        assert action.target_speed_ms == pytest.approx(4.0)
+
+    def test_platform_crossing_speed_preserved(self) -> None:
+        # 平台可下发 3+ m/s（快跑/鬼探头），不能沿用旧版 1.4 m/s 上限
+        b = PedestrianCrossBehavior(speed_ms=3.0)
+        action = b.update(0.0, None, None, 0.02)
+        assert action.target_speed_ms == pytest.approx(3.0)
+
+    def test_speed_floored(self) -> None:
+        b = PedestrianCrossBehavior(speed_ms=0.05)
+        action = b.update(0.0, None, None, 0.02)
+        assert action.target_speed_ms == pytest.approx(0.3)
 
     def test_done_after_duration(self) -> None:
         b = PedestrianCrossBehavior(crossing_duration_s=5.0)

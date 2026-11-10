@@ -1,0 +1,26 @@
+{
+  "version": "1.26.0",
+  "note": "构造用例：未知 behavior_type 必须 fail-loud（SceneMappingError: unsupported_behavior），不允许静默降级为直线行驶。",
+  "scene_id": "unknown-behavior",
+  "scene_name": "未知行为：warp_drive",
+  "map": {
+    "map_id": "Town03",
+    "map_type": "carla_town",
+    "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+  },
+  "spawn_semantics": "relative_to_ego",
+  "ego_vehicle": {"model": "hunter_se", "initial_speed": 5.0},
+  "duration": 20.0,
+  "actors": [
+    {
+      "actor_id": "ufo-1",
+      "type": "vehicle",
+      "spawn_point": {"x": 15.0, "y": 0.0},
+      "behavior": {
+        "behavior_type": "warp_drive",
+        "parameters": {"speed": 10.0}
+      }
+    }
+  ],
+  "events": []
+}

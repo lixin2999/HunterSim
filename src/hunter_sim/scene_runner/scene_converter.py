@@ -12,9 +12,17 @@ from typing import Any
 from hunter_sim.common.models import SimMode
 from hunter_sim.common.utils import get_logger
 from hunter_sim.engine.weather_manager import WeatherProfile
-from hunter_sim.scene_runner.scene_config import SceneConfig
+from hunter_sim.scene_runner.scene_config import SceneConfig, ScenarioBehaviorType
 
 logger = get_logger(__name__)
+
+#: 内部 actor_type → ScenarioRunner 兼容类型（prop 不能统计成车）
+_SCENARIO_RUNNER_TYPE = {
+    "walker": "pedestrian",
+    "cyclist": "cyclist",
+    "prop": "static_prop",
+    "vehicle": "other_vehicle",
+}
 
 
 @dataclass
@@ -108,7 +116,10 @@ class SceneConfigConverter:
                     y=sp.y,
                     z=sp.z,
                     yaw_deg=sp.yaw_deg,
-                    autopilot=(tp.behavior.value == "constant_speed"),
+                    autopilot=(
+                        tp.actor_type in ("vehicle", "cyclist")
+                        and tp.behavior != ScenarioBehaviorType.STATIC
+                    ),
                 )
             )
 
@@ -165,7 +176,7 @@ class SceneConfigConverter:
         for tp in config.traffic_participants:
             sp = tp.spawn_point
             actors.append({
-                "type": "pedestrian" if tp.actor_type == "walker" else "other_vehicle",
+                "type": _SCENARIO_RUNNER_TYPE.get(tp.actor_type, "other_vehicle"),
                 "name": tp.participant_id,
                 "model": tp.blueprint,
                 "x": sp.x,

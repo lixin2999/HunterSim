@@ -1,7 +1,8 @@
 """行人控制器封装（PROMPT-ENG-005-B）。
 
 封装 CARLA controller.ai.walker 蓝图，提供行人目的地、速度和行为控制接口。
-最大步速 1.4 m/s（符合行人行为规格）。
+最大步速 4.0 m/s：平台 ``crossing_speed`` 可下发 3+ m/s（快跑/鬼探头），
+旧版 1.4 m/s 硬上限会让行人变「慢动作」。
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
-_WALKER_MAX_SPEED_MS = 1.4  # 行人最大步速
+_WALKER_MAX_SPEED_MS = 4.0  # 行人最大步速（平台可下发 3+ m/s）
+_WALKER_MIN_SPEED_MS = 0.3
 
 
 class WalkerControllerWrapper:
@@ -34,9 +36,9 @@ class WalkerControllerWrapper:
 
         Args:
             destination: carla.Location 目标位置。
-            speed_ms: 行走速度，不超过 1.4 m/s。
+            speed_ms: 行走速度，不超过 :data:`_WALKER_MAX_SPEED_MS`。
         """
-        speed = min(self._max_speed, max(0.1, speed_ms))
+        speed = min(self._max_speed, max(_WALKER_MIN_SPEED_MS, speed_ms))
         try:
             self._controller.start()
             self._controller.set_max_speed(speed)
@@ -54,7 +56,7 @@ class WalkerControllerWrapper:
 
     def set_destination(self, destination: Any, speed_ms: float = 1.2) -> None:
         """更新行人目的地（不重启导航）。"""
-        speed = min(self._max_speed, max(0.1, speed_ms))
+        speed = min(self._max_speed, max(_WALKER_MIN_SPEED_MS, speed_ms))
         try:
             self._controller.set_max_speed(speed)
             self._controller.go_to_location(destination)

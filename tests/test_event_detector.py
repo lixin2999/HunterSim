@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from hunter_sim.common.models import Transform, VehicleState
-from hunter_sim.scene_runner.event_detector import DetectedEvent, EventDetector
+from hunter_sim.scene_runner.event_detector import DetectedEvent, EventDetector, TriggerMetrics
 from hunter_sim.scene_runner.scene_config import (
     SceneEventDefinition,
     SceneEventTrigger,
@@ -117,6 +117,144 @@ class TestFailureAndReset:
 
         det = EventDetector([], on_event=_boom)
         det.on_collision(1.0, 1, 50.0)  # 不应抛出
+        assert len(det.detected_events) == 1
+
+
+class TestSceneTriggers:
+    """平台事件每 tick 评估（V1.26.0 / J+K+L）。"""
+
+    @staticmethod
+    def _trigger(
+        trigger_type: TriggerType, value: float, comparator: str = ">"
+    ) -> SceneEventTrigger:
+        return SceneEventTrigger(
+            trigger_type=trigger_type,
+            value=value,
+            comparator=comparator,  # type: ignore[arg-type]
+            source_condition_type=trigger_type.value,
+        )
+
+    def _definition(
+        self,
+        event_id: str,
+        trigger_type: TriggerType,
+        value: float,
+        comparator: str = ">",
+        *,
+        evaluable: bool = True,
+    ) -> SceneEventDefinition:
+        return SceneEventDefinition(
+            event_id=event_id,
+            event_type=SceneEventType.CUSTOM,
+            trigger=self._trigger(trigger_type, value, comparator),
+            is_runtime_evaluable=evaluable,
+        )
+
+    def test_scene_trigger_emits_trigger_reached(self) -> None:
+        det = EventDetector([self._definition("e1", TriggerType.TIME, 2.0)])
+        det.update_scene_triggers(1.0, TriggerMetrics(elapsed_s=1.0))
+        assert det.detected_events == []
+        # 严格大于：t=2.0 与阈值相等不触发，t=2.5 才越过阈值
+        det.update_scene_triggers(2.0, TriggerMetrics(elapsed_s=2.0))
+        assert det.detected_events == []
+        det.update_scene_triggers(2.5, TriggerMetrics(elapsed_s=2.5))
+        assert len(det.detected_events) == 1
+        event = det.detected_events[0]
+        assert event.event_id == "e1"
+        assert event.event_type == SceneEventType.TRIGGER_REACHED.value
+        assert event.data["actual"] == pytest.approx(2.5)
+        assert event.data["threshold"] == pytest.approx(2.0)
+
+    def test_comparator_lt_and_gt(self) -> None:
+        det = EventDetector([self._definition("e1", TriggerType.DISTANCE, 10.0, "<")])
+        metrics = TriggerMetrics(relative_distance_m={"euclidean": 12.0})
+        det.update_scene_triggers(1.0, metrics)
+        assert det.detected_events == []
+        det.update_scene_triggers(2.0, TriggerMetrics(relative_distance_m={"euclidean": 5.0}))
+        assert len(det.detected_events) == 1
+
+    def test_relation_selects_distance_metric(self) -> None:
+        trigger = SceneEventTrigger(
+            trigger_type=TriggerType.DISTANCE,
+            value=10.0,
+            comparator="<",
+            relation="longitudinal",
+        )
+        det = EventDetector(
+            [
+                SceneEventDefinition(
+                    event_id="e1", event_type=SceneEventType.CUSTOM, trigger=trigger
+                )
+            ]
+        )
+        det.update_scene_triggers(
+            1.0,
+            TriggerMetrics(
+                relative_distance_m={"euclidean": 2.0, "longitudinal": 30.0}
+            ),
+        )
+        assert det.detected_events == []
+
+    def test_disabled_never_emits(self) -> None:
+        definition = SceneEventDefinition(
+            event_id="e1",
+            event_type=SceneEventType.CUSTOM,
+            trigger=SceneEventTrigger(trigger_type=TriggerType.DISABLED),
+            is_runtime_evaluable=False,
+        )
+        det = EventDetector([definition])
+        det.update_scene_triggers(
+            10.0,
+            TriggerMetrics(
+                elapsed_s=10.0,
+                traveled_distance_m=100.0,
+                speed_ms=10.0,
+                acceleration_ms2=5.0,
+            ),
+        )
+        assert det.detected_events == []
+
+    def test_edge_latch_once(self) -> None:
+        det = EventDetector([self._definition("e1", TriggerType.TIME, 1.0)])
+        for index in range(5):
+            det.update_scene_triggers(
+                float(index), TriggerMetrics(elapsed_s=2.0 + index)
+            )
+        assert len(det.detected_events) == 1
+
+    def test_reset_rearms_scene_trigger(self) -> None:
+        det = EventDetector([self._definition("e1", TriggerType.TIME, 1.0)])
+        det.update_scene_triggers(1.0, TriggerMetrics(elapsed_s=2.0))
+        det.reset()
+        det.update_scene_triggers(2.0, TriggerMetrics(elapsed_s=3.0))
+        assert len(det.detected_events) == 1
+
+    def test_trigger_not_counted_as_collision(self) -> None:
+        definition = self._definition("e1", TriggerType.TIME, 1.0)
+        # 平台事件标记本身不是失败条件；失败计数只由 collision/emergency_brake 定义决定
+        definition = definition.model_copy(update={"is_failure_condition": False})
+        det = EventDetector([definition])
+        det.update_scene_triggers(1.0, TriggerMetrics(elapsed_s=2.0))
+        assert all(
+            event.event_type != SceneEventType.COLLISION.value
+            for event in det.detected_events
+        )
+        assert det.failure_events == []
+
+    def test_optional_metrics_skip_when_missing(self) -> None:
+        det = EventDetector(
+            [self._definition("thw", TriggerType.TIME_HEADWAY, 1.0, "<")]
+        )
+        det.update_scene_triggers(1.0, TriggerMetrics(time_headway_s=None))
+        assert det.detected_events == []
+        det.update_scene_triggers(2.0, TriggerMetrics(time_headway_s=0.5))
+        assert len(det.detected_events) == 1
+
+    def test_offroad_metric(self) -> None:
+        det = EventDetector([self._definition("off", TriggerType.OFFROAD, 0.5, ">")])
+        det.update_scene_triggers(1.0, TriggerMetrics(offroad=False))
+        assert det.detected_events == []
+        det.update_scene_triggers(2.0, TriggerMetrics(offroad=True))
         assert len(det.detected_events) == 1
 
 

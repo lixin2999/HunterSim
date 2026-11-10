@@ -9,6 +9,7 @@ import pytest
 from hunter_sim.common.models import QualityLevel, SimMode
 from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
+    MappingWarning,
     ScenarioBehaviorType,
     SceneConfig,
     SceneEventDefinition,
@@ -173,3 +174,54 @@ class TestSceneConfigValidator:
             behavior=ScenarioBehaviorType.CUT_IN,
         )
         assert tp.behavior == ScenarioBehaviorType.CUT_IN
+
+
+class TestSemanticsV126Model:
+    """V1.26.0 新增字段/枚举的最小契约。"""
+
+    def test_trigger_types_extended(self) -> None:
+        assert TriggerType.ACCELERATION.value == "acceleration"
+        assert TriggerType.OFFROAD.value == "offroad"
+        assert TriggerType.TRAVELED_DISTANCE.value == "traveled_distance"
+        assert TriggerType.TIME_HEADWAY.value == "time_headway"
+        assert TriggerType.TIME_TO_COLLISION.value == "time_to_collision"
+        assert TriggerType.DISABLED.value == "disabled"
+
+    def test_trigger_reached_event_type(self) -> None:
+        ev = SceneEventDefinition(
+            event_id="e1",
+            event_type=SceneEventType.TRIGGER_REACHED,
+            trigger=SceneEventTrigger(trigger_type=TriggerType.TIME, value=1.0),
+        )
+        assert ev.event_type.value == "trigger_reached"
+
+    def test_trigger_comparator_defaults(self) -> None:
+        trigger = SceneEventTrigger(trigger_type=TriggerType.DISTANCE, value=10.0)
+        assert trigger.comparator == ">"
+        assert trigger.relation == ""
+        assert trigger.is_approximate is False
+
+    def test_prop_actor_type(self) -> None:
+        tp = TrafficParticipantConfig(
+            participant_id="p",
+            actor_type="prop",
+            spawn_point=_spawn(),
+        )
+        assert tp.actor_type == "prop"
+
+    def test_lane_id_accepts_legacy_string(self) -> None:
+        spawn = SpawnPoint(x=0.0, y=0.0, lane_id="lane-1")
+        assert spawn.lane_id == "lane-1"
+        assert spawn.lane_index is None
+
+    def test_initial_steer_range(self) -> None:
+        ego = EgoVehicleConfig(spawn_point=_spawn(), initial_steer=0.5)
+        assert ego.initial_steer == 0.5
+        with pytest.raises(Exception):
+            EgoVehicleConfig(spawn_point=_spawn(), initial_steer=2.0)
+
+    def test_mapping_warning_and_scene_config(self) -> None:
+        cfg = _config(
+            mapping_warnings=[MappingWarning(code="condition_missing", event_id="e1")]
+        )
+        assert cfg.mapping_warnings[0].code == "condition_missing"

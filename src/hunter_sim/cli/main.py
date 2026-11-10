@@ -9,6 +9,7 @@
   实例库/录制目录/mcap/Kafka/平台），一次跑完单机部署指南里的手工检查项，
   失败即非零退出，可直接用于 CI 与上线前门禁；
 - ``huntersim version``：打印包版本（供脚本核对镜像 tag 与代码版本是否一致）。
+- ``huntersim scene-check``：离线校验平台 scene_config 语义映射（不连 CARLA）。
 
 设计口径：
 - ``doctor`` 只读检查，不修改任何状态，不启动服务；
@@ -881,6 +882,127 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_scene_check(args: argparse.Namespace) -> int:
+    """离线校验平台 scene_config → 内部 SceneConfig 映射（不连 CARLA）。"""
+    from hunter_sim.platform_adapter.scene_mapper import (  # noqa: PLC0415
+        SceneMappingError,
+        map_scene_config,
+    )
+
+    path = Path(args.input)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"读取场景文件失败：{exc}", file=sys.stderr)
+        return EXIT_BAD_ARGS
+
+    scenes = _scene_entries(payload, path.stem)
+    if not scenes:
+        print("场景文件中没有任何 scene_config", file=sys.stderr)
+        return EXIT_BAD_ARGS
+
+    results: list[dict[str, Any]] = []
+    strict_failures: list[str] = []
+    total_actors = 0
+    total_events = 0
+    total_warnings = 0
+    for index, (scene_id, scene_config) in enumerate(scenes):
+        entry: dict[str, Any] = {"scene_id": scene_id, "index": index}
+        try:
+            config = map_scene_config(scene_config, scene_id=scene_id)
+        except SceneMappingError as exc:
+            entry.update({"ok": False, "error": exc.code, "detail": exc.detail})
+            strict_failures.append(f"{scene_id}:{exc.code}")
+            results.append(entry)
+            continue
+        report = dict(config.extra_params.get("mapping_report") or {})
+        warnings = list(report.get("warnings") or [])
+        actor_count = len(config.traffic_participants)
+        event_count = len(config.scene_events)
+        total_actors += actor_count
+        total_events += event_count
+        total_warnings += len(warnings)
+        for warning in warnings:
+            code = str(warning.get("code") or "")
+            if code.startswith("unresolved_param:") or code.startswith("condition_unknown:"):
+                strict_failures.append(f"{scene_id}:{code}")
+        entry.update(
+            {
+                "ok": True,
+                "actors": actor_count,
+                "events": event_count,
+                "warnings": len(warnings),
+                "mapping_report": report,
+            }
+        )
+        results.append(entry)
+
+    if args.json_out:
+        output = Path(args.json_out)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(
+                {
+                    "input": str(path),
+                    "scenes": results,
+                    "totals": {
+                        "scenes": len(results),
+                        "actors": total_actors,
+                        "events": total_events,
+                        "warnings": total_warnings,
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    failures = [entry for entry in results if not entry.get("ok")]
+    print(
+        f"scene-check: scenes={len(results)} ok={len(results) - len(failures)} "
+        f"actors={total_actors} events={total_events} warnings={total_warnings}"
+    )
+    for entry in failures:
+        print(
+            f"  FAIL {entry['scene_id']}: {entry.get('error')} {entry.get('detail')}",
+            file=sys.stderr,
+        )
+    if failures:
+        return EXIT_FAIL
+    if args.strict and strict_failures:
+        for item in strict_failures:
+            print(f"  STRICT {item}", file=sys.stderr)
+        return EXIT_FAIL
+    return EXIT_OK
+
+
+def _scene_entries(payload: Any, stem: str) -> list[tuple[str, dict[str, Any]]]:
+    """从单场景/场景列表/批处理产物中展开 ``(scene_id, scene_config)``。"""
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("scenes"), list):
+        items = payload["scenes"]
+    else:
+        items = [payload]
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        config = item.get("scene_config")
+        if not isinstance(config, dict):
+            config = item
+        scene_id = str(
+            item.get("scene_id")
+            or item.get("id")
+            or config.get("scene_id")
+            or f"{stem}-{index}"
+        )
+        entries.append((scene_id, config))
+    return entries
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令解析器。"""
     parser = argparse.ArgumentParser(
@@ -976,6 +1098,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     version_parser = subparsers.add_parser("version", help="打印包版本")
     version_parser.set_defaults(handler=_cmd_version)
+
+    scene_check = subparsers.add_parser(
+        "scene-check",
+        help="离线校验平台 scene_config 的场景语义映射（不连 CARLA）",
+        description=(
+            "逐条执行 platform scene_config → 内部 SceneConfig 映射，输出参与者/事件/"
+            "映射告警统计。--strict 时 SceneMappingError 或 unresolved_param / "
+            "condition_unknown 返回非零退出码，可直接用于平台升级门禁。"
+        ),
+    )
+    scene_check.add_argument("--input", required=True, help="场景 JSON（单场景/列表/批处理产物）")
+    scene_check.add_argument("--json-out", default="", help="把完整映射报告写入指定 JSON 文件")
+    scene_check.add_argument(
+        "--strict",
+        action="store_true",
+        help="映射失败或存在 unresolved_param / condition_unknown 时返回 1",
+    )
+    scene_check.set_defaults(handler=_cmd_scene_check)
 
     connect = subparsers.add_parser(
         "connect",

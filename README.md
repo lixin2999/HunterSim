@@ -5,7 +5,7 @@ HunterSim 是面向 **HUNTER SE 自动驾驶底盘车** 的仿真端：按平台
 仿真端只做「执行」——用户、租户、场景库、批量任务、审计、OTA、远程操控等**治理能力全部归云端**，本仓库不重复实现。
 
 - **车辆规格**：820×640×310 mm，整备质量 60 kg，轴距 0.46 m，后轮驱动 + 前轮阿克曼转向，最大速度 4.8 m/s。
-- **当前版本**：`3.4.4`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 / V3.4.3 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.4.3 让主视区回归 CARLA 原生 1080p 画质（overview 不再套用 `ADAPTER_STREAM_MAX_WIDTH` 降采样）、深度图预览默认勾选、修复行人 AI 附着坐标错误并新增蓝图回退/出生点重试/脚本化兜底，自车状态取不到时改返回空值不再写零位姿，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索，V3.4.4 修复自车状态取数误用 `get_rotation` 导致整场无数据、主视区改为 BGRA 直编 JPEG 快路径并给出慢编码告警、参与者映射兼容 `traffic_participants` 等别名键并输出可诊断汇总、场景收尾按阶段落日志以便定位 CARLA 原生崩溃）。
+- **当前版本**：`3.5.0`（破坏性变更清单见 [`release.md`](release.md) 的 V3.0.0 章节，补丁修复见 V3.0.1 / V3.0.2 / V3.0.3 / V3.0.4 / V3.1.1 / V3.1.2 / V3.1.3 / V3.2.1 / V3.2.2 / V3.2.3 / V3.2.4 / V3.2.5 / V3.2.6 / V3.3.3 / V3.3.4 / V3.3.5 / V3.4.1 / V3.4.2 / V3.4.3 / V3.4.4 章节，V3.4.0 新增出生点有效坐标替换与传感器按实际外形挂载，V3.4.1 新增环视主视区、启动期日志治理（409→204）与 Kafka TLS 证书自动发现，V3.4.2 修复场景车辆与参与者不运动、场景行为不生效、场景结束后 CARLA 卡死，并将环视流改为独立编码，V3.4.3 让主视区回归 CARLA 原生 1080p 画质（overview 不再套用 `ADAPTER_STREAM_MAX_WIDTH` 降采样）、深度图预览默认勾选、修复行人 AI 附着坐标错误并新增蓝图回退/出生点重试/脚本化兜底，自车状态取不到时改返回空值不再写零位姿，V3.1.0 新增一键启动与可视化客户端，V3.2.0 新增仿真节点接入，V3.2.1 修复 `.env` 模板留空项导致的首启失败，V3.2.2 落地 V2.0 节点级回传通道与下发 mTLS、`huntersim connect` 三步接入，并把接入开关默认全开、无凭据静默跳过、`.env.example` 收敛为极简模板，V3.2.3 修复 mTLS 启动 `ssl_cert_reqs` 参数类型错误，V3.2.4 修复 mTLS 就绪探测失败，V3.2.5 将 viz 改为探针面（:8080 HTTP）反向代理访问、免除浏览器导入证书，V3.2.6 修复 viz 代理向管理面建连时服务端证书 EKU 校验失败导致的 502，V3.3.0 VIL 消费端 Kafka 连接参数自动继承 CloudSettings、消除 .env 重复配置，V3.3.1 曾将平台下发「Carla 管理 API 连接超时」归因于 `.env` 漏配 `ADAPTER_HOST`（后由 V3.3.2 定论为现场 NAT 拓扑问题，配置本身当时已正确），V3.3.2 修复仿真节点 `endpoint_mismatch` 诊断在多网卡场景下误报、并将 NAT 导致平台学到错误回调地址写成可直接定位的排障线索，V3.4.4 修复自车状态取数误用 `get_rotation` 导致整场无数据、主视区改为 BGRA 直编 JPEG 快路径并给出慢编码告警、参与者映射兼容 `traffic_participants` 等别名键并输出可诊断汇总、场景收尾按阶段落日志以便定位 CARLA 原生崩溃，V3.5.0 对齐 HunterCore V1.26.0 场景语义：actor 三分类（vehicle/walker/cyclist/prop）、行为/触发条件按真实数值执行、平台事件每 tick 触发并输出 `TRIGGER_REACHED`、新增 `mapping.json` 与 `huntersim scene-check` 离线校验）。
 - **运行环境**：Python 3.12 · CARLA 0.9.16 · Kafka 3.6 ·（可选）ROS2 Humble
 
 ---
@@ -107,6 +107,9 @@ pip install carla==0.9.16                     # 不在 pyproject 依赖内，需
 ```bash
 huntersim doctor                              # 配置/端口/磁盘/GPU/CARLA/实例库/录制目录/mcap/Kafka
 huntersim doctor --json --strict               # 脚本消费 / 上线门禁（warn 提为 fail）
+huntersim scene-check --input tests/fixtures/scenes/semantics_sample_v1_26.json \
+  --json-out build/mapping_report.json         # 离线校验平台 scene_config 语义映射（不连 CARLA）
+huntersim scene-check --input <平台样本>.json --strict   # unresolved_param / condition_unknown 即非零退出
 ```
 
 未装 CARLA SDK 时服务仍可启动，但下发场景返回 `503`；未装 `mcap` 时录制降级为 no-op。

@@ -203,7 +203,9 @@ class PedestrianCrossBehavior(ActorBehavior):
         behavior_id: str = "ped_cross",
     ) -> None:
         super().__init__(behavior_id)
-        self._speed = min(1.4, speed_ms)  # 行人最大速度 1.4 m/s
+        # 平台 crossing_speed 可到 3+ m/s；按物理区间 [0.3, 4.0] 夹取，
+        # 不再沿用旧版 1.4 m/s 硬上限。
+        self._speed = max(0.3, min(4.0, speed_ms))
         self._duration = crossing_duration_s
 
     def update(self, elapsed_time: float, actor: Any, ego_vehicle: Any, delta_seconds: float) -> ActorAction:

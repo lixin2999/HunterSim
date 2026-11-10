@@ -33,7 +33,7 @@ from hunter_sim.common.metrics import SENSOR_FRAMES_DROPPED_TOTAL
 from hunter_sim.common.models import SensorType
 from hunter_sim.common.utils import get_logger
 from hunter_sim.scene_runner.custom_scenario import CustomScenarioBase
-from hunter_sim.scene_runner.event_detector import EventDetector
+from hunter_sim.scene_runner.event_detector import EventDetector, TriggerMetrics
 from hunter_sim.scene_runner.scene_config import (
     EgoVehicleConfig,
     ScenarioBehaviorType,
@@ -115,6 +115,11 @@ _MAX_VISIBLE_DISTANCE_M = 80.0
 
 #: 行人脚本化横穿的到达判定阈值（米）
 _WALKER_ARRIVE_EPS_M = 0.3
+
+#: 行人速度物理范围（m/s）：平台下发的 crossing_speed 可能高达 3+ m/s，
+#: 不能沿用旧版 1.4 m/s 硬上限，否则鬼探头会「慢动作」。
+_WALKER_MIN_SPEED = 0.3
+_WALKER_MAX_SPEED = 4.0
 
 # 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
 _SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
@@ -277,6 +282,11 @@ class BuiltinScenario(CustomScenarioBase):
         self._cut_in_done: set[int] = set()
         # 自车非 autopilot 时的简单速度保持
         self._ego_manual_speed: float = 0.0
+        self._ego_initial_steer: float = 0.0
+        # 已行驶里程积分（平台事件 traveled_distance 用）
+        self._traveled_distance_m: float = 0.0
+        # 车类 prop（停放/事故/故障车）生成位置，boarding 行为据此选择目标
+        self._parked_spawns: list[SpawnPoint] = []
         self._cleaned = False
 
     @property
@@ -309,9 +319,13 @@ class BuiltinScenario(CustomScenarioBase):
         self._scripted_walkers.clear()
         self._cut_in_done.clear()
         self._ego_manual_speed = 0.0
+        self._ego_initial_steer = 0.0
+        self._traveled_distance_m = 0.0
+        self._parked_spawns.clear()
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
+        self._collect_parked_spawns()
         requested = list(self._config.traffic_participants)
         spawned_ids: list[str] = []
         for participant in requested:
@@ -350,8 +364,7 @@ class BuiltinScenario(CustomScenarioBase):
         """
         self._apply_ego_manual_speed(delta_seconds)
         self._advance_scripted_walkers(delta_seconds)
-        if not self._participant_controllers:
-            return
+        self._update_traveled_distance(delta_seconds)
         for controller in list(self._participant_controllers):
             try:
                 action = controller.update(self._ego, delta_seconds)
@@ -364,6 +377,14 @@ class BuiltinScenario(CustomScenarioBase):
                 self._apply_participant_action(controller, action)
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"Participant behavior apply failed: {exc}")
+
+        if self._config.extra_params.get("disable_scene_event_triggers"):
+            return
+        try:
+            metrics = self._trigger_metrics(world, timestamp, delta_seconds)
+            self._event_detector.update_scene_triggers(timestamp, metrics)
+        except Exception as exc:  # noqa: BLE001  事件评估失败不阻断仿真
+            logger.debug(f"Scene trigger evaluation failed: {exc}")
 
     def check_finish(self, world: Any, timestamp: float) -> bool:
         """运行时长达到 ``duration_seconds`` 时结束场景。"""
@@ -531,6 +552,25 @@ class BuiltinScenario(CustomScenarioBase):
                     )
                 except Exception as exc:  # noqa: BLE001  TM 未就绪时降级为手动控制
                     logger.warning(f"Ego autopilot enable failed: {exc}")
+        self._ego_initial_steer = float(ego_cfg.initial_steer)
+        if self._ego_initial_steer != 0.0:
+            if ego_cfg.autopilot:
+                logger.warning(
+                    "ego_initial_steer_ignored_autopilot: initial_steer=%.3f 在 "
+                    "autopilot 模式下会被 Traffic Manager 覆盖",
+                    self._ego_initial_steer,
+                )
+            else:
+                self._apply_vehicle_control(
+                    actor,
+                    throttle=0.0,
+                    brake=0.0,
+                    steer=self._ego_initial_steer,
+                )
+                logger.info(
+                    "Ego initial steer applied: %.3f (manual control)",
+                    self._ego_initial_steer,
+                )
         return actor
 
     def _spawn_participant(
@@ -543,8 +583,19 @@ class BuiltinScenario(CustomScenarioBase):
         沿自车航向 / 横向小幅偏移重试；成功后打印参与者 ID / 蓝图 / 坐标与到
         自车的距离，便于从日志判断它是否落在环视相机视野内。
         """
-        is_walker = participant.actor_type == "walker"
-        prefix = "walker." if participant.actor_type in ("walker", "cyclist") else "vehicle."
+        is_pedestrian = participant.actor_type == "walker"
+        is_cyclist = participant.actor_type == "cyclist"
+        is_prop = participant.actor_type == "prop"
+        if is_prop:
+            prefix = (
+                "vehicle."
+                if participant.blueprint.startswith("vehicle.")
+                else "static.prop."
+            )
+        elif is_cyclist:
+            prefix = "vehicle."
+        else:
+            prefix = "walker." if is_pedestrian else "vehicle."
         blueprint = self._participant_blueprint(library, participant, prefix)
         if blueprint is None:
             logger.warning(
@@ -593,14 +644,22 @@ class BuiltinScenario(CustomScenarioBase):
         self._log_participant_spawned(participant, actor, actual)
 
         try:
-            if is_walker:
+            if is_prop:
+                # 车类 prop（事故车/故障车/停放车）显式驻车；static.prop 无控制接口
+                if participant.blueprint.startswith("vehicle."):
+                    self._park_actor(actor)
+                if participant.source_behavior_type == "door_open":
+                    self._try_open_door(actor, participant)
+                return True
+            if is_pedestrian:
                 if participant.behavior == ScenarioBehaviorType.STATIC:
                     return True  # 静止行人：不挂 AI 控制器，保持原地
                 self._setup_walker_ai(world, library, actor, actual, participant)
                 return True
+            # vehicle / cyclist：TM autopilot + 场景控制器
             if participant.behavior == ScenarioBehaviorType.STATIC:
                 # 静止障碍：显式刹停，避免被 TM 接管后自行开走
-                self._apply_vehicle_control(actor, throttle=0.0, brake=1.0, steer=0.0)
+                self._park_actor(actor)
                 return True
             # 车辆类参与者统一交给 TM autopilot 保持在车道内行驶；
             # 场景化行为再通过每帧期望速度 / 变道指令叠加。
@@ -614,23 +673,75 @@ class BuiltinScenario(CustomScenarioBase):
             )
         return True
 
+    def _park_actor(self, actor: Any) -> None:
+        """把车辆类 Actor 显式驻车（含手刹），避免被重力/TM 带着滑动。"""
+        self._apply_vehicle_control(actor, throttle=0.0, brake=1.0, steer=0.0)
+        setter = getattr(actor, "set_hand_brake", None)
+        if callable(setter):
+            try:
+                setter(True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"set_hand_brake failed: {exc}")
+
+    def _try_open_door(
+        self, actor: Any, participant: TrafficParticipantConfig
+    ) -> None:
+        """探测并尝试开门；无 API 时只降级为路边停车，不判场景失败。"""
+        opener = getattr(actor, "open_door", None)
+        if not callable(opener):
+            logger.warning(
+                "door_api_unavailable: participant=%s actor has no open_door()",
+                participant.participant_id,
+            )
+            return
+        try:
+            import carla  # noqa: PLC0415
+
+            door = getattr(getattr(carla, "VehicleDoor", None), "FL", 0)
+            opener(door, True)
+            logger.info("Participant '%s' door opened", participant.participant_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "door_api_unavailable: participant=%s %s",
+                participant.participant_id,
+                exc,
+            )
+
+    def _collect_parked_spawns(self) -> None:
+        """记录车类 prop 的生成位置，``boarding`` 行为据此选择最近车辆。"""
+        base = (
+            self._ego_spawn
+            if self._ego_spawn is not None
+            else self._config.ego_vehicle.spawn_point
+        )
+        for participant in self._config.traffic_participants:
+            if participant.object_kind not in (
+                "parked_vehicle",
+                "accident_vehicle",
+                "broken_vehicle",
+            ):
+                continue
+            try:
+                self._parked_spawns.append(
+                    resolve_actor_spawn(
+                        base, participant.spawn_point, self._config.spawn_semantics
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "parked spawn resolve failed for %s: %s",
+                    participant.participant_id,
+                    exc,
+                )
+
     @staticmethod
     def _participant_blueprint(
         library: Any, participant: TrafficParticipantConfig, prefix: str
     ) -> Any:
-        """按配置取参与者蓝图；缺失时回退到同类通用蓝图（不抛异常）。"""
-        try:
-            return BuiltinScenario._find_blueprint(library, participant.blueprint, prefix)
-        except CarlaSimulationError as exc:
-            logger.info(
-                f"Participant '{participant.participant_id}' blueprint fallback: {exc}"
-            )
-        fallbacks = (
-            ("walker.pedestrian.0001", "walker.pedestrian.*")
-            if prefix == "walker."
-            else ("vehicle.tesla.model3", "vehicle.*")
-        )
-        for candidate in fallbacks:
+        """按主蓝图 + 候选链取参与者蓝图；全部缺失时按家族通配兜底。"""
+        for candidate in [participant.blueprint, *participant.blueprint_candidates]:
+            if not candidate:
+                continue
             if candidate.endswith("*"):
                 try:
                     matches = list(library.filter(candidate))
@@ -645,11 +756,28 @@ class BuiltinScenario(CustomScenarioBase):
                 continue
             blueprint = _safe_find(library, candidate)
             if blueprint is not None:
-                logger.warning(
-                    f"Participant '{participant.participant_id}' 蓝图 "
-                    f"'{participant.blueprint}' 不可用，回退到 '{candidate}'"
-                )
+                if candidate != participant.blueprint:
+                    logger.warning(
+                        f"Participant '{participant.participant_id}' 蓝图 "
+                        f"'{participant.blueprint}' 不可用，回退到 '{candidate}'"
+                    )
                 return blueprint
+        if prefix == "walker.":
+            wildcard = "walker.pedestrian.*"
+        elif prefix == "static.prop.":
+            wildcard = "static.prop.*"
+        else:
+            wildcard = "vehicle.*"
+        try:
+            matches = list(library.filter(wildcard))
+        except Exception:  # noqa: BLE001
+            matches = []
+        if matches:
+            logger.warning(
+                f"Participant '{participant.participant_id}' 使用家族通配兜底蓝图 "
+                f"'{getattr(matches[0], 'id', wildcard)}'"
+            )
+            return matches[0]
         return None
 
     def _participant_spawn_candidates(self, spawn_point: SpawnPoint) -> list[SpawnPoint]:
@@ -747,9 +875,16 @@ class BuiltinScenario(CustomScenarioBase):
             try:
                 set_autopilot(True, self._traffic_manager_port)
             except Exception as exc:  # noqa: BLE001  TM 未就绪时降级为手动行为
-                logger.warning(
-                    f"Participant '{participant.participant_id}' autopilot failed: {exc}"
-                )
+                if participant.actor_type == "cyclist":
+                    logger.warning(
+                        "cyclist_tm_unavailable: participant=%s %s；降级为手动控制",
+                        participant.participant_id,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        f"Participant '{participant.participant_id}' autopilot failed: {exc}"
+                    )
         self._set_desired_speed(actor, participant.speed_ms)
 
     def _set_desired_speed(self, actor: Any, speed_ms: float) -> bool:
@@ -815,13 +950,21 @@ class BuiltinScenario(CustomScenarioBase):
         if trigger is None:
             return None
         trigger_type = trigger.trigger_type
+        if trigger_type == TriggerType.DISABLED:
+            logger.debug(
+                f"Participant '{participant.participant_id}' behavior trigger disabled"
+            )
+            return None
         if trigger_type == TriggerType.POSITION:
             # SceneEventTrigger 不携带坐标，无法构造位置触发
             logger.debug(
                 f"Participant '{participant.participant_id}' position trigger unsupported"
             )
             return None
-        config: dict[str, Any] = {"type": trigger_type.value}
+        config: dict[str, Any] = {
+            "type": trigger_type.value,
+            "comparator": trigger.comparator,
+        }
         if trigger_type == TriggerType.EVENT:
             config["event_name"] = trigger.event_name
         else:
@@ -920,7 +1063,156 @@ class BuiltinScenario(CustomScenarioBase):
         error = self._ego_manual_speed - self._current_speed(self._ego)
         throttle = min(1.0, max(0.0, error * 0.5))
         brake = 1.0 if error < -1.0 else 0.0
-        self._apply_vehicle_control(self._ego, throttle=throttle, brake=brake, steer=0.0)
+        self._apply_vehicle_control(
+            self._ego,
+            throttle=throttle,
+            brake=brake,
+            steer=self._ego_initial_steer,
+        )
+
+    def _update_traveled_distance(self, delta_seconds: float) -> None:
+        """积分自车速度得到已行驶里程（供 traveled_distance 事件使用）。"""
+        if self._ego is None:
+            return
+        step = max(0.0, min(float(delta_seconds), 1.0))
+        self._traveled_distance_m += max(0.0, self._current_speed(self._ego)) * step
+
+    def _trigger_metrics(
+        self, world: Any, timestamp: float, delta_seconds: float
+    ) -> TriggerMetrics:
+        """构造本 tick 的平台事件度量快照。"""
+        metrics = TriggerMetrics(
+            elapsed_s=timestamp,
+            traveled_distance_m=self._traveled_distance_m,
+        )
+        if self._ego is None:
+            return metrics
+        metrics.speed_ms = self._current_speed(self._ego)
+        try:
+            accel = self._ego.get_acceleration()
+            metrics.acceleration_ms2 = math.sqrt(
+                float(accel.x) ** 2 + float(accel.y) ** 2 + float(accel.z) ** 2
+            )
+        except Exception:  # noqa: BLE001  Mock/无位姿 Actor
+            metrics.acceleration_ms2 = 0.0
+        metrics.offroad = self._is_offroad(world)
+
+        distances, lead_gap, lead_speed = self._relative_gaps()
+        metrics.relative_distance_m = distances
+        if lead_gap is not None:
+            metrics.time_headway_s = lead_gap / max(0.1, metrics.speed_ms)
+            closing = metrics.speed_ms - (lead_speed or 0.0)
+            if closing > 0.1:
+                metrics.time_to_collision_s = lead_gap / closing
+        return metrics
+
+    def _relative_gaps(
+        self,
+    ) -> tuple[dict[str, float], Optional[float], Optional[float]]:
+        """计算参与者相对自车的距离指标与前方最近车。
+
+        Returns:
+            ``(按关系类型的最小距离, 前车纵向间隔, 前车沿自车航向速度)``。
+            无前方车辆时间隔/速度为 None。
+        """
+        distances: dict[str, float] = {}
+        if self._ego is None:
+            return distances, None, None
+        forward, left = self._ego_axes()
+        try:
+            ego_location = self._ego.get_transform().location
+            ex, ey = float(ego_location.x), float(ego_location.y)
+        except Exception:  # noqa: BLE001
+            return distances, None, None
+
+        lead_gap: Optional[float] = None
+        lead_speed: Optional[float] = None
+        for actor in self._actors:
+            try:
+                location = actor.get_transform().location
+            except Exception:  # noqa: BLE001
+                continue
+            dx = float(location.x) - ex
+            dy = float(location.y) - ey
+            longitudinal = dx * forward[0] + dy * forward[1]
+            lateral = abs(dx * left[0] + dy * left[1])
+            euclidean = math.hypot(dx, dy)
+            distances["euclidean"] = min(
+                distances.get("euclidean", math.inf), euclidean
+            )
+            distances["sightline"] = min(
+                distances.get("sightline", math.inf), euclidean
+            )
+            distances["lateral"] = min(distances.get("lateral", math.inf), lateral)
+            if longitudinal > 0:
+                distances["longitudinal"] = min(
+                    distances.get("longitudinal", math.inf), longitudinal
+                )
+                if lead_gap is None or longitudinal < lead_gap:
+                    lead_gap = longitudinal
+                    lead_speed = self._projected_speed(actor, forward)
+        return distances, lead_gap, lead_speed
+
+    def _ego_axes(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """自车航向的前向/左向单位向量（无位姿时退回生成点 yaw）。"""
+        yaw = None
+        if self._ego is not None:
+            try:
+                yaw = float(self._ego.get_transform().rotation.yaw)
+            except Exception:  # noqa: BLE001
+                yaw = None
+        if yaw is None:
+            spawn = self._ego_spawn or self._config.ego_vehicle.spawn_point
+            yaw = float(spawn.yaw_deg)
+        heading = math.radians(yaw)
+        return (math.cos(heading), math.sin(heading)), (
+            -math.sin(heading),
+            math.cos(heading),
+        )
+
+    @staticmethod
+    def _projected_speed(
+        actor: Any, forward: tuple[float, float]
+    ) -> Optional[float]:
+        """参与者速度沿自车前向的投影（读取失败返回 None）。"""
+        try:
+            velocity = actor.get_velocity()
+            return float(velocity.x) * forward[0] + float(velocity.y) * forward[1]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _is_offroad(self, world: Any) -> bool:
+        """按 waypoint 车道类型判断是否越界；接口缺失时按「未越界」容错。"""
+        if self._ego is None:
+            return False
+        get_map = getattr(world, "get_map", None)
+        if not callable(get_map):
+            return False
+        try:
+            carla_map = get_map()
+            getter = getattr(self._ego, "get_location", None)
+            if callable(getter):
+                location = getter()
+            else:
+                location = self._ego.get_transform().location
+            get_waypoint = getattr(carla_map, "get_waypoint", None)
+            if not callable(get_waypoint):
+                return False
+            waypoint = get_waypoint(location, project_to_road=False)
+        except Exception:  # noqa: BLE001  Mock/接口差异
+            return False
+        if waypoint is None:
+            return True
+        try:
+            import carla  # noqa: PLC0415
+
+            driving = carla.LaneType.Driving
+        except ImportError:
+            return False
+        lane_type = getattr(waypoint, "lane_type", None)
+        if lane_type is None:
+            return False
+        return bool(lane_type != driving)
 
     @staticmethod
     def _current_speed(actor: Any) -> float:
@@ -973,8 +1265,14 @@ class BuiltinScenario(CustomScenarioBase):
             logger.warning("carla SDK 不可用，行人保持静态")
             return
         speed = float(participant.speed_ms) if participant.speed_ms > 0 else 1.2
-        speed = min(1.4, max(0.3, speed))
-        destination = self._walker_destination(spawn_point, carla)
+        speed = max(_WALKER_MIN_SPEED, min(_WALKER_MAX_SPEED, speed))
+        if speed > 2.0:
+            logger.info(
+                "Participant '%s' walker speed %.2f m/s 高于常规步速，按平台语义执行",
+                participant.participant_id,
+                speed,
+            )
+        destination = self._walker_destination(spawn_point, carla, participant)
 
         blueprint = _safe_find(library, "controller.ai.walker")
         if blueprint is None:
@@ -1023,14 +1321,27 @@ class BuiltinScenario(CustomScenarioBase):
             _format_distance(self._distance_to_ego(spawn_point)),
         )
 
-    def _walker_destination(self, spawn_point: SpawnPoint, carla_module: Any) -> Any:
+    def _walker_destination(
+        self,
+        spawn_point: SpawnPoint,
+        carla_module: Any,
+        participant: Optional[TrafficParticipantConfig] = None,
+    ) -> Any:
         """计算行人横穿目的地：朝自车车道方向走过整条车道。
 
         方向取「垂直于自车航向」的横向：行人在自车左侧就向右走，反之向左走。
         这样无论平台下发的 yaw 是「朝车道」还是「顺车道」，画面里都能看到行人
         从路边走向 / 穿过自车行驶线；距离按横向偏离量 + 安全余量取 8~18m，
         比固定 8m 更容易在环视相机里持续可见。
+
+        ``boarding`` 行为改为走向最近的停放车辆（短程），避免长距离横穿。
         """
+        if participant is not None and participant.source_behavior_type == "boarding":
+            boarding_target = self._boarding_destination(
+                spawn_point, participant, carla_module
+            )
+            if boarding_target is not None:
+                return boarding_target
         ego = self._ego_spawn
         heading = math.radians(ego.yaw_deg if ego is not None else spawn_point.yaw_deg)
         # 自车左侧单位向量（yaw 以北向顺时针为正）
@@ -1044,6 +1355,71 @@ class BuiltinScenario(CustomScenarioBase):
         y = spawn_point.y + direction * left_y * offset
         z = spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M
         return carla_module.Location(x=x, y=y, z=z)
+
+    def _boarding_destination(
+        self,
+        spawn_point: SpawnPoint,
+        participant: TrafficParticipantConfig,
+        carla_module: Any,
+    ) -> Optional[Any]:
+        """``boarding`` 目标：最近停放车辆侧向 1.0 m；无车则向自车走 2.5 m。"""
+        if not self._parked_spawns:
+            logger.warning(
+                "boarding_target_missing: participant=%s 场景内无停放车辆，"
+                "退化为向自车方向走 2.5m",
+                participant.participant_id,
+            )
+            return self._short_walk_toward_ego(spawn_point, carla_module)
+        nearest = min(
+            self._parked_spawns,
+            key=lambda parked: math.hypot(
+                parked.x - spawn_point.x, parked.y - spawn_point.y
+            ),
+        )
+        distance = math.hypot(
+            nearest.x - spawn_point.x, nearest.y - spawn_point.y
+        )
+        if distance > 15.0:
+            logger.warning(
+                "boarding_target_missing: participant=%s 最近停放车辆 %.1fm（>15m），"
+                "退化为向自车方向走 2.5m",
+                participant.participant_id,
+                distance,
+            )
+            return self._short_walk_toward_ego(spawn_point, carla_module)
+        if distance < 1e-3:
+            return carla_module.Location(
+                x=nearest.x,
+                y=nearest.y,
+                z=spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M,
+            )
+        dx = (spawn_point.x - nearest.x) / distance
+        dy = (spawn_point.y - nearest.y) / distance
+        # 车辆侧向 1.0 m 处（从车辆中心朝行人方向偏移）
+        return carla_module.Location(
+            x=nearest.x + dx * min(1.0, distance),
+            y=nearest.y + dy * min(1.0, distance),
+            z=spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M,
+        )
+
+    def _short_walk_toward_ego(
+        self, spawn_point: SpawnPoint, carla_module: Any
+    ) -> Optional[Any]:
+        """退化目标：向自车方向走 2.5m（不足则走到自车位置）。"""
+        ego = self._ego_spawn
+        if ego is None:
+            return None
+        dx = ego.x - spawn_point.x
+        dy = ego.y - spawn_point.y
+        distance = math.hypot(dx, dy)
+        if distance < 1e-3:
+            return None
+        step = min(2.5, distance)
+        return carla_module.Location(
+            x=spawn_point.x + dx / distance * step,
+            y=spawn_point.y + dy / distance * step,
+            z=spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M,
+        )
 
     def _register_scripted_walker(
         self,

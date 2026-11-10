@@ -51,16 +51,22 @@ class TestNavigation:
     def test_start_navigation_clamps_speed(self) -> None:
         ctrl = _RecordingController()
         wc = WalkerControllerWrapper(_Walker(), ctrl)
-        wc.start_navigation("DEST", speed_ms=5.0)  # 超过上限
+        wc.start_navigation("DEST", speed_ms=8.0)  # 超过 4.0 m/s 物理上限
         assert ctrl.started is True
         assert ctrl.go_calls == ["DEST"]
-        assert ctrl.speed_calls[0] == pytest.approx(1.4)  # 最大步速
+        assert ctrl.speed_calls[0] == pytest.approx(4.0)  # 最大步速
+
+    def test_start_navigation_keeps_platform_fast_speed(self) -> None:
+        ctrl = _RecordingController()
+        wc = WalkerControllerWrapper(_Walker(), ctrl)
+        wc.start_navigation("DEST", speed_ms=3.2)
+        assert ctrl.speed_calls[0] == pytest.approx(3.2)
 
     def test_start_navigation_min_speed(self) -> None:
         ctrl = _RecordingController()
         wc = WalkerControllerWrapper(_Walker(), ctrl)
         wc.start_navigation("DEST", speed_ms=0.01)
-        assert ctrl.speed_calls[0] == pytest.approx(0.1)
+        assert ctrl.speed_calls[0] == pytest.approx(0.3)
 
     def test_start_error_wrapped(self) -> None:
         class _Boom:

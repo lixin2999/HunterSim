@@ -1,0 +1,37 @@
+{
+  "version": "1.26.0",
+  "note": "object_kind 全表 + 旧别名 + 未知 kind + 动物降级；用于核对 prop 蓝图链、资产降级告警与报告计数。",
+  "scene_id": "prop-kinds",
+  "scene_name": "静态物体全表",
+  "map": {
+    "map_id": "Town03",
+    "map_type": "carla_town",
+    "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+  },
+  "spawn_semantics": "relative_to_ego",
+  "ego_vehicle": {"model": "hunter_se", "initial_speed": 5.0},
+  "duration": 30.0,
+  "actors": [
+    {"actor_id": "prop-cone", "type": "other", "spawn_point": {"x": 10.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "cone"}}},
+    {"actor_id": "prop-construction", "type": "other", "spawn_point": {"x": 12.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "construction"}}},
+    {"actor_id": "prop-road-barrier", "type": "other", "spawn_point": {"x": 14.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "road_barrier"}}},
+    {"actor_id": "prop-container", "type": "other", "spawn_point": {"x": 16.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "container"}}},
+    {"actor_id": "prop-tyre", "type": "other", "spawn_point": {"x": 18.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "tyre"}}},
+    {"actor_id": "prop-fallen-load", "type": "other", "spawn_point": {"x": 20.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "fallen_load"}}},
+    {"actor_id": "prop-debris", "type": "other", "spawn_point": {"x": 22.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "debris"}}},
+    {"actor_id": "prop-sign", "type": "other", "spawn_point": {"x": 24.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "sign"}}},
+    {"actor_id": "prop-bin", "type": "other", "spawn_point": {"x": 26.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "bin"}}},
+    {"actor_id": "prop-ball", "type": "other", "spawn_point": {"x": 28.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "ball"}}},
+    {"actor_id": "prop-bus-stop-shelter", "type": "other", "spawn_point": {"x": 30.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "bus_stop_shelter"}}},
+    {"actor_id": "prop-building-corner", "type": "other", "spawn_point": {"x": 32.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "building_corner"}}},
+    {"actor_id": "prop-gravel", "type": "other", "spawn_point": {"x": 34.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "gravel"}}},
+    {"actor_id": "prop-liquid", "type": "other", "spawn_point": {"x": 36.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "liquid"}}},
+    {"actor_id": "prop-parked-vehicle", "type": "other", "spawn_point": {"x": 38.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "parked_vehicle"}}},
+    {"actor_id": "prop-accident-vehicle", "type": "other", "spawn_point": {"x": 40.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "accident_vehicle"}}},
+    {"actor_id": "prop-broken-vehicle", "type": "other", "spawn_point": {"x": 42.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "broken_vehicle"}}},
+    {"actor_id": "prop-legacy-parked", "type": "other", "spawn_point": {"x": 44.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "parked"}}},
+    {"actor_id": "prop-unknown-tunnel", "type": "other", "spawn_point": {"x": 46.0, "y": 0.0}, "behavior": {"behavior_type": "static", "parameters": {"object_kind": "tunnel"}}},
+    {"actor_id": "animal-dog", "type": "other", "spawn_point": {"x": 48.0, "y": 0.0}, "behavior": {"behavior_type": "cross_road", "parameters": {"animal_kind": "dog", "crossing_speed": 2.0}}}
+  ],
+  "events": []
+}

@@ -198,6 +198,7 @@ class MockBlueprintLibrary:
             MockBlueprint("vehicle.tesla.model3"),
             MockBlueprint("vehicle.chevrolet.impala"),
             MockBlueprint("vehicle.hunter_se"),
+            MockBlueprint("vehicle.bh.crossbike"),
             MockBlueprint("walker.pedestrian.0001"),
             MockBlueprint("sensor.lidar.ray_cast"),
             MockBlueprint("sensor.camera.rgb"),

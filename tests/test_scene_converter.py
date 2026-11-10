@@ -90,3 +90,56 @@ class TestScenarioRunnerDict:
         types = {a["name"]: a["type"] for a in d["actors"]}
         assert types["v1"] == "other_vehicle"
         assert types["p1"] == "pedestrian"
+
+
+class TestSemanticsV126Conversion:
+    def _config_with(self, *participants: TrafficParticipantConfig) -> SceneConfig:
+        return SceneConfig(
+            scene_id="s1",
+            map_id="Town03",
+            ego_vehicle=EgoVehicleConfig(spawn_point=_spawn()),
+            traffic_participants=list(participants),
+        )
+
+    def test_prop_and_cyclist_types(self) -> None:
+        cfg = self._config_with(
+            TrafficParticipantConfig(
+                participant_id="prop-1",
+                actor_type="prop",
+                blueprint="static.prop.constructioncone",
+                spawn_point=_spawn(),
+                behavior=ScenarioBehaviorType.STATIC,
+            ),
+            TrafficParticipantConfig(
+                participant_id="cyc-1",
+                actor_type="cyclist",
+                blueprint="vehicle.bh.crossbike",
+                spawn_point=_spawn(),
+                behavior=ScenarioBehaviorType.CONSTANT_SPEED,
+            ),
+        )
+        d = SceneConfigConverter().to_scenario_runner_dict(cfg)
+        types = {a["name"]: a["type"] for a in d["actors"]}
+        assert types["prop-1"] == "static_prop"
+        assert types["cyc-1"] == "cyclist"
+
+    def test_cyclist_autopilot_and_prop_not(self) -> None:
+        cfg = self._config_with(
+            TrafficParticipantConfig(
+                participant_id="prop-1",
+                actor_type="prop",
+                blueprint="static.prop.constructioncone",
+                spawn_point=_spawn(),
+                behavior=ScenarioBehaviorType.STATIC,
+            ),
+            TrafficParticipantConfig(
+                participant_id="cyc-1",
+                actor_type="cyclist",
+                blueprint="vehicle.bh.crossbike",
+                spawn_point=_spawn(),
+                behavior=ScenarioBehaviorType.CONSTANT_SPEED,
+            ),
+        )
+        params = SceneConfigConverter().convert(cfg)
+        autopilot = {p.actor_type: p.autopilot for p in params.participant_spawns}
+        assert autopilot == {"prop": False, "cyclist": True}

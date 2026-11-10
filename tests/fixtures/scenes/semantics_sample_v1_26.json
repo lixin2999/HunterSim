@@ -1,0 +1,293 @@
+{
+  "version": "1.26.0",
+  "seed": 20261109,
+  "generated_by": "HunterCore scripts/batch_add_scenes.py --dry-run --seed 20261109",
+  "note": "HunterCore V1.26.0 场景语义对齐回归样本（裁剪版）：覆盖行人/儿童/开门/wrong_way/cyclist/施工绕行。",
+  "scenes": [
+    {
+      "scene_id": "v126-occluded-pedestrian",
+      "scene_name": "鬼探头：遮挡车 + 横穿行人",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town03",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "lane_id": 1}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "HUNTER-SE", "initial_speed": 8.0, "initial_steer": 0.0},
+        "weather": {"cloudiness": 20.0, "rain": 0.0, "fog": 0.0, "sun_altitude": 45.0},
+        "duration": 30.0,
+        "actors": [
+          {
+            "actor_id": "occluder-1",
+            "type": "vehicle",
+            "spawn_point": {"x": 18.0, "y": 3.5, "yaw": 0.0},
+            "behavior": {
+              "behavior_type": "static",
+              "parameters": {"vehicle_kind": "car", "blueprint": "vehicle.tesla.model3"}
+            }
+          },
+          {
+            "actor_id": "pedestrian-1",
+            "type": "pedestrian",
+            "spawn_point": {"x": 20.0, "y": -4.0, "yaw": 1.5708},
+            "behavior": {
+              "behavior_type": "occluded_dash",
+              "parameters": {"crossing_speed": 2.6}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-collision",
+            "type": "collision",
+            "description": "发生碰撞",
+            "trigger": {"condition_type": "collision", "condition": "发生碰撞"}
+          },
+          {
+            "event_id": "ev-ped-close",
+            "type": "pedestrian_crossing",
+            "description": "行人距自车小于 12m",
+            "trigger": {
+              "condition_type": "relative_distance",
+              "parameters": {"value": 12.0, "rule": "<", "relative_distance_type": "euclidean"}
+            }
+          },
+          {
+            "event_id": "ev-ttc",
+            "type": "cut_in",
+            "description": "TTC 小于 1.5s",
+            "trigger": {
+              "condition_type": "time_to_collision",
+              "parameters": {"value": 1.5, "rule": "<"}
+            },
+            "action": {"action_type": "emergency_stop", "parameters": {"deceleration": 6.5}}
+          },
+          {
+            "event_id": "ev-timeout",
+            "type": "custom",
+            "description": "运行满 30s",
+            "trigger": {
+              "condition_type": "simulation_time",
+              "parameters": {"value": 30.0, "rule": ">"}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "v126-child-chasing-ball",
+      "scene_name": "儿童追球突然横穿",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town03",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 2}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 7.0},
+        "duration": 25.0,
+        "actors": [
+          {
+            "actor_id": "child-1",
+            "type": "pedestrian",
+            "spawn_point": {"x": 16.0, "y": -5.0},
+            "behavior": {
+              "behavior_type": "child_chase_ball",
+              "parameters": {"crossing_speed": 3.2, "target_dist": 9.0}
+            }
+          },
+          {
+            "actor_id": "ball-1",
+            "type": "other",
+            "spawn_point": {"x": 14.0, "y": 1.0},
+            "behavior": {
+              "behavior_type": "static",
+              "parameters": {"object_kind": "ball"}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-child",
+            "type": "pedestrian_crossing",
+            "trigger": {
+              "condition_type": "relative_distance",
+              "parameters": {"value": 10.0, "rule": "<", "relative_distance_type": "longitudinal"}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "v126-door-opening",
+      "scene_name": "路边开门 + 行人上车",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town05",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 6.0},
+        "duration": 40.0,
+        "actors": [
+          {
+            "actor_id": "parked-door-1",
+            "type": "vehicle",
+            "spawn_point": {"x": 12.0, "y": 4.0, "yaw": 0.0},
+            "behavior": {
+              "behavior_type": "door_open",
+              "parameters": {"vehicle_kind": "car", "blueprint": "vehicle.tesla.model3"}
+            }
+          },
+          {
+            "actor_id": "boarder-1",
+            "type": "pedestrian",
+            "spawn_point": {"x": 10.0, "y": 7.0},
+            "behavior": {
+              "behavior_type": "boarding",
+              "parameters": {"crossing_speed": 1.1}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-door",
+            "type": "custom",
+            "trigger": {
+              "condition_type": "relative_distance",
+              "parameters": {"value": 8.0, "rule": "<"}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "v126-wrong-way",
+      "scene_name": "对向车道逆行会车",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town03",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 9.0},
+        "duration": 20.0,
+        "actors": [
+          {
+            "actor_id": "wrong-way-1",
+            "type": "vehicle",
+            "spawn_point": {"x": 45.0, "y": 3.5, "yaw": 3.14159},
+            "behavior": {
+              "behavior_type": "borrow_oncoming",
+              "parameters": {"vehicle_kind": "truck", "target_speed": 9.0}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-thw",
+            "type": "custom",
+            "trigger": {
+              "condition_type": "time_headway",
+              "parameters": {"value": 1.0, "rule": "<"}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "v126-cyclist",
+      "scene_name": "自行车同向交互",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town03",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 8.0},
+        "duration": 40.0,
+        "actors": [
+          {
+            "actor_id": "cyclist-1",
+            "type": "other",
+            "spawn_point": {"x": 10.0, "y": 1.8},
+            "behavior": {
+              "behavior_type": "lane_follow",
+              "parameters": {"vehicle_kind": "bicycle", "cyclist_speed": 4.5}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-distance",
+            "type": "custom",
+            "trigger": {
+              "condition_type": "traveled_distance",
+              "parameters": {"value": 40.0, "rule": ">="}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scene_id": "v126-construction-detour",
+      "scene_name": "施工绕行",
+      "scene_config": {
+        "version": "1.26.0",
+        "map": {
+          "map_id": "Town05",
+          "map_type": "carla_town",
+          "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+        },
+        "spawn_semantics": "relative_to_ego",
+        "ego_vehicle": {"model": "hunter_se", "initial_speed": 6.0},
+        "duration": 45.0,
+        "actors": [
+          {
+            "actor_id": "cone-1",
+            "type": "other",
+            "spawn_point": {"x": 22.0, "y": 2.0},
+            "behavior": {"behavior_type": "static", "parameters": {"object_kind": "cone"}}
+          },
+          {
+            "actor_id": "barrier-1",
+            "type": "other",
+            "spawn_point": {"x": 26.0, "y": 3.2},
+            "behavior": {
+              "behavior_type": "static",
+              "parameters": {"object_kind": "road_barrier"}
+            }
+          },
+          {
+            "actor_id": "car-1",
+            "type": "vehicle",
+            "spawn_point": {"x": 30.0, "y": 1.8},
+            "behavior": {
+              "behavior_type": "lane_follow",
+              "parameters": {"vehicle_kind": "van", "target_speed": 6.0}
+            }
+          }
+        ],
+        "events": [
+          {
+            "event_id": "ev-od",
+            "type": "custom",
+            "trigger": {
+              "condition_type": "reach_position",
+              "parameters": {"value": 35.0}
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

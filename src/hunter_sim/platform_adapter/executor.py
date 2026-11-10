@@ -609,7 +609,7 @@ class SimulationExecutor:
     def _write_artifacts(
         self, context: _RunContext, evaluation: SceneEvaluationResult
     ) -> list[ArtifactResult]:
-        """写 eval.json/events.jsonl/run.log（上传失败不阻断）。"""
+        """写 mapping.json/eval.json/events.jsonl/run.log（上传失败不阻断）。"""
         record = context.record
         current = self._store.get(record.instance_id) or record
         manager = ArtifactManager(
@@ -619,7 +619,12 @@ class SimulationExecutor:
             sim_id=record.sim_id,
             scene_id=record.scene_id,
         )
+        mapping = dict(context.scene.extra_params.get("mapping_report") or {})
+        warning_counts = mapping.get("warning_counts") or {}
+        actors = mapping.get("actors") or {}
+        events = mapping.get("events") or {}
         artifacts = [
+            manager.write_json("mapping.json", mapping),
             manager.write_json("eval.json", evaluation.to_dict()),
             manager.write_jsonl(
                 "events.jsonl", [_event_to_dict(event) for event in _detected_events(context.runner)]
@@ -633,6 +638,18 @@ class SimulationExecutor:
                         f"instance_id={record.instance_id}",
                         f"status={current.status}",
                         f"message={current.message or ''}",
+                        f"actors_declared={actors.get('declared', 0)}",
+                        f"actors_mapped={actors.get('mapped', 0)}",
+                        f"actors_by_type={actors.get('by_actor_type', {})}",
+                        f"events_total={events.get('total', 0)}",
+                        f"events_runtime={events.get('runtime_evaluable', 0)}",
+                        f"events_disabled={events.get('disabled', 0)}",
+                        f"mapping_warnings={warning_counts}",
+                        *[
+                            f"mapping_warning {warning.get('code', '')} "
+                            f"{warning.get('detail', '')}".rstrip()
+                            for warning in (mapping.get("warnings") or [])[:100]
+                        ],
                     ]
                 )
                 + "\n",

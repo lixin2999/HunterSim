@@ -1,0 +1,36 @@
+{
+  "version": "1.26.0",
+  "note": "构造用例：未知 condition_type 必须映射为 DISABLED 并写 condition_unknown 告警，绝不回落 TIME。",
+  "scene_id": "unknown-condition",
+  "scene_name": "未知触发条件：quantum_entangle",
+  "map": {
+    "map_id": "Town03",
+    "map_type": "carla_town",
+    "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+  },
+  "spawn_semantics": "relative_to_ego",
+  "ego_vehicle": {"model": "hunter_se", "initial_speed": 5.0},
+  "duration": 20.0,
+  "actors": [
+    {
+      "actor_id": "car-1",
+      "type": "vehicle",
+      "spawn_point": {"x": 12.0, "y": 1.8},
+      "behavior": {
+        "behavior_type": "lane_follow",
+        "parameters": {"vehicle_kind": "car", "target_speed": 5.0}
+      }
+    }
+  ],
+  "events": [
+    {
+      "event_id": "ev-quantum",
+      "type": "custom",
+      "description": "未知条件",
+      "trigger": {
+        "condition_type": "quantum_entangle",
+        "parameters": {"value": 1.0}
+      }
+    }
+  ]
+}

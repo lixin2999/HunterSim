@@ -1,0 +1,42 @@
+{
+  "version": "1.26.0",
+  "note": "构造用例：trigger 缺少 condition_type（旧载荷/描述性事件），必须 DISABLED 并写 condition_missing。",
+  "scene_id": "missing-condition",
+  "scene_name": "缺失触发条件",
+  "map": {
+    "map_id": "Town03",
+    "map_type": "carla_town",
+    "spawn_point": {"x": 0.0, "y": 0.0, "yaw": 0.0, "lane_id": 1}
+  },
+  "spawn_semantics": "relative_to_ego",
+  "ego_vehicle": {"model": "hunter_se", "initial_speed": 5.0},
+  "duration": 20.0,
+  "actors": [
+    {
+      "actor_id": "car-1",
+      "type": "vehicle",
+      "spawn_point": {"x": 12.0, "y": 1.8},
+      "behavior": {
+        "behavior_type": "constant_velocity",
+        "parameters": {
+          "speed": 5.0,
+          "trigger": {"parameters": {"value": 3.0}}
+        }
+      }
+    }
+  ],
+  "events": [
+    {
+      "event_id": "ev-missing",
+      "type": "custom",
+      "description": "旧载荷没有 condition_type",
+      "trigger": {"parameters": {"source": "batch", "value": 5.0}}
+    },
+    {
+      "event_id": "ev-collision",
+      "type": "collision",
+      "description": "碰撞由传感器驱动，不依赖数值触发",
+      "trigger": {"condition_type": "collision"}
+    }
+  ]
+}

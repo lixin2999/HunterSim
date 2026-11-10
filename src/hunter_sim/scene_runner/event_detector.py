@@ -16,9 +16,39 @@ from typing import Any, Callable, Optional
 
 from hunter_sim.common.models import VehicleState
 from hunter_sim.common.utils import get_logger
-from hunter_sim.scene_runner.scene_config import SceneEventDefinition, SceneEventType
+from hunter_sim.scene_runner.scene_config import (
+    SceneEventDefinition,
+    SceneEventTrigger,
+    SceneEventType,
+    TriggerType,
+)
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class TriggerMetrics:
+    """平台事件每 tick 评估所需的度量快照。
+
+    Attributes:
+        elapsed_s: 场景已运行时间（秒）。
+        traveled_distance_m: 自车已行驶里程（积分）。
+        speed_ms: 自车速度（m/s）。
+        acceleration_ms2: 加速度模长（m/s²）。
+        offroad: 是否越界（0/1 指标）。
+        relative_distance_m: 按关系类型（longitudinal/lateral/euclidean/sightline）的最近距离。
+        time_headway_s: 纵向车头时距（秒），前方无车时为 None。
+        time_to_collision_s: 碰撞时间（秒），前方无车时为 None。
+    """
+
+    elapsed_s: float = 0.0
+    traveled_distance_m: float = 0.0
+    speed_ms: float = 0.0
+    acceleration_ms2: float = 0.0
+    offroad: bool = False
+    relative_distance_m: dict[str, float] = field(default_factory=dict)
+    time_headway_s: Optional[float] = None
+    time_to_collision_s: Optional[float] = None
 
 
 @dataclass
@@ -316,6 +346,54 @@ class EventDetector:
             self.check_emergency_brake(timestamp, -forward_accel)
         self._prev_speed = vehicle_state.vehicle_speed
 
+    def update_scene_triggers(self, timestamp: float, metrics: TriggerMetrics) -> None:
+        """逐个评估平台事件定义；只发出 ``TRIGGER_REACHED`` 标记，不判失败。
+
+        Args:
+            timestamp: 当前仿真时间戳（秒）。
+            metrics: 本 tick 的度量快照。
+        """
+        for definition in list(self._definitions.values()):
+            trigger = definition.trigger
+            if not definition.is_runtime_evaluable:
+                continue
+            if trigger.trigger_type in (
+                TriggerType.DISABLED,
+                TriggerType.EVENT,
+                TriggerType.POSITION,
+            ):
+                # EVENT 由碰撞传感器驱动，POSITION 仅用于参与者行为触发
+                continue
+            actual = _actual_value(trigger, metrics)
+            if actual is None:
+                continue
+            hit = _compare(actual, trigger.comparator, trigger.value)
+            if not self._edge_latch(f"definition:{definition.event_id}", hit):
+                continue
+            self._emit(
+                DetectedEvent(
+                    event_id=definition.event_id,
+                    event_type=SceneEventType.TRIGGER_REACHED.value,
+                    time_stamp=timestamp,
+                    sim_time=timestamp,
+                    description=(
+                        f"Trigger reached: {trigger.trigger_type.value} "
+                        f"{trigger.comparator} {trigger.value:g} (actual={actual:.3f})"
+                    ),
+                    data={
+                        "trigger_type": trigger.trigger_type.value,
+                        "comparator": trigger.comparator,
+                        "threshold": trigger.value,
+                        "actual": actual,
+                        "relation": trigger.relation,
+                        "approximate": trigger.is_approximate,
+                        "expects_action": definition.action_type,
+                        "expects_action_parameters": definition.action_parameters,
+                    },
+                    event_level="info",
+                )
+            )
+
     def _emit(self, event: DetectedEvent) -> None:
         """记录事件并触发回调。"""
         with self._lock:
@@ -336,3 +414,45 @@ class EventDetector:
         self._target_reached = False
         self._timeout_emitted = False
         logger.debug("EventDetector reset")
+
+
+def _actual_value(trigger: SceneEventTrigger, metrics: TriggerMetrics) -> Optional[float]:
+    """按触发类型取出本 tick 的实际度量；无法评估时返回 None。"""
+    trigger_type = trigger.trigger_type
+    if trigger_type is TriggerType.TIME:
+        return metrics.elapsed_s
+    if trigger_type is TriggerType.VELOCITY:
+        return metrics.speed_ms
+    if trigger_type is TriggerType.ACCELERATION:
+        return metrics.acceleration_ms2
+    if trigger_type is TriggerType.OFFROAD:
+        return 1.0 if metrics.offroad else 0.0
+    if trigger_type is TriggerType.TRAVELED_DISTANCE:
+        return metrics.traveled_distance_m
+    if trigger_type is TriggerType.TIME_HEADWAY:
+        return metrics.time_headway_s
+    if trigger_type is TriggerType.TIME_TO_COLLISION:
+        return metrics.time_to_collision_s
+    if trigger_type is TriggerType.DISTANCE:
+        relation = trigger.relation or "euclidean"
+        return metrics.relative_distance_m.get(relation) or metrics.relative_distance_m.get(
+            "euclidean"
+        )
+    return None
+
+
+def _compare(actual: float, comparator: str, threshold: float) -> bool:
+    """按平台 ``rule`` 比较实际值与阈值。"""
+    if comparator == ">":
+        return actual > threshold
+    if comparator == ">=":
+        return actual >= threshold
+    if comparator == "<":
+        return actual < threshold
+    if comparator == "<=":
+        return actual <= threshold
+    if comparator == "==":
+        return abs(actual - threshold) < 1e-6
+    if comparator == "!=":
+        return abs(actual - threshold) >= 1e-6
+    return False

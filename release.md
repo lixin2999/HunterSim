@@ -3119,3 +3119,86 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 0xC0000409 属 CARLA 原生 fail-fast，本次只做到「分阶段定位 + 线程守卫」，若日志停在 `destroying actors` 仍需在 CARLA 侧排查（如 `destroy()` 与传感器回调竞争、跨实例 client 复用等既有已知问题）。
 - 主视区仍为 1920x1080 原生编码；单客户端 MJPEG 带宽约 2~3 MB/s，多客户端同时观看时受机器磁盘/CPU 限制，必要时降低 `overview_camera` 分辨率。
 - 「儿童追球」仍映射为行人横穿，球道具与追球跑位需平台下发道具 Actor 后再补。
+
+
+## V3.5.0 — HunterCore V1.26.0 场景语义对齐（actor 三分类 / 真实触发 / 映射报告）
+
+**发布日期**：2026-11-10
+**版本定位**：对齐平台 HunterCore **V1.26.0** 场景语义（minor：新增 actor 类型、行为、触发类型与映射报告产物）。此前平台已用 `semantics.resolve_value` 把 `parameters` 中的变量名解析为真实数值，仿真端按真实数值执行；未知行为继续 **fail-loud**，未知/缺失触发条件**显式禁用**，不再回落 `TIME`。
+
+### 修复的问题
+
+1. **静态物体被当成行人**：平台 `type=other` 的锥桶/护栏/散落物一律映射为 walker，画面里出现「站立行人」。
+2. **自行车被当成行人**：`vehicle_kind=bicycle` 未识别，cyclist 场景实际生成行人。
+3. **速度语义丢失**：平台下发的 `crossing_speed` / `target_speed` / `cyclist_speed` 等别名读不到，统一回落 5 m/s；行人又被夹到 1.4 m/s，快跑/鬼探头变成慢动作。
+4. **触发条件是死代码**：`time_headway` / `time_to_collision` 被映射成 `EVENT` 但从未 `fire()`；`traveled_distance` 被当成「与自车距离」；缺失 `condition_type` 一律回落 `TIME=0`，导致 `t=0` 即触发。
+5. **平台事件没有每 tick 消费者**：`EventDetector.check_tick` 全仓无调用，`cut_in` / `pedestrian_crossing` / `obstacle_appearance` 等事件永远进不了 `events.jsonl`。
+6. **无法离线定位映射问题**：平台升级后只能等真机跑场景，缺少参与者/事件/告警的结构化报告。
+
+### 新增与变更
+
+**一、数据模型（`scene_runner/scene_config.py`）**
+
+- `TriggerType` 新增 `ACCELERATION` / `OFFROAD` / `TRAVELED_DISTANCE` / `TIME_HEADWAY` / `TIME_TO_COLLISION` / `DISABLED`。
+- `SceneEventTrigger` 新增 `comparator`（`>` `>=` `<` `<=` `==` `!=`）、`relation`（longitudinal/lateral/euclidean/sightline）、`source_condition_type`、`is_approximate`。
+- `TrafficParticipantConfig.actor_type` 扩展为 `vehicle/walker/cyclist/prop`，并新增 `source_actor_type` / `source_behavior_type` / `object_kind` / `vehicle_kind` / `animal_kind` / `blueprint_candidates` / `behavior_params` / `target_distance_m`。
+- `SpawnPoint` 新增 `lane_id`（原值透传，`"lane-1"` 等占位值不参与选道）与 `lane_index`（仅可转整数时填充）；`EgoVehicleConfig` 新增 `initial_steer`。
+- `SceneEventType.TRIGGER_REACHED`：平台触发器命中标记，不参与碰撞/失败统计。
+- `SceneEventDefinition` 新增 `action_type` / `action_parameters` / `is_runtime_evaluable`；`SceneConfig` 新增 `mapping_warnings`。
+
+**二、平台映射（`platform_adapter/scene_mapper.py`）**
+
+- **actor 三分类**：`vehicle_kind=bicycle` → `cyclist`；`object_kind` 非空 → `prop`；`animal_kind` → 资产降级为 walker 并告警；`type=other` 且无任何 kind → 保持 walker 兼容并打 `actor_type_legacy_other`。
+- **行为对齐**：`cross_road` 修正为 `PEDESTRIAN_CROSS`；`borrow_oncoming` / `door_open` / `boarding` 可执行但标记 `behavior_approx`；未知 `behavior_type` 仍抛 `SceneMappingError(unsupported_behavior:*)`。
+- **速度**：支持 `speed/speed_ms/target_speed/target_speed_ms/velocity/crossing_speed/cut_in_speed/cyclist_speed/animal_speed`；按 actor 类型分档；行人夹取到 0.3–4.0 m/s 并告警；参数值仍是变量名时记 `unresolved_param` 后使用默认值。
+- **prop 蓝图链**：`object_kind` → `static.prop.*` 候选链（锥桶/护栏/集装箱/轮胎/路牌/垃圾桶等）；停放/事故/故障车走 `vehicle.*`；`ball` / `bus_stop_shelter` / `building_corner` / `gravel` / `liquid` 标记 `prop_asset_degraded`；未知 kind 打 `object_kind_unknown` 后按锥桶近似。
+- **触发条件**：未知/缺失 `condition_type` → `DISABLED`（`condition_unknown` / `condition_missing`），**绝不回落 TIME**；`reach_position` 近似为 `TRAVELED_DISTANCE`，`offroad` 标注近似；保留平台 `rule` 比较符与 `relative_distance_type`。
+- **映射报告**：`extra_params["mapping_report"]` 汇总 actors（declared/mapped/by_source_type/by_actor_type/by_behavior）、events（total/runtime_evaluable/disabled/by_condition）、warnings 与 `warning_counts`。
+
+**三、执行端（`scene_runner/builtin_scenario.py`、`scene_runner/scene_converter.py`）**
+
+- 新增 prop / cyclist 生成分支：`static.prop` 不进入车辆控制；车类 prop 显式驻车（含手刹）；`door_open` 探测 `open_door()`，缺失时日志 `door_api_unavailable` 并降级为路边停车；`boarding` 走向最近停放车辆（>15 m 或不存在时退化为向自车走 2.5 m 并告警）。
+- 行人速度按 0.3–4.0 m/s 执行，不再截断到 1.4；`WalkerControllerWrapper` 同步放宽上限。
+- 自车 `initial_steer` 在手动模式应用；autopilot 模式下忽略并告警。
+- 每 tick 评估平台事件：积分已行驶里程、读取加速度/越界/相对距离/THW/TTC，命中后发出 `TRIGGER_REACHED`（边沿闩锁，只发一次）。
+- `SceneConfigConverter`：`prop → static_prop`、`cyclist → cyclist`；autopilot 仅对 vehicle/cyclist 且非 `STATIC` 开启。
+
+**四、产物与 CLI（`platform_adapter/executor.py`、`cli/main.py`）**
+
+- 实例产物新增 `mapping.json`（映射报告），`run.log` 汇总 actors/events/warnings。
+- 新增 `huntersim scene-check --input <json> [--json-out] [--strict]`：离线执行平台 → 内部映射，输出参与者/事件/告警统计；`--strict` 下映射失败或存在 `unresolved_param` / `condition_unknown` 返回非零退出码，可直接用于平台升级门禁。
+
+### 向后兼容与行为变化（需公告）
+
+- **事件流会变化**：V3.4.4 及以前平台事件基本不会进入 `events.jsonl`；V3.5.0 起会按真实条件触发并输出 `TRIGGER_REACHED`，同场景评估基线会变化。`TRIGGER_REACHED` 不计入碰撞/失败统计。
+- 旧载荷（无 `condition_type`）仍可加载，但对应事件为 `DISABLED`，不参与运行时评估；碰撞事件仍由碰撞传感器驱动，不受影响。
+- `type=other` 且无 kind 保持 walker 兼容（仅新增告警）；原有 `actors` 载荷与别名键读取逻辑不变。
+- `lane_id` 仅透传，不改变出生点选择；`initial_steer` 仅在非 autopilot 模式生效。
+
+### 验证
+
+- `pytest -q` 全量：**1399 passed**（新增 `tests/test_scene_fixtures.py` 24 项；场景语义相关单测覆盖 mapper/scene_config/event_detector/trigger_conditions/scene_converter/builtin_scenario/actor_behaviors/walker_controller）。
+- `mypy src/hunter_sim`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 新增 fixture：`tests/fixtures/scenes/semantics_sample_v1_26.json`、`legacy_v1_25_sample.json`、`unknown_behavior.json`、`unknown_condition.json`、`missing_condition.json`、`prop_kinds.json`。
+- 离线 CLI 验证：`huntersim scene-check --input tests/fixtures/scenes/semantics_sample_v1_26.json --json-out build/mapping_report.json` → `scenes=6 ok=6 actors=11 events=9`。
+- 真机 CARLA 0.9.16 端到端验收待执行（开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.0`；
+2. 升级前先用 `huntersim scene-check --input <平台样本> --strict` 核对映射报告，确认 `condition_unknown` / `unresolved_param` 为 0（旧载荷的 `condition_missing` 属预期）；
+3. 重启 `huntersim up`，下发场景后检查日志：`actors=N/N`、`Scene participants mapped: ...`、无未知 `object_kind` 的 `spawn skipped`；
+4. 检查实例产物 `mapping.json` 的 `warning_counts` 与 `run.log` 汇总；
+5. 复核评估：`events.jsonl` 中的 `TRIGGER_REACHED` 不应计入碰撞/失败。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.0`；`pyproject.toml` 版本 `3.5.0`；wheel / 容器版本号一致。
+
+### 待办 / 已知边界
+
+- `reach_position` 仅按 `traveled_distance` 近似（平台只下发标量距离），复杂路口仍建议平台提供路径点。
+- `offroad` 使用 waypoint 车道类型判断；无 `get_waypoint` 接口或地图数据缺失时按「未越界」容错。
+- 动物资产在 CARLA 0.9.16 缺失，仍降级为行人外观并报 `animal_asset_missing`。
+- 车类 prop 的开门动画依赖 CARLA `open_door()`；无该 API 时只做路边停车降级。
+- 事件 `action`（如 `emergency_stop`）当前只随 `TRIGGER_REACHED.data` 留存，不在仿真端执行。

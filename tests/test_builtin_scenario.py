@@ -628,3 +628,202 @@ class TestSpawnReplacement:
         assert world.spawn_attempts >= 2
         assert scenario._ego_spawn is not None
         assert is_placeholder_origin(scenario._ego_spawn) is False
+
+
+class TestSemanticsV126Execution:
+    """V1.26.0 执行端语义：prop/cyclist/行人速度/initial_steer/boarding。"""
+
+    def test_prop_spawn_no_control(self) -> None:
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "cone-1",
+                        "actor_type": "prop",
+                        "blueprint": "static.prop.constructioncone",
+                        "spawn_point": {"x": 6.0, "y": 2.0},
+                        "behavior": "static",
+                    }
+                ]
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        prop = next(
+            actor for actor in world.get_actors() if actor.type_id.startswith("static.prop.")
+        )
+        # static.prop 没有车辆控制接口，绝不能进入车辆控制分支
+        assert not hasattr(prop, "get_control")
+        assert not hasattr(prop, "set_autopilot")
+
+    def test_parked_vehicle_prop_braked(self) -> None:
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "parked-1",
+                        "actor_type": "prop",
+                        "object_kind": "parked_vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 12.0, "y": 0.0},
+                        "behavior": "static",
+                    }
+                ]
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        prop = next(
+            actor
+            for actor in world.get_actors()
+            if actor.type_id == "vehicle.tesla.model3"
+        )
+        control = prop.get_control()
+        assert control is not None
+        assert control.brake == pytest.approx(1.0)
+        assert prop._autopilot is False
+
+    def test_cyclist_uses_vehicle_blueprint(self) -> None:
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "cyc-1",
+                        "actor_type": "cyclist",
+                        "blueprint": "vehicle.bh.crossbike",
+                        "spawn_point": {"x": 8.0, "y": 1.0},
+                        "behavior": "constant_speed",
+                        "speed_ms": 4.0,
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        cyclist = next(
+            actor for actor in world.get_actors() if actor.type_id == "vehicle.bh.crossbike"
+        )
+        assert cyclist._autopilot is True
+
+    def test_walker_speed_not_capped_at_1_4(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda *args, **kwargs: MockTransform(),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+        )
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "walker-fast",
+                        "actor_type": "walker",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 20.0, "y": 0.0},
+                        "behavior": "pedestrian_cross",
+                        "speed_ms": 3.2,
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        controller = scenario._walker_ai_controllers[0]  # noqa: SLF001
+        assert controller.max_speed == pytest.approx(3.2)
+
+    def test_initial_steer_applied_in_manual_mode(self) -> None:
+        scenario = _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 1.0, "y": 2.0},
+                    "autopilot": False,
+                    "initial_steer": 0.35,
+                },
+                "traffic_participants": [],
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        ego = scenario.ego_actor
+        assert ego is not None
+        assert ego.get_control().steer == pytest.approx(0.35)
+
+    def test_boarding_targets_parked_vehicle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda *args, **kwargs: MockTransform(),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+        )
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "parked-1",
+                        "actor_type": "prop",
+                        "object_kind": "parked_vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 12.0, "y": 0.0},
+                        "behavior": "static",
+                    },
+                    {
+                        "participant_id": "person-1",
+                        "actor_type": "walker",
+                        "source_behavior_type": "boarding",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 10.0, "y": 5.0},
+                        "behavior": "pedestrian_cross",
+                        "speed_ms": 1.2,
+                    },
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        controller = scenario._walker_ai_controllers[0]  # noqa: SLF001
+        destination = controller.destination
+        assert destination is not None
+        distance = ((destination.x - 12.0) ** 2 + (destination.y - 0.0) ** 2) ** 0.5
+        assert distance == pytest.approx(1.0, abs=0.05)
+
+    def test_tick_evaluates_scene_triggers(self) -> None:
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [],
+                "scene_events": [
+                    {
+                        "event_id": "ev-time",
+                        "event_type": "custom",
+                        "trigger": {"trigger_type": "time", "value": 0.5},
+                    }
+                ],
+            }
+        )
+        world = MockWorld()
+        scenario.setup(world)
+
+        scenario.tick(world, 0.0, 0.4)
+        assert scenario._event_detector.detected_events == []  # noqa: SLF001
+        scenario.tick(world, 0.6, 0.2)
+        events = scenario._event_detector.detected_events  # noqa: SLF001
+        assert len(events) == 1
+        assert events[0].event_type == "trigger_reached"
+        assert events[0].event_id == "ev-time"

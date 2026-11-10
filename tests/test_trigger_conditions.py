@@ -7,10 +7,15 @@ from typing import Optional
 import pytest
 
 from hunter_sim.traffic_sim.trigger_conditions import (
+    AccelerationTrigger,
     DistanceTrigger,
     EventTrigger,
+    OffroadTrigger,
     PositionTrigger,
+    TimeHeadwayTrigger,
+    TimeToCollisionTrigger,
     TimeTrigger,
+    TraveledDistanceTrigger,
     VelocityTrigger,
     create_trigger_from_config,
 )
@@ -146,3 +151,83 @@ class TestTriggerFactory:
     def test_unknown_type_raises(self) -> None:
         with pytest.raises(ValueError):
             create_trigger_from_config({"type": "magic"})
+
+
+class _MetricActor:
+    """携带加速度/里程/越界/THW/TTC 属性的测试 Actor。"""
+
+    def __init__(self, **metrics: object) -> None:
+        self._metrics = metrics
+
+    def __getattr__(self, name: str) -> object:
+        if name in self._metrics:
+            return self._metrics[name]
+        raise AttributeError(name)
+
+
+class _AccelActor(_MetricActor):
+    def __init__(self, magnitude: float) -> None:
+        super().__init__()
+        self._magnitude = magnitude
+
+    def get_acceleration(self) -> _Vec:
+        return _Vec(self._magnitude, 0.0)
+
+
+class TestExtendedTriggers:
+    def test_acceleration_threshold(self) -> None:
+        trig = AccelerationTrigger(3.0, comparator=">")
+        assert trig.check(0.0, None, _AccelActor(2.0)) is False
+        assert trig.check(0.0, None, _AccelActor(4.0)) is True
+
+    def test_traveled_distance(self) -> None:
+        trig = TraveledDistanceTrigger(100.0, comparator=">=")
+        assert trig.check(0.0, None, _MetricActor(traveled_distance_m=99.0)) is False
+        assert trig.check(0.0, None, _MetricActor(traveled_distance_m=100.0)) is True
+
+    def test_traveled_distance_without_metric_is_false(self) -> None:
+        assert TraveledDistanceTrigger(1.0).check(0.0, None, _MetricActor()) is False
+
+    def test_offroad(self) -> None:
+        trig = OffroadTrigger(0.5, ">")
+        assert trig.check(0.0, None, _MetricActor(offroad=False)) is False
+        assert trig.check(0.0, None, _MetricActor(offroad=True)) is True
+
+    def test_time_headway(self) -> None:
+        trig = TimeHeadwayTrigger(1.0, "<")
+        assert trig.check(0.0, None, _MetricActor(time_headway_s=1.5)) is False
+        assert trig.check(0.0, None, _MetricActor(time_headway_s=0.5)) is True
+
+    def test_time_to_collision(self) -> None:
+        trig = TimeToCollisionTrigger(2.0, "<")
+        assert trig.check(0.0, None, _MetricActor(time_to_collision_s=3.0)) is False
+        assert trig.check(0.0, None, _MetricActor(time_to_collision_s=1.0)) is True
+
+    def test_velocity_lt_for_standstill(self) -> None:
+        trig = VelocityTrigger(0.1, comparator="<")
+        assert trig.check(0.0, None, _Actor(_Vec(0.0, 0.0), vel=_Vec(0.05, 0.0))) is True
+        assert trig.check(0.0, None, _Actor(_Vec(0.0, 0.0), vel=_Vec(1.0, 0.0))) is False
+
+    def test_factory_extended_types(self) -> None:
+        assert isinstance(
+            create_trigger_from_config({"type": "acceleration", "value": 3.0}),
+            AccelerationTrigger,
+        )
+        assert isinstance(
+            create_trigger_from_config({"type": "traveled_distance", "value": 50.0}),
+            TraveledDistanceTrigger,
+        )
+        assert isinstance(
+            create_trigger_from_config({"type": "offroad", "value": 0.5}), OffroadTrigger
+        )
+        assert isinstance(
+            create_trigger_from_config({"type": "time_headway", "value": 1.0}),
+            TimeHeadwayTrigger,
+        )
+        assert isinstance(
+            create_trigger_from_config({"type": "time_to_collision", "value": 2.0}),
+            TimeToCollisionTrigger,
+        )
+        assert isinstance(
+            create_trigger_from_config({"type": "standstill"}), VelocityTrigger
+        )
