@@ -80,7 +80,11 @@ def _make_map_manager_resolver(settings: HunterSimSettings) -> MapManagerResolve
 
             client = carla.Client(endpoint.host, endpoint.rpc_port)
             client.set_timeout(float(settings.carla.timeout_seconds))
-            return MapManager(client)
+            return MapManager(
+                client,
+                rpc_timeout_seconds=float(settings.carla.timeout_seconds),
+                map_load_timeout_seconds=float(settings.carla.map_load_timeout_seconds),
+            )
         except Exception as exc:  # noqa: BLE001  端点不可达 / SDK 缺失
             logger.warning(f"Adapter map manager unavailable for {endpoint.key}: {exc}")
             return None

@@ -3202,3 +3202,46 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 - 动物资产在 CARLA 0.9.16 缺失，仍降级为行人外观并报 `animal_asset_missing`。
 - 车类 prop 的开门动画依赖 CARLA `open_door()`；无该 API 时只做路边停车降级。
 - 事件 `action`（如 `emergency_stop`）当前只随 `TRIGGER_REACHED.data` 留存，不在仿真端执行。
+
+---
+
+## V3.5.1 — 实例装配报 `load_map(Town06) time-out of 10000ms`：地图加载沿用普通 RPC 超时
+
+**发布日期**：2026-11-10
+**版本定位**：patch 修复。平台下发 3-actor 行人横穿场景（SCN-8990-CP-NRN-14）后，实例 11s 内直接 `failed`：`execution_unavailable:Failed to assemble scene runtime on engine '127.0.0.1:2000' for map 'Town06': [carla_engine][load_map(Town06)] time-out of 10000ms while waiting for the simulator`；`sensors_r1.mcap` 为 `frames=0`（331B 空包）。
+
+### 根因
+
+1. **超时口径错配**：`MapManager.load_map` 直接走 `client.load_world()`，而 CARLA 客户端的 RPC 超时只有一个（`CARLA_TIMEOUT_SECONDS`，默认 **10s**，V3.3.3 起为每次装配新建连接并 `set_timeout`）。`load_world` 不是普通 RPC：首次加载/切换地图需服务端重建世界、加载建筑与导航数据，Town06 这类大地图冷启动普遍 **20~60s**，于是服务端还在加载、客户端已抛 `time-out of 10000ms while waiting for the simulator`。时间线亦吻合：`10:15:20` 开始加载 → `10:15:31` 失败（≈ 10s 超时 + 开销）。
+2. **排障信息不足**：错误只透传 LibCarla 原文，看不出是「加载慢」还是「CARLA 卡在同步模式等 tick」，也看不到真实加载耗时（成功分支才有 `loaded in ...ms`）。
+
+### 修复
+
+- **`common/models.py`**：`CarlaSettings` 新增 `map_load_timeout_seconds`（`CARLA_MAP_LOAD_TIMEOUT_SECONDS`，默认 **180s**，上限 1800s），与常规 `timeout_seconds` 分离。
+- **`engine/map_manager.py`**：新增 `_map_load_timeout()` 上下文管理器——仅 `load_world` / `generate_opendrive_world` 期间把客户端超时临时放宽到 `map_load_timeout_seconds`，**无论成功或异常都恢复**为常规超时（生成、推进、取快照等仍受 10s 约束，避免真卡死时长时间阻塞）。配置写反（加载超时 < 常规超时）时按常规超时执行，不缩减。客户端无 `set_timeout`（Mock/受限实现）时退化为原行为。
+- **`platform_adapter/app.py`**：装配器把两个超时同时注入 `MapManager`。
+- **错误信息**：超时失败追加处置提示（调大 `CARLA_MAP_LOAD_TIMEOUT_SECONDS` / 检查 CARLA 是否停在同步模式等 tick），非超时错误保持原样；成功日志新增 `rpc timeout raised to ...s`，便于判断真实加载耗时。
+- **文档/模板**：`.env.example`、`user_manual.md` FAQ 补充该变量与排障口径。
+
+### 向后兼容与行为变化
+
+- 新增变量有默认值，`.env` 不填照样生效（默认 180s）；旧配置文件零改动。
+- 上限从「所有 RPC 10s」变为「地图加载 180s + 其余 10s」：仅当地图确实加载超过 10s 时行为变化（从失败变为等待）。若 CARLA server 真死，实例会在 180s 后失败（仍受 `ADAPTER_WATCHDOG_*` 看门狗兜底）。
+
+### 验证
+
+- `pytest -q` 全量：**1404 passed**（新增 `tests/test_map_manager.py::TestMapLoadTimeout` 5 项：加载期间放宽并恢复、失败路径恢复 + 提示文案、非超时错误无提示、无 `set_timeout` 的客户端仍可加载、配置写反不缩超时）。`tests/mocks/carla_mocks.py` 的 `MockCarlaClient` 补齐 `set_timeout`/`timeout`/`timeout_seen_during_load`。
+- `mypy src/hunter_sim`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 真机 CARLA 0.9.16 复测待执行（开发环境 `.venv` 未安装 `carla` 模块，无法本地拉起引擎）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.1`；
+2. 重启 `huntersim up`（配置无需修改，默认即生效）；
+3. 重新下发该场景，日志应出现 `Map 'Town06' loaded in <ms> (rpc timeout raised to 180s)`，其后正常进入 `Scene participants mapped` 与传感器推流；
+4. 若仍报超时：先看 `<ms>` 与 CARLA server 控制台；若 `load_world` 在 180s 内无任何进度输出，按「CARLA 停在同步模式等待 tick」处理——重启 CARLA server，必要时调 `CARLA_MAP_LOAD_TIMEOUT_SECONDS`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.1`；`pyproject.toml` 版本 `3.5.1`；wheel / 容器版本号一致。
+

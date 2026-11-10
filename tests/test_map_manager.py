@@ -15,7 +15,7 @@ import pytest
 
 from hunter_sim.common.exceptions import CarlaSimulationError, ConfigurationError
 from hunter_sim.engine.map_manager import BUILTIN_MAPS, MapInfo, MapManager
-from tests.mocks.carla_mocks import MockCarlaClient
+from tests.mocks.carla_mocks import MockCarlaClient, MockWorld
 
 
 class _WaypointMap:
@@ -87,6 +87,75 @@ class TestLoadMap:
         # Town02 预加载成功，BadMap 触发 warning 分支
         mgr = MapManager(client, preload_maps=["Town02", "BadMap"])
         assert mgr.current_map_id == "Town02"
+
+
+class TestMapLoadTimeout:
+    """V3.5.1：地图加载期间临时放宽 RPC 超时。
+
+    大地图（Town06 等）冷启动可达 20~60s，沿用常规 10s 超时会直接
+    报 ``time-out of 10000ms while waiting for the simulator``。
+    """
+
+    def test_timeout_raised_during_load_and_restored(self) -> None:
+        client = MockCarlaClient()
+        mgr = MapManager(client, rpc_timeout_seconds=10.0, map_load_timeout_seconds=180.0)
+
+        mgr.load_map("Town06")
+
+        assert client.timeout_seen_during_load == [180.0]
+        assert client.timeout == 10.0  # 加载结束立即恢复常规超时
+
+    def test_timeout_restored_on_failure_and_hint_message(self) -> None:
+        client = MockCarlaClient()
+
+        def _boom(map_name: str) -> Any:
+            raise RuntimeError("time-out of 180000ms while waiting for the simulator")
+
+        client.load_world = _boom  # type: ignore[assignment]
+        mgr = MapManager(client, rpc_timeout_seconds=10.0, map_load_timeout_seconds=180.0)
+
+        with pytest.raises(CarlaSimulationError) as excinfo:
+            mgr.load_map("Town06")
+
+        assert client.timeout == 10.0
+        assert "CARLA_MAP_LOAD_TIMEOUT_SECONDS" in str(excinfo.value)
+
+    def test_non_timeout_error_has_no_hint(self) -> None:
+        client = MockCarlaClient()
+
+        def _boom(map_name: str) -> Any:
+            raise RuntimeError("Map not found")
+
+        client.load_world = _boom  # type: ignore[assignment]
+        mgr = MapManager(client, rpc_timeout_seconds=10.0, map_load_timeout_seconds=180.0)
+
+        with pytest.raises(CarlaSimulationError) as excinfo:
+            mgr.load_map("Town06")
+
+        assert "CARLA_MAP_LOAD_TIMEOUT_SECONDS" not in str(excinfo.value)
+
+    def test_client_without_set_timeout_still_loads(self) -> None:
+        class _MinimalClient:
+            def __init__(self) -> None:
+                self._world = MockWorld()
+
+            def load_world(self, map_name: str) -> Any:
+                self._world = MockWorld(map_name)
+                return self._world
+
+        mgr = MapManager(_MinimalClient(), map_load_timeout_seconds=180.0)  # type: ignore[arg-type]
+        assert mgr.load_map("Town01").get_map().name == "Town01"
+
+    def test_map_load_timeout_never_below_rpc_timeout(self) -> None:
+        client = MockCarlaClient()
+        client.set_timeout(30.0)
+        mgr = MapManager(client, rpc_timeout_seconds=30.0, map_load_timeout_seconds=5.0)
+
+        mgr.load_map("Town01")
+
+        # 配置写反时不缩超时：加载期间保持 30s
+        assert client.timeout_seen_during_load == [30.0]
+        assert client.timeout == 30.0
 
 
 class TestOpenDriveImport:

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Protocol, cast
+from typing import Any, Iterator, Optional, Protocol, cast
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,10 @@ BUILTIN_MAPS: frozenset[str] = frozenset([
 
 # custom/{map_name} 引用名称安全字符集（防路径穿越，与 API 层 _MAP_ID_PATTERN 一致）
 _CUSTOM_MAP_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+
+# 地图加载默认 RPC 超时（秒）：首次 load_world 需构建世界/导航网格，
+# Town06 等大地图冷启动常达 20~60s，远大于常规 RPC 超时。
+_DEFAULT_MAP_LOAD_TIMEOUT_SECONDS = 180.0
 
 
 class MapInfo(BaseModel):
@@ -72,6 +77,7 @@ class CarlaClientProtocol(Protocol):
     def load_world(self, map_name: str) -> CarlaWorldProtocol: ...
     def generate_opendrive_world(self, xodr_str: str) -> CarlaWorldProtocol: ...
     def get_trafficmanager(self, port: int = 8000) -> object: ...
+    def set_timeout(self, seconds: float) -> None: ...
 
 
 class MapManager:
@@ -84,6 +90,9 @@ class MapManager:
         client: CARLA 客户端连接实例。
         preload_maps: 初始化时预加载的地图 ID 列表。
         custom_map_dir: 自定义 OpenDRIVE 文件存储目录。
+        rpc_timeout_seconds: 常规 RPC 超时（地图加载结束后恢复为该值）。
+        map_load_timeout_seconds: 地图加载/切换专用超时（首次 ``load_world``
+            可达数十秒，不能沿用常规 RPC 超时）。
     """
 
     def __init__(
@@ -91,8 +100,15 @@ class MapManager:
         client: CarlaClientProtocol,
         preload_maps: list[str] | None = None,
         custom_map_dir: Path | None = None,
+        rpc_timeout_seconds: float = 10.0,
+        map_load_timeout_seconds: float = _DEFAULT_MAP_LOAD_TIMEOUT_SECONDS,
     ) -> None:
         self._client = client
+        self._rpc_timeout_seconds = float(rpc_timeout_seconds)
+        # 地图加载超时至少不短于常规 RPC 超时，避免配置写反把加载卡死
+        self._map_load_timeout_seconds = max(
+            float(map_load_timeout_seconds), float(rpc_timeout_seconds)
+        )
         self._custom_map_dir: Path = custom_map_dir or Path("data/maps")
         self._loaded_maps: dict[str, MapInfo] = {}
         self._current_map_id: Optional[str] = None
@@ -168,6 +184,34 @@ class MapManager:
         """
         return map_id in self._loaded_maps
 
+    @contextmanager
+    def _map_load_timeout(self) -> Iterator[None]:
+        """地图加载期间临时放宽 CARLA RPC 超时。
+
+        CARLA ``load_world`` 与后续 RPC 共用同一个客户端超时：若沿用常规
+        超时（默认 10s），首次加载/切换大地图（如 Town06）会在服务端仍在
+        构建世界时抛 ``time-out of 10000ms while waiting for the simulator``。
+        退出时（无论成功/异常）恢复为常规超时。
+        """
+        setter = getattr(self._client, "set_timeout", None)
+        if not callable(setter) or self._map_load_timeout_seconds <= self._rpc_timeout_seconds:
+            yield
+            return
+        try:
+            setter(self._map_load_timeout_seconds)
+            applied = True
+        except Exception as exc:  # noqa: BLE001  Mock/受限客户端可能不支持
+            logger.debug(f"Cannot extend CARLA RPC timeout for map load: {exc}")
+            applied = False
+        try:
+            yield
+        finally:
+            if applied:
+                try:
+                    setter(self._rpc_timeout_seconds)
+                except Exception as exc:  # noqa: BLE001  恢复失败不应掩藏原始错误
+                    logger.debug(f"Cannot restore CARLA RPC timeout: {exc}")
+
     def load_map(self, map_id: str) -> CarlaWorldProtocol:
         """加载内置地图或已注册的自定义地图。
 
@@ -215,26 +259,51 @@ class MapManager:
         info = self._loaded_maps[map_id]
         logger.info(f"Loading map: {map_id} (builtin={info.is_builtin})")
         t0 = time.perf_counter()
+        timeout_raised = self._map_load_timeout_seconds > self._rpc_timeout_seconds
 
         try:
-            if info.is_builtin:
-                world = self._client.load_world(map_id)
-            else:
-                xodr_str = self._read_xodr_file(info.xodr_path)
-                world = self._client.generate_opendrive_world(xodr_str)
+            with self._map_load_timeout():
+                if info.is_builtin:
+                    world = self._client.load_world(map_id)
+                else:
+                    xodr_str = self._read_xodr_file(info.xodr_path)
+                    world = self._client.generate_opendrive_world(xodr_str)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             info.load_time_ms = elapsed_ms
             self._current_world = world
             self._current_map_id = map_id
-            logger.info(f"Map '{map_id}' loaded in {elapsed_ms:.0f}ms")
+            logger.info(
+                f"Map '{map_id}' loaded in {elapsed_ms:.0f}ms"
+                + (
+                    f" (rpc timeout raised to {self._map_load_timeout_seconds:.0f}s)"
+                    if timeout_raised
+                    else ""
+                )
+            )
             return world
 
         except Exception as exc:
             raise CarlaSimulationError(
                 operation=f"load_map({map_id})",
-                message=str(exc),
+                message=self._load_failure_message(map_id, exc),
             ) from exc
+
+    def _load_failure_message(self, map_id: str, exc: Exception) -> str:
+        """构造地图加载失败信息（超时附加处置提示）。
+
+        超时的两种典型成因必须能一眼区分：
+        1. 大地图首次加载耗时超过客户端 RPC 超时 → 调大 ``CARLA_MAP_LOAD_TIMEOUT_SECONDS``；
+        2. 上一个场景结束时世界停在同步模式等待 ``tick`` → 需重启 CARLA server。
+        """
+        message = str(exc)
+        if "time-out" not in message.lower() and "timeout" not in message.lower():
+            return message
+        return (
+            f"{message}（地图 '{map_id}' 加载超过 {self._map_load_timeout_seconds:.0f}s："
+            "若为大地图冷启动可调大 CARLA_MAP_LOAD_TIMEOUT_SECONDS；"
+            "若 CARLA server 处于同步模式等待 tick（上一个场景未恢复异步），需重启 CARLA server）"
+        )
 
     def import_opendrive_map(
         self,

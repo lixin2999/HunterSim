@@ -376,15 +376,24 @@ class MockCarlaClient:
         self.port = port
         self._world: MockWorld = MockWorld()
         self._traffic_manager: MockTrafficManager = MockTrafficManager()
+        # 与 CARLA PythonAPI 一致：超时随客户端保存，可被 set_timeout 覆盖
+        self.timeout: float = 10.0
+        # 地图加载期间观察到的超时值（单测用于校验临时放宽/恢复）
+        self.timeout_seen_during_load: list[float] = []
+
+    def set_timeout(self, seconds: float) -> None:
+        self.timeout = float(seconds)
 
     def get_world(self) -> MockWorld:
         return self._world
 
     def load_world(self, map_name: str) -> MockWorld:
+        self.timeout_seen_during_load.append(self.timeout)
         self._world = MockWorld(map_name)
         return self._world
 
     def generate_opendrive_world(self, xodr_content: str, **kwargs: Any) -> MockWorld:
+        self.timeout_seen_during_load.append(self.timeout)
         self._world = MockWorld("custom")
         return self._world
 

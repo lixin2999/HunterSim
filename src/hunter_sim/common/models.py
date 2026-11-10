@@ -241,6 +241,15 @@ class CarlaSettings(BaseSettings):
     stream_port: int = Field(2001, ge=1024, le=65535, description="数据流端口")
     tm_port: int = Field(8000, ge=1024, le=65535, description="Traffic Manager 端口")
     timeout_seconds: float = Field(10.0, gt=0.0, description="连接超时（秒）")
+    map_load_timeout_seconds: float = Field(
+        180.0,
+        gt=0.0,
+        le=1800.0,
+        description=(
+            "地图加载/切换（load_world）专用 RPC 超时（秒）。"
+            "首次加载 Town06 等大地图/冷启动可达 20~60s，不能沿用 timeout_seconds"
+        ),
+    )
     read_timeout_seconds: float = Field(30.0, gt=0.0, description="读取超时（秒）")
     max_reconnect_attempts: int = Field(3, ge=0, description="最大重连次数")
     fixed_delta_seconds: float = Field(0.02, description="同步模式固定步长（秒），0.02=50Hz")
