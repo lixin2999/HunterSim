@@ -71,10 +71,33 @@ class _FakeService(_ReadOnlyService):
             "enabled": True,
             "topics": {"/carla/lidar_points": 5},
         }
+        self.actor_items: list[dict[str, Any]] = [
+            {
+                "id": "lead-1",
+                "actor_type": "vehicle",
+                "behavior": "constant_speed",
+                "spawned": True,
+                "ahead_m": 18.0,
+                "left_m": 0.0,
+                "visible": True,
+            },
+            {
+                "id": "lead-2",
+                "actor_type": "vehicle",
+                "behavior": "lane_follow",
+                "spawned": True,
+                "ahead_m": -6.0,
+                "left_m": 12.0,
+                "visible": False,
+            },
+        ]
         self.runtime_calls = 0
 
     def events(self, instance_id: str) -> list[dict[str, Any]]:
         return list(self.event_items)
+
+    def actors(self, instance_id: str) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.actor_items]
 
     def sensors(self, instance_id: str) -> dict[str, Any]:
         return dict(self.sensor_body)
@@ -205,6 +228,30 @@ class TestEvents:
             body = client.get("/viz/api/instances/inst-1/events").json()
 
         assert body == {"instance_id": "inst-1", "count": 0, "counts": {}, "items": []}
+
+
+class TestActors:
+    def test_actor_items_with_visibility_summary(self, client: TestClient) -> None:
+        body = client.get("/viz/api/instances/inst-1/actors").json()
+
+        assert body["count"] == 2
+        assert body["spawned"] == 2
+        # 主视区计数用于面板一眼定位「车生成了但画面里看不到」
+        assert body["visible"] == 1
+        assert [item["id"] for item in body["items"]] == ["lead-1", "lead-2"]
+        assert body["items"][1]["visible"] is False
+
+    def test_service_without_actors_returns_empty(self) -> None:
+        with TestClient(create_app(service=_ReadOnlyService())) as client:
+            body = client.get("/viz/api/instances/inst-1/actors").json()
+
+        assert body == {
+            "instance_id": "inst-1",
+            "count": 0,
+            "spawned": 0,
+            "visible": 0,
+            "items": [],
+        }
 
 
 class TestSensors:

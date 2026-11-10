@@ -4,6 +4,7 @@
  * 数据来源（全部同源，无跨域）：
  *   /viz/api/status                          顶栏状态灯 + 仿真端模块连通性
  *   /viz/api/instances/{id}/events          场景事件（碰撞/偏离/通过…）
+ *   /viz/api/instances/{id}/actors          交通参与者（类型/期望行为/车速/相对自车方位）
  *   /viz/api/instances/{id}/sensors         传感器各流帧数/帧率 + ROS2 话题
  *   /viz/api/instances/{id}/sensors/{stream} 单流最新帧（深度 PNG / 点云 JSON / IMU JSON）
  *   /viz/api/logs、/viz/api/logs/stream     仿真日志（SSE 增量，断线降级为轮询）
@@ -21,6 +22,7 @@
     detail: 1500,
     sensors: 2000,
     events: 2000,
+    actors: 1000,
     preview: 1500,
     screenshot: 700,
     logFallback: 1500
@@ -345,6 +347,8 @@
     setNote("event-summary", "—");
     $("sensor-table").querySelector("tbody").textContent = "";
     $("ros-table").querySelector("tbody").textContent = "";
+    $("actor-table").querySelector("tbody").textContent = "";
+    setNote("actor-summary", "—");
     fillKv($("instance-info"), []);
     fillKv($("ego-info"), []);
     fillKv($("imu-info"), []);
@@ -354,6 +358,7 @@
       refreshDetail();
       refreshSensors();
       refreshEvents();
+      refreshActors();
       setNote("video-empty", "等待实例启动…");
       setNote("stream-state", "未开始推流");
       setNote("video-meta", "等待运行");
@@ -838,6 +843,83 @@
     ]);
   }
 
+  // ── 交通参与者（场内到底有谁 / 期望行为 / 在自车哪个方位） ────────────────
+
+  function relativeText(ahead, left) {
+    if (typeof ahead !== "number" || !isFinite(ahead)) {
+      return "—";
+    }
+    var side = typeof left === "number" && isFinite(left) ? left : 0;
+    return (
+      (ahead >= 0 ? "前 " : "后 ") +
+      num(Math.abs(ahead), 1) +
+      " / " +
+      (side >= 0 ? "左 " : "右 ") +
+      num(Math.abs(side), 1)
+    );
+  }
+
+  async function refreshActors() {
+    if (!state.instanceId) {
+      return;
+    }
+    var target = state.instanceId;
+    var payload = await fetchJSON(vizPath("/actors"));
+    if (!payload || state.instanceId !== target) {
+      return;
+    }
+    var items = payload.items || [];
+    var body = $("actor-table").querySelector("tbody");
+    body.textContent = "";
+    items.forEach(function (item) {
+      var row = el("tr");
+      // 视区外的行标黄：一眼定位「车生成了但画面里看不到」
+      if (!item.visible) {
+        row.className = "stale";
+      }
+      row.appendChild(el("td", "", item.id || "—"));
+      row.appendChild(el("td", "", item.actor_type || "—"));
+      row.appendChild(el("td", "", item.behavior || "—"));
+      row.appendChild(el("td", "num", item.spawned ? num(item.speed_ms, 1) + " m/s" : "未生成"));
+      row.appendChild(el("td", "num", relativeText(item.ahead_m, item.left_m)));
+      row.appendChild(el("td", "num", num(item.distance_to_ego_m, 1) + " m"));
+      row.appendChild(el("td", "", item.visible ? "在视区内" : "视区外"));
+      row.title =
+        "world=(" +
+        num(item.x, 1) +
+        ", " +
+        num(item.y, 1) +
+        ") yaw=" +
+        num(item.yaw_deg, 1) +
+        "° · blueprint=" +
+        String(item.blueprint || "—");
+      body.appendChild(row);
+    });
+    if (!items.length) {
+      body.appendChild(
+        emptyRow(7, "当前场景未声明交通参与者，或场景尚未开始 tick")
+      );
+    }
+    var count = payload.count || 0;
+    var visible = payload.visible || 0;
+    setNote(
+      "actor-summary",
+      "声明 " + count + " · 已生成 " + (payload.spawned || 0) + " · 主视区 " + visible
+    );
+    if (count > 0 && visible === 0) {
+      // 这是「主车前面看不到其他车」最直接的页面提示
+      setNote(
+        "actor-note",
+        "有参与者但全部落在环视主视区外：画面里只能看到自车。请检查平台下发的相对偏移（x 前向 / y 左向，米）。"
+      );
+    } else {
+      setNote(
+        "actor-note",
+        "环视相机挂在自车后缘、朝前 100° 视场；“视区外”的参与者画面里看不到。"
+      );
+    }
+  }
+
   // ── 场景事件 ─────────────────────────────────────────────────────────────
 
   async function refreshEvents() {
@@ -1060,6 +1142,7 @@
         refreshEvents();
       }
     }, POLL_MS.events);
+    setInterval(refreshActors, POLL_MS.actors);
     setInterval(function () {
       if (!isTerminalInstance() && isRunningInstance()) {
         refreshPreviews();

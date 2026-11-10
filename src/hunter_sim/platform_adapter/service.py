@@ -47,6 +47,8 @@ _STREAM_IDLE_TIMEOUT_S = 5.0
 EventItems = list[dict[str, Any]]
 # 实例 ID 列表类型别名（同上：规避类内 ``list`` 方法遮蔽内置类型）
 InstanceIds = list[str]
+# 参与者状态列表类型别名（同上）
+ActorItems = list[dict[str, Any]]
 
 
 class StreamLimitExceeded(RuntimeError):
@@ -329,6 +331,22 @@ class AdapterService:
         if hub is None:
             return None
         return hub.latest(stream)
+
+    def actors(self, instance_id: str) -> ActorItems:
+        """交通参与者状态快照（可视化「参与者」面板；无运行时为空列表）。
+
+        只读视图：数据由运行器 tick 线程缓存，未运行/已释放时返回空列表，
+        不得因运行器状态变化抛异常（面板拉取失败会连带整页报错）。
+        """
+        getter = getattr(self._executor, "actors", None)
+        if not callable(getter):
+            return []
+        try:
+            states = getter(instance_id)
+        except Exception as exc:  # noqa: BLE001  只读视图不得因运行器已释放而 500
+            logger.debug(f"Read actor states failed for {instance_id}: {exc}")
+            return []
+        return [dict(item) for item in states or [] if isinstance(item, dict)]
 
     def sensors(self, instance_id: str) -> dict[str, Any]:
         """传感器各流的累计帧数、实时帧率与最新帧摘要。

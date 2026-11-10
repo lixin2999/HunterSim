@@ -297,6 +297,18 @@ class SimulationExecutor:
             return []
         return [_event_to_dict(event) for event in _detected_events(context.runner)]
 
+    def actors(self, instance_id: str) -> list[dict[str, Any]]:
+        """当前运行的交通参与者状态快照（可视化「参与者」面板）。
+
+        数据来自 ``SceneRunnerService.actor_states()``（tick 线程 5Hz 缓存）：
+        HTTP 线程不得直接访问 CARLA Actor。实例未运行/未装配时返回空列表。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        if context is None or context.runner is None:
+            return []
+        return _runner_actor_states(context.runner)
+
     def ros_status(self, instance_id: str) -> dict[str, Any]:
         """当前运行的 ROS2 桥接状态（未启用时 ``enabled=False``）。
 
@@ -1251,6 +1263,18 @@ def _detected_events(runner: Any) -> list[Any]:
         return list(events) if events else []
     except Exception:  # noqa: BLE001
         return []
+
+
+def _runner_actor_states(runner: Any) -> list[dict[str, Any]]:
+    """安全读取运行器缓存的交通参与者状态（只读、不抛异常）。"""
+    getter = getattr(runner, "actor_states", None)
+    if not callable(getter):
+        return []
+    try:
+        states = getter()
+    except Exception:  # noqa: BLE001  运行器可能正在释放
+        return []
+    return [dict(item) for item in states or [] if isinstance(item, dict)]
 
 
 def _runner_ego_state(runner: Any) -> dict[str, Any]:

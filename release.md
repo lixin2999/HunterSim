@@ -7,6 +7,7 @@
 > 2. **功能新增或功能变更**：版本号在**第二位（minor）**递增，第三位归零（例：`3.4.1` → `3.5.0`）。
 > 3. **问题修复或功能完善**：版本号在**第三位（patch）**递增（例：`3.4.0` → `3.4.1`）。
 > 4. 新条目需同步更新 `pyproject.toml` 的 `version`，并在条目中写明「验证（测试/mypy/flake8）」与「分发」tag。
+> 5. 每条发布必须同步更新**文档四件套**：`README.md`（当前版本 + 能力清单）、`user_manual.md`（端点数/面板行为/FAQ）、`deployment_and_operations.md`（升级章节）、`docs/单机部署指南.md`（版本头 + 排障表），缺一不算发版完成。
 
 ---
 
@@ -3245,3 +3246,82 @@ V3.3.3 升级后首次实机下发场景（`SCN-1501-SNO-STD-L1-v12.7`，雪天�
 
 镜像 tag `hunter-sim:3.5.1`；`pyproject.toml` 版本 `3.5.1`；wheel / 容器版本号一致。
 
+---
+
+## V3.5.2 — 跟车场景主车前看不到目标车：参与者出生点未按自车航向旋转
+
+**发布日期**：2026-11-10
+**版本定位**：patch 修复（含配套可视化补强）。平台下发跟车场景 `SCN-0176-FOL_LVV-L1-LVV-1a1e`（参与者 `lead-1`，`spawn_semantics=relative_to_ego` x=18.47 m / y=0 m，行为 `lane_follow`）后：
+
+1. 测试主车（自车）**前方看不到任何车辆**，但日志 `actors=1/1`、`Participant 'lead-1' spawned: spawn=(18.5, 0.0, 0.0, yaw=0) distance_to_ego=18.5m` 一切「正常」；
+2. `/viz` 只能看到主视区画面，**无法确认场景声明了哪些参与者、各自期望行为、为什么画面里没有**；
+3. 日志夹杂三类噪声/真实故障：`SimDataProducer 初始化失败，降级为 no-op：KafkaConfigurationError: Must set delivery_timeout_ms higher than linger_ms + request_timeout_ms`、`ERROR: Exception in ASGI application` + `httpcore.ReadError`（HTTP 500）、`Viz proxy connect failed`（502）。
+
+### 根因
+
+1. **相对偏移只做了平移、没做旋转（核心）**。`spawn_resolver.resolve_actor_spawn` 对 `relative_to_ego` 直接 `world = base + offset`，未按自车 `yaw` 把**车体系**（x 前向 / y 左向）转到世界系。本例自车占位被替换为 `(392.47, 212.90, 0.30, yaw=90)`，于是「正前方 18.47 m」被放到了**自车正右方 18.47 m**（`world≈(410.94, 212.90)`）；环视相机前向 FOV 100°，自然拍不到。日志三处自相矛盾正是证据：`ego ... yaw=90` + `spawn=(18.5, 0.0, 0.0, yaw=0)`（车体系原值直接当世界坐标输出）+ `distance_to_ego=18.5m`（距离对、方位错）。自车 `yaw=0` 时平移恰好等价，因此历史场景未暴露。
+2. **Kafka producer 超时组合不合法**。kafka-python 校验 `delivery_timeout_ms >= linger_ms + request_timeout_ms`；三个 producer 只设了 `delivery_timeout_ms=5000/10000`，而 `request_timeout_ms` 未设时默认 30000 → 构造即 `KafkaConfigurationError`，`SimDataProducer` 降级为 **no-op**：整场 `sensor_data` / `telemetry` / 节点结果**静默不上报**，平台侧同样「看不到数据」。
+3. **viz 反向代理未兜住读取期异常**。探针面 `:8080` 反代控制面 `:8090` 时只把 `ConnectError` / `TimeoutException` 做了映射；`httpcore.ReadError` / `RemoteProtocolError` 属 `httpx.HTTPError` 但不在捕获链内，冒泡成 ASGI 500 + traceback（日志被刷屏），流式中途断开还会连带 `Viz proxy connect failed` 502。
+4. **可观测性缺口**：可视化只有「画面 / 传感器 / 事件 / 日志」，没有「参与者」维度；日志也不打印参与者相对自车的前向/侧向分解与视区判定，无法一眼定责「是平台偏移下错、还是仿真端放错、还是相机拍不到」。
+
+### 修复
+
+**一、出生点旋转（`scene_runner/spawn_resolver.py`、`scene_runner/builtin_scenario.py`）**
+
+- `resolve_actor_spawn` 改为按 `base.yaw_deg` 旋转：`world = base + x*forward + y*left`（`forward=(cos,sin)`、`left=(-sin,cos)`），`yaw = base.yaw + offset.yaw`；新增 `relative_offset_from_ego(ego_transform, point) -> (ahead, left)` 反解工具（世界→车体系），并入 `__all__`。
+- `builtin_scenario` 的出生基准改为**自车实时位姿**（`_participant_base()` 读 `get_transform()`，取不到才回落 `_ego_spawn` / 配置值），修掉「占位原点被替换后仍按原配置算偏移」的隐患；新增 `_actor_spawn_point` / `_estimate_participant_visible` / `_participant_base`，`_collect_parked_spawns` / `_participant_spawn_candidates` / `_distance_to_ego` 统一走实时基准。
+- 新增 `participant_states()`：按 `traffic_participants` 逐个输出 `{id, actor_type, behavior, blueprint, spawned, speed_ms, x/y/z, yaw_deg, ahead_m, left_m, distance_to_ego_m, visible}`，供可视化只读消费；`custom_scenario` 补默认 `participant_states() -> []`。
+
+**二、参与者可观测性（`scene_runner_service` → `platform_adapter` → `/viz`）**
+
+- `scene_runner_service`：新增 `_ACTOR_STATE_REFRESH_TICKS = 10`（tick 50 Hz → 快照 5 Hz）与 `_actor_state_cache`，tick 线程写、HTTP 线程无锁读，`actor_states()` 返回副本；异常限频 WARNING 并保留旧快照，释放时清空。
+- `executor.actors(instance_id)` / `service.actors(instance_id)`：只读降级（运行器已释放/未运行一律空列表，不 500）；`service` 侧新增 `ActorItems` 类型别名（类内 `list` 方法会遮蔽内置 `list`）。
+- 新增 `GET /viz/api/instances/{id}/actors`（`include_in_schema=False`）：返回 `{instance_id, count, spawned, visible, items}`，`visible` 按环视相机几何粗估（后向 2.5 m 内、80 m 外、侧向超出 100° FOV 判为不可见）。
+- `/viz` 新增「参与者」面板：`ID / 类型 / 期望行为 / 车速 / 相对自车（前·左）/ 距自车 / 环视主视区`，1 s 轮询，不可见行置灰（`stale`）；`count>0 && visible==0` 时面板顶部直接提示「检查平台下发的相对偏移（x 前向 / y 左向，米）」。
+
+**三、日志口径（`builtin_scenario.py`）**
+
+- 新增 `Participant '<id>' spawn resolve: semantics=... offset=(...) base=(...) world=(...)`：把「平台给的偏移 / 自车基准 / 最终世界位姿」三段一次打全，可直接判定错在哪一层。
+- `Participant '<id>' spawned:` 追加 `ego=(x,y,yaw)`、`relative=(ahead=..m, left=..m)`；判为视区外时输出 WARNING（车后、超 80 m 或侧向偏出 FOV），点名核对平台偏移语义。
+- `setup()` 末尾新增 `Scene expectations:`：列出声明的参与者清单与行为，并显式提示「事件 `action_type` 仅留存不执行，需由参与者行为体现」（避免把「前车减速/急刹」误判为仿真端漏做）。
+
+**四、Kafka 上报（`cloud/sim_data_producer.py`、`telemetry_producer.py`、`node_result_producer.py`）**
+
+- 三个 producer 统一补 `_LINGER_MS=5`、`_REQUEST_TIMEOUT_MS=10_000`、`_DELIVERY_TIMEOUT_MS=30_000`，显式传 `request_timeout_ms` / `delivery_timeout_ms`，满足 `delivery ≥ linger + request` 校验，不再降级 no-op。
+
+**五、viz 反向代理容错（`probes/viz_proxy.py`）**
+
+- 建连/发送：`TimeoutException → 504`，`httpx.HTTPError`（含 `httpcore.ReadError`、`RemoteProtocolError`）`→ 502`，其余兜底 `→ 502`，新增 `_proxy_error(status, detail)` 统一错误体。
+- 流式与读体：`_stream()` 捕获异常后打 WARNING 正常结束（不再冒泡成 ASGI 500），新增 `_safe_aclose()` 保证释放；`aread()` 失败返回 502。
+
+### 向后兼容与行为变化（需公告）
+
+- **相对偏移语义修正**：`spawn_semantics=relative_to_ego` 且**自车 `yaw≠0`** 的场景，参与者出生位置会变（此前落在错误方位）；`yaw=0` 的场景结果与旧版一致。平台侧偏移定义（x 前向 / y 左向 / 米）不变。
+- **平台会重新收到数据**：Kafka 从「配置非法 → no-op」变为真正上报，此前静默缺失的 `sensor_data` / `telemetry` / 节点结果将恢复，平台侧注意去重与基线。
+- **HTTP 状态码**：viz 反代失败由 `500` 改为 `502`（上游不可达/协议中断）/`504`（超时），前端与告警按新码归类。
+- **新增只读接口**：`GET /viz/api/instances/{id}/actors`，只增不改，不进 OpenAPI；页面资源无版本号，升级后需 **Ctrl+F5 强刷**。
+
+### 验证
+
+- `pytest -q` 全量：**1412 passed**（新增 `tests/test_spawn_resolver.py` 航向旋转/左向/往返/后方 5 项，`tests/test_builtin_scenario.py` 参与者相对方位与车后判定 2 项，`tests/test_viz_api.py` 参与者面板聚合 2 项）。
+- `mypy src/hunter_sim`：**90 source files, Success: no issues found**；`flake8 src tests`：无告警。
+- 真机 CARLA 0.9.16 端到端复测待执行（开发环境 `.venv` 未安装 `carla` 模块）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.5.2`；
+2. 重启 `huntersim up`，重新下发该跟车场景，日志应出现 `Participant 'lead-1' spawn resolve: semantics=relative_to_ego offset=(18.47,0.00,0.00,yaw=0.00) base=(392.47,212.90,yaw=90.00) world=(392.47,231.37,yaw=90.00)`，其后 `relative=(ahead=18.5m, left=0.0m)` 且**无**「落在环视主视区外」WARNING；
+3. 打开 <http://127.0.0.1:8090/viz>（Ctrl+F5），「参与者」面板应为 `声明 1 / 已生成 1 / 主视区 1`，行内 `相对自车 ≈ 前 18.5 m / 左 0.0 m`，环视画面中目标车位于自车正前方约 18 m 处；
+4. 确认 `SimDataProducer` 不再打印 `KafkaConfigurationError`，`/health` 的 `cloud` 段为启用态；viz 日志不再出现 `Exception in ASGI application`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.5.2`；`pyproject.toml` 版本 `3.5.2`；wheel / 容器版本号一致。
+
+### 待办 / 已知边界
+
+- 自车蓝图 `hunter_se` 未部署时仍回退 `tesla.model3`（日志 `ego blueprint ... 回退`），包围盒与相机挂载尺寸按回退蓝图计算，属 V3.4.x 既有行为；需要精确外廓时请在 `assets` 中提供 `hunter_se`。
+- 平台事件 `action_type`（如 `emergency_stop`）仍**仅随 `TRIGGER_REACHED` 留存、不在仿真端执行**；「前车减速/急刹」要可见，需平台把动作映射为参与者行为（如 `lane_follow` 叠加减速度）。
+- `visible` 为按环视相机位姿与 FOV 的几何粗估，未做遮挡判断；自车正前方被大车遮挡时可能「标记可见但实际被挡」。
+
+---

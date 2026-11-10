@@ -108,19 +108,18 @@ async def proxy_request(
     )
     try:
         upstream_response = await client.send(upstream_request, stream=True)
-    except httpx.ConnectError as exc:
-        logger.warning(f"Viz proxy connect failed: {exc}")
-        return Response(
-            content='{"detail": "upstream unavailable"}',
-            status_code=502,
-            media_type="application/json",
-        )
-    except httpx.TimeoutException:
-        return Response(
-            content='{"detail": "upstream timeout"}',
-            status_code=504,
-            media_type="application/json",
-        )
+    except httpx.TimeoutException as exc:
+        logger.warning(f"Viz proxy timeout: {type(exc).__name__}: {exc}")
+        return _proxy_error(504, "upstream timeout")
+    except httpx.HTTPError as exc:
+        # ConnectError / ReadError / RemoteProtocolError 均属 HTTPError 子类。
+        # 上游（管理面）重启/断连是正常运维事件，必须映射为 502：
+        # 早期只捕 ConnectError，ReadError 会冒泡成 500 + ASGI traceback。
+        logger.warning(f"Viz proxy upstream error: {type(exc).__name__}: {exc}")
+        return _proxy_error(502, "upstream unavailable")
+    except Exception as exc:  # noqa: BLE001  代理层兜底：上游任何异常都不得变成 500
+        logger.warning(f"Viz proxy unexpected error: {type(exc).__name__}: {exc}")
+        return _proxy_error(502, "upstream error")
 
     content_type = upstream_response.headers.get("content-type", "")
 
@@ -133,8 +132,14 @@ async def proxy_request(
                 # SSE 回放与小尺寸 MJPEG 帧被整段拖住。
                 async for chunk in upstream_response.aiter_raw():
                     yield chunk
+            except Exception as exc:  # noqa: BLE001  响应头已下发，无法再改状态码
+                # MJPEG/SSE 上游中途断开（管理面重启/客户端关闭）：已发出的帧
+                # 不受影响，这里只记录并结束本次流，不让异常冒到 ASGI 层
+                logger.warning(
+                    f"Viz proxy stream interrupted: {type(exc).__name__}: {exc}"
+                )
             finally:
-                await upstream_response.aclose()
+                await _safe_aclose(upstream_response)
 
         # 过滤响应头中的 hop-by-hop
         resp_headers = {
@@ -149,8 +154,15 @@ async def proxy_request(
         )
 
     # 普通响应：读取全量后返回
-    content = await upstream_response.aread()
-    await upstream_response.aclose()
+    try:
+        content = await upstream_response.aread()
+    except Exception as exc:  # noqa: BLE001  读体阶段断连同样不得变成 500
+        logger.warning(
+            f"Viz proxy body read failed: {type(exc).__name__}: {exc}"
+        )
+        return _proxy_error(502, "upstream read error")
+    finally:
+        await _safe_aclose(upstream_response)
 
     resp_headers = {
         k: v for k, v in upstream_response.headers.items()
@@ -162,6 +174,23 @@ async def proxy_request(
         headers=resp_headers,
         media_type=content_type or None,
     )
+
+
+def _proxy_error(status_code: int, detail: str) -> Response:
+    """构造代理错误响应（JSON；不抛异常）。"""
+    return Response(
+        content=f'{{"detail": "{detail}"}}',
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+async def _safe_aclose(response: httpx.Response) -> None:
+    """关闭上游响应；关闭失败只记 DEBUG（客户端已断开时常见）。"""
+    try:
+        await response.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Viz proxy upstream close failed: {exc}")
 
 
 def _is_streaming(content_type: str) -> bool:

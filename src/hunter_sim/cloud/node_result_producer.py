@@ -26,6 +26,13 @@ from hunter_sim.common.utils import get_logger
 
 logger = get_logger(__name__)
 
+#: Kafka 生产者超时组合（毫秒）：必须满足 delivery >= linger + request，否则
+#: kafka-python 初始化抛 KafkaConfigurationError（request_timeout_ms 默认 30000），
+#: 节点结果回传降级 no-op
+_LINGER_MS = 5
+_REQUEST_TIMEOUT_MS = 10_000
+_DELIVERY_TIMEOUT_MS = 30_000
+
 #: 生产者工厂注入点（单测用桩替换，避免依赖真实 kafka-python）
 ProducerFactory = Callable[[CloudSettings], Any]
 
@@ -165,10 +172,11 @@ class NodeResultProducer:
             "security_protocol": c.security_protocol,
             "sasl_mechanism": c.sasl_mechanism,
             "acks": c.sensor_data_acks,
-            "linger_ms": 5,
+            "linger_ms": _LINGER_MS,
             "retries": 5,
             "max_block_ms": 1000,
-            "delivery_timeout_ms": 10000,
+            "request_timeout_ms": _REQUEST_TIMEOUT_MS,
+            "delivery_timeout_ms": _DELIVERY_TIMEOUT_MS,
         }
         if c.sasl_username is not None:
             kwargs["sasl_plain_username"] = c.sasl_username.get_secret_value()

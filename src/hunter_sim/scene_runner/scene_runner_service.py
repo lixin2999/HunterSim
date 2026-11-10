@@ -46,6 +46,10 @@ _EGO_STATE_WARN_INTERVAL_S = 30.0
 #: 视为「自车」的 CARLA role_name（与 CARLA 官方 example 一致）
 _EGO_ROLE_NAME = "hero"
 
+#: 参与者状态缓存刷新周期（tick 数）：50Hz / 10 = 5Hz，与可视化面板刷新频率一致。
+#: 每次刷新都要读每个 Actor 的位姿（CARLA RPC），太高会把 tick 线程拖慢。
+_ACTOR_STATE_REFRESH_TICKS = 10
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -137,6 +141,10 @@ class SceneRunnerService:
         # 自车状态取数失败告警限频状态
         self._ego_state_warn_at: float = 0.0
         self._ego_state_warn_count: int = 0
+        # 交通参与者状态缓存（tick 线程 5Hz 写入，executor/HTTP 线程无锁读取）：
+        # 可视化「参与者」面板靠它看到「谁在跑、跑多快、在自车哪个方位」
+        self._actor_state_cache: list[dict[str, Any]] = []
+        self._actor_state_warn_at: float = 0.0
 
     @property
     def weather_manager(self) -> WeatherManager:
@@ -424,6 +432,38 @@ class SceneRunnerService:
         with self._lock:
             return self._event_detector.detected_events if self._event_detector else []
 
+    def actor_states(self) -> list[dict[str, Any]]:
+        """获取交通参与者状态快照（最近一次 tick 线程缓存）。
+
+        返回空列表表示：场景无参与者、或场景尚未开始 tick。字段见
+        ``BuiltinScenario.participant_states``：``id/actor_type/behavior/
+        blueprint/spawned/速度/世界坐标/ahead_m/left_m/distance_to_ego_m/visible``。
+        """
+        return [dict(state) for state in self._actor_state_cache]
+
+    def _refresh_actor_states(self) -> None:
+        """刷新参与者状态缓存（仅 tick 线程调用）。
+
+        取数失败不阻断仿真：保留上一帧快照并限频告警，避免 50Hz 日志风暴。
+        """
+        scenario = self._scenario
+        if scenario is None:
+            return
+        getter = getattr(scenario, "participant_states", None)
+        if not callable(getter):
+            return
+        try:
+            states = list(getter())
+        except Exception as exc:  # noqa: BLE001  单个场景实现异常不影响仿真
+            now = time.monotonic()
+            if now - self._actor_state_warn_at >= _EGO_STATE_WARN_INTERVAL_S:
+                self._actor_state_warn_at = now
+                logger.warning(
+                    f"Participant states unavailable: {type(exc).__name__}: {exc}"
+                )
+            return
+        self._actor_state_cache = states
+
     def _run_loop(self) -> None:
         """场景运行主循环（独立线程执行）。"""
         delta_seconds = 0.02  # 50Hz
@@ -489,6 +529,9 @@ class SceneRunnerService:
 
                 # 无条件更新自车状态缓存（供 executor 线程安全读取，不依赖 sample_sink / producer）
                 self._get_ego_state()
+                # 参与者状态缓存（5Hz）：可视化面板与「拍不到」排查都靠它
+                if tick_count % _ACTOR_STATE_REFRESH_TICKS == 0:
+                    self._refresh_actor_states()
 
                 # 评估/回传采样钩子（VIL 轨迹、指标计算用）
                 if self._sample_sink is not None:
@@ -584,6 +627,8 @@ class SceneRunnerService:
             logger.warning(f"Scenario cleanup error: {exc}")
         else:
             logger.info(f"Scenario cleanup done: {scene_id}")
+        # 场景已销毁：清掉参与者快照，避免面板继续显示已经不存在的车
+        self._actor_state_cache = []
 
     def _stop_if_running(self, timeout_s: float = 5.0) -> None:
         """若有场景循环线程在跑，先停掉（不修改公开状态机，供重新下发场景使用）。"""

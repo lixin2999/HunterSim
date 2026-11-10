@@ -629,6 +629,72 @@ class TestSpawnReplacement:
         assert scenario._ego_spawn is not None
         assert is_placeholder_origin(scenario._ego_spawn) is False
 
+    def test_participant_states_reports_relative_bearing(self) -> None:
+        """可视化参与者面板：身份 / 期望行为 / 车体系方位 / 是否在主视区。"""
+        scenario = _make_scenario(
+            {
+                "spawn_semantics": "relative_to_ego",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": False,
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "lead-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": 18.0, "y": 0.0},
+                        "behavior": "constant_speed",
+                    }
+                ],
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        states = scenario.participant_states()
+        assert len(states) == 1
+        state = states[0]
+        assert state["id"] == "lead-1"
+        assert state["behavior"] == "constant_speed"
+        assert state["spawned"] is True
+        # 车体系分量：x 前向/y 左向，偏移 (18, 0) → 正前方 18m
+        assert state["ahead_m"] == pytest.approx(18.0, abs=0.5)
+        assert state["left_m"] == pytest.approx(0.0, abs=0.5)
+        assert state["distance_to_ego_m"] == pytest.approx(18.0, abs=0.5)
+        assert state["visible"] is True
+
+    def test_participant_states_flags_actor_behind_ego(self) -> None:
+        """车后的参与者必须标记为不在主视区（否则现场只能凭画面猜）。"""
+        scenario = _make_scenario(
+            {
+                "spawn_semantics": "relative_to_ego",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": False,
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "rear-1",
+                        "actor_type": "vehicle",
+                        "blueprint": "vehicle.tesla.model3",
+                        "spawn_point": {"x": -9.0, "y": 0.0},
+                        "behavior": "constant_speed",
+                    }
+                ],
+            }
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        state = scenario.participant_states()[0]
+        assert state["ahead_m"] == pytest.approx(-9.0, abs=0.5)
+        assert state["visible"] is False
+
 
 class TestSemanticsV126Execution:
     """V1.26.0 执行端语义：prop/cyclist/行人速度/initial_steer/boarding。"""

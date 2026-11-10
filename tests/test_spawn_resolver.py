@@ -14,6 +14,7 @@ from hunter_sim.scene_runner.spawn_resolver import (
     candidate_spawns,
     is_carla_town,
     is_placeholder_origin,
+    relative_offset_from_ego,
     resolve_actor_spawn,
     resolve_ego_spawn_candidates,
     scene_key_of,
@@ -150,14 +151,33 @@ class TestEgoSpawn:
 
 
 class TestActorSpawn:
-    def test_relative_semantics_adds_ego_base(self) -> None:
-        ego = SpawnPoint(x=100.0, y=20.0, z=0.5, yaw_deg=90.0)
+    def test_relative_semantics_adds_ego_base_when_yaw_zero(self) -> None:
+        ego = SpawnPoint(x=100.0, y=20.0, z=0.5, yaw_deg=0.0)
         offset = SpawnPoint(x=5.0, y=-3.0, z=0.0, yaw_deg=10.0)
         result = resolve_actor_spawn(ego, offset, "relative_to_ego")
         assert result.x == pytest.approx(105.0)
         assert result.y == pytest.approx(17.0)
         assert result.z == pytest.approx(0.5)
-        assert result.yaw_deg == pytest.approx(100.0)
+        assert result.yaw_deg == pytest.approx(10.0)
+
+    def test_relative_offset_is_rotated_by_ego_yaw(self) -> None:
+        """平台偏移是车体系（x 前向/y 左向），自车 yaw=90 时必须旋转叠加。"""
+        ego = SpawnPoint(x=392.47, y=212.90, z=0.30, yaw_deg=90.0)
+        offset = SpawnPoint(x=18.47, y=0.0, z=0.0, yaw_deg=0.0)
+        result = resolve_actor_spawn(ego, offset, "relative_to_ego")
+        # yaw=90：车体前向 = 世界 +y，因此 x 偏移落到世界 y 上
+        assert result.x == pytest.approx(392.47, abs=1e-6)
+        assert result.y == pytest.approx(212.90 + 18.47, abs=1e-6)
+        assert result.yaw_deg == pytest.approx(90.0)
+
+    def test_relative_left_offset_goes_to_world_minus_x(self) -> None:
+        """y 为正表示自车左侧；yaw=90 时左侧 = 世界 -x。"""
+        ego = SpawnPoint(x=0.0, y=0.0, yaw_deg=90.0)
+        result = resolve_actor_spawn(
+            ego, SpawnPoint(x=0.0, y=4.0), "relative_to_ego"
+        )
+        assert result.x == pytest.approx(-4.0)
+        assert result.y == pytest.approx(0.0)
 
     def test_relative_yaw_normalized(self) -> None:
         ego = SpawnPoint(x=0.0, y=0.0, yaw_deg=170.0)
@@ -170,3 +190,20 @@ class TestActorSpawn:
         offset = SpawnPoint(x=5.0, y=-3.0, yaw_deg=10.0)
         assert resolve_actor_spawn(ego, offset, "absolute") == offset
         assert resolve_actor_spawn(ego, offset, "") == offset
+
+    def test_relative_offset_round_trip(self) -> None:
+        """``relative_offset_from_ego`` 是叠加的逆运算（日志/面板方位用）。"""
+        ego = SpawnPoint(x=392.47, y=212.90, yaw_deg=90.0)
+        offset = SpawnPoint(x=18.47, y=-3.0)
+        world = resolve_actor_spawn(ego, offset, "relative_to_ego")
+        ahead, left = relative_offset_from_ego(ego, world)
+        assert ahead == pytest.approx(18.47, abs=1e-6)
+        assert left == pytest.approx(-3.0, abs=1e-6)
+
+    def test_relative_offset_reports_behind(self) -> None:
+        ego = SpawnPoint(x=10.0, y=10.0, yaw_deg=0.0)
+        ahead, left = relative_offset_from_ego(
+            ego, SpawnPoint(x=10.0 - 5.0, y=10.0 + 2.0)
+        )
+        assert ahead == pytest.approx(-5.0)
+        assert left == pytest.approx(2.0)

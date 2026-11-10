@@ -46,6 +46,7 @@ from hunter_sim.scene_runner.scene_config import (
 )
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
 from hunter_sim.scene_runner.spawn_resolver import (
+    relative_offset_from_ego,
     resolve_actor_spawn,
     resolve_ego_spawn_candidates,
     scene_key_of,
@@ -112,6 +113,12 @@ _OVERVIEW_SLOW_LOG_INTERVAL_S = 60.0
 #: 交通参与者「可视距离」告警阈值（米）：超出该距离时环视相机基本拍不到，
 #: 日志给出 WARNING 便于定位「参与者生成了但画面里看不到」
 _MAX_VISIBLE_DISTANCE_M = 80.0
+
+#: 环视相机安装参数（与 ``configs/sensor_configs.json`` 的 overview_camera 一致）：
+#: 挂在自车后缘再向后 5m、水平 FOV 100°、pitch -20°。仅用于粗估参与者是否落在
+#: 主视区内（日志告警 / 可视化面板的「可见」判据），不做精确投影。
+_OVERVIEW_CAMERA_BACK_M = 5.0
+_OVERVIEW_HALF_FOV_DEG = 50.0
 
 #: 行人脚本化横穿的到达判定阈值（米）
 _WALKER_ARRIVE_EPS_M = 0.3
@@ -287,6 +294,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._traveled_distance_m: float = 0.0
         # 车类 prop（停放/事故/故障车）生成位置，boarding 行为据此选择目标
         self._parked_spawns: list[SpawnPoint] = []
+        # 参与者 ID → 已生成 Actor / 实际出生点：可视化「参与者」面板与
+        # 「生成了但拍不到」排障都靠它按 ID 回查
+        self._actor_by_participant: dict[str, Any] = {}
+        self._participant_spawns: dict[str, SpawnPoint] = {}
         self._cleaned = False
 
     @property
@@ -303,6 +314,64 @@ class BuiltinScenario(CustomScenarioBase):
             if actor_id is not None:
                 ids.append(int(actor_id))
         return ids
+
+    def participant_states(self) -> list[dict[str, Any]]:
+        """交通参与者状态快照（可视化「参与者」面板数据源）。
+
+        平台下发的每个参与者都返回一条记录：身份 / 类型 / 期望行为 + 实时位姿，
+        并附带车体系偏移 ``ahead_m``（前正后负）与 ``left_m``（左正右负）。
+
+        只给世界坐标是不够的：自车基准 yaw 常被替换成地图出生点航向（Town01
+        常见 90°），此时「正前方 18m」在世界系里表现为 y 方向 +18m，无法判断
+        「在前还是在右」。``visible`` 是环视主视区的粗估结论，用于快速定位
+        「参与者生成了但画面里看不到」。
+
+        仅由 tick 线程调用（读取 CARLA Actor 位姿属 RPC，非线程安全），结果由
+        ``SceneRunnerService`` 缓存后供 executor / HTTP 线程读取。
+        """
+        base = self._participant_base()
+        states: list[dict[str, Any]] = []
+        for participant in self._config.traffic_participants:
+            actor = self._actor_by_participant.get(participant.participant_id)
+            pose = self._actor_spawn_point(actor)
+            if pose is None:
+                pose = self._participant_spawns.get(participant.participant_id)
+            state: dict[str, Any] = {
+                "id": participant.participant_id,
+                "actor_type": participant.actor_type,
+                "behavior": str(
+                    getattr(participant.behavior, "value", participant.behavior)
+                ),
+                "blueprint": getattr(actor, "type_id", participant.blueprint),
+                "spawned": actor is not None,
+                "speed_ms": (
+                    round(self._current_speed(actor), 2) if actor is not None else 0.0
+                ),
+                "x": None,
+                "y": None,
+                "z": None,
+                "yaw_deg": None,
+                "ahead_m": None,
+                "left_m": None,
+                "distance_to_ego_m": None,
+                "visible": False,
+            }
+            if pose is not None:
+                ahead, left = relative_offset_from_ego(base, pose)
+                state.update(
+                    {
+                        "x": round(pose.x, 2),
+                        "y": round(pose.y, 2),
+                        "z": round(pose.z, 2),
+                        "yaw_deg": round(pose.yaw_deg, 1),
+                        "ahead_m": round(ahead, 2),
+                        "left_m": round(left, 2),
+                        "distance_to_ego_m": round(math.hypot(ahead, left), 2),
+                        "visible": self._estimate_participant_visible(ahead, left),
+                    }
+                )
+            states.append(state)
+        return states
 
     # ── CustomScenarioBase 实现 ───────────────────────────────────────────
 
@@ -322,6 +391,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_initial_steer = 0.0
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
+        self._actor_by_participant.clear()
+        self._participant_spawns.clear()
 
         library = self._blueprint_library(world)
         self._ego = self._spawn_ego(world, library)
@@ -353,6 +424,38 @@ class BuiltinScenario(CustomScenarioBase):
                 len(self._actors),
                 len(requested),
                 missing or "未知",
+            )
+        self._log_scene_expectations()
+
+    def _log_scene_expectations(self) -> None:
+        """把「场景期望」落成日志：参与者期望行为 + 事件期望动作。
+
+        平台事件上的 ``action_type``（如「前车紧急制动」）当前只做期望留档，
+        不驱动仿真（见 ``SceneEventDefinition.action_type``）。现场看到「期望
+        刹车但前车没减速」时，可以从这行日志直接确认属契约范围而非执行失败。
+        """
+        participants = [
+            f"{item.participant_id}[{item.actor_type}/"
+            f"{getattr(item.behavior, 'value', item.behavior)}"
+            f"@({item.spawn_point.x:.1f},{item.spawn_point.y:.1f})]"
+            for item in self._config.traffic_participants
+        ]
+        logger.info(
+            "Scene expectations: participants=%d %s",
+            len(participants),
+            " ".join(participants) if participants else "无（场景无交通参与者）",
+        )
+        actions = [
+            f"{event.event_id}:"
+            f"{getattr(event.event_type, 'value', event.event_type)}"
+            f"->{event.action_type}"
+            for event in self._config.scene_events
+            if event.action_type
+        ]
+        if actions:
+            logger.info(
+                "Scene event actions (仅留存不执行，需由参与者行为体现): %s",
+                " ".join(actions),
             )
 
     def tick(self, world: Any, timestamp: float, delta_seconds: float) -> None:
@@ -469,6 +572,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego = None
         self._ego_spawn = None
         self._actors.clear()
+        self._actor_by_participant.clear()
+        self._participant_spawns.clear()
         logger.info("Scenario cleanup done")
 
     # ── 内部实现 ─────────────────────────────────────────────────────────
@@ -573,6 +678,44 @@ class BuiltinScenario(CustomScenarioBase):
                 )
         return actor
 
+    def _participant_base(self) -> SpawnPoint:
+        """参与者相对偏移的基准：优先自车实时位姿，其次生成位姿 / 配置位姿。
+
+        V3.4.5 起不再固定用 ``_ego_spawn``：自车被 Traffic Manager / VIL 驾驶后
+        位置持续变化，固定用出生点会让「相对偏移」在运行中逐渐失真（回查日志时
+        也会把「参与者位置计算错」误判成「偏移下发错」）。
+        """
+        pose = self._actor_spawn_point(self._ego)
+        if pose is not None:
+            return pose
+        return self._ego_spawn or self._config.ego_vehicle.spawn_point
+
+    @staticmethod
+    def _actor_spawn_point(actor: Any) -> Optional[SpawnPoint]:
+        """读取 Actor 当前位姿（Actor 为空 / 已被销毁时返回 None）。"""
+        if actor is None:
+            return None
+        getter = getattr(actor, "get_transform", None)
+        if not callable(getter):
+            return None
+        try:
+            return transform_to_spawn_point(getter())
+        except Exception as exc:  # noqa: BLE001  Actor 可能已被外部销毁
+            logger.debug(f"actor_pose_unavailable: {exc}")
+            return None
+
+    @staticmethod
+    def _estimate_participant_visible(ahead_m: float, left_m: float) -> bool:
+        """粗估参与者是否落在环视主视区内（排障用，非精确投影）。"""
+        if ahead_m <= -_OVERVIEW_CAMERA_BACK_M * 0.5:
+            return False  # 在自车后方：环视相机朝前，拍不到
+        if math.hypot(ahead_m, left_m) > _MAX_VISIBLE_DISTANCE_M:
+            return False
+        half_width = math.tan(math.radians(_OVERVIEW_HALF_FOV_DEG)) * max(
+            1.0, ahead_m + _OVERVIEW_CAMERA_BACK_M
+        )
+        return abs(left_m) <= half_width
+
     def _spawn_participant(
         self, world: Any, library: Any, participant: TrafficParticipantConfig
     ) -> bool:
@@ -603,11 +746,7 @@ class BuiltinScenario(CustomScenarioBase):
                 f"蓝图 '{participant.blueprint}' 及同类回退蓝图均不可用"
             )
             return False
-        base = (
-            self._ego_spawn
-            if self._ego_spawn is not None
-            else self._config.ego_vehicle.spawn_point
-        )
+        base = self._participant_base()
         try:
             spawn_point = resolve_actor_spawn(
                 base, participant.spawn_point, self._config.spawn_semantics
@@ -617,6 +756,26 @@ class BuiltinScenario(CustomScenarioBase):
                 f"Participant '{participant.participant_id}' spawn skipped: {exc}"
             )
             return False
+        # 平台偏移（车体系）与叠加后的世界坐标一起落日志：只打其中一个时，
+        # 现场无法区分「平台偏移下发错」与「仿真端基准/旋转算错」。
+        logger.info(
+            "Participant '%s' spawn resolve: semantics=%s offset=(%.1f,%.1f,%.1f,yaw=%.0f) "
+            "base=(%.1f,%.1f,%.1f,yaw=%.0f) world=(%.1f,%.1f,%.1f,yaw=%.0f)",
+            participant.participant_id,
+            self._config.spawn_semantics,
+            participant.spawn_point.x,
+            participant.spawn_point.y,
+            participant.spawn_point.z,
+            participant.spawn_point.yaw_deg,
+            base.x,
+            base.y,
+            base.z,
+            base.yaw_deg,
+            spawn_point.x,
+            spawn_point.y,
+            spawn_point.z,
+            spawn_point.yaw_deg,
+        )
 
         actor: Any = None
         actual = spawn_point
@@ -641,6 +800,8 @@ class BuiltinScenario(CustomScenarioBase):
             return False
 
         self._actors.append(actor)
+        self._actor_by_participant[participant.participant_id] = actor
+        self._participant_spawns[participant.participant_id] = actual
         self._log_participant_spawned(participant, actor, actual)
 
         try:
@@ -709,11 +870,7 @@ class BuiltinScenario(CustomScenarioBase):
 
     def _collect_parked_spawns(self) -> None:
         """记录车类 prop 的生成位置，``boarding`` 行为据此选择最近车辆。"""
-        base = (
-            self._ego_spawn
-            if self._ego_spawn is not None
-            else self._config.ego_vehicle.spawn_point
-        )
+        base = self._participant_base()
         for participant in self._config.traffic_participants:
             if participant.object_kind not in (
                 "parked_vehicle",
@@ -787,8 +944,7 @@ class BuiltinScenario(CustomScenarioBase):
         参与者会被静默丢弃（画面里就只剩自车）。这里沿自车航向前后 / 左右
         各偏移 2~6m 重试，仍失败才报 WARNING。
         """
-        base = self._ego_spawn
-        yaw = math.radians(base.yaw_deg if base is not None else spawn_point.yaw_deg)
+        yaw = math.radians(self._participant_base().yaw_deg)
         forward = (math.cos(yaw), math.sin(yaw))
         lateral = (-math.sin(yaw), math.cos(yaw))
         offsets = (
@@ -813,22 +969,27 @@ class BuiltinScenario(CustomScenarioBase):
         ]
 
     def _distance_to_ego(self, spawn_point: SpawnPoint) -> Optional[float]:
-        """参与者出生点到自车的水平距离（无自车基准时返回 None）。"""
-        ego = self._ego_spawn
-        if ego is None:
-            return None
-        return math.hypot(spawn_point.x - ego.x, spawn_point.y - ego.y)
+        """参与者出生点到自车（实时位姿）的水平距离。"""
+        base = self._participant_base()
+        return math.hypot(spawn_point.x - base.x, spawn_point.y - base.y)
 
     def _log_participant_spawned(
         self, participant: TrafficParticipantConfig, actor: Any, spawn_point: SpawnPoint
     ) -> None:
-        """参与者生成成功日志 + 「可能拍不到」告警（可视化验收排障用）。"""
-        distance = self._distance_to_ego(spawn_point)
-        distance_text = "n/a" if distance is None else f"{distance:.1f}m"
+        """参与者生成成功日志 + 「可能拍不到」告警（可视化验收排障用）。
+
+        除世界坐标外同时打印 ``(ahead, left)`` 车体系偏移：世界坐标在自车 yaw
+        非 0 时看不出「在前还是在右」，而这正是「车生成了、画面里却看不到」的
+        唯一判据。
+        """
+        base = self._participant_base()
+        ahead, left = relative_offset_from_ego(base, spawn_point)
+        distance = math.hypot(ahead, left)
         behavior = getattr(participant.behavior, "value", participant.behavior)
         logger.info(
             "Participant '%s' spawned: actor=%s blueprint=%s type=%s behavior=%s "
-            "spawn=(%.1f,%.1f,%.1f,yaw=%.0f) distance_to_ego=%s",
+            "spawn=(%.1f,%.1f,%.1f,yaw=%.0f) ego=(%.1f,%.1f,yaw=%.0f) "
+            "relative=(ahead=%.1fm, left=%.1fm) distance_to_ego=%.1fm",
             participant.participant_id,
             getattr(actor, "id", "n/a"),
             getattr(actor, "type_id", participant.blueprint),
@@ -838,16 +999,23 @@ class BuiltinScenario(CustomScenarioBase):
             spawn_point.y,
             spawn_point.z,
             spawn_point.yaw_deg,
-            distance_text,
+            base.x,
+            base.y,
+            base.yaw_deg,
+            ahead,
+            left,
+            distance,
         )
         if participant.behavior == ScenarioBehaviorType.STATIC:
             return
-        if distance is not None and distance > _MAX_VISIBLE_DISTANCE_M:
+        if not self._estimate_participant_visible(ahead, left):
             logger.warning(
-                "Participant '%s' 距自车 %.1fm（> %.0fm），环视主视区可能拍不到；"
-                "如需看到行为请收小平台下发的相对偏移",
+                "Participant '%s' 相对自车 ahead=%.1fm / left=%.1fm，落在环视主视区外"
+                "（车后、超出 %.0fm 或侧向偏出 FOV）：可视化画面里看不到它的行为；"
+                "请确认平台下发的相对偏移（x 前向 / y 左向，米）是否符合场景意图",
                 participant.participant_id,
-                distance,
+                ahead,
+                left,
                 _MAX_VISIBLE_DISTANCE_M,
             )
 

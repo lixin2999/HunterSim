@@ -102,6 +102,16 @@ class CustomScenarioBase(ABC):
         """
         ...
 
+    def participant_states(self) -> list[dict[str, Any]]:
+        """交通参与者状态快照（可视化「参与者」面板数据源）。
+
+        默认返回空列表：未声明交通参与者的自定义场景不需要实现。子类若生成了
+        参与者，可覆写返回 ``id/actor_type/behavior/位置/速度`` 等字段；框架会
+        在 tick 线程按 5Hz 调用并缓存，供 executor / HTTP 线程读取（不要在
+        HTTP 线程直接调 CARLA RPC）。
+        """
+        return []
+
     def _update_elapsed(self) -> None:
         """内部方法：更新已运行时间。"""
         if self._start_time == 0.0:

@@ -240,13 +240,18 @@ def resolve_actor_spawn(
 ) -> SpawnPoint:
     """把参与者相对自车的偏移叠加到（替换后的）自车基准上。
 
+    平台下发的 ``x/y`` 是**自车车体系**偏移（x 向前、y 向左，米），并非世界系
+    增量；自车基准被替换成地图出生点后 yaw 通常不是 0（Town01 常见 yaw=90），
+    因此必须按基准 yaw 旋转后再叠加，否则「正前方 18m 的前车」会被摆到自车
+    正右方 18m——环视主视区里看不到任何参与者。
+
     Args:
         ego_transform: 自车实际 transform（``carla.Transform`` 或 ``SpawnPoint``）。
-        offset: 平台下发的参与者相对偏移（x/y/z 米、yaw 度）。
-        spawn_semantics: ``relative_to_ego`` 时执行 base+offset，其余原样返回。
+        offset: 平台下发的参与者相对偏移（x 前向/y 左向/z 米、yaw 度）。
+        spawn_semantics: ``relative_to_ego`` 时执行旋转叠加，其余原样返回。
 
     Returns:
-        参与者世界坐标（度制，yaw 归一到 ``[-180, 180]``）。
+        参与者世界坐标（度制，yaw 归一到 ``[-180, 180)``）。
     """
     if (spawn_semantics or "").strip().lower() != _RELATIVE_SEMANTICS:
         return offset
@@ -255,16 +260,44 @@ def resolve_actor_spawn(
         if isinstance(ego_transform, SpawnPoint)
         else transform_to_spawn_point(ego_transform)
     )
-    yaw = _normalize_degrees(base.yaw_deg + offset.yaw_deg)
+    heading = math.radians(base.yaw_deg)
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
+    # 车体系 (x 前向, y 左向) → 世界系旋转：forward=(cos,sin), left=(-sin,cos)
     return SpawnPoint(
-        x=base.x + offset.x,
-        y=base.y + offset.y,
+        x=base.x + offset.x * cos_h - offset.y * sin_h,
+        y=base.y + offset.x * sin_h + offset.y * cos_h,
         z=base.z + offset.z,
-        yaw_deg=yaw,
+        yaw_deg=_normalize_degrees(base.yaw_deg + offset.yaw_deg),
         # 平台偏移不含俯仰/横滚；与旧 to_absolute_spawn_offsets 口径一致
         pitch_deg=0.0,
         roll_deg=0.0,
     )
+
+
+def relative_offset_from_ego(
+    ego_transform: Any, point: SpawnPoint
+) -> tuple[float, float]:
+    """计算世界坐标点相对自车的车体系偏移（排障/日志用）。
+
+    Args:
+        ego_transform: 自车 transform（``carla.Transform`` 或 ``SpawnPoint``）。
+        point: 待换算的世界坐标点。
+
+    Returns:
+        ``(ahead_m, left_m)``：正值为自车前方/左侧，负值为后方/右侧。
+    """
+    base = (
+        ego_transform
+        if isinstance(ego_transform, SpawnPoint)
+        else transform_to_spawn_point(ego_transform)
+    )
+    heading = math.radians(base.yaw_deg)
+    dx = point.x - base.x
+    dy = point.y - base.y
+    ahead = dx * math.cos(heading) + dy * math.sin(heading)
+    left = -dx * math.sin(heading) + dy * math.cos(heading)
+    return ahead, left
 
 
 def _normalize_degrees(value: float) -> float:
@@ -284,6 +317,7 @@ __all__ = [
     "candidate_spawns",
     "is_carla_town",
     "is_placeholder_origin",
+    "relative_offset_from_ego",
     "resolve_actor_spawn",
     "resolve_ego_spawn_candidates",
     "scene_key_of",

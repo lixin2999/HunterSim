@@ -99,10 +99,12 @@ main {
   grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
   grid-template-areas:
     "video side"
+    "actors side"
     "sensor side"
     "event log";
 }
 .video-panel { grid-area: video; }
+.actor-panel { grid-area: actors; }
 .side-panel { grid-area: side; }
 .sensor-panel { grid-area: sensor; }
 .event-panel { grid-area: event; }
@@ -111,7 +113,7 @@ main {
 @media (max-width: 1180px) {
   main {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "video" "side" "sensor" "event" "log";
+    grid-template-areas: "video" "side" "actors" "sensor" "event" "log";
   }
 }
 

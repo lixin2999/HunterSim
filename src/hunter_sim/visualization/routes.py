@@ -166,6 +166,30 @@ def register_viz_routes(app: FastAPI) -> None:
         items = events[-limit:] if limit > 0 else events
         return {"instance_id": instance_id, "count": len(events), "counts": counts, "items": items}
 
+    @app.get("/viz/api/instances/{instance_id}/actors", include_in_schema=False)
+    def viz_actors(instance_id: str, request: Request) -> dict[str, Any]:
+        """交通参与者状态（身份/类型/期望行为/车速/相对自车方位）。
+
+        前端「参与者」面板据此展示「场景里到底有谁、期望它做什么、现在在自车
+        哪个方位」——这是排查「主车前面看不到其他车」的主要入口。
+        """
+        service = _require_instance(request, instance_id)
+        getter = getattr(service, "actors", None)
+        items: list[dict[str, Any]] = []
+        if callable(getter):
+            try:
+                items = [dict(item) for item in getter(instance_id) or []]
+            except Exception as exc:  # noqa: BLE001  只读面板不得 500
+                logger.warning(f"Viz actors read failed for {instance_id}: {exc}")
+        visible = [item for item in items if item.get("visible")]
+        return {
+            "instance_id": instance_id,
+            "count": len(items),
+            "spawned": sum(1 for item in items if item.get("spawned")),
+            "visible": len(visible),
+            "items": items,
+        }
+
     @app.get("/viz/api/instances/{instance_id}/sensors", include_in_schema=False)
     def viz_sensors(instance_id: str, request: Request) -> dict[str, Any]:
         """各传感器流的帧数/帧率/最新帧摘要 + ROS2 话题状态。"""
