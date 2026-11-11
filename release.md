@@ -3897,3 +3897,57 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.6.1 → **3.6.2**。
 
 ---
+
+## V3.6.3 — 脚本化行人被占位原点瞬移修复（动物横穿「看不到」）
+
+**发布日期**：2026-11-11
+**版本定位**：补丁修复（第三位递增）。V3.6.2 把场景行人默认改为脚本化横穿后，崩溃消失，但暴露同源的**位姿未同步**缺陷：动物不再出现在横穿画面里，面板显示其「视区外数百米 / 0.0 m/s」。
+
+### 现场
+
+| 时刻 | 读数 | 结论 |
+|------|------|------|
+| 09:17:58 | `Walker 'animal-1' scripted crossing: speed=1.50 m/s from=(548.6,37.2) to=(548.6,47.7)` | 脚本化横穿已登记（V3.6.2 生效，不再崩溃） |
+| 09:17:58 | `Event detected: [trigger_reached] Trigger reached: distance < 39 (actual=0.000)` | t=0 自车↔行人距离读到 **0.000**（占位原点假读数） |
+| 09:19:xx | 面板 `animal-1 ... 0.0 m/s 后 476.9 / 右 35.0 479.1 m 视区外` | 行人不在自车前方 45m，而在世界原点附近 |
+
+### 根因
+
+`scene_runner_service._run_loop_body()` 里 `scenario.tick()`（含 `_advance_scripted_walkers`）**先于** `world.tick()` 执行。同步模式下首 tick 前 Actor 的 `get_transform()` 返回**占位原点 (0,0,0)**（V3.5.3/V3.6.1 已记录的同源现象）。`_advance_scripted_walkers` 未做未同步判据，直接以 `(0,0,0)` 为起点朝目标 `(548.6,47.7)` 推进 → `set_transform` 把行人从真实出生点 (548.6,37.2) **瞬移到世界原点**，再横穿整张地图。`_relative_gaps()` 同样在首 tick 前把自车与参与者都读成原点，`euclidean=0` 误触发 DISTANCE 事件（`actual=0.000`）。
+
+### 修复内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - `_ScriptedWalker` 新增 `spawn` 字段（登记时的真实出生点）；`_register_scripted_walker` 写入 `spawn=spawn_point`。
+  - `_advance_scripted_walkers()`：推进前判据——读数落在占位原点而登记的出生点不在原点时**跳过本 tick**（不 `set_transform`、不置 `done`），等位姿同步后再走。与 `_pose_not_synced` 同口径。
+  - `_relative_gaps()`：自车读数判为未同步时本 tick 不产出距离度量；逐个参与者跳过占位原点读数，消除 `actual=0.000` 误触发。
+
+### 向后兼容
+
+- 无接口/契约变更。仅纠正「首 tick 前占位读数被当真值」的错误行为：行人保持在真实出生点横穿、距离事件不再在 t=0 误触发。
+- `pyproject.toml` 版本 `3.6.2` → `3.6.3`（问题修复，第三位递增）。
+
+### 验证
+
+- `pytest -q -p no:randomly` 全量：**1538 passed**（较 V3.6.2 基线 1537 +1，为新增回归用例）；flake8 exit=0；mypy no issues。
+- 新增回归用例 `test_scripted_walker_not_teleported_by_placeholder_origin`：占位原点读数下 `_advance_scripted_walkers` **不得** `set_transform`（行人不被瞬移到原点）；位姿同步后从真实出生点沿横穿方向推进、x 基本不变。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.6.3`；
+2. 重下发 `SCN-2054-AC-DOG-L4`（动物穿行）场景：自车前方约 45m 应看到动物横向穿过路面，面板 `animal-1` 距离回到数十米量级、不再「视区外几百米」；
+3. `trigger_reached ... actual=0.000` 不再在 t=0 出现。
+
+### 分发
+
+镜像 tag `hunter-sim:3.6.3`；`pyproject.toml` 版本 `3.6.3`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.6.3`，V3.6.x 条目追加补丁说明；测试计数 1537 → 1538。
+- `user_manual.md`：版本头 → V3.6.3；§11 FAQ 补充「行人/动物横穿看不到」问答。
+- `deployment_and_operations.md`：版本头 → V3.6.3；§5.7 排障表补充 V3.6.3 行；新增 `### V3.6.2 → V3.6.3` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.6.3；§9 排障表补充 V3.6.3 行；§5 冒烟预期补充「动物应在自车前方横穿」。
+- `pyproject.toml`：`version` 3.6.2 → **3.6.3**。
+
+---

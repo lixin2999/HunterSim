@@ -472,6 +472,73 @@ class TestMotionAndBehaviors:
 
         assert ((after.x - before.x) ** 2 + (after.y - before.y) ** 2) ** 0.5 > 1.0
 
+    def test_scripted_walker_not_teleported_by_placeholder_origin(self) -> None:
+        """首 tick 前占位原点读数不得把脚本化行人瞬移到世界原点。
+
+        回归 V3.6.3：scenario.tick() 先于 world.tick() 执行，同步模式下首 tick 前
+        walker.get_transform() 返回 (0,0,0)。若不判据就会把行人从真实出生点
+        (548.6,37.2) 推向目标 (548.6,47.7) 时以原点为起点，等价于瞬移到世界原点再
+        横穿整张地图（画面里动物消失、视区外数百米）。
+        """
+        from hunter_sim.scene_runner.builtin_scenario import _ScriptedWalker
+
+        class _Rotation:
+            def __init__(self, pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0) -> None:
+                self.pitch, self.yaw, self.roll = pitch, yaw, roll
+
+        class _Transform:
+            def __init__(self, location: Any, rotation: Any) -> None:
+                self.location, self.rotation = location, rotation
+
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda loc, rot: _Transform(loc, rot),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+            Rotation=_Rotation,
+        )
+
+        class _WalkerActor:
+            def __init__(self, real: tuple[float, float, float]) -> None:
+                self.real = MockLocation(*real)
+                self.report_placeholder = True
+                self.set_calls: list[Any] = []
+
+            def get_transform(self) -> Any:
+                loc = (
+                    MockLocation(0.0, 0.0, 0.0)
+                    if self.report_placeholder
+                    else self.real
+                )
+                return _Transform(loc, _Rotation())
+
+            def set_transform(self, transform: Any) -> None:
+                self.set_calls.append(transform)
+                self.real = transform.location
+
+        scenario = _make_scenario(traffic_manager=MockTrafficManager())
+        walker = _WalkerActor((548.6, 37.2, 0.3))
+        scenario._scripted_walkers.append(  # noqa: SLF001
+            _ScriptedWalker(
+                actor=walker,
+                destination=(548.6, 47.7, 0.3),
+                speed_ms=1.5,
+                carla_module=fake_carla,
+                spawn=SpawnPoint(x=548.6, y=37.2, z=0.3),
+            )
+        )
+
+        # 未同步（读数落在原点）：本 tick 必须跳过推进，绝不 set_transform
+        scenario._advance_scripted_walkers(0.02)  # noqa: SLF001
+        assert walker.set_calls == []
+        assert scenario._scripted_walkers[0].done is False  # noqa: SLF001
+
+        # 位姿同步后：从真实出生点沿 +y 推向目标，x 基本不变（不会往原点跑）
+        walker.report_placeholder = False
+        scenario._advance_scripted_walkers(0.02)  # noqa: SLF001
+        assert len(walker.set_calls) == 1
+        new_loc = walker.set_calls[0].location
+        assert abs(new_loc.x - 548.6) < 1.0
+        assert new_loc.y > 37.2
+
 
 class TestEgoFallback:
     """标准 CARLA 不带 vehicle.hunter_se 资产时的自车回退。"""

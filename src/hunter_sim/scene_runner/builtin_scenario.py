@@ -199,6 +199,7 @@ class _ScriptedWalker:
         destination: 目标点 ``(x, y, z)``。
         speed_ms: 直行速度（m/s）。
         carla_module: 已导入的 carla 模块（构造 Transform/Location/Rotation）。
+        spawn: 行人登记时的真实出生点（用于识别首 tick 前的占位原点读数）。
         done: 是否已到达/放弃（到达后不再抖动）。
     """
 
@@ -206,6 +207,7 @@ class _ScriptedWalker:
     destination: tuple[float, float, float]
     speed_ms: float
     carla_module: Any
+    spawn: SpawnPoint
     done: bool = False
 
 
@@ -1535,6 +1537,13 @@ class BuiltinScenario(CustomScenarioBase):
             ex, ey = float(ego_location.x), float(ego_location.y)
         except Exception:  # noqa: BLE001
             return distances, None, None
+        # V3.6.3：首 tick 前自车/参与者位姿均为占位原点 (0,0,0)，两者做差会得到
+        # euclidean=0 的假距离，误触发 DISTANCE 事件（actual=0.000）。自车读数落在
+        # 原点而已知出生点不在 → 视为未同步，本 tick 不产出距离度量。
+        if _pose_not_synced(
+            SpawnPoint(x=ex, y=ey, z=0.0), self._ego_spawn
+        ):
+            return distances, None, None
 
         lead_gap: Optional[float] = None
         lead_speed: Optional[float] = None
@@ -1543,8 +1552,12 @@ class BuiltinScenario(CustomScenarioBase):
                 location = actor.get_transform().location
             except Exception:  # noqa: BLE001
                 continue
-            dx = float(location.x) - ex
-            dy = float(location.y) - ey
+            px, py = float(location.x), float(location.y)
+            # 跳过未同步的占位原点读数（Town 地图出生点不会落在原点）。
+            if is_placeholder_origin(SpawnPoint(x=px, y=py, z=0.0)):
+                continue
+            dx = px - ex
+            dy = py - ey
             longitudinal = dx * forward[0] + dy * forward[1]
             lateral = abs(dx * left[0] + dy * left[1])
             euclidean = math.hypot(dx, dy)
@@ -1866,6 +1879,7 @@ class BuiltinScenario(CustomScenarioBase):
                 destination=target,
                 speed_ms=max(0.1, speed_ms),
                 carla_module=carla_module,
+                spawn=spawn_point,
             )
         )
         logger.info(
@@ -1898,6 +1912,19 @@ class BuiltinScenario(CustomScenarioBase):
                 location = getattr(transform, "location", None)
                 if location is None:
                     walker.done = True
+                    continue
+                # V3.6.3：scenario.tick() 先于 world.tick() 执行，同步模式下首 tick
+                # 前 get_transform() 返回占位原点 (0,0,0)。若不判据直接推进，就会把
+                # 行人从真实出生点瞬移到世界原点、再横穿整张地图（表现为「动物不见了 /
+                # 视区外几百米」）。读数落在原点而登记的出生点不在原点 → 视为未同步，
+                # 本 tick 跳过推进（与 _pose_not_synced 同口径），等位姿同步后再走。
+                if is_placeholder_origin(
+                    SpawnPoint(
+                        x=float(location.x),
+                        y=float(location.y),
+                        z=float(location.z),
+                    )
+                ) and not is_placeholder_origin(walker.spawn):
                     continue
                 dx = walker.destination[0] - float(location.x)
                 dy = walker.destination[1] - float(location.y)
