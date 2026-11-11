@@ -539,6 +539,115 @@ class TestMotionAndBehaviors:
         assert abs(new_loc.x - 548.6) < 1.0
         assert new_loc.y > 37.2
 
+    def test_sudden_cross_dash_waits_for_ego_then_dashes(self) -> None:
+        """sudden_cross 行人：自车接近前保持在出生点，到位后以窜入速度冲过。
+
+        V3.7.0：把 sudden_cross 从「起步即匀速横穿」改为「等待→快速窜入」，
+        恢复鬼探头的时机语义（自车冲近才突然穿出），避免行人过早站在车道中间
+        让 Traffic Manager 持续刹车、把自车卡在低速。
+        """
+        from hunter_sim.scene_runner.builtin_scenario import _ScriptedWalker
+
+        class _Rotation:
+            def __init__(self, pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0) -> None:
+                self.pitch, self.yaw, self.roll = pitch, yaw, roll
+
+        class _Transform:
+            def __init__(self, location: Any, rotation: Any) -> None:
+                self.location, self.rotation = location, rotation
+
+        class _WalkerActor:
+            def __init__(self, real: tuple[float, float, float]) -> None:
+                self.real = MockLocation(*real)
+                self.set_calls: list[Any] = []
+
+            def get_transform(self) -> Any:
+                return _Transform(self.real, _Rotation())
+
+            def set_transform(self, transform: Any) -> None:
+                self.set_calls.append(transform)
+                self.real = transform.location
+
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda loc, rot: _Transform(loc, rot),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+            Rotation=_Rotation,
+        )
+
+        scenario = _make_scenario(traffic_manager=MockTrafficManager())
+        walker = _WalkerActor((548.6, 37.2, 0.3))
+        scenario._scripted_walkers.append(  # noqa: SLF001
+            _ScriptedWalker(
+                actor=walker,
+                destination=(548.6, 54.0, 0.3),
+                speed_ms=1.5,
+                carla_module=fake_carla,
+                spawn=SpawnPoint(x=548.6, y=37.2, z=0.3),
+                mode="dash",
+                waiting=True,
+                trigger_distance_m=15.0,
+                dash_speed_ms=4.5,
+            )
+        )
+        ego = MockActor("vehicle.hunter_se")
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=548.6, y=37.2, z=0.3, yaw_deg=0.0)  # noqa: SLF001
+
+        # 自车相距 60m（>15m 触发距离）：行人保持在出生点，绝不 set_transform
+        ego._transform = MockTransform(  # noqa: SLF001
+            MockLocation(488.6, 37.2, 0.3), MockRotation(yaw=0.0)
+        )
+        scenario._advance_scripted_walkers(0.5)  # noqa: SLF001
+        assert walker.set_calls == []
+        assert scenario._scripted_walkers[0].waiting is True  # noqa: SLF001
+
+        # 自车接近到 6m（<15m）：时机到，切窜入速度（4.5×0.5=2.25m）沿 +y 冲出
+        ego._transform = MockTransform(  # noqa: SLF001
+            MockLocation(542.6, 37.2, 0.3), MockRotation(yaw=0.0)
+        )
+        scenario._advance_scripted_walkers(0.5)  # noqa: SLF001
+        assert scenario._scripted_walkers[0].waiting is False  # noqa: SLF001
+        assert len(walker.set_calls) == 1
+        moved = walker.set_calls[0].location
+        assert abs(moved.x - 548.6) < 1.0
+        assert moved.y > 37.2
+
+    def test_crossing_offset_clears_wide_road(self) -> None:
+        """有地图时横穿终点应越出对向路缘，而非停在行车道中间。"""
+        scenario = _make_scenario()
+        fake_carla = types.SimpleNamespace(
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z)
+        )
+
+        class _Wp:
+            def __init__(self, loc: Any) -> None:
+                self.transform = types.SimpleNamespace(location=loc)
+
+        class _Map:
+            # 模拟路面横带：y 在 [36, 50] 视为仍在行车道，之外返回 None（路缘外）
+            def get_waypoint(self, loc: Any, project_to_road: bool = True) -> Any:
+                if 36.0 <= loc.y <= 50.0:
+                    return _Wp(loc)
+                return None
+
+        world = types.SimpleNamespace(get_map=lambda: _Map())
+        spawn = SpawnPoint(x=548.6, y=37.2, z=0.3)
+        # direction=+1, left=(0,1) → 沿 +y 横穿；纯几何 base_offset 只有 10.5m
+        offset = scenario._crossing_offset(world, fake_carla, spawn, 1.0, 0.0, 1.0, 10.5, 4.5)  # noqa: SLF001
+        assert offset > 12.0            # 明显大于纯几何估算，按实际路面宽度延伸
+        assert spawn.y + offset > 50.0  # 终点落在路面（<=50）之外
+
+    def test_crossing_offset_falls_back_without_map(self) -> None:
+        """无法读取地图时退回几何下限，绝不报错。"""
+        scenario = _make_scenario()
+        fake_carla = types.SimpleNamespace(
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z)
+        )
+        world = types.SimpleNamespace()  # 无 get_map
+        spawn = SpawnPoint(x=548.6, y=37.2, z=0.3)
+        offset = scenario._crossing_offset(world, fake_carla, spawn, 1.0, 0.0, 1.0, 10.5, 4.5)  # noqa: SLF001
+        assert offset == pytest.approx(10.5)
+
 
 class TestEgoFallback:
     """标准 CARLA 不带 vehicle.hunter_se 资产时的自车回退。"""

@@ -3951,3 +3951,59 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.6.2 → **3.6.3**。
 
 ---
+
+## V3.7.0 — 动物/行人穿行语义对齐：带符号纵向加速度 + sudden_cross 时机化窜入 + 横穿终点离路
+
+**发布日期**：2026-11-11
+**版本定位**：功能变更（第二位递增）。V3.6.3 后动物已能横穿，但对照场景语义仍有三处偏差——面板加速度恒正（实为三维模长）、`sudden_cross` 被近似成「起步即匀速横穿」（丢失「突然」时机）、横穿终点落在行车道中间（行人 done 后杵在自车行驶线上，TM 持续刹车把自车卡在低速）。本版逐项对齐。
+
+### 现场
+
+| 现象 | 读数/日志 | 结论 |
+|------|-----------|------|
+| 面板「加速度一直为正、速度卡在 0.35」 | `ego_state.acceleration` 取 `\|acceleration\|` 三维模长 | 恒 ≥0，把横向/垂向分量与制动都显示成正值，误导为「一直加速」 |
+| 鬼探头「不突然」 | `scene_mapping_warning code=unresolved_param:crossing_speed`；`scripted crossing: speed=1.50` | `sudden_cross→PEDESTRIAN_CROSS`，起步即以步速匀速横穿，无等待/窜入 |
+| 自车低速爬行 | `from=(548.6,37.2) to=(548.6,47.7)`，终点仅越自车线 6m | 行人停在行车道内，TM 避让持续刹车 |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：`_acceleration_magnitude` → `_longitudinal_acceleration(vehicle, yaw_rad)`，把加速度投影到自车前向单位向量 `(cos(yaw), sin(yaw))`，得到**带符号纵向加速度**（加速为正、制动为负，忽略含重力的 z 分量）；`ego_state["acceleration"]` 与 `sim_telemetry.acceleration` 随之上行，面板显示口径修正。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - `_trigger_metrics` 的事件度量 `acceleration_ms2` 同样改为沿自车前向的带符号投影——顺带修正 `emergency_brake`（判据 `< -3.0`）此前因恒正模长**永不触发**的问题。
+  - **sudden_cross 时机化窜入**：`_ScriptedWalker` 新增 `mode`/`waiting`/`trigger_distance_m`/`dash_speed_ms`；`_register_scripted_walker` 按 `participant.source_behavior_type == "sudden_cross"` 走 `dash` 模式；`_advance_scripted_walkers` 在自车水平距离进入 `_SUDDEN_CROSS_TRIGGER_M`（15m）前保持在出生点不动，到位后以 `_SUDDEN_CROSS_DASH_SPEED_MS`（4.5 m/s）快速窜入。实时位姿未同步时不判定（沿用 V3.6.3 占位原点判据）。
+  - **横穿终点离路**：`_walker_destination` 新增 `_crossing_offset`——沿横穿方向用 `get_waypoint(project_to_road=True)` 逐点探测路面，越过最靠外仍在路面的点后加 `_CURB_CLEARANCE_M`（3m）余量，确保终点落在对向路缘外；无法读图时退回「至少跨过自车车道 + 余量」的几何估算。`_setup_walker_ai` 调用处补传 `world`。
+
+### 向后兼容
+
+- **接口/契约无字段增删**，但有两处**语义变更**：
+  1. 面板/`sim_telemetry`/事件度量的 `acceleration` 由「三维模长」改为「带符号纵向分量」——读数会由恒正变为可正可负，制动为负。
+  2. `sudden_cross` 参与者由「起步即匀速横穿」改为「等待自车接近再快速窜入」，画面上行人会先伏在路缘、自车临近时冲出。
+- `pyproject.toml` 版本 `3.6.3` → `3.7.0`（功能变更，第二位递增、第三位归零）。
+
+### 验证
+
+- `pytest -q` 全量：**1541 passed**（较 V3.6.3 基线 1538 +3 新增用例）；flake8 exit=0；mypy no issues。
+- 新增/调整用例：
+  - `test_sudden_cross_dash_waits_for_ego_then_dashes`：自车 60m 外不推进（保持等待），接近到 6m 后以窜入速度冲出。
+  - `test_crossing_offset_clears_wide_road` / `test_crossing_offset_falls_back_without_map`：宽路面下终点越出路面；无地图退回几何下限。
+  - `test_ego_state_reads_ego_actor_attribute`：加速度断言改为带符号纵向分量（`yaw=90°`、`accel=(0,-2,9.81)` → `-2.0`，z 被忽略）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.7.0`；
+2. 重下发 `SCN-2054-AC-DOG-L4`（动物穿行）：面板加速度制动时转负、速度随自车加速正常上升；动物先伏在路缘、自车临近时快速窜过并离开路面，不再卡在低速；
+3. 日志中 `Walker 'animal-1' scripted sudden-dash crossing ... [wait until ego<15m then dash 4.5m/s]` 为 sudden_cross 生效标志。
+
+### 分发
+
+镜像 tag `hunter-sim:3.7.0`；`pyproject.toml` 版本 `3.7.0`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.7.0`，追加 V3.7.0 能力条目；测试计数 1538 → 1541。
+- `user_manual.md`：版本头 → V3.7.0；FAQ 补充「加速度恒正 / 自车卡在低速 / sudden_cross 不突然」问答。
+- `deployment_and_operations.md`：版本头 → V3.7.0；§5.7 排障表补充 V3.7.0 行；新增 `### V3.6.3 → V3.7.0` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.7.0；§9 排障表补充 V3.7.0 行；§5 冒烟预期补充「sudden_cross 等待后窜入、终点离路」。
+- `pyproject.toml`：`version` 3.6.3 → **3.7.0**。
+
+---

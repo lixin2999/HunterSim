@@ -1095,7 +1095,7 @@ class SceneRunnerService:
                 "yaw": yaw,
                 "velocity": round(speed, 4),
                 "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
-                "acceleration": round(self._acceleration_magnitude(vehicle), 4),
+                "acceleration": round(self._longitudinal_acceleration(vehicle, yaw), 4),
             }
         except Exception as exc:  # noqa: BLE001  单帧读取失败不阻断场景
             self._warn_ego_state("read", exc)
@@ -1117,10 +1117,18 @@ class SceneRunnerService:
         logger.warning(f"Ego state unavailable (stage={stage}){detail}{suffix}")
 
     @staticmethod
-    def _acceleration_magnitude(vehicle: Any) -> float:
-        """读取加速度向量模长（不支持时回退 0）。"""
+    def _longitudinal_acceleration(vehicle: Any, yaw_rad: float) -> float:
+        """沿自车航向的带符号纵向加速度（m/s²：加速为正、制动为负）。
+
+        历史版本上报三维加速度模长（恒 ≥0），把横向/垂向分量与减速都显示成
+        正值，面板因此「加速度一直为正」。改为把加速度向量投影到自车前向单位
+        向量 ``(cos(yaw), sin(yaw))``（``yaw_rad`` 已是弧度）；读取失败回退 0。
+        忽略 z 分量（含重力/坡度），只保留真正影响纵向速度的分量。
+        """
         try:
             accel = vehicle.get_acceleration()
-            return float(math.sqrt(accel.x ** 2 + accel.y ** 2 + accel.z ** 2))
+            return float(
+                float(accel.x) * math.cos(yaw_rad) + float(accel.y) * math.sin(yaw_rad)
+            )
         except Exception:  # noqa: BLE001
             return 0.0

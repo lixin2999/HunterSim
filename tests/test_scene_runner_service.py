@@ -379,7 +379,7 @@ def _vehicle() -> Any:
             rotation=SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
         ),
         get_velocity=lambda: SimpleNamespace(x=10.0, y=0.0, z=0.0),
-        get_acceleration=lambda: SimpleNamespace(x=0.0, y=0.0, z=9.81),
+        get_acceleration=lambda: SimpleNamespace(x=0.0, y=-2.0, z=9.81),
         get_control=lambda: SimpleNamespace(steer=-0.25, throttle=0.6, brake=0.0),
     )
 
@@ -421,7 +421,10 @@ class TestEgoState:
         assert state["heading"] == pytest.approx(math.radians(90.0), abs=1e-6)
         assert state["yaw"] == pytest.approx(math.radians(90.0), abs=1e-6)
         assert state["steering"] == pytest.approx(-0.25)
-        assert state["acceleration"] == pytest.approx(9.81, abs=1e-3)
+        # V3.7.0：加速度为沿航向的带符号纵向分量（不再是三维模长）。
+        # yaw=90° 时前向单位向量 (cos90, sin90)=(0,1)，accel=(0,-2,9.81) 投影
+        # = 0*0 + (-2)*1 = -2.0（制动为负），z 分量（重力）被忽略。
+        assert state["acceleration"] == pytest.approx(-2.0, abs=1e-3)
 
     def test_ego_state_matches_ego_vehicle_property(self) -> None:
         """状态取数必须与 ``ego_vehicle`` property 同源，避免两处解析规则漂移。"""

@@ -141,6 +141,22 @@ _WALKER_ARRIVE_EPS_M = 0.3
 _WALKER_MIN_SPEED = 0.3
 _WALKER_MAX_SPEED = 4.0
 
+#: sudden_cross（鬼探头/突然窜出）语义参数：行人先在路缘等待，自车水平距离
+#: 近到 ``_SUDDEN_CROSS_TRIGGER_M`` 内才以 ``_SUDDEN_CROSS_DASH_SPEED_MS`` 快速窜
+#: 过车道——起步即匀速横穿会把「突然」这一关键时机抹掉，也让自车来不及反应。
+#: 窜入速度略高于常规步速上限，突出「突然冲出」而非「慢悠悠过街」。
+_SUDDEN_CROSS_TRIGGER_M = 15.0
+_SUDDEN_CROSS_DASH_SPEED_MS = 4.5
+
+#: 横穿终点需越出路缘后保留的安全余量（米），避免行人 done 后杵在行车道上，
+#: 触发 Traffic Manager 持续刹车、把自车卡在低速。
+_CURB_CLEARANCE_M = 3.0
+#: 无法读取地图车道信息时，几何估算横穿终点的兜底距离（米）。
+_CROSSING_FALLBACK_OFFSET_M = 16.0
+#: 逐点探测路面时用 ``get_waypoint(project_to_road=True)``：投影后落点与原探测点
+#: 偏离超过该阈值（米）即视为已离开行车道（路缘外）。
+_ROAD_SNAP_TOL_M = 2.5
+
 #: 场景行人是否使用 CARLA 原生 ``controller.ai.walker`` 导航（默认关闭）。
 #: 场景行人的出生点与横穿目标是平台下发的任意坐标，不保证落在
 #: RecastNavigation 导航网格上；对 off-mesh 点调用 go_to_location 会触发
@@ -201,6 +217,10 @@ class _ScriptedWalker:
         carla_module: 已导入的 carla 模块（构造 Transform/Location/Rotation）。
         spawn: 行人登记时的真实出生点（用于识别首 tick 前的占位原点读数）。
         done: 是否已到达/放弃（到达后不再抖动）。
+        mode: ``"cross"`` 匀速横穿；``"dash"`` sudden_cross 时机化窜入。
+        waiting: ``dash`` 模式下是否仍在等待自车接近（未到触发距离前不移动）。
+        trigger_distance_m: ``dash`` 模式下自车水平距离小于该值才发起窜入。
+        dash_speed_ms: ``dash`` 窜入阶段的速度（>0 时覆盖 speed_ms）。
     """
 
     actor: Any
@@ -209,6 +229,10 @@ class _ScriptedWalker:
     carla_module: Any
     spawn: SpawnPoint
     done: bool = False
+    mode: str = "cross"
+    waiting: bool = False
+    trigger_distance_m: float = 0.0
+    dash_speed_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1460,8 +1484,11 @@ class BuiltinScenario(CustomScenarioBase):
         metrics.speed_ms = self._current_speed(self._ego)
         try:
             accel = self._ego.get_acceleration()
-            metrics.acceleration_ms2 = math.sqrt(
-                float(accel.x) ** 2 + float(accel.y) ** 2 + float(accel.z) ** 2
+            # 带符号纵向分量（沿自车前向投影）：制动为负，供 emergency_brake 判据使用。
+            # 历史用三维模长（恒 ≥0）使 check_emergency_brake(<-3.0) 永不触发。
+            forward, _ = self._ego_axes()
+            metrics.acceleration_ms2 = float(
+                float(accel.x) * forward[0] + float(accel.y) * forward[1]
             )
         except Exception:  # noqa: BLE001  Mock/无位姿 Actor
             metrics.acceleration_ms2 = 0.0
@@ -1696,7 +1723,7 @@ class BuiltinScenario(CustomScenarioBase):
                 participant.participant_id,
                 speed,
             )
-        destination = self._walker_destination(spawn_point, carla, participant)
+        destination = self._walker_destination(spawn_point, carla, participant, world)
 
         # V3.6.2：默认走脚本化横穿（set_transform 逐帧推进，纯运动学、不碰原生
         # 导航）。场景行人的出生点/目标是平台下发的任意坐标，不保证落在导航网格
@@ -1763,6 +1790,7 @@ class BuiltinScenario(CustomScenarioBase):
         spawn_point: SpawnPoint,
         carla_module: Any,
         participant: Optional[TrafficParticipantConfig] = None,
+        world: Any = None,
     ) -> Any:
         """计算行人横穿目的地：朝自车车道方向走过整条车道。
 
@@ -1787,11 +1815,76 @@ class BuiltinScenario(CustomScenarioBase):
         if ego is not None:
             side = (spawn_point.x - ego.x) * left_x + (spawn_point.y - ego.y) * left_y
         direction = -1.0 if side > 0 else 1.0
-        offset = min(18.0, max(8.0, abs(side) + 6.0))
+        base_offset = min(18.0, max(8.0, abs(side) + 6.0))
+        offset = self._crossing_offset(
+            world, carla_module, spawn_point, direction, left_x, left_y,
+            base_offset, abs(side),
+        )
         x = spawn_point.x + direction * left_x * offset
         y = spawn_point.y + direction * left_y * offset
         z = spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M
         return carla_module.Location(x=x, y=y, z=z)
+
+    def _crossing_offset(
+        self,
+        world: Any,
+        carla_module: Any,
+        spawn_point: SpawnPoint,
+        direction: float,
+        left_x: float,
+        left_y: float,
+        base_offset: float,
+        lateral_offset_from_ego: float,
+    ) -> float:
+        """横穿距离：尽量把终点落到对向路缘外（离开行车道）。
+
+        历史版本用固定几何估算（8~18m），宽路面下终点会落在行车道中间；行人
+        done 后长期杵在自车行驶线上，Traffic Manager 会持续刹车、把自车卡在
+        低速。现在沿横穿方向逐点探测路面，越过最靠外仍在路面的点后加安全余量；
+        无法读图时退回“至少跨过自车车道 + 余量”的几何估算。
+        """
+        # 保证终点至少跨过自车行驶线再往外留出余量（几何下限）。
+        geo_floor = max(base_offset, lateral_offset_from_ego + _CURB_CLEARANCE_M)
+        if world is None:
+            return min(geo_floor, 30.0)
+        try:
+            get_map = getattr(world, "get_map", None)
+            if not callable(get_map):
+                return min(geo_floor, 30.0)
+            carla_map = get_map()
+            get_waypoint = getattr(carla_map, "get_waypoint", None)
+            if not callable(get_waypoint):
+                return min(geo_floor, 30.0)
+        except Exception:  # noqa: BLE001  Mock / 地图接口差异
+            return min(geo_floor, 30.0)
+        z = spawn_point.z if spawn_point.z > 0 else _FALLBACK_Z_M
+        step = 1.0
+        max_len = 40.0
+        travelled = 0.0
+        last_on_road = 0.0
+        on_road_seen = False
+        try:
+            while travelled <= max_len:
+                px = spawn_point.x + direction * left_x * travelled
+                py = spawn_point.y + direction * left_y * travelled
+                probe = carla_module.Location(x=px, y=py, z=z)
+                wp = get_waypoint(probe, project_to_road=True)
+                dev = None
+                if wp is not None:
+                    wloc = wp.transform.location
+                    dev = math.hypot(float(wloc.x) - px, float(wloc.y) - py)
+                if wp is not None and dev is not None and dev <= _ROAD_SNAP_TOL_M:
+                    on_road_seen = True
+                    last_on_road = travelled
+                elif on_road_seen:
+                    break  # 已经走过路面，现在离开 → 对向路缘
+                travelled += step
+        except Exception:  # noqa: BLE001  单点探测失败不阻断
+            return min(geo_floor, 30.0)
+        if not on_road_seen:
+            # 探测不到任何路面（坐标不在导航网格/地图上）：退回几何估算。
+            return min(max(geo_floor, _CROSSING_FALLBACK_OFFSET_M), 30.0)
+        return min(max(last_on_road + _CURB_CLEARANCE_M, geo_floor), 30.0)
 
     def _boarding_destination(
         self,
@@ -1867,31 +1960,47 @@ class BuiltinScenario(CustomScenarioBase):
         participant: TrafficParticipantConfig,
         carla_module: Any,
     ) -> None:
-        """登记脚本化行人（AI 不可用时每个 tick 直行推向目的地）。"""
+        """登记脚本化行人（AI 不可用时每个 tick 直行推向目的地）。
+
+        ``sudden_cross``（鬼探头）走 ``dash`` 模式：先在出生点等待，自车接近
+        到触发距离后才快速窜入；其余行为保持 ``cross`` 匀速横穿。
+        """
         target = (
             float(getattr(destination, "x", spawn_point.x)),
             float(getattr(destination, "y", spawn_point.y)),
             float(getattr(destination, "z", spawn_point.z)),
         )
-        self._scripted_walkers.append(
-            _ScriptedWalker(
-                actor=actor,
-                destination=target,
-                speed_ms=max(0.1, speed_ms),
-                carla_module=carla_module,
-                spawn=spawn_point,
-            )
+        is_sudden = participant.source_behavior_type == "sudden_cross"
+        walker = _ScriptedWalker(
+            actor=actor,
+            destination=target,
+            speed_ms=max(0.1, speed_ms),
+            carla_module=carla_module,
+            spawn=spawn_point,
         )
+        if is_sudden:
+            walker.mode = "dash"
+            walker.waiting = True
+            walker.trigger_distance_m = _SUDDEN_CROSS_TRIGGER_M
+            walker.dash_speed_ms = _SUDDEN_CROSS_DASH_SPEED_MS
+        self._scripted_walkers.append(walker)
         logger.info(
-            "Walker '%s' scripted crossing: speed=%.2f m/s from=(%.1f,%.1f) "
-            "to=(%.1f,%.1f) distance_to_ego=%s",
+            "Walker '%s' scripted %s crossing: speed=%.2f m/s from=(%.1f,%.1f) "
+            "to=(%.1f,%.1f) distance_to_ego=%s%s",
             participant.participant_id,
+            "sudden-dash" if is_sudden else "",
             speed_ms,
             spawn_point.x,
             spawn_point.y,
             target[0],
             target[1],
             _format_distance(self._distance_to_ego(spawn_point)),
+            (
+                f" [wait until ego<{_SUDDEN_CROSS_TRIGGER_M:.0f}m then dash "
+                f"{_SUDDEN_CROSS_DASH_SPEED_MS:.1f}m/s]"
+                if is_sudden
+                else ""
+            ),
         )
 
     def _advance_scripted_walkers(self, delta_seconds: float) -> None:
@@ -1926,13 +2035,30 @@ class BuiltinScenario(CustomScenarioBase):
                     )
                 ) and not is_placeholder_origin(walker.spawn):
                     continue
+                # sudden_cross：自车接近前保持在出生点不动（等待窜入时机）。
+                # 用自车实时位姿（_ego_live_pose 已忽略首 tick 前的占位读数）判定
+                # 水平距离；仍在触发距离之外就本 tick 不推进，到位后切窜入速度。
+                if walker.mode == "dash" and walker.waiting:
+                    ego_pose = self._ego_live_pose()
+                    if ego_pose is None:
+                        continue  # 自车尚未同步，本 tick 不判定，继续等待
+                    gap = math.hypot(
+                        ego_pose.x - float(location.x),
+                        ego_pose.y - float(location.y),
+                    )
+                    if gap > walker.trigger_distance_m:
+                        continue  # 自车尚远，保持在路缘等待
+                    walker.waiting = False  # 时机已到，发起快速窜入
                 dx = walker.destination[0] - float(location.x)
                 dy = walker.destination[1] - float(location.y)
                 distance = math.hypot(dx, dy)
                 if distance <= _WALKER_ARRIVE_EPS_M:
                     walker.done = True
                     continue
-                step = min(distance, walker.speed_ms * step_budget)
+                eff_speed = walker.speed_ms
+                if walker.mode == "dash" and walker.dash_speed_ms > 0:
+                    eff_speed = walker.dash_speed_ms
+                step = min(distance, eff_speed * step_budget)
                 carla_module = walker.carla_module
                 rotation = getattr(transform, "rotation", None)
                 new_transform = carla_module.Transform(
