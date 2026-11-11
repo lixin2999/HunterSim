@@ -423,6 +423,60 @@ class CarlaMailbox:
         self._warn_once(op, self._violation_text(op) + "; caller must fall back to cache")
         return False
 
+    def direct_call(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        name: str = "",
+        timeout: Optional[float] = None,
+        fallback: Any = None,
+    ) -> Any:
+        """安全执行一次「只读兜底」类 CARLA 调用：读缓存降级 + 端点锁串行。
+
+        与 :meth:`can_access_directly` 的区别——后者只做「能不能碰」的布尔判定，
+        调用方随后仍在**不持锁**的情况下发 RPC。一旦端点已无 owner（tick 线程收尾
+        后 ``relinquish`` 释放所有权、HTTP/executor 线程仍在轮询），多个线程会并发
+        操作同一 Client，触发 0xC0000409 原生 fail-fast。本方法在真正发 RPC 前获取
+        端点锁：owner 线程重入计数、无 owner 线程互斥串行，从而彻底封死该窗口。
+
+        Args:
+            fn: 真正触碰 CARLA 对象的可调用对象（通常是读缓存兜底前的 RPC）。
+            *args: 传给 ``fn`` 的位置参数。
+            name: 操作名（日志/指标标签）。
+            timeout: 等锁上限（秒）；None 用默认内联超时。
+            fallback: 未获授权（有存活他线程 owner）或未抢到端点锁时的返回值。
+
+        Returns:
+            ``fn()`` 的结果，或 ``fallback``。
+        """
+        op = name or getattr(fn, "__name__", "carla_direct")
+        if not self._can_run_inline():
+            # 有存活的他人 owner：读操作必须降级到缓存，不能撞正在 tick 的连接
+            CARLA_OFFOWNER_RPC_TOTAL.labels(engine=self.key, op=op).inc()
+            if _strict_mode_enabled():
+                raise CarlaThreadViolation(self._violation_text(op))
+            self._warn_once(op, self._violation_text(op) + "; caller must fall back to cache")
+            return fallback
+        limit = self._inline_timeout_s if timeout is None else max(0.05, float(timeout))
+        if not self._gate.acquire(limit):
+            # 无 owner 但端点被另一线程（如释放事务 apply_settings）占住：
+            # 宁可降级读数，也不能与之并发发 RPC
+            self._stats["timeout"] += 1
+            CARLA_MAILBOX_TASKS_TOTAL.labels(engine=self.key, op=op, result="timeout").inc()
+            self._warn_once(
+                op,
+                f"CarlaMailbox[{self.key}] direct read '{op}' skipped: endpoint busy "
+                f"(held by thread '{self._gate.holder_name}'); returning fallback",
+            )
+            return fallback
+        try:
+            result = fn(*args)
+        finally:
+            self._gate.release()
+        self._stats["inline"] += 1
+        CARLA_MAILBOX_TASKS_TOTAL.labels(engine=self.key, op=op, result="ok").inc()
+        return result
+
     def require_owner(self, op: str) -> None:
         """断言「当前线程有权直接访问 CARLA 对象」（供未走信箱的历史调用点自检）。
 

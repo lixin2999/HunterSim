@@ -346,13 +346,20 @@ class EventDetector:
             self.check_emergency_brake(timestamp, -forward_accel)
         self._prev_speed = vehicle_state.vehicle_speed
 
-    def update_scene_triggers(self, timestamp: float, metrics: TriggerMetrics) -> None:
+    def update_scene_triggers(
+        self, timestamp: float, metrics: TriggerMetrics
+    ) -> list[SceneEventDefinition]:
         """逐个评估平台事件定义；只发出 ``TRIGGER_REACHED`` 标记，不判失败。
 
         Args:
             timestamp: 当前仿真时间戳（秒）。
             metrics: 本 tick 的度量快照。
+
+        Returns:
+            本 tick **越沿新触发**的事件定义列表（供场景执行层按 ``action_type``
+            驱动自车/参与者动作）；未触发时为空列表。
         """
+        fired: list[SceneEventDefinition] = []
         for definition in list(self._definitions.values()):
             trigger = definition.trigger
             if not definition.is_runtime_evaluable:
@@ -370,6 +377,7 @@ class EventDetector:
             hit = _compare(actual, trigger.comparator, trigger.value)
             if not self._edge_latch(f"definition:{definition.event_id}", hit):
                 continue
+            fired.append(definition)
             self._emit(
                 DetectedEvent(
                     event_id=definition.event_id,
@@ -393,6 +401,7 @@ class EventDetector:
                     event_level="info",
                 )
             )
+        return fired
 
     def _emit(self, event: DetectedEvent) -> None:
         """记录事件并触发回调。"""

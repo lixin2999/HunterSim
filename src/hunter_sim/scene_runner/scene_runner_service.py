@@ -265,15 +265,21 @@ class SceneRunnerService:
         world = self._world
         if world is None:
             return None
-        # V3.6.0：非 owner 线程直接放弃兜底查找（告警不能阻止崩溃，只能降级）：
-        # 宁可自车引用缺席，也不能让 HTTP/executor 线程对着正在 tick 的连接发 RPC
-        if not self._mailbox.can_access_directly("world.get_actors(ego_fallback)"):
-            return None
-        try:
-            actors = list(world.get_actors().filter("vehicle.*"))
-        except Exception as exc:  # noqa: BLE001  接口缺失 / 跨线程读失败
-            logger.debug(f"ego actor world lookup failed: {exc}")
-            return None
+        # V3.8.1：兜底查找要发 world.get_actors() RPC，必须经信箱端点锁串行。
+        # 旧写法先 can_access_directly 判定、再**不持锁**直接发 RPC：一旦 tick 线程
+        # 收尾释放 owner 而 HTTP/executor 线程仍在轮询，多线程并发撞同一 Client →
+        # 0xC0000409 原生 fail-fast。direct_call 在有 owner 时降级、无 owner 时持锁串行。
+
+        def _lookup() -> list[Any]:
+            try:
+                return list(world.get_actors().filter("vehicle.*"))
+            except Exception as exc:  # noqa: BLE001  接口缺失 / 跨线程读失败
+                logger.debug(f"ego actor world lookup failed: {exc}")
+                return []
+
+        actors = self._mailbox.direct_call(
+            _lookup, name="world.get_actors(ego_fallback)", fallback=[]
+        )
         for actor in actors:
             try:
                 if str(actor.attributes.get("role_name", "")).lower() == _EGO_ROLE_NAME:
@@ -1007,15 +1013,22 @@ class SceneRunnerService:
     def _get_actor_count(self) -> int:
         """获取世界中当前 Actor 数量（失败时返回 0）。
 
-        会发 CARLA RPC，仅 owner/无 owner 线程可调；周期上报走
-        :meth:`_refresh_actor_count` 写的缓存。
+        会发 CARLA RPC，经信箱端点锁串行（V3.8.1）：周期上报走
+        :meth:`_refresh_actor_count` 写的缓存；无 owner 的收尾窗口也不得裸发 RPC。
         """
-        if not self._mailbox.can_access_directly("world.get_actors(count)"):
-            return self._actors_count_cache
-        try:
-            return len(self._world.get_actors())
-        except Exception:  # noqa: BLE001
-            return 0
+        def _count() -> int:
+            world = self._world
+            if world is None:
+                return 0
+            try:
+                return len(world.get_actors())
+            except Exception:  # noqa: BLE001
+                return 0
+
+        count: int = self._mailbox.direct_call(
+            _count, name="world.get_actors(count)", fallback=self._actors_count_cache
+        )
+        return count
 
     def _refresh_actor_count(self) -> None:
         """刷新 Actor 数量缓存（仅 tick 线程调用，与参与者状态同频 5Hz）。"""
@@ -1078,44 +1091,49 @@ class SceneRunnerService:
 
         V3.6.0：非 owner 线程走到这里时返回缓存而不是发 RPC——历史上正是这条
         路径（进度轮询/状态上报）与 tick 线程并发操作 Client 导致原生崩溃。
+        V3.8.1：owner 已释放的收尾窗口也不再裸发 RPC，改走 direct_call 端点锁串行。
         """
-        if not self._mailbox.can_access_directly("actor.get_transform(ego_state)"):
-            return dict(self._ego_state_cache)
-        try:
-            vehicle = self.ego_vehicle
-        except Exception as exc:  # noqa: BLE001  解析异常与读取异常分开定位
-            self._warn_ego_state("resolve", exc)
-            return {}
-        if vehicle is None:
-            self._warn_ego_state("actor_missing", None)
-            return {}
-        try:
-            # CARLA Actor 没有 get_rotation()：位姿（位置 + 姿态）统一从
-            # get_transform() 读取。V3.4.3 误用 get_rotation() 使整个读取块
-            # 每帧抛 AttributeError，面板整场显示「—」（旧版则写零值）。
-            pose = vehicle.get_transform()
-            loc = pose.location
-            rot = pose.rotation
-            vel = vehicle.get_velocity()
-            speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
-            ctrl = vehicle.get_control()
-            yaw = round(math.radians(float(getattr(rot, "yaw", 0.0))), 6)
-            accel = self._update_longitudinal_accel(vel, yaw, delta_seconds)
-            state = {
-                "x": round(loc.x, 4),
-                "y": round(loc.y, 4),
-                "z": round(loc.z, 4),
-                "heading": yaw,
-                "yaw": yaw,
-                "velocity": round(speed, 4),
-                "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
-                "acceleration": round(accel, 4),
-            }
-        except Exception as exc:  # noqa: BLE001  单帧读取失败不阻断场景
-            self._warn_ego_state("read", exc)
-            return {}
-        self._ego_state_cache = state  # tick 线程写入缓存，executor 线程安全读取
-        return state
+        def _read() -> dict[str, Any]:
+            try:
+                vehicle = self.ego_vehicle
+            except Exception as exc:  # noqa: BLE001  解析异常与读取异常分开定位
+                self._warn_ego_state("resolve", exc)
+                return {}
+            if vehicle is None:
+                self._warn_ego_state("actor_missing", None)
+                return {}
+            try:
+                # CARLA Actor 没有 get_rotation()：位姿（位置 + 姿态）统一从
+                # get_transform() 读取。V3.4.3 误用 get_rotation() 使整个读取块
+                # 每帧抛 AttributeError，面板整场显示「—」（旧版则写零值）。
+                pose = vehicle.get_transform()
+                loc = pose.location
+                rot = pose.rotation
+                vel = vehicle.get_velocity()
+                speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+                ctrl = vehicle.get_control()
+                yaw = round(math.radians(float(getattr(rot, "yaw", 0.0))), 6)
+                accel = self._update_longitudinal_accel(vel, yaw, delta_seconds)
+                state = {
+                    "x": round(loc.x, 4),
+                    "y": round(loc.y, 4),
+                    "z": round(loc.z, 4),
+                    "heading": yaw,
+                    "yaw": yaw,
+                    "velocity": round(speed, 4),
+                    "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
+                    "acceleration": round(accel, 4),
+                }
+            except Exception as exc:  # noqa: BLE001  单帧读取失败不阻断场景
+                self._warn_ego_state("read", exc)
+                return {}
+            self._ego_state_cache = state  # tick 线程写入缓存，executor 线程安全读取
+            return state
+
+        ego_state: dict[str, Any] = self._mailbox.direct_call(
+            _read, name="actor.get_transform(ego_state)", fallback=dict(self._ego_state_cache)
+        )
+        return ego_state
 
     def _warn_ego_state(self, stage: str, exc: Optional[BaseException]) -> None:
         """自车状态取数失败告警（按窗口限频，串行输出被抑制条数）。"""

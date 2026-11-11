@@ -230,7 +230,8 @@ class SceneEventDefinition(BaseModel):
         trigger: 触发条件。
         description: 事件描述字符串。
         is_failure_condition: 是否判定为失败事件。
-        action_type: 平台期望动作类型（仅留存，不执行）。
+        action_type: 平台期望动作类型（brake/emergency_stop 类在确定性控制下
+            驱动自车减速；其余仅留存，TM 托管时避让由 TM 负责）。
         action_parameters: 平台期望动作参数。
         is_runtime_evaluable: 是否参与运行时触发评估（DISABLED → False）。
     """

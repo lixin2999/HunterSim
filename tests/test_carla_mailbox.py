@@ -444,3 +444,69 @@ class TestRegistry:
         assert stats["queued"] == 1
         assert stats["executed"] == 1
         assert stats["inline"] == 0  # 排队路径不计入内联
+
+
+# ── direct_call：无 owner 直读串行（V3.8.1 teardown 并发窗口回归）────────────────
+
+
+class TestDirectCall:
+    def test_direct_call_without_owner_executes_inline(self) -> None:
+        mailbox = CarlaMailbox("127.0.0.1:2000")
+        assert mailbox.direct_call(lambda: 42, name="read") == 42
+        assert mailbox.stats["inline"] == 1
+
+    def test_direct_call_degrades_when_alive_owner_holds_endpoint(self) -> None:
+        # 有存活的他人 owner：只读兜底必须降级，不能撞正在 tick 的连接
+        mailbox = CarlaMailbox("127.0.0.1:2000")
+        release = threading.Event()
+        owner = _OwnerThread(mailbox).start(hold=release)
+        try:
+            called = {"hit": False}
+
+            def _fn() -> str:
+                called["hit"] = True
+                return "rpc"
+
+            assert mailbox.direct_call(_fn, name="ego_state", fallback="cache") == "cache"
+            assert called["hit"] is False
+        finally:
+            release.set()
+            owner.stop()
+
+    def test_direct_call_serializes_concurrent_readers_after_owner_release(self) -> None:
+        # V3.8.1 现场：tick 线程 relinquish 后无 owner，多线程并发直读曾裸发 RPC。
+        # direct_call 必须经端点锁串行，任何时刻最多一个线程在执行 RPC。
+        mailbox = CarlaMailbox("127.0.0.1:2000")
+        inflight = {"now": 0, "max": 0}
+        guard = threading.Lock()
+
+        def _rpc() -> None:
+            with guard:
+                inflight["now"] += 1
+                inflight["max"] = max(inflight["max"], inflight["now"])
+            time.sleep(0.02)
+            with guard:
+                inflight["now"] -= 1
+
+        threads = [
+            threading.Thread(target=mailbox.direct_call, args=(_rpc,), kwargs={"name": "read"})
+            for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(_WAIT_S)
+
+        assert inflight["max"] == 1  # 严格串行，绝不并发发 RPC
+
+    def test_direct_call_owner_thread_reentrant_no_deadlock(self) -> None:
+        # owner 线程内嵌再取端点锁（_get_ego_state 里再走 _actor_from_world）不锁死
+        mailbox = CarlaMailbox("127.0.0.1:2000")
+        assert mailbox.claim(threading.current_thread().name, timeout=1.0)
+        try:
+            def _outer() -> int:
+                return mailbox.direct_call(lambda: 1, name="inner", fallback=-1)
+
+            assert mailbox.direct_call(_outer, name="outer", fallback=-1) == 1
+        finally:
+            mailbox.relinquish()

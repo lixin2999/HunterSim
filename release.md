@@ -4119,3 +4119,58 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.7.1 → **3.8.0**。
 
 ---
+
+## V3.8.1 — 封死 teardown 并发窗口（0xC0000409 原生崩溃）+ 事件制动接入自车减速
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 + 功能完善（第三位递增）。修掉 V3.8.0 明确遗留的「场景结束 `destroying actors` 后 `0xC0000409` 原生崩溃」，并把 V3.8.0 确定性控制的副作用（横穿/跟车场景自车不再由 TM 避让）补齐——把平台事件 `ev-*.action_type=brake` 接入自车减速。
+
+### 现场（V3.8.0 实机日志）
+
+| 现象 | 定位证据 | 根因 |
+|------|----------|------|
+| 场景 completed 后 cleanup 全部成功、`owner released`（L127, 08:30:21），5s 后控制面进程 `code=3221226505`（0xC0000409）崩溃、`up` 自动重启 | L116–L150：崩溃发生在 owner **已释放之后**的收尾窗口 | tick 线程 `relinquish()` 释放端点锁后，`can_access_directly` 对「无 owner」直接放行、调用方随后**不持锁**裸发 `world.get_actors()` RPC；HTTP/viz 轮询线程与 executor 释放线程并发操作同一 `carla.Client` → 原生 fail-fast |
+| `Scene event actions (仅留存不执行)` + 跟车场景自车不因前车制动减速 | L104/L111：`ev-1:emergency_brake->brake`、`follow_condition_unmet` | 确定性纵向控制解除 TM 后，自车不再由 TM 避让前车/窜出物，事件 `brake` 动作历史仅留存不执行 |
+
+### 变更内容
+
+- **`src/hunter_sim/engine/carla_mailbox.py`**：新增 `direct_call(fn, *args, name, timeout, fallback)`——只读兜底类 CARLA 调用的**串行执行**入口：有存活他人 owner 时降级返回 `fallback`（不撞正在 tick 的连接），无 owner 时**先获取端点锁再发 RPC**（owner 线程重入计数、异线程互斥串行），彻底封死 teardown 窗口的并发裸发。
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：三处「`can_access_directly` 判定后裸发 RPC」的只读兜底改走 `direct_call`——`_actor_from_world`（`world.get_actors(ego_fallback)`）、`_get_actor_count`（`world.get_actors(count)`）、`_get_ego_state`（`actor.get_transform(ego_state)`）；拿不到端点时分别降级为 `[]`/缓存计数/缓存位姿。
+- **`src/hunter_sim/scene_runner/event_detector.py`**：`update_scene_triggers` 返回本 tick **越沿新触发**的事件定义列表（原返回 `None`，向后兼容）。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - `tick` 捕获 `update_scene_triggers` 返回值并调用新增 `_apply_scene_event_actions(fired)`。
+  - `_apply_scene_event_actions`：`action_type` 命中 brake/stop/decelerate 关键字（`_is_ego_brake_action`）且**处于确定性控制**时，置 `_ego_event_brake_ms`（默认目标 0 m/s 停车，可用 `action_parameters.target_speed[_ms]` 覆盖）；TM 托管时仅记 `deferred_to_traffic_manager`（避让仍由 TM 负责）。
+  - `_apply_ego_manual_speed`：事件制动触发后以 `_ego_event_brake_ms` 为目标减速，**达到目标后保持制动**（`_EGO_BRAKE_HOLD=0.3`）而非巡航前馈油门，避免停稳后被重新推进。
+
+### 向后兼容
+
+- 只读兜底语义不变（能读则读、不能读降级为缓存），仅把「裸发 RPC」改为「持端点锁发 RPC」。
+- 事件制动**只在 V3.8.0 直道确定性控制下生效**；TM 托管、`autopilot=False` 场景行为不变；仍可用 `HUNTER_SIM_EGO_DRIVE=tm` 整体回退。
+- `pyproject.toml` 版本 `3.8.0` → `3.8.1`（问题修复，第三位递增）。
+
+### 验证
+
+- `pytest -q` 全量：**1556 passed**（较 V3.8.0 基线 1548 +8）；flake8 exit=0；mypy no issues。
+- 新增用例：
+  - `tests/test_carla_mailbox.py::TestDirectCall`：无 owner 内联执行、有存活 owner 降级 `fallback`、**8 线程并发直读串行（任何时刻最多 1 个在发 RPC）**、owner 线程重入不死锁；
+  - `tests/test_builtin_scenario.py::TestDeterministicEgoDrive`：brake 仅在确定性模式接车、非制动动作不接管、`target_speed` 解析、事件制动三区（前进→零油门强制动、停稳→保持制动）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.8.1`；
+2. 重下发跟车/横穿场景：直道确定性控制下日志应出现 `scene_event_action ego_brake: event=ev-1 ... 自车减速目标 0.0 m/s`，自车对前车紧急制动自动减速并停稳；
+3. 场景结束不再出现 `0xC0000409`（`owner released` 后收尾窗口内多线程只读均经端点锁串行）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.1`；`pyproject.toml` 版本 `3.8.1`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.1`，追加 V3.8.1 条目；测试计数 1548 → 1556。
+- `user_manual.md`：版本头 → V3.8.1；FAQ 补充「场景结束偶发原生崩溃已修复」与「事件制动驱动自车减速」。
+- `deployment_and_operations.md`：版本头 → V3.8.1；排障表补充 V3.8.1 行；新增 `### V3.8.0 → V3.8.1` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.1；排障表补充 V3.8.1 行；冒烟预期补充「事件 `brake` 驱动自车减速、场景结束不再崩溃」。
+- `pyproject.toml`：`version` 3.8.0 → **3.8.1**。
+
+---

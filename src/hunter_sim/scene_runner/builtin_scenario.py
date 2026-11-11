@@ -172,6 +172,11 @@ _EGO_SPEED_KP = 0.6
 _EGO_SPEED_FEEDFORWARD = 0.12
 _EGO_BRAKE_GAIN = 0.8
 _EGO_SPEED_DEADBAND = 0.15
+#: 确定性控制收到事件制动且已减速到目标后的保持制动（防溜车，0~1）。
+_EGO_BRAKE_HOLD = 0.3
+#: V3.8.1：平台事件动作中判定为「驱动自车减速」的 action_type 关键字
+#: （子串匹配，覆盖 brake / emergency_brake / emergency_stop / decelerate / stop）。
+_EGO_BRAKE_ACTION_KEYWORDS = ("brake", "stop", "decelerate")
 
 #: 事件度量纵向加速度的一阶低通系数（与面板/遥测口径一致）。
 _ACCEL_EMA_ALPHA = 0.5
@@ -373,6 +378,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_initial_steer: float = 0.0
         # V3.8.0：直道确定性纵向控制是否接管自车（解除 TM 托管）
         self._ego_deterministic: bool = False
+        # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
+        # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
+        self._ego_event_brake_ms: Optional[float] = None
         # 已行驶里程积分（平台事件 traveled_distance 用）
         self._traveled_distance_m: float = 0.0
         # 车类 prop（停放/事故/故障车）生成位置，boarding 行为据此选择目标
@@ -494,6 +502,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_manual_speed = 0.0
         self._ego_initial_steer = 0.0
         self._ego_deterministic = False
+        self._ego_event_brake_ms = None
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
@@ -556,9 +565,10 @@ class BuiltinScenario(CustomScenarioBase):
     def _log_scene_expectations(self) -> None:
         """把「场景期望」落成日志：参与者期望行为 + 事件期望动作。
 
-        平台事件上的 ``action_type``（如「前车紧急制动」）当前只做期望留档，
-        不驱动仿真（见 ``SceneEventDefinition.action_type``）。现场看到「期望
-        刹车但前车没减速」时，可以从这行日志直接确认属契约范围而非执行失败。
+        平台事件上的 ``action_type``（如「前车紧急制动」）自 V3.8.1 起会在
+        直道确定性纵向控制下驱动自车减速（见 :meth:`_apply_scene_event_actions`）；
+        TM 托管时仍只做期望留档（避让由 TM 负责）。现场看到「期望刹车但前车
+        没减速」时，可从这行日志确认驱动方式与是否属契约范围。
 
         同时打车体系 ``offset`` 与叠加后的 ``world``：只打一个时无法区分「下发错」
         与「算错」，旧版把 offset 印成 ``@(18.5,0.0)`` 更易被误读成世界坐标。
@@ -592,7 +602,8 @@ class BuiltinScenario(CustomScenarioBase):
         ]
         if actions:
             logger.info(
-                "Scene event actions (仅留存不执行，需由参与者行为体现): %s",
+                "Scene event actions: %s（V3.8.1：brake/emergency_stop 类在确定性纵向"
+                "控制下驱动自车减速；TM 托管时仅留存，避让由 TM 负责）",
                 " ".join(actions),
             )
 
@@ -625,7 +636,8 @@ class BuiltinScenario(CustomScenarioBase):
             return
         try:
             metrics = self._trigger_metrics(world, timestamp, delta_seconds)
-            self._event_detector.update_scene_triggers(timestamp, metrics)
+            fired = self._event_detector.update_scene_triggers(timestamp, metrics)
+            self._apply_scene_event_actions(fired)
         except Exception as exc:  # noqa: BLE001  事件评估失败不阻断仿真
             logger.debug(f"Scene trigger evaluation failed: {exc}")
 
@@ -1336,6 +1348,48 @@ class BuiltinScenario(CustomScenarioBase):
             speed,
         )
 
+    def _apply_scene_event_actions(self, fired: list[Any]) -> None:
+        """执行本 tick 越沿触发的平台事件动作（V3.8.1：brake 类接入自车减速）。
+
+        历史上事件 ``action_type`` 只「留存不执行」；确定性纵向控制绕开 TM 后，自
+        车不再由 TM 避让前车/窜出物，因此需把 brake/emergency_stop 类动作显式接回自
+        车。只在直道确定性控制下接管自车纵向；TM 托管时避让本由 TM 负责，不干预。
+        """
+        for definition in fired:
+            action_type = str(getattr(definition, "action_type", "") or "")
+            if not self._is_ego_brake_action(action_type):
+                continue
+            if not self._ego_deterministic:
+                logger.info(
+                    "scene_event_action deferred_to_traffic_manager: event=%s action=%s "
+                    "（未启用确定性控制，自车避让由 TM 负责）",
+                    getattr(definition, "event_id", "?"),
+                    action_type,
+                )
+                continue
+            params = getattr(definition, "action_parameters", {}) or {}
+            raw = params.get("target_speed", params.get("target_speed_ms", 0.0))
+            try:
+                target_ms = float(raw)
+            except (TypeError, ValueError):
+                target_ms = 0.0
+            self._ego_event_brake_ms = max(0.0, target_ms)
+            logger.info(
+                "scene_event_action ego_brake: event=%s action=%s -> 自车减速目标 %.1f m/s"
+                "（确定性纵向控制接管，达目标后保持制动）",
+                getattr(definition, "event_id", "?"),
+                action_type,
+                self._ego_event_brake_ms,
+            )
+
+    @staticmethod
+    def _is_ego_brake_action(action_type: str) -> bool:
+        """action_type 是否为驱动自车减速类（子串匹配，忽略大小写）。"""
+        text = str(action_type or "").strip().lower()
+        if not text:
+            return False
+        return any(keyword in text for keyword in _EGO_BRAKE_ACTION_KEYWORDS)
+
     def _reapply_post_spawn_controls_once(self) -> None:
         """首个 tick 之后补发一次 autopilot / 期望速度指令。
 
@@ -1575,19 +1629,35 @@ class BuiltinScenario(CustomScenarioBase):
         用于非 TM 驱动（``autopilot=False`` 或直道确定性模式）：以前向投影速度为
         反馈量，误差超过死区才给油/制动，稳态保留巡航前馈油门，避免 TM 速度环的
         油门/刹车极限环。
+
+        V3.8.1：若事件制动已触发（``_ego_event_brake_ms`` 非空），目标速度改为事件
+        制动的目标（默认 0=停车），并在达到目标后保持制动（而非前馈油门），使自车
+        能对前车紧急制动/窜出物自动减速并停稳。
         """
-        if self._ego is None or self._ego_manual_speed <= 0:
+        if self._ego is None:
             return
+        event_brake = self._ego_event_brake_ms
+        if event_brake is not None:
+            target = event_brake
+            hold_brake = True
+        else:
+            if self._ego_manual_speed <= 0:
+                return
+            target = self._ego_manual_speed
+            hold_brake = False
         forward, _ = self._ego_axes()
         projected = self._projected_speed(self._ego, forward)
         current = projected if projected is not None else self._current_speed(self._ego)
-        error = self._ego_manual_speed - current
+        error = target - current
         if error > _EGO_SPEED_DEADBAND:
             throttle = min(1.0, max(0.0, _EGO_SPEED_FEEDFORWARD + _EGO_SPEED_KP * error))
             brake = 0.0
         elif error < -_EGO_SPEED_DEADBAND:
             throttle = 0.0
             brake = min(1.0, max(0.0, _EGO_BRAKE_GAIN * -error))
+        elif hold_brake:
+            throttle = 0.0
+            brake = _EGO_BRAKE_HOLD
         else:
             throttle = _EGO_SPEED_FEEDFORWARD
             brake = 0.0

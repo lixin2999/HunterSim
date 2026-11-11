@@ -15,6 +15,7 @@ import pytest
 
 from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.scene_runner.builtin_scenario import (
+    _EGO_BRAKE_HOLD,
     _EGO_SPEED_FEEDFORWARD,
     BuiltinScenario,
 )
@@ -1509,3 +1510,59 @@ class TestDeterministicEgoDrive:
         scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
         assert ego._control.throttle == pytest.approx(_EGO_SPEED_FEEDFORWARD)  # noqa: SLF001
         assert ego._control.brake == pytest.approx(0.0)  # noqa: SLF001
+
+    @staticmethod
+    def _fired(action_type: str, **params: Any) -> Any:
+        return types.SimpleNamespace(
+            event_id="ev-1", action_type=action_type, action_parameters=params
+        )
+
+    def test_event_brake_engages_only_in_deterministic_mode(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+
+        # 未启用确定性控制：TM 负责避让，不接管
+        scenario._apply_scene_event_actions([self._fired("brake")])  # noqa: SLF001
+        assert scenario._ego_event_brake_ms is None  # noqa: SLF001
+
+        # 确定性控制下：brake 动作接回自车（默认目标 0=停车）
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._apply_scene_event_actions([self._fired("brake")])  # noqa: SLF001
+        assert scenario._ego_event_brake_ms == pytest.approx(0.0)  # noqa: SLF001
+
+    def test_non_brake_action_does_not_engage(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._apply_scene_event_actions([self._fired("change_lane")])  # noqa: SLF001
+        assert scenario._ego_event_brake_ms is None  # noqa: SLF001
+
+    def test_event_brake_target_speed_from_parameters(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._apply_scene_event_actions(  # noqa: SLF001
+            [self._fired("emergency_stop", target_speed=1.5)]
+        )
+        assert scenario._ego_event_brake_ms == pytest.approx(1.5)  # noqa: SLF001
+
+    def test_event_brake_controller_decelerates_then_holds(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001  事件已触发制动
+
+        # 尚在以 3 m/s 前进：目标 0 → 零油门、强制动
+        ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(0.0)  # noqa: SLF001
+        assert ego._control.brake > 0.5  # noqa: SLF001
+
+        # 已停稳（死区内）：保持制动而非前馈油门（防止重新推进）
+        ego._velocity = MockVector3D(0.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(0.0)  # noqa: SLF001
+        assert ego._control.brake == pytest.approx(_EGO_BRAKE_HOLD)  # noqa: SLF001
