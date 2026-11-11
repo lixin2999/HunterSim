@@ -1946,3 +1946,80 @@ class TestV385TmTeardownFollowingAndSpeedChange:
             scenario._apply_scene_event_actions([definition])  # noqa: SLF001
         assert scenario._ego_manual_speed == 3.0  # noqa: SLF001
         assert "speed_change_unsupported" in caplog.text
+
+
+class TestV386IntersectionBranchSampleRetentionAndWedgeGuard:
+    """V3.8.6：路口直行优先、cleanup 保留最小车距采样、物理卡滞停油保护。"""
+
+    @staticmethod
+    def _scenario() -> BuiltinScenario:
+        return _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": True,
+                    "initial_speed_ms": 3.0,
+                },
+                "traffic_participants": [],
+            }
+        )
+
+    def test_cleanup_retains_min_distance_samples(self) -> None:
+        scenario = self._scenario()
+        scenario.min_distance_samples = [0.788, 5.0]  # noqa: SLF001
+        scenario.cleanup(object())
+        # 评估在 cleanup 之后读采样，清空会导致 inf→假通过
+        assert scenario.min_distance_samples == [0.788, 5.0]  # noqa: SLF001
+
+    def test_lane_keep_prefers_straight_branch_at_intersection(self) -> None:
+        scenario = self._scenario()
+        ego = mock.Mock()
+        ego.get_transform.return_value = types.SimpleNamespace(
+            location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            rotation=types.SimpleNamespace(yaw=0.0),
+        )
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_initial_steer = 0.0  # noqa: SLF001
+
+        def _wp(x: float, y: float) -> Any:
+            return types.SimpleNamespace(
+                transform=types.SimpleNamespace(location=types.SimpleNamespace(x=x, y=y))
+            )
+
+        left = _wp(10.0, 10.0)  # 左转分支（bearing 45°）
+        straight = _wp(10.0, 0.0)  # 直行分支（bearing 0°）
+        waypoint = mock.Mock()
+        waypoint.next.return_value = [left, straight]  # ahead[0] 为左转
+        carla_map = mock.Mock()
+        carla_map.get_waypoint.return_value = waypoint
+        world = mock.Mock()
+        world.get_map.return_value = carla_map
+        scenario._world = world  # noqa: SLF001
+        fake_carla = types.SimpleNamespace(
+            Location=lambda x, y, z: types.SimpleNamespace(x=x, y=y, z=z)
+        )
+        with mock.patch.dict(sys.modules, {"carla": fake_carla}):
+            steer = scenario._compute_lane_keep_steer()  # noqa: SLF001
+        # 应选直行分支→转向近 0，而非被左转分支甩出去
+        assert abs(steer) < 0.1
+
+    def test_physical_wedge_guard_stops_throttle(self) -> None:
+        scenario = self._scenario()
+        ego = mock.Mock()
+        ego.get_velocity.return_value = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        ego.get_transform.return_value = types.SimpleNamespace(
+            location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            rotation=types.SimpleNamespace(yaw=0.0),
+        )
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_deterministic = False  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._elapsed = 10.0  # noqa: SLF001
+        with mock.patch.object(scenario, "_apply_vehicle_control") as ctl:
+            scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001  # 计时起点
+            scenario._elapsed = 14.0  # noqa: SLF001  # 持续 4s > 3s
+            scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        kwargs = ctl.call_args.kwargs
+        assert kwargs["throttle"] == 0.0
+        assert kwargs["brake"] == pytest.approx(_EGO_BRAKE_HOLD)

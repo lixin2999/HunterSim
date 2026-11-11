@@ -174,6 +174,8 @@ _EGO_LANE_WHEELBASE_M = 2.9
 _EGO_LANE_MAX_STEER_RAD = 0.7
 #: 车道保持转向重算间隔（秒）：降低 get_waypoint RPC 频率，间隔内保持上次转向。
 _EGO_LANE_STEER_INTERVAL_S = 0.1
+#: V3.8.6：物理卡滞判定窗口（秒）：油门高却几乎不动持续超此时长→停油保持制动。
+_EGO_PHYS_STUCK_S = 3.0
 #: 确定性速度控制：比例增益 / 巡航前馈油门 / 制动增益 / 稳态死区（m/s）。
 _EGO_SPEED_KP = 0.6
 _EGO_SPEED_FEEDFORWARD = 0.12
@@ -411,6 +413,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_ctrl_throttle: float = 0.0
         self._ego_ctrl_brake: float = 0.0
         self._ego_ctrl_steer: float = 0.0
+        # V3.8.6：物理卡滞保护计时与告警标志（油门高却不动→停油保持制动）。
+        self._ego_phys_stuck_since_s: float = 0.0
+        self._ego_phys_stuck_warned: bool = False
         self.min_distance_samples: list[float] = []
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
@@ -546,6 +551,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_ctrl_throttle = 0.0
         self._ego_ctrl_brake = 0.0
         self._ego_ctrl_steer = 0.0
+        self._ego_phys_stuck_since_s = 0.0
+        self._ego_phys_stuck_warned = False
         self.min_distance_samples = []
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
@@ -780,7 +787,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_spawn = None
         self._world = None
         self._ego_brake_latched = False
-        self.min_distance_samples = []
+        # V3.8.6：min_distance_samples 不在 cleanup 清空——评估在 cleanup 之后
+        # 读取（executor._evaluate），清空会让最小车距=inf→近距擦碰假通过。
+        # 新场景由 setup() 重置。
         self._actors.clear()
         self._actor_by_participant.clear()
         self._participant_spawns.clear()
@@ -1842,6 +1851,27 @@ class BuiltinScenario(CustomScenarioBase):
         else:
             throttle = _EGO_SPEED_FEEDFORWARD
             brake = 0.0
+        # V3.8.6：物理卡滞保护——油门高却几乎不动（路外/楔住/顶住障碍）持续
+        # >_EGO_PHYS_STUCK_S 时停止给油并保持制动，避免 throttle=1 空转楔死整场
+        # （实机 Town01 自车冲出路外后 throttle=1.00/actual=0.00刷 170s）。
+        if throttle > 0.5 and current < 0.1:
+            if self._ego_phys_stuck_since_s == 0.0:
+                self._ego_phys_stuck_since_s = self.elapsed_seconds
+            elif self.elapsed_seconds - self._ego_phys_stuck_since_s > _EGO_PHYS_STUCK_S:
+                if not self._ego_phys_stuck_warned:
+                    self._ego_phys_stuck_warned = True
+                    logger.warning(
+                        "ego_physical_stuck: throttle=%.2f 却 actual=%.2f m/s 持续 >%.0fs，"
+                        "判定物理卡滞（路外/楔住/顶住障碍），停止给油并保持制动",
+                        throttle,
+                        current,
+                        _EGO_PHYS_STUCK_S,
+                    )
+                throttle = 0.0
+                brake = _EGO_BRAKE_HOLD
+        else:
+            self._ego_phys_stuck_since_s = 0.0
+            self._ego_phys_stuck_warned = False
         steer = self._ego_initial_steer
         if self._ego_deterministic:
             steer = self._lane_keep_steer(delta_seconds)
@@ -1900,8 +1930,22 @@ class BuiltinScenario(CustomScenarioBase):
             ahead = waypoint.next(_EGO_LANE_LOOKAHEAD_M)
             if not ahead:
                 return self._ego_initial_steer
-            target = ahead[0].transform.location
             yaw_deg = float(transform.rotation.yaw)
+            # V3.8.6：路口 next() 返回多分支，ahead[0] 可能恰为左/右转分支，纯追踪
+            # 会把自车甩离直线路径冲出路外物理卡滞（实机 Town01 steer=-0.72、
+            # y 偏移 123m）。改取与当前航向夹角最小的分支（直行优先）。
+
+            def _branch_deviation(wp: Any) -> float:
+                loc = wp.transform.location
+                bearing_deg = math.degrees(
+                    math.atan2(
+                        float(loc.y) - float(location.y),
+                        float(loc.x) - float(location.x),
+                    )
+                )
+                return abs(self._wrap_deg(bearing_deg - yaw_deg))
+
+            target = min(ahead, key=_branch_deviation).transform.location
             bearing = math.degrees(
                 math.atan2(
                     float(target.y) - float(location.y),

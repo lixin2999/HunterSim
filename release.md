@@ -4412,3 +4412,55 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.4 → **3.8.5**。
 
 ---
+
+## V3.8.6 — 路口直行优先 + 评估采样保留 + 物理卡滞停油保护（修 Town01 自车冲出路外楔死、近距接触仍 passed=True）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 / 功能完善（patch）。V3.8.5 实机回传 Town01 三动物（cattle→walker sudden_cross）场景：收尾已不崩溃（V3.8.5 生效），但自车在路口被车道保持甩出路外物理楔死（throttle=1.00/actual=0.00 刷 170s），且与动物近距接触（trigger actual=0.788 < 平台阈值 4.25）仍 `passed=True`。
+
+### 现场（inst-6775…，Town01，3×animal sudden_cross，ego 确定性 3 m/s）
+
+| 日志/截图锚点 | 现象 | 判定 |
+|---|---|---|
+| L131→L151 | `ego_speed_stuck desired=3 actual=0.00 throttle=1.00 brake=0.00` 刷 170s | **物理楔死**：自车冲出路外顶住地形/障碍，油门全开却不动 |
+| /viz 自车 (344.16,322.39)、steer=-0.720 | 自车 y 偏离出生轴 123m、硬左转向 | **路口分支误选**：lane-keep 取 `waypoint.next()[0]`，路口首分支为左转→纯追踪把自车甩离直线路径 |
+| L134 + L170 | `trigger distance<39 actual=0.788` 但 `passed=True` | **假通过回归**：`cleanup()` 清空 `min_distance_samples`，而评估在 cleanup 之后读→空采样→inf→判据放行 |
+| L154→L165 | 同步 cleanup→release TM→restore async，无崩溃 | V3.8.5 收尾修复**已验证生效** |
+
+### 根因
+
+1. **路口分支误选**：`_compute_lane_keep_steer` 用 `ahead[0]` 作前视点；路口 `next()` 返回多分支，首分支可能为左/右转→纯追踪产生大转向（-0.72）把自车甩出路外→物理楔死。
+2. **评估采样被 cleanup 清空**：V3.8.4 在 `cleanup()` 重置 `min_distance_samples=[]`，但 `executor._evaluate` 在 cleanup 之后才读 `runner.min_distance_samples`→空→`safety.min_distance_m=inf`→`min_distance_ok=True`→近距接触假通过。
+3. **楔死后仍全油门**：确定性控制无「油门高却不动」保护，throttle=1 空转楔死整场。
+
+### 变更
+
+- `builtin_scenario._compute_lane_keep_steer`：路口多分支改取**与当前航向夹角最小**者（直行优先），不再盲取 `ahead[0]`。
+- `builtin_scenario.cleanup`：**不再清空** `min_distance_samples`（评估在 cleanup 后读）；新场景由 `setup()` 重置。
+- `builtin_scenario._apply_ego_manual_speed`：新增物理卡滞保护——`throttle>0.5 且 current<0.1` 持续 `_EGO_PHYS_STUCK_S=3.0`s → 停油 + 保持制动（`_EGO_BRAKE_HOLD`）并落 `ego_physical_stuck` WARNING；速度恢复后自动复位。
+
+### 验证
+
+- 全量 `pytest`：**1586 passed**（1583 + 3 新增）。
+- 新增单测 `TestV386IntersectionBranchSampleRetentionAndWedgeGuard`：cleanup 保留采样、路口直行优先（ahead[0]=左转仍选直行）、楔死保护停油保持制动。
+- `flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.6`。
+2. 重下发 Town01 animal 场景：自车应**沿直行车道过路口**（不再硬左甩出路外、不再 y 偏移百米）；若仍楔死，3s 后应见 `ego_physical_stuck` 并停油（不再 throttle=1 刷整场）。
+3. 与动物近距接触（<4.25m）时 `success_criteria_result.min_safe_distance_ok=false` → `passed=false`（不再假通过）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.6`；`pyproject.toml` 版本 `3.8.6`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.6`，追加 V3.8.6 条目；测试计数 1583 → 1586。
+- `user_manual.md`：版本头 → V3.8.6；FAQ 补充「路口甩出路外/楔死/近距接触假通过已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.6；新增 `### V3.8.5 → V3.8.6` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.6；排障表补充 V3.8.6 行；冒烟预期补充「路口直行/不再假通过」。
+- `pyproject.toml`：`version` 3.8.5 → **3.8.6**。
+
+---
