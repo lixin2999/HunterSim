@@ -1517,6 +1517,12 @@ class TestDeterministicEgoDrive:
             event_id="ev-1", action_type=action_type, action_parameters=params
         )
 
+    @staticmethod
+    def _hazard(x: float, y: float) -> Any:
+        actor = MockActor("walker.pedestrian.0001")
+        actor.set_transform(MockTransform(location=MockLocation(x, y, 0.3)))
+        return actor
+
     def test_event_brake_engages_only_in_deterministic_mode(self) -> None:
         scenario = self._ego_scenario(3.0)
         scenario._ego = MockVehicle()  # noqa: SLF001
@@ -1554,6 +1560,8 @@ class TestDeterministicEgoDrive:
         scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
         scenario._ego_manual_speed = 3.0  # noqa: SLF001
         scenario._ego_event_brake_ms = 0.0  # noqa: SLF001  事件已触发制动
+        # V3.8.2：制动生效需危险物在自车行驶路径内（前方且横向≤半宽）
+        scenario._actors = [self._hazard(10.0, 0.0)]  # noqa: SLF001
 
         # 尚在以 3 m/s 前进：目标 0 → 零油门、强制动
         ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001
@@ -1566,3 +1574,54 @@ class TestDeterministicEgoDrive:
         scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
         assert ego._control.throttle == pytest.approx(0.0)  # noqa: SLF001
         assert ego._control.brake == pytest.approx(_EGO_BRAKE_HOLD)  # noqa: SLF001
+
+    def test_event_brake_inactive_while_hazard_waits_at_curb(self) -> None:
+        """V3.8.2：等待型横穿伏在路缘（横向数米）时不刹停，避免互锁死锁。"""
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001  事件已武装
+        scenario._actors = [self._hazard(10.0, 4.5)]  # noqa: SLF001  路缘等待
+
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+        # 未进路径：恢复巡航（低于期望给油），而非被刹停
+        ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle > _EGO_SPEED_FEEDFORWARD  # noqa: SLF001
+        assert ego._control.brake == pytest.approx(0.0)  # noqa: SLF001
+
+    def test_event_brake_active_when_hazard_enters_lane(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001
+        scenario._actors = [self._hazard(10.0, 0.0)]  # noqa: SLF001  窜入车道
+
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.brake > 0.5  # noqa: SLF001
+
+    def test_event_brake_inactive_for_hazard_behind_ego(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001
+        scenario._actors = [self._hazard(-10.0, 0.0)]  # noqa: SLF001  已越过自车
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+
+    def test_event_brake_releases_after_hazard_clears_lane(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001
+        actor = self._hazard(10.0, 0.0)
+        scenario._actors = [actor]  # noqa: SLF001
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        # 横穿完成、离开车道横向半宽 → 解除制动恢复巡航
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 6.0, 0.3)))
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001

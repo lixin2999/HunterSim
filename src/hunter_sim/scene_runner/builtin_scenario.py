@@ -177,6 +177,10 @@ _EGO_BRAKE_HOLD = 0.3
 #: V3.8.1：平台事件动作中判定为「驱动自车减速」的 action_type 关键字
 #: （子串匹配，覆盖 brake / emergency_brake / emergency_stop / decelerate / stop）。
 _EGO_BRAKE_ACTION_KEYWORDS = ("brake", "stop", "decelerate")
+#: V3.8.2：事件制动的「在路径内」横向半宽（米）。只有参与者落在自车行驶路径
+#: （前方且 |横向| ≤ 该值）时才真正制动；等待型横穿（sudden_cross）伏在路缘
+#: （横向数米）时不制动，避免「自车刹停 ↔ 行人等自车靠近」互锁死锁。
+_EGO_BRAKE_LANE_HALF_M = 2.0
 
 #: 事件度量纵向加速度的一阶低通系数（与面板/遥测口径一致）。
 _ACCEL_EMA_ALPHA = 0.5
@@ -1354,6 +1358,10 @@ class BuiltinScenario(CustomScenarioBase):
         历史上事件 ``action_type`` 只「留存不执行」；确定性纵向控制绕开 TM 后，自
         车不再由 TM 避让前车/窜出物，因此需把 brake/emergency_stop 类动作显式接回自
         车。只在直道确定性控制下接管自车纵向；TM 托管时避让本由 TM 负责，不干预。
+
+        V3.8.2：越沿触发只「武装」制动目标，不立即刹停；是否真正制动交由
+        :meth:`_ego_event_brake_active` 每 tick 判定目标是否已进入自车行驶路径，
+        避免与等待型横穿（sudden_cross）互锁死锁。
         """
         for definition in fired:
             action_type = str(getattr(definition, "action_type", "") or "")
@@ -1376,7 +1384,7 @@ class BuiltinScenario(CustomScenarioBase):
             self._ego_event_brake_ms = max(0.0, target_ms)
             logger.info(
                 "scene_event_action ego_brake: event=%s action=%s -> 自车减速目标 %.1f m/s"
-                "（确定性纵向控制接管，达目标后保持制动）",
+                "（确定性纵向控制接管；目标进入自车行驶路径后才制动，达目标后保持）",
                 getattr(definition, "event_id", "?"),
                 action_type,
                 self._ego_event_brake_ms,
@@ -1389,6 +1397,45 @@ class BuiltinScenario(CustomScenarioBase):
         if not text:
             return False
         return any(keyword in text for keyword in _EGO_BRAKE_ACTION_KEYWORDS)
+
+    def _ego_event_brake_active(self) -> Optional[float]:
+        """事件制动目标在本 tick 是否生效（V3.8.2：危险物在路径内才制动）。
+
+        事件越沿触发只「武装」制动目标；若此时触发源（如伏在路缘等待的
+        sudden_cross 动物）尚未进入自车行驶路径，立即刹停会让自车永远到不了
+        行人的窜出触发距离，形成互锁死锁。故仅当存在前方且在车道横向半宽内的
+        参与者时才返回制动目标，否则返回 None（恢复巡航）。
+        """
+        if self._ego_event_brake_ms is None:
+            return None
+        if self._hazard_in_ego_path():
+            return self._ego_event_brake_ms
+        return None
+
+    def _hazard_in_ego_path(self) -> bool:
+        """是否存在落在自车行驶路径内（前方且横向≤半宽）的参与者。"""
+        if self._ego is None:
+            return False
+        forward, left = self._ego_axes()
+        try:
+            location = self._ego.get_transform().location
+            ex, ey = float(location.x), float(location.y)
+        except Exception:  # noqa: BLE001
+            return False
+        for actor in self._actors:
+            try:
+                p = actor.get_transform().location
+            except Exception:  # noqa: BLE001
+                continue
+            px, py = float(p.x), float(p.y)
+            if is_placeholder_origin(SpawnPoint(x=px, y=py, z=0.0)):
+                continue
+            dx, dy = px - ex, py - ey
+            ahead = dx * forward[0] + dy * forward[1]
+            lateral = abs(dx * left[0] + dy * left[1])
+            if ahead > 0.0 and lateral <= _EGO_BRAKE_LANE_HALF_M:
+                return True
+        return False
 
     def _reapply_post_spawn_controls_once(self) -> None:
         """首个 tick 之后补发一次 autopilot / 期望速度指令。
@@ -1633,10 +1680,13 @@ class BuiltinScenario(CustomScenarioBase):
         V3.8.1：若事件制动已触发（``_ego_event_brake_ms`` 非空），目标速度改为事件
         制动的目标（默认 0=停车），并在达到目标后保持制动（而非前馈油门），使自车
         能对前车紧急制动/窜出物自动减速并停稳。
+
+        V3.8.2：事件制动是否生效改由 :meth:`_ego_event_brake_active` 判定（危险物
+        进入自车行驶路径才制动），等待型横穿伏在路缘时不刹停、恢复巡航。
         """
         if self._ego is None:
             return
-        event_brake = self._ego_event_brake_ms
+        event_brake = self._ego_event_brake_active()
         if event_brake is not None:
             target = event_brake
             hold_brake = True
@@ -1688,6 +1738,10 @@ class BuiltinScenario(CustomScenarioBase):
         ego_cfg = self._config.ego_vehicle
         desired = float(getattr(ego_cfg, "initial_speed_ms", 0.0) or 0.0)
         if desired <= 0.0:
+            return
+        if self._ego_event_brake_active() is not None:
+            # 事件制动生效中的主动停车不是「卡低速」，不告警（避免误归因 TM 避让）。
+            self._slow_since_s = 0.0
             return
         actual = self._current_speed(self._ego)
         now = self.elapsed_seconds

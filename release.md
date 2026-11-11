@@ -4174,3 +4174,56 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.0 → **3.8.1**。
 
 ---
+
+## V3.8.2 — 修复事件制动与等待型横穿的互锁死锁（危险物在路径内才制动）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复（第三位递增）。修掉 V3.8.1 事件制动接入后在 `sudden_cross`（鬼探头/动物突然窜出）场景引入的**互锁死锁**：自车被过早刹停、行人永远等不到自车靠近，整场双方冻结。
+
+### 现场（V3.8.1 实机日志 + /viz 截图）
+
+| 现象 | 定位证据 | 根因 |
+|------|----------|------|
+| 自车整场 0.00 m/s、位置不变；动物整场 0.0 m/s 伏在路缘（前 38.1/右 4.5）不窜出；`ego_speed_stuck` 从 4s 刷到 214s | L95 `scripted sudden-dash … [wait until ego<15m then dash]`；L117 `Trigger reached: distance < 39 (actual=38.905)`（t≈1.3s）；L118 `ego_brake -> 自车减速目标 0.0`；L119+ `throttle=0.00 brake=0.30` | 平台条件「动物进入车道且距自车低于阈值」被映射为**纯欧氏距离** `distance<39`，丢掉了「进入车道」合取项：动物还在路缘（横向 4.5m、未进车道）时即越沿触发→V3.8.1 立即把自车刹停到 0；而 `sudden_cross` 要等自车 <15m 才窜出→自车被刹停在 38.9m 永远到不了 15m→**互锁死锁** |
+| 场景「completed/passed=True」但实际什么都没发生 | L142–L159：时长耗尽自然结束 | 死锁下无碰撞/无越界，判据空转通过，掩盖了行为缺陷 |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - 新增常量 `_EGO_BRAKE_LANE_HALF_M=2.0`（事件制动「在路径内」横向半宽）。
+  - 新增 `_hazard_in_ego_path()`：是否存在**前方且 |横向|≤半宽**的参与者（跳过占位原点读数）。
+  - 新增 `_ego_event_brake_active()`：事件越沿触发只「武装」`_ego_event_brake_ms`；仅当 `_hazard_in_ego_path()` 为真才返回制动目标，否则返回 `None`（恢复巡航）。
+  - `_apply_ego_manual_speed` 改以 `_ego_event_brake_active()` 为事件制动输入：等待型横穿伏在路缘时不刹停、窜入车道才减速、横穿离开后恢复巡航。
+  - `_warn_ego_speed_stuck` 在事件制动生效期间**不告警**（主动停车不是「卡低速」，避免误归因 TM 避让）。
+  - `_apply_scene_event_actions` 日志/文案更新为「目标进入自车行驶路径后才制动」。
+
+### 向后兼容
+
+- 事件制动仍**只在直道确定性控制下生效**；TM 托管场景行为不变（`deferred_to_traffic_manager`）。
+- 跟车场景前车本就在车道内（横向≈0），事件触发即制动，行为与 V3.8.1 一致；仅「触发源尚未进入自车路径」的情形不再过早刹停。
+- 不改对外接口、不新增环境变量；`pyproject.toml` 版本 `3.8.1` → `3.8.2`。
+
+### 验证
+
+- `pytest -q` 全量：**1560 passed**（较 V3.8.1 基线 1556 +4）；flake8 exit=0；mypy no issues。
+- 新增/调整用例（`tests/test_builtin_scenario.py::TestDeterministicEgoDrive`）：路缘等待不制动且恢复巡航、窜入车道才制动、身后目标不制动、横穿离开后解除制动；原「停稳保持制动」用例补「危险物在路径内」前置。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.8.2`；
+2. 重下发 `SCN-2054-AC-DOG-L4`：自车应**先平稳加速接近**（不再 t≈1.3s 即刹停），动物在自车 <15m 时窜入车道，自车随即减速避让；`ego_speed_stuck` 不再整场刷屏；
+3. 动物横穿离开后自车恢复巡航；场景结束仍无 `0xC0000409`（V3.8.1 修复保持）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.2`；`pyproject.toml` 版本 `3.8.2`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.2`，追加 V3.8.2 条目；测试计数 1556 → 1560。
+- `user_manual.md`：版本头 → V3.8.2；FAQ 补充「事件制动与等待型横穿互锁死锁已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.2；新增 `### V3.8.1 → V3.8.2` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.2；排障表补充 V3.8.2 行；冒烟预期补充「自车先接近、动物窜出才制动」。
+- `pyproject.toml`：`version` 3.8.1 → **3.8.2**。
+
+---
