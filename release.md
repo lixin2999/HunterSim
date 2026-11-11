@@ -3795,3 +3795,52 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - 沿用 V3.5.5 待办（未接入 NVENC 硬编码、自适应只降 JPEG 质量）。
 
 ---
+
+## V3.6.1 — 场景结束后崩溃补修 + follow_condition_unmet 偏移计算修正
+
+**发布日期**：2026-11-11
+**版本定位**：补丁修复（第三位递增）。V3.6.0 信箱结构收口了 owner / 非 owner 两类并发，但实机验证发现两条仍可导致 `0xC0000409` 的路径：① 场景 cleanup 后 `relinquish()` 立刻释放端点锁，executor 线程紧接着访问 CARLA Client 时 LibCarla 内部线程仍有在途传感器回调未排空——两个线程并发操作同一连接；② `_warn_follow_condition_unmet()` 缺少 `_pose_not_synced` 检查，首 tick 前占位原点 `(0,0,0)` 被当作参与者真实坐标参与相对偏移计算，导致告警日志输出数百米的荒谬 ahead/left 值。
+
+### 现场
+
+| 时刻 | 读数 | 结论 |
+|------|------|------|
+| 08:28:43 | `follow_condition_unmet: lead-1(ahead=-212.9m, left=392.5m)` | lead-1 实际相对 ego 仅 ahead=18.5m，偏差来源：参与者位姿仍为占位原点 `(0,0,0)`，`_warn_follow_condition_unmet` 直接采信并与 ego 真实位置做差 |
+| 08:30:21 | `CarlaMailbox[127.0.0.1:2000] owner released` | tick 线程正常释放信箱 |
+| 08:30:26 | `[up] carla-manager 异常退出（code=3221226505）（0xC0000409 原生 fail-fast…）` | cleanup 后约 5s（executor 完成 artifact 上传并调用 `plane.release()`）时，LibCarla 传感器回调线程仍在往 Python callback 投帧，executor 线程对同一 Client 发 RPC，两者并发触发 fail-fast |
+
+### 修复内容
+
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：`_run_loop()` 的 finally 块在 `self._mailbox.relinquish()` 之前增加 `time.sleep(_CALLBACK_DRAIN_S)`（默认 0.5s），等待 LibCarla 网络 I/O 线程把在途传感器帧投递完毕再归还端点。新增常量 `_CALLBACK_DRAIN_S = 0.5` 并附中文注释说明取舍。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：`_warn_follow_condition_unmet()` 补充 `_pose_not_synced` 检查——若 `_actor_spawn_point(actor)` 返回占位原点且 `_participant_spawns` 中记录的出生点不是原点，则不使用该未同步读数，改回落出生点，与 `participant_states()` 的判据对齐。
+
+### 向后兼容
+
+- 无接口/契约变更；`_CALLBACK_DRAIN_S` 在 owner 退出路径增加约 0.5s 延迟，场景结束后控制面回到「Manager idle」状态的时刻略晚，不影响平台下发。
+- `pyproject.toml` 版本 `3.6.0` → `3.6.1`（问题修复，第三位递增）。
+
+### 验证
+
+- `pytest -q -p no:randomly` 全量：**1536 passed**，与 V3.6.0 基线一致（本次修复不引入新逻辑分支，通过现有回归护栏验证）；
+- 关键路径测试：`TestSyncModeEgoBase::test_follow_condition_warns_when_lead_is_behind`（占位原点 lead-1 场景必须触发 `follow_condition_unmet` WARNING）通过；
+- `mypy src/hunter_sim`：**91 source files, Success: no issues found**；`flake8 src tests`：exit 0。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.6.1`；
+2. 跑 Town01/lead_follow 场景，等待场景自然结束，`[up]` **不应出现** `异常退出（code=3221226505）` 行；
+3. 跟车场景 `follow_condition_unmet` 日志（若有）中 `lead-1(ahead=…m, left=…m)` 数值应在合理范围内（与 spawn 日志中 `relative=(ahead=…)` 量级一致，不应出现数百米）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.6.1`；`pyproject.toml` 版本 `3.6.1`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.6.1`，V3.6.x 条目追加补丁说明。
+- `user_manual.md`：版本头 → V3.6.1；§11 FAQ 补充「场景结束后崩溃是否已修」与「follow_condition_unmet 偏移荒谬值」两问。
+- `deployment_and_operations.md`：版本头 → V3.6.1；§5.7 排障表补充 V3.6.1 两行；新增 `### V3.6.0 → V3.6.1` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.6.1；§9 排障表补充 V3.6.1 两行；§5 冒烟预期补充「场景结束不应崩溃」。
+- `pyproject.toml`：`version` 3.6.0 → **3.6.1**。
+
+---

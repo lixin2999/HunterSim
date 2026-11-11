@@ -1479,9 +1479,14 @@ class BuiltinScenario(CustomScenarioBase):
         base = self._reference_pose()
         layout: list[str] = []
         for participant_id, actor in list(self._actor_by_participant.items())[:5]:
-            pose = self._actor_spawn_point(actor) or self._participant_spawns.get(
-                participant_id
-            )
+            spawned = self._participant_spawns.get(participant_id)
+            pose = self._actor_spawn_point(actor)
+            # 同步模式首 tick 前参与者位姿仍是占位原点 (0,0,0)，直接采信会
+            # 把出生坐标与原点做差，得到数百米量级的错误 ahead/left（V3.6.1 修复）。
+            if pose is not None and _pose_not_synced(pose, spawned):
+                pose = None
+            if pose is None:
+                pose = spawned
             if pose is None:
                 continue
             ahead, left = relative_offset_from_ego(base, pose)

@@ -72,6 +72,13 @@ _OWNER_CLAIM_TIMEOUT_S = 10.0
 #: ``mailbox.run`` 未执行时的哨兵 fallback（区分「执行了但返回 None」与「没执行」）
 _NOT_EXECUTED = object()
 
+#: 场景 cleanup 后、释放信箱前等待 LibCarla 内部线程排空传感器回调的时长（秒）。
+#: CARLA Client 的传感器回调在 LibCarla 自己的网络 I/O 线程上触发；
+#: sensor.stop() 只阻断新帧，已在途的帧仍会到达。
+#: 如果不等待就 relinquish，executor 线程会立即对同一 Client 发 RPC，
+#: 两个线程并发操作导致 Windows fail-fast（0xC0000409）。
+_CALLBACK_DRAIN_S = 0.5
+
 
 class SceneRunnerService:
     """场景运行服务主类。
@@ -622,6 +629,12 @@ class SceneRunnerService:
             logger.info("Scene loop: cleaning up scenario resources")
             self._cleanup()
             logger.info("Scene loop: cleanup finished, releasing CARLA ownership")
+            # V3.6.1：cleanup 内 sensor.stop() 只阻断新帧，已在途的帧仍会在
+            # LibCarla 内部线程上触发回调。relinquish 一旦释放端点锁，
+            # executor 线程就会马上对同一个 Client 发 RPC——两个线程并发
+            # 即触发 Windows fail-fast（0xC0000409）。等待短暂时间让
+            # 在途回调排空，再归还端点。
+            time.sleep(_CALLBACK_DRAIN_S)
             self._mailbox.relinquish()
 
     def _run_loop_body(self) -> None:
