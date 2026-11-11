@@ -9,7 +9,9 @@ from __future__ import annotations
 import sys
 import time
 import types
+import logging
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -1835,3 +1837,112 @@ class TestV384SmoothingHysteresisAndMetrics:
         scenario._actors = [self._hazard(110.0, 100.0)]  # noqa: SLF001
         scenario._trigger_metrics(None, 1.0, 0.02)  # noqa: SLF001
         assert scenario.min_distance_samples == [pytest.approx(10.0)]
+
+
+class TestV385TmTeardownFollowingAndSpeedChange:
+    """V3.8.5：TM 托管收尾先释放、跟车不误报卡滞、speed_change 动作生效。"""
+
+    @staticmethod
+    def _scenario(speed: float = 15.0) -> BuiltinScenario:
+        return _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 100.0, "y": 100.0},
+                    "autopilot": True,
+                    "initial_speed_ms": speed,
+                },
+                "traffic_participants": [],
+            }
+        )
+
+    def test_cleanup_releases_tm_before_destroy(self) -> None:
+        scenario = self._scenario()
+        calls: list[str] = []
+
+        def _actor(aid: int) -> Any:
+            a = mock.Mock()
+            a.id = aid
+            a.set_autopilot.side_effect = lambda on: calls.append(f"autopilot{aid}={on}")
+            a.destroy.side_effect = lambda: calls.append(f"destroy{aid}")
+            return a
+
+        ego = _actor(1)
+        lead = _actor(2)
+        scenario._ego = ego  # noqa: SLF001
+        scenario._actors = [lead]  # noqa: SLF001
+        scenario._tm_managed = [(lead, 4.0)]  # noqa: SLF001
+        scenario.cleanup(object())
+        assert calls.index("autopilot1=False") < calls.index("destroy1")
+        assert calls.index("autopilot2=False") < calls.index("destroy2")
+        assert scenario._tm_managed == []  # noqa: SLF001
+
+    def _following_scenario(self, with_lead: bool) -> BuiltinScenario:
+        scenario = self._scenario(15.0)
+        ego = MockVehicle()
+        ego._velocity = MockVector3D(x=4.0, y=0.0, z=0.0)  # noqa: SLF001
+        ego.set_transform(
+            MockTransform(location=MockLocation(100.0, 100.0, 0.3), rotation=MockRotation(yaw=0.0))
+        )
+        ego.apply_control(types.SimpleNamespace(throttle=0.2, brake=0.0))
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=100.0, y=100.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_deterministic = False  # noqa: SLF001
+        scenario._elapsed = 20.0  # noqa: SLF001
+        scenario._slow_since_s = 1.0  # noqa: SLF001  # 已低速 19s，首调即应告警
+        if with_lead:
+            lead = MockVehicle()
+            lead._velocity = MockVector3D(x=4.0, y=0.0, z=0.0)  # noqa: SLF001
+            lead.set_transform(
+                MockTransform(location=MockLocation(110.0, 100.0, 0.3), rotation=MockRotation(yaw=0.0))
+            )
+            scenario._actors = [lead]  # noqa: SLF001
+            scenario._actor_by_participant = {"cyclist-1": lead}  # noqa: SLF001
+            scenario._tm_managed = [(lead, 4.0)]  # noqa: SLF001
+        return scenario
+
+    def test_stuck_warning_suppressed_when_tm_following(self, caplog) -> None:
+        scenario = self._following_scenario(with_lead=True)
+        with caplog.at_level(logging.WARNING):
+            scenario._warn_ego_speed_stuck()  # noqa: SLF001
+        assert "ego_speed_stuck" not in caplog.text
+
+    def test_stuck_warning_fires_without_lead(self, caplog) -> None:
+        scenario = self._following_scenario(with_lead=False)
+        with caplog.at_level(logging.WARNING):
+            scenario._warn_ego_speed_stuck()  # noqa: SLF001
+        assert "ego_speed_stuck" in caplog.text
+
+    def test_speed_change_tm_sets_desired_speed(self) -> None:
+        scenario = self._scenario()
+        scenario._ego_deterministic = False  # noqa: SLF001
+        scenario._ego = mock.Mock()  # noqa: SLF001
+        definition = types.SimpleNamespace(
+            event_id="ev-1", action_type="speed_change",
+            action_parameters={"speed": 2.0},
+        )
+        scenario._apply_scene_event_actions([definition])  # noqa: SLF001
+        scenario._ego.set_desired_speed.assert_called_once_with(2.0)
+
+    def test_speed_change_deterministic_sets_manual_speed(self) -> None:
+        scenario = self._scenario()
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        definition = types.SimpleNamespace(
+            event_id="ev-1", action_type="custom_speed_change",
+            action_parameters={"target_speed": 2.0},
+        )
+        scenario._apply_scene_event_actions([definition])  # noqa: SLF001
+        assert scenario._ego_manual_speed == 2.0  # noqa: SLF001
+
+    def test_speed_change_missing_param_ignored(self, caplog) -> None:
+        scenario = self._scenario()
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        definition = types.SimpleNamespace(
+            event_id="ev-1", action_type="speed_change", action_parameters={},
+        )
+        with caplog.at_level(logging.WARNING):
+            scenario._apply_scene_event_actions([definition])  # noqa: SLF001
+        assert scenario._ego_manual_speed == 3.0  # noqa: SLF001
+        assert "speed_change_unsupported" in caplog.text

@@ -863,3 +863,15 @@ class TestTickLoopDrainsMailbox:
             runner._stop_event.set()  # noqa: SLF001
             thread.join(timeout=5.0)
             assert not thread.is_alive()
+
+
+class TestV385TeardownOrder:
+    """V3.8.5：收尾先销毁 Actor（仍同步）再恢复异步，避免 TM 线程并发销毁崩溃。"""
+
+    def test_teardown_world_cleans_before_restore_async(self) -> None:
+        runner = SceneRunnerService.__new__(SceneRunnerService)
+        calls: list[str] = []
+        runner._cleanup = lambda: calls.append("cleanup")  # noqa: SLF001
+        runner._restore_async = lambda: calls.append("restore")  # noqa: SLF001
+        runner._teardown_world()  # noqa: SLF001
+        assert calls == ["cleanup", "restore"]

@@ -550,9 +550,13 @@ class SceneRunnerService:
         return False
 
     def _teardown_world(self) -> None:
-        """世界收尾：先恢复异步再清理场景资源（幂等，只经信箱派发进入）。"""
-        self._restore_async()
+        """世界收尾：先清理场景资源再恢复异步（幂等，只经信箱派发进入）。
+
+        V3.8.5：顺序不可颠倒——恢复异步后 TM/世界自行 tick，再销毁 TM 托管
+        Actor 会与 TM 线程并发触发原生 fail-fast（0xC0000409）。
+        """
         self._cleanup()
+        self._restore_async()
 
     def destroy(self, timeout_s: float = _RUNNER_JOIN_TIMEOUT_S) -> bool:
         """销毁场景，释放所有资源。
@@ -644,12 +648,16 @@ class SceneRunnerService:
             self._publish_terminal_status()
             # 先放行其他线程排进来的收尾/读数任务，再做本线程自己的收尾
             drained = self._mailbox.drain(max_tasks=32)
+            # V3.8.5：先销毁 Actor 再恢复异步。恢复异步会让 TM/世界在独立线程
+            # 自动 tick，若此时再销毁 TM 托管 Actor 会与 TM 线程并发 → 0xC0000409。
+            # 同步模式下 TM 只随 world.tick() 推进，收尾期间无 tick，销毁安全。
             logger.info(
-                f"Scene loop: restoring async world mode (drained={drained} queued task(s))"
+                f"Scene loop: cleaning up scenario resources while synchronous "
+                f"(drained={drained} queued task(s))"
             )
-            self._restore_async()
-            logger.info("Scene loop: cleaning up scenario resources")
             self._cleanup()
+            logger.info("Scene loop: restoring async world mode")
+            self._restore_async()
             logger.info("Scene loop: cleanup finished, releasing CARLA ownership")
             # V3.6.1：cleanup 内 sensor.stop() 只阻断新帧，已在途的帧仍会在
             # LibCarla 内部线程上触发回调。relinquish 一旦释放端点锁，

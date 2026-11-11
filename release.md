@@ -4358,3 +4358,57 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.3 → **3.8.4**。
 
 ---
+
+## V3.8.5 — TM 托管收尾顺序修复 + 跟车误报抑制 + speed_change 事件动作（修 cyclist 群场景 teardown 0xC0000409、卡低速误报、事件动作被忽略）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 / 功能完善（patch）。针对 V3.8.4 实机回传的 **Town07 三骑行者（cyclist）群场景**（TM 托管、自车期望 15 m/s）日志暴露的三类缺陷：收尾原生崩溃、跟车被误报为卡滞、`speed_change` 事件动作只留存不执行。
+
+### 现场（inst-4a56…，Town07，3×cyclist constant_speed 4 m/s，ego TM autopilot 15 m/s）
+
+| 日志锚点 | 现象 | 判定 |
+|---|---|---|
+| L109→L110→L115→L149 | `restoring async world mode` → `cleaning up` → `destroying actors (participants=3)` → `code=3221226505 (0xC0000409)` | **收尾崩溃**：先恢复异步使 TM/世界在独立线程自动 tick，再销毁 TM 托管 Actor → 并发 fail-fast |
+| L63/64/65/68… | `ego_speed_stuck desired=15 actual≈4.09 throttle≈0.2 brake=0` 持续刷 | **误报**：TM 正常跟随 4 m/s 前车（actual≈lead），非物理卡滞 |
+| L54 | `ev-1:custom->speed_change` | **契约缺口**：仅 brake/stop/decelerate 关键字被消费，`speed_change` 被静默忽略 |
+| L61/62/70-98 | `trigger distance<1 actual=0.14~1.0` 反复越沿 | 自车与骑行者近距（<1 m）；事件本应减速却未执行 |
+
+### 根因
+
+1. **teardown 顺序**：`scene_runner_service` 循环退出与 `_teardown_world` 均「先 `_restore_async()` 再 `_cleanup()`」。恢复异步后 TM 切异步并在自有线程 tick，此时销毁仍被 TM 登记的 Actor（本场景 ego+3 cyclist 全 TM 托管）与 TM 线程并发 → LibCarla fail-fast。V3.8.1 的 `direct_call` 只封了「只读兜底裸发 RPC」窗口，未覆盖此「异步恢复先于销毁」顺序窗口。
+2. **跟车误报**：`_warn_ego_speed_stuck` 只比较 desired 与 actual，未识别「TM 跟车时 actual≈前车速度」属预期行为。
+3. **speed_change 未消费**：`_apply_scene_event_actions` 仅匹配 `_EGO_BRAKE_ACTION_KEYWORDS`，`speed_change` 既不制动也不改期望速度。
+
+### 变更
+
+- `scene_runner/scene_runner_service.py`：**收尾顺序反转**——循环退出与 `_teardown_world` 改为「先 `_cleanup()`（仍同步、TM 不 tick）销毁 Actor，再 `_restore_async()`」；日志改 `cleaning up scenario resources while synchronous` → `restoring async world mode`。
+- `scene_runner/builtin_scenario.py`：
+  - `cleanup()` 销毁 Actor 前新增「releasing Traffic Manager control」阶段：对 ego+全部参与者 `set_autopilot(False)` 并清空 `_tm_managed`，双保险解除 TM 登记。
+  - `_warn_ego_speed_stuck()`：非确定性（TM）模式下新增 `_tm_lead_speed()`（复用 `_relative_gaps` 前车判定），`abs(actual-lead)≤1.0` 判为跟车 → 重置计时不告警。
+  - 新增 `_EGO_SPEED_CHANGE_KEYWORDS=(speed_change,change_speed,set_speed,adjust_speed)` + `_is_ego_speed_change_action()` + `_apply_ego_speed_change()`：从 `action_parameters` 的 speed/target_speed/desired_speed/speed_ms/value 取目标速度；确定性改 `_ego_manual_speed`、TM 改 `set_desired_speed`；缺省/负值告警忽略。
+
+### 验证
+
+- 全量 `pytest`：**1583 passed**（1576 + 7 新增）。
+- 新增单测：`TestV385TmTeardownFollowingAndSpeedChange`（cleanup 先 set_autopilot(False) 再 destroy、TM 跟车不告警/无前车仍告警、speed_change TM/确定性/缺参 3 例）+ `TestV385TeardownOrder`（`_teardown_world` 先 cleanup 再 restore_async）。
+- `flake8` exit=0；`mypy` Success（2 源文件）。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.5`（`pip show hunter-sim` 核版本）。
+2. 重下发 Town07 cyclist 群场景：收尾日志应为 `cleaning up … while synchronous` → `destroying actors` → `releasing Traffic Manager control` → `restoring async world mode`，**不再 0xC0000409**。
+3. TM 跟随 4 m/s 前车时**不再刷 `ego_speed_stuck`**；若平台 ev-1 带 speed_change 参数，日志出现 `scene_event_action ego_speed_change … -> 期望速度 X m/s`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.5`；`pyproject.toml` 版本 `3.8.5`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.5`，追加 V3.8.5 条目；测试计数 1576 → 1583。
+- `user_manual.md`：版本头 → V3.8.5；FAQ 补充「TM 群场景收尾崩溃/跟车误报/speed_change 已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.5；新增 `### V3.8.4 → V3.8.5` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.5；排障表补充 V3.8.5 行；冒烟预期补充「TM 群场景收尾不崩溃」。
+- `pyproject.toml`：`version` 3.8.4 → **3.8.5**。
+
+---

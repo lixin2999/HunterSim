@@ -184,6 +184,9 @@ _EGO_BRAKE_HOLD = 0.3
 #: V3.8.1：平台事件动作中判定为「驱动自车减速」的 action_type 关键字
 #: （子串匹配，覆盖 brake / emergency_brake / emergency_stop / decelerate / stop）。
 _EGO_BRAKE_ACTION_KEYWORDS = ("brake", "stop", "decelerate")
+#: V3.8.5：平台事件动作中判定为「改变自车期望速度」的 action_type 关键字
+#: （子串匹配，覆盖 speed_change / change_speed / set_speed / adjust_speed）。
+_EGO_SPEED_CHANGE_KEYWORDS = ("speed_change", "change_speed", "set_speed", "adjust_speed")
 #: V3.8.2：事件制动的「在路径内」横向半宽（米）。只有参与者落在自车行驶路径
 #: （前方且 |横向| ≤ 该值）时才真正制动；等待型横穿（sudden_cross）伏在路缘
 #: （横向数米）时不制动，避免「自车刹停 ↔ 行人等自车靠近」互锁死锁。
@@ -757,6 +760,17 @@ class BuiltinScenario(CustomScenarioBase):
             self._ego is not None,
             len(self._actors),
         )
+        # V3.8.5：销毁前先解除 TM 托管。TM 仍登记着这些 Actor 时直接 destroy，
+        # TM 内部状态与销毁 RPC 并发会触发原生 fail-fast（0xC0000409）。
+        logger.info("Scenario cleanup: releasing Traffic Manager control")
+        for actor in ([self._ego] if self._ego is not None else []) + self._actors:
+            set_autopilot = getattr(actor, "set_autopilot", None)
+            if callable(set_autopilot):
+                try:
+                    set_autopilot(False)
+                except Exception as exc:  # noqa: BLE001  Actor 可能已失效
+                    logger.debug(f"TM release failed: {exc}")
+        self._tm_managed.clear()
         for actor in ([self._ego] if self._ego is not None else []) + self._actors:
             try:
                 actor.destroy()
@@ -1405,6 +1419,9 @@ class BuiltinScenario(CustomScenarioBase):
         """
         for definition in fired:
             action_type = str(getattr(definition, "action_type", "") or "")
+            if self._is_ego_speed_change_action(action_type):
+                self._apply_ego_speed_change(definition, action_type)
+                continue
             if not self._is_ego_brake_action(action_type):
                 continue
             if not self._ego_deterministic:
@@ -1437,6 +1454,60 @@ class BuiltinScenario(CustomScenarioBase):
         if not text:
             return False
         return any(keyword in text for keyword in _EGO_BRAKE_ACTION_KEYWORDS)
+
+    @staticmethod
+    def _is_ego_speed_change_action(action_type: str) -> bool:
+        """V3.8.5：action_type 是否为改变自车期望速度类（子串匹配）。"""
+        text = str(action_type or "").strip().lower()
+        if not text:
+            return False
+        return any(keyword in text for keyword in _EGO_SPEED_CHANGE_KEYWORDS)
+
+    def _apply_ego_speed_change(self, definition: Any, action_type: str) -> None:
+        """V3.8.5：执行 speed_change 类事件动作，改自车期望速度。
+
+        确定性控制改 ``_ego_manual_speed``；TM 托管改 ``set_desired_speed``。
+        目标速度从 action_parameters 的 speed/target_speed/desired_speed/
+        speed_ms/value 依次取；缺省/负值忽略并告警。补齐历史上
+        「custom->speed_change 只留存不执行」的契约缺口。
+        """
+        params = getattr(definition, "action_parameters", {}) or {}
+        target: Optional[float] = None
+        for key in ("speed", "target_speed", "desired_speed", "speed_ms", "value"):
+            raw = params.get(key)
+            if raw is None:
+                continue
+            try:
+                target = float(raw)
+            except (TypeError, ValueError):
+                continue
+            break
+        if target is None or target < 0.0:
+            logger.warning(
+                "scene_event_action speed_change_unsupported: event=%s action=%s "
+                "params=%s（缺少非负速度参数，忽略）",
+                getattr(definition, "event_id", "?"),
+                action_type,
+                params,
+            )
+            return
+        if self._ego_deterministic:
+            self._ego_manual_speed = target
+        else:
+            setter = getattr(self._ego, "set_desired_speed", None)
+            if callable(setter):
+                try:
+                    setter(target)
+                except Exception as exc:  # noqa: BLE001  TM 未就绪时降级
+                    logger.debug(f"ego set_desired_speed failed: {exc}")
+        logger.info(
+            "scene_event_action ego_speed_change: event=%s action=%s -> 期望速度 %.1f m/s"
+            "（%s）",
+            getattr(definition, "event_id", "?"),
+            action_type,
+            target,
+            "确定性纵向控制" if self._ego_deterministic else "TM 托管",
+        )
 
     def _ego_event_brake_active(self) -> Optional[float]:
         """事件制动目标在本 tick 是否生效（V3.8.2：危险物在路径内才制动）。
@@ -1871,6 +1942,13 @@ class BuiltinScenario(CustomScenarioBase):
             self._slow_since_s = 0.0
             return
         actual = self._current_speed(self._ego)
+        # V3.8.5：TM 托管且实际速度≈最近前车速度 = 正常跟车（非卡滞），不告警。
+        # 现场 cyclist 群场景期望 15 m/s 但 TM 跟随 4 m/s 前车，属预期跟车行为。
+        if not self._ego_deterministic:
+            lead = self._tm_lead_speed()
+            if lead is not None and abs(actual - lead) <= 1.0:
+                self._slow_since_s = 0.0
+                return
         now = self.elapsed_seconds
         if actual >= desired * 0.4:
             self._slow_since_s = 0.0
@@ -1906,6 +1984,17 @@ class BuiltinScenario(CustomScenarioBase):
             len(self._tm_managed),
             getattr(ego_cfg, "autopilot", False),
         )
+
+    def _tm_lead_speed(self) -> Optional[float]:
+        """V3.8.5：TM 托管时最近前车的沿航向速度（m/s）；无前车返回 None。
+
+        复用 :meth:`_relative_gaps` 的前车判定；用于区分「正常跟车低速」与
+        「物理卡滞」：实际速度≈前车速度时为跟车。
+        """
+        if self._ego is None or not self._tm_managed:
+            return None
+        _distances, _lead_gap, lead_speed = self._relative_gaps()
+        return lead_speed
 
     def _trigger_metrics(
         self, world: Any, timestamp: float, delta_seconds: float
