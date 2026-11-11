@@ -167,6 +167,13 @@ _EGO_STRAIGHT_LOOKAHEAD_M = 40.0
 _EGO_STRAIGHT_STEP_M = 4.0
 #: 累计航向变化超过该角度（度）即视为弯道，保留 Traffic Manager。
 _EGO_STRAIGHT_MAX_HEADING_DEG = 8.0
+#: V3.8.3：确定性控制车道保持（pure-pursuit）的前视距离（米）。
+_EGO_LANE_LOOKAHEAD_M = 10.0
+#: 车道保持自行车模型轴距（米）与 steer=1 对应的最大前轮转角（弧度）。
+_EGO_LANE_WHEELBASE_M = 2.9
+_EGO_LANE_MAX_STEER_RAD = 0.7
+#: 车道保持转向重算间隔（秒）：降低 get_waypoint RPC 频率，间隔内保持上次转向。
+_EGO_LANE_STEER_INTERVAL_S = 0.1
 #: 确定性速度控制：比例增益 / 巡航前馈油门 / 制动增益 / 稳态死区（m/s）。
 _EGO_SPEED_KP = 0.6
 _EGO_SPEED_FEEDFORWARD = 0.12
@@ -382,6 +389,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_initial_steer: float = 0.0
         # V3.8.0：直道确定性纵向控制是否接管自车（解除 TM 托管）
         self._ego_deterministic: bool = False
+        # V3.8.3：setup 注入的世界句柄（车道保持取 waypoint 用）与转向缓存
+        self._world: Any = None
+        self._ego_lane_steer: float = 0.0
+        self._ego_lane_steer_age_s: float = 0.0
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
         self._ego_event_brake_ms: Optional[float] = None
@@ -507,6 +518,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_initial_steer = 0.0
         self._ego_deterministic = False
         self._ego_event_brake_ms = None
+        self._world = world
+        self._ego_lane_steer = 0.0
+        self._ego_lane_steer_age_s = 0.0
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
@@ -727,6 +741,7 @@ class BuiltinScenario(CustomScenarioBase):
                 logger.debug(f"Actor destroy failed: {exc}")
         self._ego = None
         self._ego_spawn = None
+        self._world = None
         self._actors.clear()
         self._actor_by_participant.clear()
         self._participant_spawns.clear()
@@ -1683,6 +1698,9 @@ class BuiltinScenario(CustomScenarioBase):
 
         V3.8.2：事件制动是否生效改由 :meth:`_ego_event_brake_active` 判定（危险物
         进入自车行驶路径才制动），等待型横穿伏在路缘时不刹停、恢复巡航。
+
+        V3.8.3：确定性模式下转向不再固定为初始值，改由 :meth:`_lane_keep_steer`
+        沿车道中心线纯追踪过弯，避免直道判定之后的弯道把自车甩出路外。
         """
         if self._ego is None:
             return
@@ -1711,12 +1729,72 @@ class BuiltinScenario(CustomScenarioBase):
         else:
             throttle = _EGO_SPEED_FEEDFORWARD
             brake = 0.0
+        steer = self._ego_initial_steer
+        if self._ego_deterministic:
+            steer = self._lane_keep_steer(delta_seconds)
         self._apply_vehicle_control(
             self._ego,
             throttle=throttle,
             brake=brake,
-            steer=self._ego_initial_steer,
+            steer=steer,
         )
+
+    def _lane_keep_steer(self, delta_seconds: float) -> float:
+        """确定性控制的车道保持转向（V3.8.3：pure-pursuit 沿车道中心线）。
+
+        直道判定只保证「出生点前 40m 是直道」，地图后续弯道仍会让固定转向的自车
+        冲出路外（实机 Town06 冲上草地后物理卡滞、throttle=1 却 0 m/s）。这里按
+        间隔用地图 waypoint 取前视点，按自行车模型纯追踪算前轮转角，使自车沿车道
+        中心线过弯；地图/接口缺失时退回初始转向（保持既有行为）。
+        """
+        self._ego_lane_steer_age_s += max(0.0, float(delta_seconds))
+        if self._ego_lane_steer_age_s < _EGO_LANE_STEER_INTERVAL_S:
+            return self._ego_lane_steer
+        self._ego_lane_steer_age_s = 0.0
+        self._ego_lane_steer = self._compute_lane_keep_steer()
+        return self._ego_lane_steer
+
+    def _compute_lane_keep_steer(self) -> float:
+        """按当前位姿与车道前视点计算纯追踪转向（-1~1）；失败退回初始转向。"""
+        world = self._world
+        if world is None or self._ego is None:
+            return self._ego_initial_steer
+        try:
+            carla_map = world.get_map()
+            get_waypoint = getattr(carla_map, "get_waypoint", None)
+            if not callable(get_waypoint):
+                return self._ego_initial_steer
+            transform = self._ego.get_transform()
+            location = transform.location
+            try:
+                import carla  # noqa: PLC0415  真实 CARLA 环境下用原生 Location
+
+                probe: Any = carla.Location(
+                    x=location.x, y=location.y, z=location.z
+                )
+            except ImportError:
+                probe = SimpleNamespace(x=location.x, y=location.y, z=location.z)
+            waypoint = get_waypoint(probe, project_to_road=True)
+            if waypoint is None:
+                return self._ego_initial_steer
+            ahead = waypoint.next(_EGO_LANE_LOOKAHEAD_M)
+            if not ahead:
+                return self._ego_initial_steer
+            target = ahead[0].transform.location
+            yaw_deg = float(transform.rotation.yaw)
+            bearing = math.degrees(
+                math.atan2(
+                    float(target.y) - float(location.y),
+                    float(target.x) - float(location.x),
+                )
+            )
+            alpha = math.radians(self._wrap_deg(bearing - yaw_deg))
+            curvature = 2.0 * math.sin(alpha) / _EGO_LANE_LOOKAHEAD_M
+            steer_rad = math.atan(_EGO_LANE_WHEELBASE_M * curvature)
+            return max(-1.0, min(1.0, steer_rad / _EGO_LANE_MAX_STEER_RAD))
+        except Exception as exc:  # noqa: BLE001  Mock / 地图接口差异
+            logger.debug(f"ego lane-keep steer failed: {exc}")
+            return self._ego_initial_steer
 
     def _update_traveled_distance(self, delta_seconds: float) -> None:
         """积分自车速度得到已行驶里程（供 traveled_distance 事件使用）。"""

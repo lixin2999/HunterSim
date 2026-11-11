@@ -4227,3 +4227,55 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.1 → **3.8.2**。
 
 ---
+
+## V3.8.3 — 确定性控制补车道保持转向（修复直道判定后弯道把自车甩出路外）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复（第三位递增）。修掉 V3.8.2 实机暴露的**自车冲出路外物理卡滞**：直道判定只保证出生点前 40m 是直道，而确定性控制的转向固定为初始值，地图后续弯道无横向控制，自车沿直线冲上草地后 `throttle=1` 却 `0 m/s` 整场卡死。
+
+### 现场（V3.8.2 实机日志 + /viz 截图）
+
+| 现象 | 定位证据 | 根因 |
+|------|----------|------|
+| 自车先正常接近/制动（V3.8.2 互锁死锁已修），但随后偏离车道冲上草地、最终整场 0 m/s | 截图 t=35.9s 自车贴左路肩、t=46.4s 完全在草地上；日志 `ego_speed_stuck … throttle=1.00 brake=0.00 actual=0.00`（物理卡滞而非制动） | 确定性纵向控制只控油门/刹车，`steer` 固定 `_ego_initial_steer`(=0)；`_road_is_straight` 仅探出生点前 40m，Town06 后续弯道无横向控制→自车沿直线冲出路外 |
+| `ego_speed_stuck` 归因文案误导（提示 TM 避让/物理卡滞二选一） | 实为「off-road 后物理卡滞」，与 TM 无关 | 缺少车道保持，自车根本不在路上 |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - 新增常量 `_EGO_LANE_LOOKAHEAD_M=10.0`（纯追踪前视）、`_EGO_LANE_WHEELBASE_M=2.9`、`_EGO_LANE_MAX_STEER_RAD=0.7`（steer=1 对应前轮转角）、`_EGO_LANE_STEER_INTERVAL_S=0.1`（转向重算间隔）。
+  - `setup` 注入 `self._world`、`cleanup` 置空；新增转向缓存 `_ego_lane_steer` / `_ego_lane_steer_age_s`。
+  - 新增 `_lane_keep_steer(delta)`：按 0.1s 间隔重算（降低 `get_waypoint` RPC 频率），间隔内保持上次转向。
+  - 新增 `_compute_lane_keep_steer()`：地图 waypoint 取前视点，按自行车模型纯追踪（`curvature=2·sin α/Ld`、`steer=atan(wheelbase·curvature)/max_steer`）算 -1~1 转向；地图/接口缺失退回初始转向。
+  - `_apply_ego_manual_speed` 在**确定性模式**下 steer 改用车道保持；非确定性（纯 manual）仍用初始转向。
+
+### 向后兼容
+
+- 仅确定性模式启用横向车道保持；TM 托管与纯 manual 行为不变。
+- 无 `get_waypoint` 的 Mock/旧客户端退回初始转向（与 V3.8.0 直道判定同样的容错）。
+- 不改对外接口、不新增环境变量；`pyproject.toml` 版本 `3.8.2` → `3.8.3`。
+
+### 验证
+
+- `pytest -q` 全量：**1566 passed**（较 V3.8.2 基线 1560 +6）；flake8 exit=0；mypy no issues。
+- 新增用例（`tests/test_builtin_scenario.py::TestDeterministicEgoDrive`）：左/右弯转向符号、直道零转向、无地图回退初始转向、确定性模式控制指令 steer 来自车道保持、非确定性保持初始转向。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.8.3`；
+2. 重下发 `SCN-2054-AC-DOG-L4`：自车接近→动物窜出制动→横穿离开恢复巡航，且**全程保持在车道内过弯**，不再冲上草地/物理卡滞；
+3. `ego_speed_stuck` 不再因 off-road 刷屏；场景结束仍无 `0xC0000409`（V3.8.1 修复保持）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.3`；`pyproject.toml` 版本 `3.8.3`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.3`，追加 V3.8.3 条目；测试计数 1560 → 1566。
+- `user_manual.md`：版本头 → V3.8.3；FAQ 补充「确定性控制弯道冲出路外已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.3；新增 `### V3.8.2 → V3.8.3` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.3；排障表补充 V3.8.3 行；冒烟预期补充「全程车道内过弯」。
+- `pyproject.toml`：`version` 3.8.2 → **3.8.3**。
+
+---

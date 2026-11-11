@@ -1408,6 +1408,24 @@ class _RoadMap:
         return _ConstYawWaypoint(0.0, self._step_yaw)
 
 
+class _LaneMap:
+    """V3.8.3 车道保持测试地图：next() 返回指定坐标的车道前视点。"""
+
+    def __init__(self, ahead_x: float, ahead_y: float) -> None:
+        self._x = ahead_x
+        self._y = ahead_y
+
+    def get_waypoint(self, _loc: Any, project_to_road: bool = True) -> Any:
+        return self
+
+    def next(self, _distance: float) -> list[Any]:
+        return [
+            types.SimpleNamespace(
+                transform=MockTransform(location=MockLocation(self._x, self._y, 0.3))
+            )
+        ]
+
+
 class TestDeterministicEgoDrive:
     """V3.8.0：SIL 直道自车确定性纵向控制（绕开 TM 速度环振荡）。"""
 
@@ -1625,3 +1643,74 @@ class TestDeterministicEgoDrive:
         # 横穿完成、离开车道横向半宽 → 解除制动恢复巡航
         actor.set_transform(MockTransform(location=MockLocation(10.0, 6.0, 0.3)))
         assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+
+    @staticmethod
+    def _lane_ego() -> Any:
+        ego = MockVehicle()
+        ego.set_transform(
+            MockTransform(MockLocation(0.0, 0.0, 0.3), MockRotation(yaw=0.0))
+        )
+        return ego
+
+    def test_lane_keep_steer_turns_toward_left_curve(self) -> None:
+        """V3.8.3：前视点偏左 → 正转向（向左过弯），不再固定 0 转向冲出路外。"""
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = self._lane_ego()  # noqa: SLF001
+        scenario._world = types.SimpleNamespace(  # noqa: SLF001
+            get_map=lambda: _LaneMap(10.0, 2.0)
+        )
+        steer = scenario._compute_lane_keep_steer()  # noqa: SLF001
+        assert steer > 0.0
+        assert -1.0 <= steer <= 1.0
+
+    def test_lane_keep_steer_turns_toward_right_curve(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = self._lane_ego()  # noqa: SLF001
+        scenario._world = types.SimpleNamespace(  # noqa: SLF001
+            get_map=lambda: _LaneMap(10.0, -2.0)
+        )
+        assert scenario._compute_lane_keep_steer() < 0.0  # noqa: SLF001
+
+    def test_lane_keep_steer_zero_on_straight(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = self._lane_ego()  # noqa: SLF001
+        scenario._world = types.SimpleNamespace(  # noqa: SLF001
+            get_map=lambda: _LaneMap(10.0, 0.0)
+        )
+        assert scenario._compute_lane_keep_steer() == pytest.approx(0.0)  # noqa: SLF001
+
+    def test_lane_keep_steer_falls_back_without_map(self) -> None:
+        """无世界/地图接口时退回初始转向（向后兼容 Mock/旧客户端）。"""
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = self._lane_ego()  # noqa: SLF001
+        scenario._ego_initial_steer = 0.2  # noqa: SLF001
+        scenario._world = None  # noqa: SLF001
+        assert scenario._compute_lane_keep_steer() == pytest.approx(0.2)  # noqa: SLF001
+
+    def test_deterministic_control_applies_lane_keep_steer(self) -> None:
+        """V3.8.3：确定性模式下控制指令的 steer 来自车道保持而非固定初始值。"""
+        scenario = self._ego_scenario(3.0)
+        ego = self._lane_ego()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._world = types.SimpleNamespace(  # noqa: SLF001
+            get_map=lambda: _LaneMap(10.0, 2.0)
+        )
+        ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.1)  # noqa: SLF001  达到重算间隔
+        assert ego._control.steer > 0.0  # noqa: SLF001
+
+    def test_non_deterministic_control_keeps_initial_steer(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = self._lane_ego()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_deterministic = False  # noqa: SLF001
+        scenario._ego_initial_steer = 0.0  # noqa: SLF001
+        scenario._world = types.SimpleNamespace(  # noqa: SLF001
+            get_map=lambda: _LaneMap(10.0, 2.0)
+        )
+        ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.1)  # noqa: SLF001
+        assert ego._control.steer == pytest.approx(0.0)  # noqa: SLF001
