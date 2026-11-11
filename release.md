@@ -4007,3 +4007,58 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.6.3 → **3.7.0**。
 
 ---
+
+## V3.7.1 — 纵向加速度改前向速度时间导数（消除近静止抖动尖峰）+ SIL 卡低速可观测性
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 / 功能完善（第三位递增）。V3.7.0 把加速度从「三维模长」改为「沿航向带符号投影」，方向正确，但仍直接采信 CARLA `get_acceleration()` 的**瞬时物理读数**：自车近乎静止/低速抖动时，逐帧速度抖动除以 `dt` 会得到 ±数 m/s² 的无意义尖峰（现场表现为「速度 0.03、加速度 6.2」），且 `emergency_brake` 判据 `< -3.0` 会被抖动误触。本版改用**前向投影速度的时间导数 + 一阶低通**，并补一条 SIL「卡低速」归因日志。
+
+### 现场
+
+| 现象 | 读数 | 结论 |
+|------|------|------|
+| 面板加速度 6.22 / 5.69 / 7.77，但速度只有 0.03 / 0.42 / 0.70 m/s | `ego_state.acceleration` 取 `get_acceleration()` 沿航向投影 | 瞬时物理值在近静止时被数值抖动主导，与「车几乎没动」自相矛盾 |
+| 自车全程 ~0.68 m/s 爬行（期望 3.0） | 位置 x 由 503.56→536.47（48.4s）→576.44（106.8s） | 真实低速，非显示问题；根因需运行时定位（TM 保守 vs 物理卡滞） |
+| 面板「加速度」来源确认 | `visualization/assets/app.js` 读 `ego_state.acceleration` | V3.7.0 改动确已接入面板，问题在取数口径而非接线 |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：
+  - `_longitudinal_acceleration(vehicle, yaw)`（投影 `get_acceleration()`）→ `_update_longitudinal_accel(vel, yaw_rad, delta_seconds)`：对**前向投影速度** `fwd = vel·(cos yaw, sin yaw)` 做时间差分 `a = Δfwd/Δt`，再经一阶低通 `a = α·raw + (1-α)·a_prev`（`_ACCEL_EMA_ALPHA = 0.5`）。匀速/停车≈0、加速为正、制动为负；首帧无历史返回 0。
+  - `_get_ego_state(delta_seconds=0.02)` 新增步长入参，tick 主循环按 50Hz 传 `delta_seconds`；主循环起始重置估计器（`_accel_prev_fwd`/`_accel_ema`），避免沿用上场景速度历史造成首帧假尖峰。
+  - `_publish_sim_telemetry` 改读 `_ego_state_cache`，不再重复调 `_get_ego_state`（否则一 tick 内估计器被推进两次、同一步长差分两次）。
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - `_trigger_metrics` 的事件度量 `acceleration_ms2` 同步改为前向速度时间导数 + 低通（口径与面板/遥测一致），使 `emergency_brake` 不再被瞬时抖动误触；新增实例态 `_accel_prev_fwd`/`_accel_ema` 并在 `setup()` 重置。
+  - **SIL 卡低速可观测性**：新增 `_warn_ego_speed_stuck()`（每 tick 调用）——自车实际速度连续 >4s 低于期望（`initial_speed_ms`）的 40% 时，每 15s 打一条 WARNING，附 `throttle`/`brake`、脚本化行人 `mode/waiting` 状态、`tm_managed` 数与 `autopilot`，用于区分「TM 为避让人/车而低速（brake 高）」与「物理卡滞/坡道/碰撞（throttle 高却不动）」。
+
+### 向后兼容
+
+- **接口/契约无字段增删**；`acceleration` 语义由「瞬时物理投影」细化为「前向速度的平滑时间导数」——读数更贴近真实纵向加/减速度，近静止时回到 ~0 而非抖动尖峰。
+- `pyproject.toml` 版本 `3.7.0` → `3.7.1`（问题修复，第三位递增）。
+
+### 验证
+
+- `pytest -q` 全量：**1542 passed**（较 V3.7.0 基线 1541 +1 新增用例）；flake8 exit=0；mypy no issues。
+- 新增/调整用例：
+  - `test_acceleration_is_smoothed_velocity_derivative`：首帧 0；`vel.y` 由 0→-0.08（`dt=0.02`、`yaw=90°`）→ `raw=-4.0`、EMA=`-2.0`（制动为负、无抖动尖峰）。
+  - `test_ego_state_reads_ego_actor_attribute`：加速度断言改为「首帧无历史 → 0.0」。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.7.1`；
+2. 重下发 `SCN-2054-AC-DOG-L4`：面板「加速度」在自车近乎静止时回到 ~0（不再是 6~7），加速为正、鬼探头自车制动时为负；
+3. 若自车仍长期低速，观察日志 `ego_speed_stuck: desired=3.0 actual=... (throttle=.. brake=..) scripted_walkers=...`——`brake` 高且行人 `wait` 多为 TM 避让，可据此判断是否需要调整行人等待位姿或 TM 策略；`throttle` 高却不动多为物理/坡道/碰撞卡滞。
+
+### 分发
+
+镜像 tag `hunter-sim:3.7.1`；`pyproject.toml` 版本 `3.7.1`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.7.1`，追加 V3.7.1 条目；测试计数 1541 → 1542。
+- `user_manual.md`：版本头 → V3.7.1；加速度口径说明补充「前向速度时间导数（平滑）」；FAQ 补充「加速度显示大值但车没动」「自车卡低速如何归因」。
+- `deployment_and_operations.md`：版本头 → V3.7.1；§5.7 排障表补充 V3.7.1 行；新增 `### V3.7.0 → V3.7.1` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.7.1；§9 排障表补充 V3.7.1 行；§5 冒烟预期补充「加速度近静止回到 ~0」。
+- `pyproject.toml`：`version` 3.7.0 → **3.7.1**。
+
+---

@@ -157,6 +157,9 @@ _CROSSING_FALLBACK_OFFSET_M = 16.0
 #: 偏离超过该阈值（米）即视为已离开行车道（路缘外）。
 _ROAD_SNAP_TOL_M = 2.5
 
+#: 事件度量纵向加速度的一阶低通系数（与面板/遥测口径一致）。
+_ACCEL_EMA_ALPHA = 0.5
+
 #: 场景行人是否使用 CARLA 原生 ``controller.ai.walker`` 导航（默认关闭）。
 #: 场景行人的出生点与横穿目标是平台下发的任意坐标，不保证落在
 #: RecastNavigation 导航网格上；对 off-mesh 点调用 go_to_location 会触发
@@ -364,6 +367,13 @@ class BuiltinScenario(CustomScenarioBase):
         # set_autopilot / set_desired_speed 会被 TM 静默丢弃，需首 tick 后补发
         self._tm_managed: list[tuple[Any, float]] = []
         self._post_tick_done = False
+        # 事件度量纵向加速度估计器（前向速度的时间导数 + 一阶低通）：
+        # 与面板/遥测口径一致，避免 get_acceleration() 瞬时抖动误触 emergency_brake
+        self._accel_prev_fwd: Optional[float] = None
+        self._accel_ema: float = 0.0
+        # SIL 现场可观测性：自车长期远低于期望速度时定位“卡低速”原因
+        self._slow_since_s: float = 0.0
+        self._slow_warned_at_s: float = 0.0
         # 「跟车条件不成立」告警限频时间戳
         self._no_lead_warned_at = 0.0
         self._cleaned = False
@@ -471,6 +481,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._participant_spawns.clear()
         self._tm_managed.clear()
         self._post_tick_done = False
+        self._accel_prev_fwd = None
+        self._accel_ema = 0.0
+        self._slow_since_s = 0.0
+        self._slow_warned_at_s = 0.0
         self._no_lead_warned_at = 0.0
 
         library = self._blueprint_library(world)
@@ -574,6 +588,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._apply_ego_manual_speed(delta_seconds)
         self._advance_scripted_walkers(delta_seconds)
         self._update_traveled_distance(delta_seconds)
+        self._warn_ego_speed_stuck()
         for controller in list(self._participant_controllers):
             try:
                 action = controller.update(self._ego, delta_seconds)
@@ -1471,6 +1486,57 @@ class BuiltinScenario(CustomScenarioBase):
         step = max(0.0, min(float(delta_seconds), 1.0))
         self._traveled_distance_m += max(0.0, self._current_speed(self._ego)) * step
 
+    def _warn_ego_speed_stuck(self) -> None:
+        """自车长期远低于期望速度时限频告警，帮助定位 SIL「卡低速」根因。
+
+        期望速度取 ``ego_vehicle.initial_speed_ms``（autopilot 下发给 TM）。
+        实际速度连续 >4s 低于期望的 40% 时，每 15s 打一条 WARNING，附油门/
+        刹车与脚本化行人状态——用于区分「TM 被行人/前车逼停」与「TM 根本没
+        提速」两类问题。
+        """
+        if self._ego is None:
+            return
+        ego_cfg = self._config.ego_vehicle
+        desired = float(getattr(ego_cfg, "initial_speed_ms", 0.0) or 0.0)
+        if desired <= 0.0:
+            return
+        actual = self._current_speed(self._ego)
+        now = self.elapsed_seconds
+        if actual >= desired * 0.4:
+            self._slow_since_s = 0.0
+            return
+        if self._slow_since_s == 0.0:
+            self._slow_since_s = now
+        if now - self._slow_since_s < 4.0:
+            return
+        if self._slow_warned_at_s and now - self._slow_warned_at_s < 15.0:
+            return
+        self._slow_warned_at_s = now
+        try:
+            ctrl = self._ego.get_control()
+            throttle = round(float(getattr(ctrl, "throttle", 0.0)), 2)
+            brake = round(float(getattr(ctrl, "brake", 0.0)), 2)
+        except Exception:  # noqa: BLE001
+            throttle = brake = -1.0
+        walkers = " ".join(
+            f"{getattr(getattr(w, 'actor', None), 'id', '?')}"
+            f"[{w.mode},{'wait' if w.waiting else 'go'}]"
+            for w in self._scripted_walkers
+        )
+        logger.warning(
+            "ego_speed_stuck: desired=%.1f m/s actual=%.2f m/s (throttle=%.2f brake=%.2f) "
+            "已持续 %.0fs；scripted_walkers=%s tm_managed=%d autopilot=%s"
+            "—— brake 高且 walkers 非空多为 TM 为避让人/车而低速；throttle 高却不动多为物理卡滞/坡道/碰撞。",
+            desired,
+            actual,
+            throttle,
+            brake,
+            now - self._slow_since_s,
+            walkers or "无",
+            len(self._tm_managed),
+            getattr(ego_cfg, "autopilot", False),
+        )
+
     def _trigger_metrics(
         self, world: Any, timestamp: float, delta_seconds: float
     ) -> TriggerMetrics:
@@ -1482,14 +1548,23 @@ class BuiltinScenario(CustomScenarioBase):
         if self._ego is None:
             return metrics
         metrics.speed_ms = self._current_speed(self._ego)
+        # 纵向加速度：用前向投影速度的时间导数 + 一阶低通，不用 get_acceleration()
+        # 的瞬时物理值（近静止/低速抖动会得到 ±数 m/s² 尖峰，会误触 emergency_brake）。
         try:
-            accel = self._ego.get_acceleration()
-            # 带符号纵向分量（沿自车前向投影）：制动为负，供 emergency_brake 判据使用。
-            # 历史用三维模长（恒 ≥0）使 check_emergency_brake(<-3.0) 永不触发。
+            vel = self._ego.get_velocity()
             forward, _ = self._ego_axes()
-            metrics.acceleration_ms2 = float(
-                float(accel.x) * forward[0] + float(accel.y) * forward[1]
-            )
+            fwd = float(vel.x) * forward[0] + float(vel.y) * forward[1]
+            prev = self._accel_prev_fwd
+            self._accel_prev_fwd = fwd
+            if prev is None:
+                self._accel_ema = 0.0
+            else:
+                dt = max(1e-3, min(float(delta_seconds), 1.0))
+                raw = (fwd - prev) / dt
+                self._accel_ema = (
+                    _ACCEL_EMA_ALPHA * raw + (1.0 - _ACCEL_EMA_ALPHA) * self._accel_ema
+                )
+            metrics.acceleration_ms2 = self._accel_ema
         except Exception:  # noqa: BLE001  Mock/无位姿 Actor
             metrics.acceleration_ms2 = 0.0
         metrics.offroad = self._is_offroad(world)

@@ -421,10 +421,36 @@ class TestEgoState:
         assert state["heading"] == pytest.approx(math.radians(90.0), abs=1e-6)
         assert state["yaw"] == pytest.approx(math.radians(90.0), abs=1e-6)
         assert state["steering"] == pytest.approx(-0.25)
-        # V3.7.0：加速度为沿航向的带符号纵向分量（不再是三维模长）。
-        # yaw=90° 时前向单位向量 (cos90, sin90)=(0,1)，accel=(0,-2,9.81) 投影
-        # = 0*0 + (-2)*1 = -2.0（制动为负），z 分量（重力）被忽略。
-        assert state["acceleration"] == pytest.approx(-2.0, abs=1e-3)
+        # V3.7.1：加速度改为「前向投影速度的时间导数 + 一阶低通」，不再用会抖动的
+        # get_acceleration() 瞬时值。首帧无历史 → 0（避免近静止时的 ±数 m/s² 尖峰）。
+        assert state["acceleration"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_acceleration_is_smoothed_velocity_derivative(self) -> None:
+        """面板/遥测加速度取前向速度的时间导数（低通），制动为负。
+
+        回归现场：V3.7.0 用 ``get_acceleration()`` 投影，自车近乎静止时逐帧
+        抖动除以 dt 会得到“速度 0.03、加速度 6.2”的无意义大值。
+        """
+        holder = {"vy": 0.0}
+        veh = SimpleNamespace(
+            get_transform=lambda: SimpleNamespace(
+                location=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=SimpleNamespace(pitch=0.0, yaw=90.0, roll=0.0),
+            ),
+            get_velocity=lambda: SimpleNamespace(x=0.0, y=holder["vy"], z=0.0),
+            get_control=lambda: SimpleNamespace(steer=0.0, throttle=0.0, brake=0.0),
+        )
+        runner = _make_runner()
+        runner._scenario = _BuiltinLikeScenario(veh)  # noqa: SLF001
+
+        # yaw=90° 前向单位向量 (0,1) → 前向速度 = vel.y；首帧无历史→ 0
+        s0 = runner._get_ego_state(delta_seconds=0.02)  # noqa: SLF001
+        assert s0["acceleration"] == pytest.approx(0.0, abs=1e-6)
+
+        # vel.y 从 0→-0.08，dt=0.02 → raw=-4.0；EMA(α=0.5)=0.5*-4+0.5*0=-2.0
+        holder["vy"] = -0.08
+        s1 = runner._get_ego_state(delta_seconds=0.02)  # noqa: SLF001
+        assert s1["acceleration"] == pytest.approx(-2.0, abs=1e-6)
 
     def test_ego_state_matches_ego_vehicle_property(self) -> None:
         """状态取数必须与 ``ego_vehicle`` property 同源，避免两处解析规则漂移。"""
@@ -770,7 +796,7 @@ class TestTickLoopDrainsMailbox:
         runner = _make_runner(engine_key="127.0.0.1:2090")
         runner._config = _minimal_config()  # noqa: SLF001
         runner._state_mgr = None  # noqa: SLF001  不走 PAUSED 分支
-        runner._get_ego_state = lambda: {}  # type: ignore[method-assign]  # noqa: SLF001
+        runner._get_ego_state = lambda *_a, **_k: {}  # type: ignore[method-assign]  # noqa: SLF001
         runner._refresh_actor_states = lambda: None  # type: ignore[assignment]  # noqa: SLF001
         runner._refresh_actor_count = lambda: None  # type: ignore[assignment]  # noqa: SLF001
 

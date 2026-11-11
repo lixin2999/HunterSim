@@ -55,6 +55,10 @@ _EGO_ROLE_NAME = "hero"
 #: 每次刷新都要读每个 Actor 的位姿（CARLA RPC），太高会把 tick 线程拖慢。
 _ACTOR_STATE_REFRESH_TICKS = 10
 
+#: 纵向加速度一阶低通系数：a = α·瞬时差分 + (1-α)·上一帧。α 越小越平滑，
+#: 用于抑制 CARLA ``get_acceleration()`` 在近静止/低速抖动下的无意义尖峰。
+_ACCEL_EMA_ALPHA = 0.5
+
 #: 等待 tick 线程退出的上限（秒）。V3.5.6：旧值 5s 在现场实测「销毁 4 个传感器
 #: + 自车 + 3 个参与者」耗时 ~7s 的情况下会提前返回，释放线程随后对同一个 world
 #: 下发 ``apply_settings``，与 tick 线程的 ``actor.destroy()`` 并发 → CARLA Client
@@ -178,6 +182,10 @@ class SceneRunnerService:
         # 自车状态取数失败告警限频状态
         self._ego_state_warn_at: float = 0.0
         self._ego_state_warn_count: int = 0
+        # 纵向加速度估计器（前向速度的时间导数 + 一阶低通）：逐 tick 更新，
+        # 只在 tick 线程内生效，避免 telemetry 重入导致同一 tick 被差分两次。
+        self._accel_prev_fwd: Optional[float] = None
+        self._accel_ema: float = 0.0
         # 交通参与者状态缓存（tick 线程 5Hz 写入，executor/HTTP 线程无锁读取）：
         # 可视化「参与者」面板靠它看到「谁在跑、跑多快、在自车哪个方位」
         self._actor_state_cache: list[dict[str, Any]] = []
@@ -641,6 +649,9 @@ class SceneRunnerService:
         """仿真主循环本体（由 ``_run_loop`` 在 owner 身份下调用）。"""
         delta_seconds = 0.02  # 50Hz
         tick_count = 0
+        # 新场景重置加速度估计器，避免沿用上场景末的速度历史造成首帧假尖峰。
+        self._accel_prev_fwd = None
+        self._accel_ema = 0.0
         timeout_time = (
             time.perf_counter() + self._config.timeout_seconds
             if self._config
@@ -708,7 +719,7 @@ class SceneRunnerService:
                 tick_count += 1
 
                 # 无条件更新自车状态缓存（供 executor 线程安全读取，不依赖 sample_sink / producer）
-                self._get_ego_state()
+                self._get_ego_state(delta_seconds)
                 # 参与者状态缓存（5Hz）：可视化面板与「拍不到」排查都靠它
                 if tick_count % _ACTOR_STATE_REFRESH_TICKS == 0:
                     self._refresh_actor_states()
@@ -935,7 +946,9 @@ class SceneRunnerService:
         try:
             from hunter_sim.cloud.sim_data_mapper import build_sim_telemetry  # noqa: PLC0415
 
-            ego = self._get_ego_state()
+            # 读 tick 线程本帧刷新的缓存，不重复调 ``_get_ego_state``：后者会
+            # 推进一步加速度估计器，一 tick 调两次会把同一步长差分两次。
+            ego = dict(self._ego_state_cache)
             speed = float(ego.get("velocity", 0.0))
             yaw = float(ego.get("yaw", 0.0))
             seq = self._sim_data_producer.next_seq()
@@ -1050,7 +1063,7 @@ class SceneRunnerService:
             return dict(self._ego_state_cache)
         return {}
 
-    def _get_ego_state(self) -> dict[str, Any]:
+    def _get_ego_state(self, delta_seconds: float = 0.02) -> dict[str, Any]:
         """获取自车状态字典（仅由 tick 线程调用）。
 
         自车引用统一走 ``ego_vehicle`` property（多形态访问器 + 世界兜底），
@@ -1087,6 +1100,7 @@ class SceneRunnerService:
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             ctrl = vehicle.get_control()
             yaw = round(math.radians(float(getattr(rot, "yaw", 0.0))), 6)
+            accel = self._update_longitudinal_accel(vel, yaw, delta_seconds)
             state = {
                 "x": round(loc.x, 4),
                 "y": round(loc.y, 4),
@@ -1095,7 +1109,7 @@ class SceneRunnerService:
                 "yaw": yaw,
                 "velocity": round(speed, 4),
                 "steering": round(float(getattr(ctrl, "steer", 0.0)), 6),
-                "acceleration": round(self._longitudinal_acceleration(vehicle, yaw), 4),
+                "acceleration": round(accel, 4),
             }
         except Exception as exc:  # noqa: BLE001  单帧读取失败不阻断场景
             self._warn_ego_state("read", exc)
@@ -1116,19 +1130,28 @@ class SceneRunnerService:
         suffix = f" (+{suppressed} suppressed)" if suppressed else ""
         logger.warning(f"Ego state unavailable (stage={stage}){detail}{suffix}")
 
-    @staticmethod
-    def _longitudinal_acceleration(vehicle: Any, yaw_rad: float) -> float:
+    def _update_longitudinal_accel(
+        self, vel: Any, yaw_rad: float, delta_seconds: float
+    ) -> float:
         """沿自车航向的带符号纵向加速度（m/s²：加速为正、制动为负）。
 
-        历史版本上报三维加速度模长（恒 ≥0），把横向/垂向分量与减速都显示成
-        正值，面板因此「加速度一直为正」。改为把加速度向量投影到自车前向单位
-        向量 ``(cos(yaw), sin(yaw))``（``yaw_rad`` 已是弧度）；读取失败回退 0。
-        忽略 z 分量（含重力/坡度），只保留真正影响纵向速度的分量。
+        取「前向投影速度」的时间导数并一阶低通，不再直接采用
+        ``get_acceleration()`` 的瞬时物理值：后者在自车近乎静止/低速抖动
+        时，逐帧速度抖动除以 dt 会得到 ±数 m/s² 的无意义大值（现场表现为
+        「速度 0.03、加速度 6.2」）。本估计匀速/停车≈0、加速为正、制动为
+        负，与 emergency_brake(<-3.0) 语义一致。``delta_seconds`` 为仿真步长
+        （同步模式 50Hz→ 0.02）；首帧无历史时返回 0。
         """
         try:
-            accel = vehicle.get_acceleration()
-            return float(
-                float(accel.x) * math.cos(yaw_rad) + float(accel.y) * math.sin(yaw_rad)
-            )
-        except Exception:  # noqa: BLE001
+            fwd = float(vel.x) * math.cos(yaw_rad) + float(vel.y) * math.sin(yaw_rad)
+        except Exception:  # noqa: BLE001  Mock/无速度 Actor
+            return self._accel_ema
+        prev = self._accel_prev_fwd
+        self._accel_prev_fwd = fwd
+        if prev is None:
+            self._accel_ema = 0.0
             return 0.0
+        dt = max(1e-3, min(float(delta_seconds), 1.0))
+        raw = (fwd - prev) / dt
+        self._accel_ema = _ACCEL_EMA_ALPHA * raw + (1.0 - _ACCEL_EMA_ALPHA) * self._accel_ema
+        return self._accel_ema
