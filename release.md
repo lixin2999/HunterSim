@@ -4062,3 +4062,60 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.7.0 → **3.7.1**。
 
 ---
+
+## V3.8.0 — SIL 直道自车确定性纵向控制（绕开 Traffic Manager 速度环极限环）
+
+**发布日期**：2026-11-11
+**版本定位**：功能变更（第二位递增）。V3.7.1 新增的 `ego_speed_stuck` 归因日志在实机运行中定位到 SIL 自车「卡低速」的真正根因：**Traffic Manager 在 50Hz 同步模式下对自车速度环存在油门/刹车极限环**——`throttle=0.85 ↔ brake=0.70` 反复交替、净速度仅 ~0.7 m/s、IMU 纵向出现 ±15~22 m/s² 剧烈抖动，且**在行人尚有 33 m、仍 `wait` 未窜入时就已发生**（排除「为避让行人」）。本版对直道场景改用**确定性纵向控制**（P + 巡航前馈）接管自车、解除 TM，弯道/复杂路况仍交 TM。
+
+### 现场（V3.7.1 实机日志 + 面板）
+
+| 现象 | 读数 | 结论 |
+|------|------|------|
+| 自车全程净速度 ~0.7 m/s（期望 3.0），位置 503→542 单调缓行 | `ego_speed_stuck` 15 条：`throttle=0.85`↔`brake=0.70` 交替 | TM 速度环极限环，非行人避让（首条 t=4s 时行人 33 m 外 `wait`） |
+| 面板加速度 7.30/5.85/3.86 与 IMU `加速度x` −14.6/−22.7/+7.4 一致 | 前向速度时间导数（V3.7.1 平滑后） | V3.7.1 加速度取数正确，读数反映的是**真实剧烈抖动**，非测量假象 |
+| 场景结束 `destroying actors` 后 `0xC0000409` 原生崩溃、`up` 自动重启 | 日志 L146–L182 | teardown 窗口仍有并发 CARLA Client 访问残留（本版未涵盖，列入后续） |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - `_configure_ego_motion(world)` 新增 `world` 入参，autopilot 场景先经 `_resolve_ego_drive_mode(world)` 决策：直道→`_enable_deterministic_ego_drive`（`set_autopilot(False)` + 确定性纵向控制），否则维持 TM。
+  - `_road_is_straight(world)`：沿自车出生车道 `get_waypoint` 逐段（步长 4 m、探测 40 m）累计航向变化，超过 8° 判为弯道；地图/`get_waypoint` 缺失或异常按「非直道」处理（**向后兼容**：无 `get_waypoint` 的 Mock/旧客户端不会误切入确定性控制）。`carla.Location` 构造在导入失败时回退轻量对象，便于隔离测试。
+  - `_apply_ego_manual_speed` 升级为确定性速度控制器：以**前向投影速度**为反馈，`error>死区` 给 `throttle=clamp(前馈+Kp·error)`、`error<-死区` 给 `brake=clamp(Kb·|error|)`、稳态保留巡航前馈油门（`_EGO_SPEED_KP=0.6 / _EGO_SPEED_FEEDFORWARD=0.12 / _EGO_BRAKE_GAIN=0.8 / _EGO_SPEED_DEADBAND=0.15`），消除 coast-down 往复。
+  - `_reapply_post_spawn_controls_once` 在确定性模式（`_ego_deterministic`）下跳过 TM 补发，避免首 tick 后把 autopilot 又打开。
+  - **运维开关**：场景参数 `ego_drive_mode` 或环境变量 `HUNTER_SIM_EGO_DRIVE`（`auto`|`tm`|`manual`）可强制驱动方式，`auto` 为默认（直道 manual、其余 tm）。
+
+### 向后兼容
+
+- 默认 `auto`：仅**直道**自车由 TM 改由确定性控制驱动；弯道、`autopilot=False`、无 `get_waypoint` 的环境行为不变。设 `HUNTER_SIM_EGO_DRIVE=tm` 可整体回退到 V3.7.1 的 TM 驱动。
+- 面板/遥测/事件度量口径不变（沿用 V3.7.1 前向速度时间导数）。
+- `pyproject.toml` 版本 `3.7.1` → `3.8.0`（功能变更，第二位递增）。
+
+### 验证
+
+- `pytest -q` 全量：**1548 passed**（较 V3.7.1 基线 1542 +6 新增用例）；flake8 exit=0；mypy no issues。
+- 新增用例（`tests/test_builtin_scenario.py::TestDeterministicEgoDrive`）：
+  - `_road_is_straight` 恒航向→True、递增航向→False；
+  - 直道 `_configure_ego_motion` → `_ego_deterministic=True`、`set_autopilot(False)`、`_ego_manual_speed=3.0`、未写 TM 期望速度；
+  - `HUNTER_SIM_EGO_DRIVE=tm` 与弯道均保持 TM（`desired_speeds[ego]=3.0`）；
+  - 确定性控制器三区：低于期望油门>前馈且无制动、高于期望零油门有制动、稳态保持巡航前馈。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.8.0`；
+2. 重下发 `SCN-2054-AC-DOG-L4`：日志应出现 `ego_drive_mode=deterministic_straight: 直道检测通过…已解除 TM`；自车应平稳加速到期望 3.0 m/s，`ego_speed_stuck` 不再刷屏，面板加速度在无真实加减速时回到 ~0；
+3. 若仍需回到旧行为对比：`set HUNTER_SIM_EGO_DRIVE=tm` 重启控制面。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.0`；`pyproject.toml` 版本 `3.8.0`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.0`，追加 V3.8.0 条目；测试计数 1542 → 1548。
+- `user_manual.md`：版本头 → V3.8.0；补充 SIL 自车驱动方式（直道确定性纵向控制 / 弯道 TM）与 `HUNTER_SIM_EGO_DRIVE` 开关；FAQ 补充「自车卡低速油门刹车振荡」。
+- `deployment_and_operations.md`：版本头 → V3.8.0；§5.7 排障表补充 V3.8.0 行；新增 `### V3.7.1 → V3.8.0` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.0；§9 排障表补充 V3.8.0 行；§5 冒烟预期补充「直道自车平稳到期望速度、`ego_drive_mode=deterministic_straight`」。
+- `pyproject.toml`：`version` 3.7.1 → **3.8.0**。
+
+---

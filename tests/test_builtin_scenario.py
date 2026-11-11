@@ -14,7 +14,10 @@ from typing import Any
 import pytest
 
 from hunter_sim.common.exceptions import CarlaSimulationError
-from hunter_sim.scene_runner.builtin_scenario import BuiltinScenario
+from hunter_sim.scene_runner.builtin_scenario import (
+    _EGO_SPEED_FEEDFORWARD,
+    BuiltinScenario,
+)
 from hunter_sim.scene_runner.event_detector import EventDetector
 from hunter_sim.scene_runner.scene_config import SceneConfig, SpawnPoint
 from hunter_sim.scene_runner.scene_state_manager import SceneStateManager
@@ -27,6 +30,7 @@ from tests.mocks.carla_mocks import (
     MockTrafficManager,
     MockTransform,
     MockVector3D,
+    MockVehicle,
     MockWorld,
 )
 
@@ -1378,3 +1382,130 @@ class TestDrivingLaneSnap:
         requested = SpawnPoint(x=30.0, y=5.0, z=0.0, yaw_deg=45.0)
 
         assert scenario._snap_to_driving_lane(world, requested, "car-1") is requested  # noqa: SLF001
+
+
+class _ConstYawWaypoint:
+    """恒定航向的车道点：next() 保持同 yaw（直道）或递增 yaw（弯道）。"""
+
+    def __init__(self, yaw: float, step_yaw: float) -> None:
+        self.transform = MockTransform(
+            MockLocation(0.0, 0.0, 0.3), MockRotation(yaw=yaw)
+        )
+        self._yaw = yaw
+        self._step_yaw = step_yaw
+
+    def next(self, _distance: float) -> list["_ConstYawWaypoint"]:
+        self._yaw += self._step_yaw
+        return [_ConstYawWaypoint(self._yaw, self._step_yaw)]
+
+
+class _RoadMap:
+    def __init__(self, step_yaw: float) -> None:
+        self._step_yaw = step_yaw
+
+    def get_waypoint(self, _loc: Any, project_to_road: bool = True) -> Any:
+        return _ConstYawWaypoint(0.0, self._step_yaw)
+
+
+class TestDeterministicEgoDrive:
+    """V3.8.0：SIL 直道自车确定性纵向控制（绕开 TM 速度环振荡）。"""
+
+    @staticmethod
+    def _ego_scenario(speed: float = 3.0) -> BuiltinScenario:
+        return _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 1.0, "y": 2.0},
+                    "autopilot": True,
+                    "initial_speed_ms": speed,
+                },
+                "traffic_participants": [],
+            }
+        )
+
+    def test_road_is_straight_true_when_heading_constant(self) -> None:
+        scenario = self._ego_scenario()
+        scenario._ego_spawn = SpawnPoint(x=1.0, y=2.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        world = types.SimpleNamespace(get_map=lambda: _RoadMap(step_yaw=0.0))
+        assert scenario._road_is_straight(world) is True  # noqa: SLF001
+
+    def test_road_is_straight_false_when_heading_drifts(self) -> None:
+        scenario = self._ego_scenario()
+        scenario._ego_spawn = SpawnPoint(x=1.0, y=2.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        # 每步 +3°，4m 步长 10 步内即超过 8° 阈值
+        world = types.SimpleNamespace(get_map=lambda: _RoadMap(step_yaw=3.0))
+        assert scenario._road_is_straight(world) is False  # noqa: SLF001
+
+    def test_straight_road_switches_ego_to_deterministic_control(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        scenario._traffic_manager = MockTrafficManager()  # noqa: SLF001
+        ego = MockVehicle()
+        ego._autopilot = True  # noqa: SLF001  模拟 spawn 阶段已开 TM
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=1.0, y=2.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        world = types.SimpleNamespace(get_map=lambda: _RoadMap(step_yaw=0.0))
+
+        scenario._configure_ego_motion(world)  # noqa: SLF001
+
+        assert scenario._ego_deterministic is True  # noqa: SLF001
+        assert ego._autopilot is False  # noqa: SLF001  TM 已解除
+        assert scenario._ego_manual_speed == pytest.approx(3.0)  # noqa: SLF001
+        # 未走 TM 期望速度分支
+        assert ego.id not in scenario._traffic_manager.desired_speeds  # noqa: SLF001
+
+    def test_env_force_tm_keeps_traffic_manager_on_straight_road(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HUNTER_SIM_EGO_DRIVE", "tm")
+        scenario = self._ego_scenario(3.0)
+        tm = MockTrafficManager()
+        scenario._traffic_manager = tm  # noqa: SLF001
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=1.0, y=2.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        world = types.SimpleNamespace(get_map=lambda: _RoadMap(step_yaw=0.0))
+
+        scenario._configure_ego_motion(world)  # noqa: SLF001
+
+        assert scenario._ego_deterministic is False  # noqa: SLF001
+        assert tm.desired_speeds[ego.id] == pytest.approx(3.0)
+
+    def test_curved_road_keeps_traffic_manager(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        tm = MockTrafficManager()
+        scenario._traffic_manager = tm  # noqa: SLF001
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=1.0, y=2.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        world = types.SimpleNamespace(get_map=lambda: _RoadMap(step_yaw=3.0))
+
+        scenario._configure_ego_motion(world)  # noqa: SLF001
+
+        assert scenario._ego_deterministic is False  # noqa: SLF001
+        assert tm.desired_speeds[ego.id] == pytest.approx(3.0)
+
+    def test_deterministic_controller_throttle_brake_regions(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+
+        # 低于期望：油门 > 巡航前馈、无制动
+        ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle > _EGO_SPEED_FEEDFORWARD  # noqa: SLF001
+        assert ego._control.brake == pytest.approx(0.0)  # noqa: SLF001
+
+        # 高于期望：零油门、有制动
+        ego._velocity = MockVector3D(4.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(0.0)  # noqa: SLF001
+        assert ego._control.brake > 0.0  # noqa: SLF001
+
+        # 稳态（死区内）：保持巡航前馈油门
+        ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(_EGO_SPEED_FEEDFORWARD)  # noqa: SLF001
+        assert ego._control.brake == pytest.approx(0.0)  # noqa: SLF001

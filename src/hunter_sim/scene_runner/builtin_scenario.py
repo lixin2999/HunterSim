@@ -157,6 +157,22 @@ _CROSSING_FALLBACK_OFFSET_M = 16.0
 #: 偏离超过该阈值（米）即视为已离开行车道（路缘外）。
 _ROAD_SNAP_TOL_M = 2.5
 
+# ── V3.8.0 确定性纵向控制（SIL 直道自车驱动）─────────────────────────────
+# 现场发现 Traffic Manager 在同步模式下对自车速度环存在油门/刹车极限环（净速度
+# 仅 ~0.7 m/s、IMU 纵向 ±15~22 m/s²），且与行人远近无关。直道场景改用确定性纵向
+# 控制（P + 巡航前馈）绕开 TM 速度环；弯道/复杂路况仍交 TM。
+#: 判定「直道」的前向探测距离（米）：沿车道 waypoint 逐段累计航向变化。
+_EGO_STRAIGHT_LOOKAHEAD_M = 40.0
+#: 直道探测步长（米）。
+_EGO_STRAIGHT_STEP_M = 4.0
+#: 累计航向变化超过该角度（度）即视为弯道，保留 Traffic Manager。
+_EGO_STRAIGHT_MAX_HEADING_DEG = 8.0
+#: 确定性速度控制：比例增益 / 巡航前馈油门 / 制动增益 / 稳态死区（m/s）。
+_EGO_SPEED_KP = 0.6
+_EGO_SPEED_FEEDFORWARD = 0.12
+_EGO_BRAKE_GAIN = 0.8
+_EGO_SPEED_DEADBAND = 0.15
+
 #: 事件度量纵向加速度的一阶低通系数（与面板/遥测口径一致）。
 _ACCEL_EMA_ALPHA = 0.5
 
@@ -355,6 +371,8 @@ class BuiltinScenario(CustomScenarioBase):
         # 自车非 autopilot 时的简单速度保持
         self._ego_manual_speed: float = 0.0
         self._ego_initial_steer: float = 0.0
+        # V3.8.0：直道确定性纵向控制是否接管自车（解除 TM 托管）
+        self._ego_deterministic: bool = False
         # 已行驶里程积分（平台事件 traveled_distance 用）
         self._traveled_distance_m: float = 0.0
         # 车类 prop（停放/事故/故障车）生成位置，boarding 行为据此选择目标
@@ -475,6 +493,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._cut_in_done.clear()
         self._ego_manual_speed = 0.0
         self._ego_initial_steer = 0.0
+        self._ego_deterministic = False
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
@@ -511,7 +530,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._attach_event_sensors(world, library)
         self._attach_sim_sensors(world, library)
         logger.info("scenario_setup stage=motion")
-        self._configure_ego_motion()
+        self._configure_ego_motion(world)
 
         logger.info(
             f"Builtin scenario '{self._config.scene_id}' ready: "
@@ -1219,18 +1238,103 @@ class BuiltinScenario(CustomScenarioBase):
 
     # ── 运动/行为控制 ─────────────────────────────────────────────────────
 
-    def _configure_ego_motion(self) -> None:
-        """应用自车初始速度（autopilot 优先交给 TM，否则手动油门）。"""
+    def _configure_ego_motion(self, world: Any) -> None:
+        """应用自车初始速度：TM 优先，直道可切确定性纵向控制。
+
+        V3.8.0：SIL 现场发现 TM 在同步模式下对自车速度环存在油门/刹车极限环
+        （实测净速度 ~0.7 m/s、IMU 纵向 ±15~22 m/s²），且与行人远近无关。对直道
+        场景改用确定性纵向控制（P + 巡航前馈）绕开 TM 速度环；弯道/复杂路况仍交
+        TM。可用场景参数 ``ego_drive_mode`` 或环境变量 ``HUNTER_SIM_EGO_DRIVE``
+        （auto|tm|manual）强制。
+        """
         if self._ego is None:
             return
         speed = float(self._config.ego_vehicle.initial_speed_ms)
         if speed <= 0:
             return
-        if self._config.ego_vehicle.autopilot and self._set_desired_speed(self._ego, speed):
-            logger.info(f"Ego initial speed set via Traffic Manager: {speed:.1f} m/s")
-            return
+        if self._config.ego_vehicle.autopilot:
+            if self._resolve_ego_drive_mode(world) == "manual":
+                self._enable_deterministic_ego_drive(speed)
+                return
+            if self._set_desired_speed(self._ego, speed):
+                logger.info(f"Ego initial speed set via Traffic Manager: {speed:.1f} m/s")
+                return
         self._ego_manual_speed = speed
         logger.info(f"Ego initial speed set via manual control: {speed:.1f} m/s")
+
+    def _resolve_ego_drive_mode(self, world: Any) -> str:
+        """决定自车纵向驱动方式：manual（确定性）或 tm（Traffic Manager）。"""
+        forced = str(
+            self._config.extra_params.get("ego_drive_mode")
+            or os.getenv("HUNTER_SIM_EGO_DRIVE")
+            or "auto"
+        ).strip().lower()
+        if forced in {"tm", "traffic_manager", "manager", "autopilot"}:
+            return "tm"
+        if forced in {"manual", "deterministic", "pcontrol"}:
+            return "manual"
+        return "manual" if self._road_is_straight(world) else "tm"
+
+    def _road_is_straight(self, world: Any) -> bool:
+        """沿自车出生车道向前累计航向变化，阈值内视为直道。
+
+        地图/waypoint 接口缺失或异常时按「非直道」处理，保持既有 TM 行为（向后
+        兼容：无 ``get_waypoint`` 的 Mock/旧客户端不会误切入确定性控制）。
+        """
+        spawn = self._ego_spawn or self._config.ego_vehicle.spawn_point
+        try:
+            carla_map = world.get_map()
+            get_waypoint = getattr(carla_map, "get_waypoint", None)
+            if not callable(get_waypoint):
+                return False
+            try:
+                import carla  # noqa: PLC0415  真实 CARLA 环境下用原生 Location
+
+                location: Any = carla.Location(x=spawn.x, y=spawn.y, z=spawn.z)
+            except ImportError:
+                location = SimpleNamespace(x=spawn.x, y=spawn.y, z=spawn.z)
+            waypoint = get_waypoint(location, project_to_road=True)
+            if waypoint is None:
+                return False
+            start_yaw = float(waypoint.transform.rotation.yaw)
+            current = waypoint
+            traveled = 0.0
+            while traveled < _EGO_STRAIGHT_LOOKAHEAD_M:
+                nxt = current.next(_EGO_STRAIGHT_STEP_M)
+                if not nxt:
+                    return True
+                current = nxt[0]
+                traveled += _EGO_STRAIGHT_STEP_M
+                delta = abs(
+                    self._wrap_deg(float(current.transform.rotation.yaw) - start_yaw)
+                )
+                if delta > _EGO_STRAIGHT_MAX_HEADING_DEG:
+                    return False
+            return True
+        except Exception as exc:  # noqa: BLE001  Mock / 地图接口差异
+            logger.debug(f"ego straight-road probe failed: {exc}")
+            return False
+
+    @staticmethod
+    def _wrap_deg(angle_deg: float) -> float:
+        """把角度折算到 [-180, 180)。"""
+        return (angle_deg + 180.0) % 360.0 - 180.0
+
+    def _enable_deterministic_ego_drive(self, speed: float) -> None:
+        """解除 TM 托管，改由确定性纵向控制驱动自车（直道）。"""
+        self._ego_deterministic = True
+        set_autopilot = getattr(self._ego, "set_autopilot", None)
+        if callable(set_autopilot):
+            try:
+                set_autopilot(False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"ego autopilot disable failed: {exc}")
+        self._ego_manual_speed = speed
+        logger.info(
+            "ego_drive_mode=deterministic_straight: 直道检测通过，自车改用确定性"
+            "纵向控制（期望 %.1f m/s，已解除 TM），绕开 TM 速度环油门/刹车振荡",
+            speed,
+        )
 
     def _reapply_post_spawn_controls_once(self) -> None:
         """首个 tick 之后补发一次 autopilot / 期望速度指令。
@@ -1245,7 +1349,7 @@ class BuiltinScenario(CustomScenarioBase):
         self._post_tick_done = True
         ego_cmds: list[str] = []
         ego_cfg = self._config.ego_vehicle
-        if self._ego is not None and ego_cfg.autopilot:
+        if self._ego is not None and ego_cfg.autopilot and not self._ego_deterministic:
             set_autopilot = getattr(self._ego, "set_autopilot", None)
             if callable(set_autopilot):
                 try:
@@ -1466,12 +1570,27 @@ class BuiltinScenario(CustomScenarioBase):
             return True
 
     def _apply_ego_manual_speed(self, delta_seconds: float) -> None:
-        """非 autopilot 自车的简单速度保持（P 控制）。"""
+        """自车确定性纵向速度控制（P + 巡航前馈，带稳态死区）。
+
+        用于非 TM 驱动（``autopilot=False`` 或直道确定性模式）：以前向投影速度为
+        反馈量，误差超过死区才给油/制动，稳态保留巡航前馈油门，避免 TM 速度环的
+        油门/刹车极限环。
+        """
         if self._ego is None or self._ego_manual_speed <= 0:
             return
-        error = self._ego_manual_speed - self._current_speed(self._ego)
-        throttle = min(1.0, max(0.0, error * 0.5))
-        brake = 1.0 if error < -1.0 else 0.0
+        forward, _ = self._ego_axes()
+        projected = self._projected_speed(self._ego, forward)
+        current = projected if projected is not None else self._current_speed(self._ego)
+        error = self._ego_manual_speed - current
+        if error > _EGO_SPEED_DEADBAND:
+            throttle = min(1.0, max(0.0, _EGO_SPEED_FEEDFORWARD + _EGO_SPEED_KP * error))
+            brake = 0.0
+        elif error < -_EGO_SPEED_DEADBAND:
+            throttle = 0.0
+            brake = min(1.0, max(0.0, _EGO_BRAKE_GAIN * -error))
+        else:
+            throttle = _EGO_SPEED_FEEDFORWARD
+            brake = 0.0
         self._apply_vehicle_control(
             self._ego,
             throttle=throttle,
