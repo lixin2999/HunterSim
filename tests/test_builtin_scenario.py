@@ -341,6 +341,8 @@ class TestMotionAndBehaviors:
         assert vehicle._control.brake == pytest.approx(1.0)
 
     def test_walker_crossing_uses_ai_controller(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 默认走脚本化横穿；仅在显式开启时启用原生 AI 导航控制器。
+        monkeypatch.setenv("SCENE_WALKER_AI_CONTROLLER", "1")
         fake_carla = types.SimpleNamespace(
             Transform=lambda *args, **kwargs: MockTransform(),
             Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
@@ -372,6 +374,46 @@ class TestMotionAndBehaviors:
         assert controller.max_speed == pytest.approx(1.2)
         # 控制器必须以相对 transform（单位变换）附着，否则会摆到「出生点×2」
         assert controller.attached_transform == MockTransform()
+
+    def test_walker_defaults_to_scripted_to_avoid_offnavmesh_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """默认不走原生 AI 导航（避免 off-mesh go_to_location 原生栈溢出）。
+
+        回归 V3.6.2：场景行人坐标为平台下发的任意值，不保证在导航网格上；
+        对 off-mesh 点调用 controller.ai.walker.go_to_location 会触发 CARLA 原生
+        RecastNavigation 深层递归（0xC00000FD）。默认必须走脚本化横穿。
+        """
+        monkeypatch.delenv("SCENE_WALKER_AI_CONTROLLER", raising=False)
+        fake_carla = types.SimpleNamespace(
+            Transform=lambda *args, **kwargs: MockTransform(),
+            Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
+        )
+        monkeypatch.setitem(sys.modules, "carla", fake_carla)
+        scenario = _make_scenario(
+            {
+                "traffic_participants": [
+                    {
+                        "participant_id": "animal-1",
+                        "actor_type": "walker",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 548.6, "y": 37.2},
+                        "behavior": "pedestrian_cross",
+                        "speed_ms": 1.2,
+                    }
+                ]
+            },
+            traffic_manager=MockTrafficManager(),
+        )
+        world = MockWorld()
+
+        scenario.setup(world)
+
+        # 不生成任何原生 AI 控制器（否则会在真实 CARLA 上 go_to_location 崩溃）
+        assert scenario._walker_ai_controllers == []  # noqa: SLF001
+        assert scenario._walker_controllers == []  # noqa: SLF001
+        # 但行人仍通过脚本化横穿保留行为
+        assert len(scenario._scripted_walkers) == 1  # noqa: SLF001
 
     def test_missing_ai_controller_falls_back_to_scripted_crossing(
         self, monkeypatch: pytest.MonkeyPatch
@@ -782,6 +824,7 @@ class TestSemanticsV126Execution:
     def test_walker_speed_not_capped_at_1_4(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("SCENE_WALKER_AI_CONTROLLER", "1")
         fake_carla = types.SimpleNamespace(
             Transform=lambda *args, **kwargs: MockTransform(),
             Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),
@@ -832,6 +875,7 @@ class TestSemanticsV126Execution:
     def test_boarding_targets_parked_vehicle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("SCENE_WALKER_AI_CONTROLLER", "1")
         fake_carla = types.SimpleNamespace(
             Transform=lambda *args, **kwargs: MockTransform(),
             Location=lambda x=0.0, y=0.0, z=0.0: MockLocation(x, y, z),

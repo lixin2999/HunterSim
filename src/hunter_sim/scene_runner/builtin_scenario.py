@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
 import threading
 import time
@@ -139,6 +140,24 @@ _WALKER_ARRIVE_EPS_M = 0.3
 #: 不能沿用旧版 1.4 m/s 硬上限，否则鬼探头会「慢动作」。
 _WALKER_MIN_SPEED = 0.3
 _WALKER_MAX_SPEED = 4.0
+
+#: 场景行人是否使用 CARLA 原生 ``controller.ai.walker`` 导航（默认关闭）。
+#: 场景行人的出生点与横穿目标是平台下发的任意坐标，不保证落在
+#: RecastNavigation 导航网格上；对 off-mesh 点调用 go_to_location 会触发
+#: CARLA 原生深层递归 → Windows 栈溢出（0xC00000FD / code=3221225725），
+#: Python 无法捕获，直接带走控制面进程。置 1 仅在确认坐标都在导航网格上时启用。
+_WALKER_AI_CONTROLLER_ENV = "SCENE_WALKER_AI_CONTROLLER"
+
+
+def _walker_ai_controller_enabled() -> bool:
+    """场景行人是否启用原生 AI 导航控制器（默认否，走脚本化横穿）。"""
+    return os.getenv(_WALKER_AI_CONTROLLER_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 # 仿真传感器类型 → FrameHub 流名（事件传感器不在其中）
 _SIM_STREAM_BY_TYPE: dict[SensorType, str] = {
@@ -1665,6 +1684,19 @@ class BuiltinScenario(CustomScenarioBase):
                 speed,
             )
         destination = self._walker_destination(spawn_point, carla, participant)
+
+        # V3.6.2：默认走脚本化横穿（set_transform 逐帧推进，纯运动学、不碰原生
+        # 导航）。场景行人的出生点/目标是平台下发的任意坐标，不保证落在导航网格
+        # 上；对 off-mesh 点调用 controller.ai.walker.go_to_location 会触发 CARLA
+        # 原生 RecastNavigation 深层递归 → Windows 栈溢出（0xC00000FD /
+        # code=3221225725），Python try/except 抓不住，直接带走控制面进程（崩在
+        # tick 循环开始前，日志表现为 spawn 后无 tick 行）。仅在显式开启
+        # SCENE_WALKER_AI_CONTROLLER 且坐标确认在导航网格上时才用原生 AI 控制器。
+        if not _walker_ai_controller_enabled():
+            self._register_scripted_walker(
+                actor, spawn_point, destination, speed, participant, carla
+            )
+            return
 
         blueprint = _safe_find(library, "controller.ai.walker")
         if blueprint is None:

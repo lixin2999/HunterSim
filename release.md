@@ -3844,3 +3844,56 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.6.0 → **3.6.1**。
 
 ---
+
+## V3.6.2 — 行人场景原生栈溢出修复（off-navmesh `go_to_location` 崩溃）
+
+**发布日期**：2026-11-11
+**版本定位**：补丁修复（第三位递增）。V3.6.0/V3.6.1 处理的是 `0xC0000409`（fail-fast）；本版修复现场新暴露的一类**不同**原生崩溃——`0xC00000FD`（原生栈溢出，`code=3221225725`），只在**行人/动物横穿**类场景复现，与信箱并发无关。
+
+### 现场
+
+| 时刻 | 读数 | 结论 |
+|------|------|------|
+| 08:44:38 | `Participant 'animal-1' spawned: actor=528 blueprint=walker.pedestrian.0001 ... world=(548.6,37.2,0.3,yaw=90) relative=(ahead=45.0m, left=-4.5m)` | 狗（`object_kind=dog`）无资产降级为行人，被放到自车前方 45m 的**路面坐标**（非人行道导航网格） |
+| 08:44:38 之后 | **无任何 tick / `Walker ... crossing` / `Manager idle` 日志** | 崩在 `_setup_walker_ai` 内、tick 循环开始之前 |
+| 08:44:44 | `Viz proxy timeout: ConnectTimeout` → 成片 503/504 → `[up] carla-manager 异常退出（code=3221225725）（0xC00000FD 原生栈溢出…）` | 控制面进程已被带走，探针面反代连不上 |
+
+### 根因
+
+`builtin_scenario._setup_walker_ai()` 把**平台下发的任意场景坐标**（行人出生点 + 几何算出的横穿目标 `_walker_destination()`）直接喂给 CARLA 原生 `controller.ai.walker.go_to_location()`。这些点不保证落在 RecastNavigation 导航网格上；对 off-mesh 点寻路会触发 CARLA 原生深层递归 → Windows 栈溢出（`0xC00000FD`），Python `try/except` 无法捕获，直接带走控制面进程。对照：`traffic_flow_manager._spawn_walkers()` 的出生点与目标点都取自 `world.get_random_location_from_navigation()`（保证在网格上），故那条路径不崩——问题只在场景运行器的行人装配路径。
+
+### 修复内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：`_setup_walker_ai()` **默认改走脚本化横穿**（`_register_scripted_walker` → 每 tick `set_transform` 纯运动学推进，不碰原生导航，行为等价且不会崩），不再对场景任意坐标调用 `controller.ai.walker.go_to_location`。新增环境变量开关 `SCENE_WALKER_AI_CONTROLLER`（默认关闭）：仅在确认行人坐标都落在导航网格上时置 `1` 才启用原生 AI 控制器（换取真实步态/避障）。新增模块级辅助 `_walker_ai_controller_enabled()` 与常量 `_WALKER_AI_CONTROLLER_ENV`，并补 `import os`。
+
+### 向后兼容
+
+- 无接口/契约变更。默认行为变化：场景行人由「原生 AI 导航」改为「脚本化直行横穿」，视觉行为一致（仍能过街），但无步态动画与避障；需原生步态时显式设 `SCENE_WALKER_AI_CONTROLLER=1`（自担 off-mesh 崩溃风险）。
+- `traffic_flow_manager` 的背景行人仍走 `get_random_location_from_navigation()` 原生导航，不受影响。
+- `pyproject.toml` 版本 `3.6.1` → `3.6.2`（问题修复，第三位递增）。
+
+### 验证
+
+- `pytest -q -p no:randomly` 全量：**1537 passed**（较 V3.6.1 基线 1536 +1，为新增回归用例）；
+- 新增回归用例 `test_walker_defaults_to_scripted_to_avoid_offnavmesh_crash`：默认（未设开关）下 `_walker_ai_controllers == []`、`_walker_controllers == []`、`_scripted_walkers` 命中 1，锁死「不再对场景坐标调用原生 `go_to_location`」；
+- 原 3 条断言 AI 控制器的用例（`test_walker_crossing_uses_ai_controller` / `test_walker_speed_not_capped_at_1_4` / `test_boarding_targets_parked_vehicle`）改为显式 `monkeypatch.setenv("SCENE_WALKER_AI_CONTROLLER", "1")` 后通过。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.6.2`；
+2. 重下发 `SCN-2054-AC-DOG-L4`（动物穿行 / `sudden_cross`）场景，行人/狗降级为 walker 后应看到 `Walker 'animal-1' scripted crossing: ...` 日志，且 `[up]` **不再出现** `异常退出（code=3221225725）`；
+3. 若需原生行人步态，确认坐标都在导航网格上后设 `SCENE_WALKER_AI_CONTROLLER=1`。
+
+### 分发
+
+镜像 tag `hunter-sim:3.6.2`；`pyproject.toml` 版本 `3.6.2`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.6.2`，V3.6.x 条目追加补丁说明。
+- `user_manual.md`：版本头 → V3.6.2；§11 FAQ 补充「行人/动物场景原生栈溢出」问答。
+- `deployment_and_operations.md`：版本头 → V3.6.2；§5.7 排障表补充 V3.6.2 行；新增 `### V3.6.1 → V3.6.2` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.6.2；§9 排障表补充 V3.6.2 行；§5 冒烟预期补充「行人场景不应原生栈溢出」。
+- `pyproject.toml`：`version` 3.6.1 → **3.6.2**。
+
+---
