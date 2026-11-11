@@ -291,6 +291,7 @@ def map_scene_config(
     initial_steer = _clamp(_as_float(ego_section.get("initial_steer"), 0.0), -1.0, 1.0)
     map_type = _map_type(map_section, map_id)
     spawn_semantics = _spawn_semantics(platform_config.get("spawn_semantics"))
+    action_semantics = _action_semantics(platform_config.get("action_semantics"), report)
     sensor_mount_reference = _as_dict(platform_config.get("sensor_mount_reference"))
 
     duration = _as_float(platform_config.get("duration"), default_duration_seconds)
@@ -313,7 +314,13 @@ def map_scene_config(
         for index, event in enumerate(_as_list(platform_config.get("events")))
     ]
     mapping_report = _build_mapping_report(
-        scene_id, platform_config, actor_sections, participants, events, report
+        scene_id,
+        platform_config,
+        actor_sections,
+        participants,
+        events,
+        report,
+        action_semantics=action_semantics,
     )
 
     success_criteria = _as_dict(platform_config.get("success_criteria"))
@@ -323,6 +330,7 @@ def map_scene_config(
         map_id=map_id,
         map_type=map_type,
         spawn_semantics=spawn_semantics,
+        action_semantics=action_semantics,
         sensor_mount_reference=sensor_mount_reference,
         quality=_quality(quality),
         mode=mode,
@@ -346,6 +354,7 @@ def map_scene_config(
             "platform_scene_config": {
                 "map": map_section,
                 "spawn_semantics": spawn_semantics,
+                "action_semantics": action_semantics,
                 "sensor_mount_reference": sensor_mount_reference,
                 "success_criteria": success_criteria,
             },
@@ -832,6 +841,26 @@ def _spawn_semantics(raw: Any) -> str:
     return "absolute" if value == "absolute" else "relative_to_ego"
 
 
+#: 平台 V1.27.0+ 事件动作语义标记：动作是评估基线而非指令（替自车执行期望
+#: 动作会使评估 oracle 恒真）。仿真端按标记分支留痕，不再按平台版本猜。
+_ACTION_SEMANTICS_EXPECTATION = "expectation_only"
+
+
+def _action_semantics(raw: Any, report: _MappingReport) -> str:
+    """规范化事件动作语义标记（平台 V1.27.0+ 下发载荷顶层字段）。
+
+    缺省（旧平台未声明）返回空串，按历史行为处理，不猜版本；未识别取值
+    原样保留并告警 ``action_semantics_unknown:<value>``，不静默改写。
+    """
+    value = str(raw or "").strip().lower()
+    if value and value != _ACTION_SEMANTICS_EXPECTATION:
+        report.warn(
+            f"action_semantics_unknown:{value}",
+            "未识别的事件动作语义标记，按历史行为处理",
+        )
+    return value
+
+
 def _spawn_point(section: Any, label: str) -> SpawnPoint:
     """平台 spawn_point（yaw 为弧度）→ 内部 SpawnPoint（度）。"""
     data = _as_dict(section)
@@ -988,11 +1017,14 @@ def _build_mapping_report(
     participants: list[TrafficParticipantConfig],
     events: list[SceneEventDefinition],
     report: _MappingReport,
+    *,
+    action_semantics: str = "",
 ) -> dict[str, Any]:
     """汇总映射结果与告警，写入 ``extra_params["mapping_report"]``。"""
     return {
         "scene_id": scene_id,
         "platform_version": str(platform_config.get("version") or ""),
+        "action_semantics": action_semantics,
         "actors": {
             "declared": len(actor_sections),
             "mapped": len(participants),

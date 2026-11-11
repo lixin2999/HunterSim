@@ -272,6 +272,8 @@ class SceneConfig(BaseModel):
         map_id: 地图 ID。
         map_type: 地图类型（``carla_town`` / ``hd_map`` / ``site_map``）。
         spawn_semantics: 出生点语义（``relative_to_ego`` 表示参与者坐标为相对自车偏移）。
+        action_semantics: 事件动作语义标记（平台 V1.27.0+ 顶层字段；
+            ``expectation_only`` = 事件动作是评估基线而非指令，空 = 旧平台未声明）。
         sensor_mount_reference: 平台下发的传感器挂载依据（``envelope_m`` 等）。
         quality: 渲染画质等级。
         mode: 仿真模式（VIL/SIL）。
@@ -295,6 +297,13 @@ class SceneConfig(BaseModel):
     spawn_semantics: str = Field(
         "absolute",
         description="出生点语义：relative_to_ego（平台 V1.25.0+）或 absolute（历史）",
+    )
+    action_semantics: str = Field(
+        "",
+        description=(
+            "事件动作语义：expectation_only（平台 V1.27.0+，评估基线非指令）；"
+            "空 = 旧平台未声明，按历史行为处理"
+        ),
     )
     sensor_mount_reference: dict[str, Any] = Field(
         default_factory=dict,

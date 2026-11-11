@@ -169,10 +169,11 @@ def register_viz_routes(app: FastAPI) -> None:
 
     @app.get("/viz/api/instances/{instance_id}/actors", include_in_schema=False)
     def viz_actors(instance_id: str, request: Request) -> dict[str, Any]:
-        """交通参与者状态（身份/类型/期望行为/车速/相对自车方位）。
+        """交通参与者状态（身份/类型/平台行为标签/车速/相对自车方位）。
 
         前端「参与者」面板据此展示「场景里到底有谁、期望它做什么、现在在自车
         哪个方位」——这是排查「主车前面看不到其他车」的主要入口。
+        ``source_behavior_type`` 为平台原始行为标签（V3.8.7，面板行为列回显）。
         """
         service = _require_instance(request, instance_id)
         getter = getattr(service, "actors", None)

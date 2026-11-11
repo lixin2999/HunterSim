@@ -588,7 +588,8 @@ class SceneRunnerService:
 
         返回空列表表示：场景无参与者、或场景尚未开始 tick。字段见
         ``BuiltinScenario.participant_states``：``id/actor_type/behavior/
-        blueprint/spawned/速度/世界坐标/ahead_m/left_m/distance_to_ego_m/visible``。
+        source_behavior_type/blueprint/spawned/速度/世界坐标/ahead_m/left_m/
+        distance_to_ego_m/visible``。
         """
         return [dict(state) for state in self._actor_state_cache]
 

@@ -4464,3 +4464,64 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.5 → **3.8.6**。
 
 ---
+
+## V3.8.7 — 场景语义对齐三项待办（participant_states 补 source_behavior_type + 消费 action_semantics 标记 + 产物直传接入 SOP）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 / 功能完善（patch）。落地《HunterSim场景语义对齐方案》（HunterCore docs）登记的三项 HunterSim 待办：两项代码修复/完善 + 一项接入配置登记（非代码缺陷）。不改对外接口、不新增环境变量（`.env.example` 补的是既有 `CloudSettings.jwt_token` 的模板占位）。
+
+### 待办 1：participant_states 补 source_behavior_type（面板回显平台原始行为标签）
+
+- **现象/根因**：重下发 `SCN-2054-AC-HRD` 后 `/viz` 参与者面板只显内部映射行为 `pedestrian_cross`，看不到平台原始标签 `sudden_cross`。映射层 `TrafficParticipantConfig.source_behavior_type` 已保留 `sudden_cross`，根因在仿真端上报/展示链路：`participant_states` 写行未带该字段、面板只回显内部行为值；平台下发侧无配合项。
+- **变更**：
+  - `scene_runner/builtin_scenario.py`：`participant_states` 写行补 `source_behavior_type`（取参与者配置原值）。
+  - `visualization/assets/app.js`：行为列优先回显 `source_behavior_type`（旧载荷无此字段回落 `behavior`），行 tooltip 追加内部映射行为。
+  - `visualization/assets/index.html`：表头「期望行为」→「行为标签」（title 说明平台原始标签语义）。
+  - `scene_runner/scene_runner_service.py` / `visualization/routes.py`：docstring 字段列表同步。
+- **验收**：重下发 `SCN-2054-AC-HRD` 后面板「行为标签」列回显 `sudden_cross`。
+
+### 待办 2：消费 action_semantics 标记（防御性，当前行为不变）
+
+- **语义背景**：平台 V1.27.0+ 下发载荷**顶层** `action_semantics=expectation_only`（与 `spawn_semantics` 并列）表示事件动作是评估基线而非指令；替自车执行期望动作会使评估 oracle 恒真。
+- **变更**（按标记分支、留痕，不改变现有确定性接管行为）：
+  - `scene_runner/scene_config.py`：`SceneConfig` 新增 `action_semantics` 字段（空 = 旧平台未声明，按历史行为处理）。
+  - `platform_adapter/scene_mapper.py`：新增 `_action_semantics` 助手（归一化大小写/空白；未知值告警 `action_semantics_unknown:<value>` 并保留原值；缺省不猜版本），`map_scene_config` 接入并写入 `extra_params.platform_scene_config` 与 `mapping_report`。
+  - `scene_runner/builtin_scenario.py`：`_log_scene_expectations` 按标记三分支落日志（`expectation_only` / 未识别 / 未声明）；`_apply_scene_event_actions` 对命中 brake/speed_change 的事件在 `expectation_only` 下追加 `scene_event_action expectation_baseline` 留痕，后续执行逻辑完全不动。
+- **验收**：日志出现 `Scene action semantics: expectation_only…`；事件制动/变速接管行为与 V3.8.6 完全一致（单测钉死 `_ego_event_brake_ms` 仍被武装）。
+
+### 待办 3：仿真节点产物直传（接入配置，非代码缺陷）
+
+- **现象/根因**：平台 result 的 `download_url` 下载报 `NoSuchKey`。`ArtifactManager` 预签名直传链路（presign→PUT→complete）代码完备，但节点未配 `HUNTER_CORE_JWT_TOKEN` 时按 best-effort 跳过（日志「HUNTER_CORE_JWT_TOKEN 未配置，产物仅落本地」），预签名地址指向的对象从未上传。
+- **变更**（配置与文档，无代码改动）：
+  - `.env.example`：补 `HUNTER_CORE_JWT_TOKEN=` 及注释（client_id 与 node_id 同值、可复用注册/心跳令牌、禁用 admin 登录 Token、TTL 7 天）。
+  - `deployment_and_operations.md`：新增 §5.10 产物直传三步接入 SOP + §5.7 排障行。
+- **接入三步**：① 管理员签发服务令牌（client_id 与 node_id 同值以对齐 owner 绑定，已有注册/心跳令牌可复用；禁用 admin 登录 Token 的 V1.23.6 约定）→ ② 节点配 `HUNTER_CORE_GATEWAY_URL` + `HUNTER_CORE_JWT_TOKEN` 并重启 → ③ 重下发。
+- **验收**：result 的 `download_url` 直接 200 下载、不再 `NoSuchKey`。
+- **易踩点**：令牌 TTL 7 天过期需重签；预签名 host 依赖平台 `MINIO_PUBLIC_ENDPOINT` 从仿真机可达。
+
+### 验证
+
+- 全量 `pytest`：**1597 passed**（1586 + 11 新增）；覆盖率门禁复测 **83.48%**（≥80%）。
+- 新增单测：`TestV387ParticipantLabelAndActionSemantics`（6 例：写行两字段、三分支语义日志、`expectation_baseline` 留痕且制动接管不变）、`TestActionSemantics`（4 例：留存+报告/缺省不猜/未知告警/归一化）、viz actors 透传（1 例）。
+- `flake8` exit=0；`mypy` Success（91 源文件）。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.7`（`pip show hunter-sim` 核版本）。
+2. 重下发 `SCN-2054-AC-HRD`：`/viz` 参与者面板「行为标签」列应显 `sudden_cross`（行悬停见 `pedestrian_cross`）；日志出现 `Scene action semantics: expectation_only`（旧载荷为 `未声明`），事件制动/变速行为与 V3.8.6 一致。
+3. 产物直传（需管理员/部署机配合）：按《部署与运维指南》§5.10 签发服务令牌 → 节点 `.env` 配 `HUNTER_CORE_GATEWAY_URL` + `HUNTER_CORE_JWT_TOKEN` → 重启 `huntersim up` → 重下发；result 的 `download_url` 应直接 200 下载。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.7`；`pyproject.toml` 版本 `3.8.7`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.7`，追加 V3.8.7 条目；测试计数 1586 → 1597，覆盖率基线 82.7% → 83.5%。
+- `user_manual.md`：版本头 → V3.8.7；参与者面板改「行为标签」说明；FAQ 补充「面板行为标签/NoSuchKey 直传接入」「action_semantics 日志含义」。
+- `deployment_and_operations.md`：版本头 → V3.8.7；§5.7 补 NoSuchKey 排障行；新增 §5.10 产物直传接入 SOP；新增 `### V3.8.6 → V3.8.7` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.7；排障表补充 V3.8.7 两行（行为标签/NoSuchKey）；冒烟预期补充 V3.8.7 bullet。
+- `.env.example`：补 `HUNTER_CORE_JWT_TOKEN=` 及接入注释。
+- `pyproject.toml`：`version` 3.8.6 → **3.8.7**。
+
+---

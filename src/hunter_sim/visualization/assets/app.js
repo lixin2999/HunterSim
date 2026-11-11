@@ -4,7 +4,7 @@
  * 数据来源（全部同源，无跨域）：
  *   /viz/api/status                          顶栏状态灯 + 仿真端模块连通性
  *   /viz/api/instances/{id}/events          场景事件（碰撞/偏离/通过…）
- *   /viz/api/instances/{id}/actors          交通参与者（类型/期望行为/车速/相对自车方位）
+ *   /viz/api/instances/{id}/actors          交通参与者（类型/平台行为标签/车速/相对自车方位）
  *   /viz/api/instances/{id}/sensors         传感器各流帧数/帧率 + ROS2 话题
  *   /viz/api/instances/{id}/sensors/{stream} 单流最新帧（深度 PNG / 点云 JSON / IMU JSON）
  *   /viz/api/logs、/viz/api/logs/stream     仿真日志（SSE 增量，断线降级为轮询）
@@ -1036,7 +1036,8 @@
       }
       row.appendChild(el("td", "", item.id || "—"));
       row.appendChild(el("td", "", item.actor_type || "—"));
-      row.appendChild(el("td", "", item.behavior || "—"));
+      // 行为标签回显平台原值（如 sudden_cross）；旧载荷无该字段时退回内部行为
+      row.appendChild(el("td", "", item.source_behavior_type || item.behavior || "—"));
       row.appendChild(el("td", "num", item.spawned ? num(item.speed_ms, 1) + " m/s" : "未生成"));
       row.appendChild(el("td", "num", relativeText(item.ahead_m, item.left_m)));
       row.appendChild(el("td", "num", num(item.distance_to_ego_m, 1) + " m"));
@@ -1049,7 +1050,9 @@
         ") yaw=" +
         num(item.yaw_deg, 1) +
         "° · blueprint=" +
-        String(item.blueprint || "—");
+        String(item.blueprint || "—") +
+        " · 内部行为=" +
+        String(item.behavior || "—");
       body.appendChild(row);
     });
     if (!items.length) {

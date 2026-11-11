@@ -77,6 +77,7 @@ class _FakeService(_ReadOnlyService):
                 "id": "lead-1",
                 "actor_type": "vehicle",
                 "behavior": "constant_speed",
+                "source_behavior_type": "forward",
                 "spawned": True,
                 "ahead_m": 18.0,
                 "left_m": 0.0,
@@ -302,6 +303,14 @@ class TestActors:
         assert body["visible"] == 1
         assert [item["id"] for item in body["items"]] == ["lead-1", "lead-2"]
         assert body["items"][1]["visible"] is False
+
+    def test_actor_items_pass_through_platform_behavior_label(self, client: TestClient) -> None:
+        """V3.8.7：平台行为标签原样透传（面板回显 sudden_cross 类原值）。"""
+        body = client.get("/viz/api/instances/inst-1/actors").json()
+
+        assert body["items"][0]["source_behavior_type"] == "forward"
+        # 旧载荷无该字段时不造假：面板自行退回内部行为
+        assert "source_behavior_type" not in body["items"][1]
 
     def test_service_without_actors_returns_empty(self) -> None:
         with TestClient(create_app(service=_ReadOnlyService())) as client:

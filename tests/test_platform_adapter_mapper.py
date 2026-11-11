@@ -490,3 +490,42 @@ class TestMapCalibration:
     def test_missing_calibration_returns_none(self) -> None:
         assert map_calibration(None) is None
         assert map_calibration({"calibration": {"map_x": 1.0}}) is None
+
+
+class TestActionSemantics:
+    """V3.8.7：平台 V1.27.0+ 顶层 action_semantics 标记消费（分支留痕，行为不变）。"""
+
+    def test_expectation_only_is_kept_and_reported(self) -> None:
+        config = map_scene_config(
+            scene_config(action_semantics="expectation_only"), scene_id="scene-1"
+        )
+        assert config.action_semantics == "expectation_only"
+        assert config.extra_params["mapping_report"]["action_semantics"] == "expectation_only"
+        assert (
+            config.extra_params["platform_scene_config"]["action_semantics"]
+            == "expectation_only"
+        )
+        assert not [
+            w for w in config.mapping_warnings if w.code.startswith("action_semantics")
+        ]
+
+    def test_missing_marker_defaults_empty_without_guess(self) -> None:
+        """旧平台未声明：空串按历史行为处理，不按版本猜。"""
+        config = map_scene_config(scene_config(), scene_id="scene-1")
+        assert config.action_semantics == ""
+        assert config.extra_params["mapping_report"]["action_semantics"] == ""
+
+    def test_unknown_marker_warns_and_keeps_raw(self) -> None:
+        config = map_scene_config(
+            scene_config(action_semantics="command"), scene_id="scene-1"
+        )
+        assert config.action_semantics == "command"
+        assert any(
+            w.code == "action_semantics_unknown:command" for w in config.mapping_warnings
+        )
+
+    def test_marker_is_normalized(self) -> None:
+        config = map_scene_config(
+            scene_config(action_semantics=" Expectation_Only "), scene_id="scene-1"
+        )
+        assert config.action_semantics == "expectation_only"

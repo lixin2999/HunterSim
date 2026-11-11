@@ -2023,3 +2023,98 @@ class TestV386IntersectionBranchSampleRetentionAndWedgeGuard:
         kwargs = ctl.call_args.kwargs
         assert kwargs["throttle"] == 0.0
         assert kwargs["brake"] == pytest.approx(_EGO_BRAKE_HOLD)
+
+
+class TestV387ParticipantLabelAndActionSemantics:
+    """V3.8.7：参与者面板回显平台行为标签 + action_semantics 标记消费。
+
+    待办 1：participant_states 写行补 source_behavior_type（映射层已保留
+    sudden_cross，只差上报/展示链路）；待办 2：expectation_only = 事件动作
+    是评估基线而非指令，按标记分支留痕，当前行为不变。
+    """
+
+    @staticmethod
+    def _sudden_cross_scenario(**config_overrides: Any) -> BuiltinScenario:
+        return _make_scenario(
+            {
+                "spawn_semantics": "relative_to_ego",
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": False,
+                },
+                "traffic_participants": [
+                    {
+                        "participant_id": "animal-1",
+                        "actor_type": "walker",
+                        "blueprint": "walker.pedestrian.0001",
+                        "spawn_point": {"x": 12.0, "y": -4.5},
+                        "behavior": "pedestrian_cross",
+                        "source_behavior_type": "sudden_cross",
+                    }
+                ],
+                **config_overrides,
+            }
+        )
+
+    def test_participant_states_echo_platform_behavior_label(self) -> None:
+        """面板行为标签回显平台原值 sudden_cross，内部执行行为保持不变。"""
+        scenario = self._sudden_cross_scenario()
+        scenario.setup(MockWorld())
+
+        state = scenario.participant_states()[0]
+        assert state["behavior"] == "pedestrian_cross"
+        assert state["source_behavior_type"] == "sudden_cross"
+
+    def test_participant_states_legacy_payload_label_empty(self) -> None:
+        """旧载荷无平台行为标签时字段为空串（面板退回内部行为）。"""
+        scenario = _make_scenario()
+        scenario.setup(MockWorld())
+
+        states = scenario.participant_states()
+        assert states
+        assert all(state["source_behavior_type"] == "" for state in states)
+
+    def test_setup_logs_expectation_only_semantics(self, caplog) -> None:
+        scenario = self._sudden_cross_scenario(action_semantics="expectation_only")
+        with caplog.at_level(logging.INFO):
+            scenario.setup(MockWorld())
+        assert "Scene action semantics: expectation_only" in caplog.text
+
+    def test_setup_logs_undeclared_semantics(self, caplog) -> None:
+        scenario = self._sudden_cross_scenario()
+        with caplog.at_level(logging.INFO):
+            scenario.setup(MockWorld())
+        assert "Scene action semantics: 未声明" in caplog.text
+
+    def test_expectation_only_brake_leaves_trace_and_keeps_behavior(self, caplog) -> None:
+        """expectation_only 分支落期望基线留痕；确定性控制制动接管行为不变。"""
+        scenario = self._sudden_cross_scenario(action_semantics="expectation_only")
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        fired = types.SimpleNamespace(
+            event_id="ev-1", action_type="brake", action_parameters={}
+        )
+
+        with caplog.at_level(logging.INFO):
+            scenario._apply_scene_event_actions([fired])  # noqa: SLF001
+
+        assert "scene_event_action expectation_baseline" in caplog.text
+        assert "semantics=expectation_only" in caplog.text
+        # 行为不变：brake 仍按 V3.8.2 口径武装制动目标（默认 0=停车）
+        assert scenario._ego_event_brake_ms == pytest.approx(0.0)  # noqa: SLF001
+
+    def test_without_marker_no_baseline_trace_but_brake_still_engages(self, caplog) -> None:
+        """旧平台未声明标记：不留期望基线痕，接管行为维持历史口径。"""
+        scenario = self._sudden_cross_scenario()
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        fired = types.SimpleNamespace(
+            event_id="ev-1", action_type="brake", action_parameters={}
+        )
+
+        with caplog.at_level(logging.INFO):
+            scenario._apply_scene_event_actions([fired])  # noqa: SLF001
+
+        assert "expectation_baseline" not in caplog.text
+        assert scenario._ego_event_brake_ms == pytest.approx(0.0)  # noqa: SLF001

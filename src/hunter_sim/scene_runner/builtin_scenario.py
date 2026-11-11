@@ -189,6 +189,9 @@ _EGO_BRAKE_ACTION_KEYWORDS = ("brake", "stop", "decelerate")
 #: V3.8.5：平台事件动作中判定为「改变自车期望速度」的 action_type 关键字
 #: （子串匹配，覆盖 speed_change / change_speed / set_speed / adjust_speed）。
 _EGO_SPEED_CHANGE_KEYWORDS = ("speed_change", "change_speed", "set_speed", "adjust_speed")
+#: V3.8.7：平台 V1.27.0+ 事件动作语义标记——动作是评估基线而非指令，
+#: 替自车执行期望动作会使评估 oracle 恒真。按标记分支留痕，不改变现有行为。
+_ACTION_SEMANTICS_EXPECTATION = "expectation_only"
 #: V3.8.2：事件制动的「在路径内」横向半宽（米）。只有参与者落在自车行驶路径
 #: （前方且 |横向| ≤ 该值）时才真正制动；等待型横穿（sudden_cross）伏在路缘
 #: （横向数米）时不制动，避免「自车刹停 ↔ 行人等自车靠近」互锁死锁。
@@ -463,6 +466,9 @@ class BuiltinScenario(CustomScenarioBase):
 
         平台下发的每个参与者都返回一条记录：身份 / 类型 / 期望行为 + 实时位姿，
         并附带车体系偏移 ``ahead_m``（前正后负）与 ``left_m``（左正右负）。
+        ``source_behavior_type`` 是平台原始行为标签（如 ``sudden_cross``）：
+        内部 ``behavior`` 是映射后的执行行为（如 ``pedestrian_cross``），面板
+        行为标签须回显平台原值，否则现场无法与下发配置对齐（V3.8.7）。
 
         只给世界坐标是不够的：自车基准 yaw 常被替换成地图出生点航向（Town01
         常见 90°），此时「正前方 18m」在世界系里表现为 y 方向 +18m，无法判断
@@ -488,6 +494,7 @@ class BuiltinScenario(CustomScenarioBase):
                 "behavior": str(
                     getattr(participant.behavior, "value", participant.behavior)
                 ),
+                "source_behavior_type": participant.source_behavior_type,
                 "blueprint": getattr(actor, "type_id", participant.blueprint),
                 "spawned": actor is not None,
                 "speed_ms": (
@@ -656,6 +663,22 @@ class BuiltinScenario(CustomScenarioBase):
                 "Scene event actions: %s（V3.8.1：brake/emergency_stop 类在确定性纵向"
                 "控制下驱动自车减速；TM 托管时仅留存，避让由 TM 负责）",
                 " ".join(actions),
+            )
+        # V3.8.7：事件动作语义标记落日志（平台 V1.27.0+ 顶层 action_semantics）：
+        # 现场据此区分「期望基线」与「指令」，不再按平台版本猜。
+        semantics = str(self._config.action_semantics or "").strip().lower()
+        if semantics == _ACTION_SEMANTICS_EXPECTATION:
+            logger.info(
+                "Scene action semantics: expectation_only（事件动作是评估基线而非指令；"
+                "现有确定性控制接管行为不变，仅分支留痕）"
+            )
+        elif semantics:
+            logger.info(
+                "Scene action semantics: %s（未识别标记，按历史行为处理）", semantics
+            )
+        else:
+            logger.info(
+                "Scene action semantics: 未声明（旧平台载荷，按历史行为处理）"
             )
 
     def tick(self, world: Any, timestamp: float, delta_seconds: float) -> None:
@@ -1425,9 +1448,26 @@ class BuiltinScenario(CustomScenarioBase):
         V3.8.2：越沿触发只「武装」制动目标，不立即刹停；是否真正制动交由
         :meth:`_ego_event_brake_active` 每 tick 判定目标是否已进入自车行驶路径，
         避免与等待型横穿（sudden_cross）互锁死锁。
+
+        V3.8.7：消费平台 ``action_semantics`` 标记——``expectation_only`` 时
+        事件动作是评估基线而非指令，按标记分支落期望基线留痕；现有接管
+        行为不变（防御性接入，后续若平台下发指令语义再在此分支扩展）。
         """
+        semantics = str(getattr(self._config, "action_semantics", "") or "").strip().lower()
         for definition in fired:
             action_type = str(getattr(definition, "action_type", "") or "")
+            if semantics == _ACTION_SEMANTICS_EXPECTATION and (
+                self._is_ego_brake_action(action_type)
+                or self._is_ego_speed_change_action(action_type)
+            ):
+                # 期望基线留痕：替自车执行期望动作会使评估 oracle 恒真，
+                # 这里只声明语义不改变执行（接管行为维持 V3.8.2/V3.8.5 口径）。
+                logger.info(
+                    "scene_event_action expectation_baseline: event=%s action=%s "
+                    "semantics=expectation_only（评估基线非指令，接管行为不变）",
+                    getattr(definition, "event_id", "?"),
+                    action_type,
+                )
             if self._is_ego_speed_change_action(action_type):
                 self._apply_ego_speed_change(definition, action_type)
                 continue
