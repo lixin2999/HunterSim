@@ -76,6 +76,85 @@ class TestEvaluationEngine:
         assert result.passed is False
         assert result.safety.collision_count == 1
 
+    def test_min_safe_distance_criterion_fails_on_near_miss(self) -> None:
+        """V3.8.4：近距擦碰（0.05m < 平台 4.25m）即使无碰撞也判失败。"""
+        engine = EvaluationEngine()
+        result = engine.evaluate_scene(
+            scene_id="near_miss",
+            vehicle_states=[],
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[0.05],
+            speed_limit_ms=3.0,
+            scene_duration_s=10.0,
+            completed=True,
+            min_safe_distance_m=4.25,
+        )
+        assert result.passed is False
+        assert result.success_criteria["min_safe_distance_ok"] is False
+        assert result.success_criteria["min_safe_distance_required"] == 4.25
+
+    def test_min_safe_distance_criterion_passes_when_clear(self) -> None:
+        engine = EvaluationEngine()
+        result = engine.evaluate_scene(
+            scene_id="clear",
+            vehicle_states=[],
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[6.0],
+            speed_limit_ms=3.0,
+            scene_duration_s=10.0,
+            completed=True,
+            min_safe_distance_m=4.25,
+        )
+        assert result.passed is True
+        assert result.success_criteria["min_safe_distance_ok"] is True
+
+    def test_speed_deviation_criterion_fails_when_over(self) -> None:
+        """V3.8.4：实测速度超期望初速+偏差上限判失败。"""
+        engine = EvaluationEngine()
+        states = [
+            {"vehicle_speed": 5.0, "timestamp": i * 0.02, "acceleration": (0.0, 0.0, 0.0), "steering": 0.0}
+            for i in range(50)
+        ]
+        result = engine.evaluate_scene(
+            scene_id="over_speed",
+            vehicle_states=states,
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[],
+            speed_limit_ms=3.0,
+            scene_duration_s=1.0,
+            completed=True,
+            max_speed_deviation_ms=1.15,
+        )
+        assert result.passed is False
+        assert result.success_criteria["max_speed_deviation_ok"] is False
+
+    def test_speed_deviation_criterion_passes_within_limit(self) -> None:
+        engine = EvaluationEngine()
+        states = [
+            {"vehicle_speed": 3.5, "timestamp": i * 0.02, "acceleration": (0.0, 0.0, 0.0), "steering": 0.0}
+            for i in range(50)
+        ]
+        result = engine.evaluate_scene(
+            scene_id="within_limit",
+            vehicle_states=states,
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[],
+            speed_limit_ms=3.0,
+            scene_duration_s=1.0,
+            completed=True,
+            max_speed_deviation_ms=1.15,
+        )
+        assert result.passed is True
+        assert result.success_criteria["max_speed_deviation_ok"] is True
+
     def test_emergency_brake_counted(self) -> None:
         engine = EvaluationEngine()
         result = engine.evaluate_scene(

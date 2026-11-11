@@ -4279,3 +4279,82 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.2 → **3.8.3**。
 
 ---
+
+## V3.8.4 — 控制平滑/制动滞回 + 成功判据接入评估（修画面抖动、近距擦碰假通过、面板速度误显）
+
+**发布日期**：2026-11-11
+**版本定位**：问题修复 + 功能完善（第三位递增）。针对 V3.8.3 实机（inst-df9c1572…）与 /viz、平台场景页逐项比对暴露的四类问题：①环视画面自车抖动；②事件制动在横穿边界抖振导致近距擦碰（trigger `actual=0.050`）却 `passed=True`；③脚本化行人面板速度恒 0；④平台成功判据（`min_safe_distance`/`max_speed_deviation`）未接入评估。
+
+### 现场与根因（V3.8.3 实机日志 + /viz + 平台场景页）
+
+| 现象 | 定位证据 | 根因 |
+|------|----------|------|
+| 环视画面自车抖动 | /viz 主视区自车/背景高频微颤；确定性控制油门/刹车/转向为 bang-bang 阶跃 | 控制输出无低通，阶跃激励悬架俯仰/侧倾（环视相机刚性挂自车） |
+| 近距擦碰却 passed=True | 日志 `trigger_reached distance<39 (actual=0.050)`（自车与动物仅 5cm）；平台 `min_safe_distance=4.25` | `executor._evaluate` 硬编码 `min_distances=[]`、`speed_limit_ms=10`，`success_criteria` 存而不用 |
+| 动物面板 0.0 m/s 却在移动 | /viz 交通参与者 animal-1 `speed=0.0` 但 ahead/left 持续变化 | 脚本化行人用 `set_transform` 推进，`get_velocity()` 恒 0 |
+| 制动↔巡航高频切换 | 横穿物在 2m 横向半宽边界来回穿越 | 事件制动门控无滞回 |
+
+### 变更内容
+
+- **`src/hunter_sim/scene_runner/builtin_scenario.py`**：
+  - 新增常量 `_EGO_BRAKE_RELEASE_HALF_M=3.0`（制动释放滞回半宽）、`_EGO_CTRL_EMA_ALPHA=0.35`（控制输出低通）、`_MAX_MIN_DISTANCE_SAMPLES=20000`。
+  - `_hazard_in_ego_path` 改带滞回锁存 `_ego_brake_latched`：未锁存用进入半宽 2.0，锁存后用释放半宽 3.0 且要求仍在前方，越界/落后再解锁。
+  - `_apply_ego_manual_speed` 确定性模式下对油门/刹车/转向输出一阶低通（抑制悬架阶跃抖动）；非确定性不变。
+  - 新增 `_participant_speed_ms`：脚本化行人报脚本有效速度（等待/到达=0、dash 用窜入速度），非脚本仍读物理速度；`participant_states` 改用之。
+  - `_trigger_metrics` 累积 `min_distance_samples`（自车-参与者最小欧氏距离），供评估判定 `min_safe_distance`；setup/cleanup 重置新增状态。
+- **`src/hunter_sim/scene_runner/scene_runner_service.py`**：新增 `min_distance_samples` 属性透传场景采样。
+- **`src/hunter_sim/eval_service/evaluation_engine.py`**：`evaluate_scene` 新增可选 `min_safe_distance_m` / `max_speed_deviation_ms` 判据；`passed` 叠加逐项达标；`success_criteria` 增加阈值与 `min_safe_distance_ok` / `max_speed_deviation_ok` 布尔。
+- **`src/hunter_sim/platform_adapter/executor.py`**：`_evaluate` 消费 `extra_params.success_criteria` 与 `runner.min_distance_samples`；速度偏差基准改场景期望初速（替代硬编码 10 m/s）。
+
+### 场景内容 vs 仿真实现差距（逐项核对）
+
+| 平台配置 | 仿真实现 | 状态 |
+|----------|----------|------|
+| 自车模型 HUNTER_SE | 蓝图缺失回退 `vehicle.tesla.model3`（挂载按包围盒换算） | 遗留（需装 hunter_se 蓝图） |
+| 动物 dog / sudden_cross | 资产缺失回退 `walker.pedestrian`；wait-then-dash 语义保留 | 遗留（资产）+ 语义已对齐 |
+| 动物速度 5 m/s | 夹取 [0.3,4.0]→4.0；dash 阶段 4.5 | 平台语义夹取（告警已留） |
+| 偏移 (45,-4.5)、yaw 90° | 相对自车出生点叠加 world=(548.6,37.2) | 对齐 |
+| 事件 ev-1「进入车道且距离<阈值」 | 映射为纯距离越沿（车道合取丢失）；V3.8.2 起制动另加在路径内门控 | 部分对齐（触发仍纯距离） |
+| 成功判据 4.25 / 1.15 / 禁撞 | V3.8.4 起接入评估 | **本版已修** |
+| 天气 云1/其余0 | WeatherManager custom | 对齐 |
+| 生成点 (0,0,0) 占位 | 替换为地图有效车道出生点 | 对齐（占位语义） |
+
+### 面板指标异常核对（/viz）
+
+- animal-1 `speed=0.0` 却移动：**本版已修**（改报脚本有效速度，dash 显 4.5）。
+- rgb/depth 实测 8.6/7.1 Hz 低于标称 30：编码/带宽瓶颈（自适应 jpeg 已启用），非数据错误；lidar 18 Hz 与 ROS2 标称 10 Hz 为传感器原生 vs 桥接降频两种口径。
+- ROS2 已发布全 0：rclpy 未安装、桥接未启用，预期。
+- 自车加速度 -3.69 与 IMU x 0.322 口径不同（面板为纵向投影低通，IMU 为比力含重力分量），非错误。
+- 碰撞 0 / 车道侵入 0：无接触/未越线，正确；近距擦碰改由 `min_safe_distance` 判据捕获（本版）。
+
+### 向后兼容
+
+- 判据参数可选：未下发时退回文档默认（`meets_targets`），旧场景/测试行为不变。
+- 控制低通与制动滞回仅确定性模式；TM 托管与纯 manual 不变。
+- 不改对外接口、不新增环境变量；`pyproject.toml` 版本 `3.8.3` → `3.8.4`。
+
+### 验证
+
+- `pytest -q` 全量：**1576 passed**（较 V3.8.3 基线 1566 +10）；flake8 exit=0；mypy no issues。
+- 新增用例：制动滞回保持/释放、低通首 tick 与收敛、非确定性不平滑、脚本行人速度、最小车距采样（`TestV384SmoothingHysteresisAndMetrics`）；评估 `min_safe_distance`/`max_speed_deviation` 达标与超标（`TestEvaluationEngine`）。
+
+### 实机执行
+
+1. `git pull` → `uv pip install -e .` → `huntersim version` 应为 `3.8.4`；
+2. 重下发 `SCN-2054-AC-DOG-L4`：画面抖动应明显减轻；动物横穿时自车停稳待其完全离开（横向>3m）再恢复，不再 5cm 擦碰；
+3. 面板 animal-1 速度 dash 阶段应显 4.5 m/s；
+4. 若仍近距擦碰，`eval.json` / 平台 `success_criteria_result.min_safe_distance_ok=false` → `passed=false`（不再假通过）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.4`；`pyproject.toml` 版本 `3.8.4`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.4`，追加 V3.8.4 条目；测试计数 1566 → 1576。
+- `user_manual.md`：版本头 → V3.8.4；FAQ 补充「画面抖动/近距擦碰假通过/行人速度误显已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.4；新增 `### V3.8.3 → V3.8.4` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.4；排障表补充 V3.8.4 行；冒烟预期补充「抖动减轻/不再假通过」。
+- `pyproject.toml`：`version` 3.8.3 → **3.8.4**。
+
+---

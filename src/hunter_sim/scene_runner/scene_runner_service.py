@@ -330,6 +330,14 @@ class SceneRunnerService:
             "error_message": snapshot.error_message,
         }
 
+    @property
+    def min_distance_samples(self) -> list[float]:
+        """自车-参与者最小欧氏距离采样（V3.8.4，供评估引擎判定 min_safe_distance）。
+
+        由场景 tick 线程累积；自定义场景未提供该属性时返回空列表（评估退回默认阈值）。
+        """
+        return list(getattr(self._scenario, "min_distance_samples", []) or [])
+
     def load_scene(self, config: SceneConfig, scenario: Optional[CustomScenarioBase] = None) -> None:
         """加载场景配置，初始化状态机和事件检测器，并把场景落到 CARLA 世界。
 

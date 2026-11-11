@@ -16,6 +16,7 @@ import pytest
 from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.scene_runner.builtin_scenario import (
     _EGO_BRAKE_HOLD,
+    _EGO_CTRL_EMA_ALPHA,
     _EGO_SPEED_FEEDFORWARD,
     BuiltinScenario,
 )
@@ -1714,3 +1715,123 @@ class TestDeterministicEgoDrive:
         ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
         scenario._apply_ego_manual_speed(0.1)  # noqa: SLF001
         assert ego._control.steer == pytest.approx(0.0)  # noqa: SLF001
+
+
+class TestV384SmoothingHysteresisAndMetrics:
+    """V3.8.4：控制低通（画面抖动）、制动滞回（近距擦碰）、行人速度/最小车距上报。"""
+
+    @staticmethod
+    def _ego_scenario(speed: float = 3.0) -> BuiltinScenario:
+        return _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 1.0, "y": 2.0},
+                    "autopilot": True,
+                    "initial_speed_ms": speed,
+                },
+                "traffic_participants": [],
+            }
+        )
+
+    @staticmethod
+    def _hazard(x: float, y: float) -> Any:
+        actor = MockActor("walker.pedestrian.0001")
+        actor.set_transform(MockTransform(location=MockLocation(x, y, 0.3)))
+        return actor
+
+    def _brake_scenario(self) -> BuiltinScenario:
+        scenario = self._ego_scenario(3.0)
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001
+        return scenario
+
+    def test_brake_hysteresis_holds_between_engage_and_release(self) -> None:
+        scenario = self._brake_scenario()
+        actor = self._hazard(10.0, 2.5)  # 介于进入 2.0 与释放 3.0 之间
+        scenario._actors = [actor]  # noqa: SLF001
+        # 未锁存：2.5 > 进入半宽 → 不制动
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+        # 窜入车道 → 锁存制动
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 0.0, 0.3)))
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        # 回到 2.5（>进入但<释放）：锁存保持制动，不抖振
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 2.5, 0.3)))
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        # 横向越过释放半宽 → 解锁恢复巡航
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 3.5, 0.3)))
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+
+    def test_brake_hysteresis_releases_when_hazard_behind(self) -> None:
+        scenario = self._brake_scenario()
+        actor = self._hazard(10.0, 0.0)
+        scenario._actors = [actor]  # noqa: SLF001
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        actor.set_transform(MockTransform(location=MockLocation(-5.0, 0.0, 0.3)))
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+
+    def test_deterministic_control_lowpass_smooths_throttle(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001  稳态死区→前馈油门
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        # 首 tick 低通从 0 起步：输出 = alpha × 前馈，而非阶跃到前馈
+        assert ego._control.throttle == pytest.approx(  # noqa: SLF001
+            _EGO_CTRL_EMA_ALPHA * _EGO_SPEED_FEEDFORWARD
+        )
+        # 多 tick 后收敛到前馈（稳态不衰减）
+        for _ in range(60):
+            scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(  # noqa: SLF001
+            _EGO_SPEED_FEEDFORWARD, abs=1e-3
+        )
+
+    def test_non_deterministic_control_not_smoothed(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_deterministic = False  # noqa: SLF001
+        ego._velocity = MockVector3D(3.0, 0.0, 0.0)  # noqa: SLF001
+        scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        assert ego._control.throttle == pytest.approx(  # noqa: SLF001
+            _EGO_SPEED_FEEDFORWARD
+        )
+
+    def test_scripted_walker_speed_reported_while_dashing(self) -> None:
+        from hunter_sim.scene_runner.builtin_scenario import _ScriptedWalker
+
+        scenario = self._ego_scenario(3.0)
+        actor = MockActor("walker.pedestrian.0001")
+        walker = _ScriptedWalker(
+            actor=actor,
+            destination=(0.0, 20.0, 0.3),
+            speed_ms=4.0,
+            carla_module=types.SimpleNamespace(),
+            spawn=SpawnPoint(x=0.0, y=0.0, z=0.3, yaw_deg=90.0),
+            mode="dash",
+            waiting=False,
+            dash_speed_ms=4.5,
+        )
+        scenario._scripted_walkers.append(walker)  # noqa: SLF001
+        assert scenario._participant_speed_ms(actor) == pytest.approx(4.5)  # noqa: SLF001
+        walker.waiting = True
+        assert scenario._participant_speed_ms(actor) == pytest.approx(0.0)  # noqa: SLF001
+        walker.waiting = False
+        walker.done = True
+        assert scenario._participant_speed_ms(actor) == pytest.approx(0.0)  # noqa: SLF001
+
+    def test_min_distance_samples_recorded(self) -> None:
+        scenario = self._ego_scenario(3.0)
+        ego = MockVehicle()
+        ego.set_transform(MockTransform(location=MockLocation(100.0, 100.0, 0.3)))
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=100.0, y=100.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._actors = [self._hazard(110.0, 100.0)]  # noqa: SLF001
+        scenario._trigger_metrics(None, 1.0, 0.02)  # noqa: SLF001
+        assert scenario.min_distance_samples == [pytest.approx(10.0)]

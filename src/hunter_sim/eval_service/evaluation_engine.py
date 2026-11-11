@@ -222,6 +222,8 @@ class EvaluationEngine:
         scene_duration_s: float = 60.0,
         completed: bool = True,
         takeover: bool = False,
+        min_safe_distance_m: float | None = None,
+        max_speed_deviation_ms: float | None = None,
     ) -> SceneEvaluationResult:
         """计算单场景的完整评估结果。
 
@@ -236,6 +238,10 @@ class EvaluationEngine:
             scene_duration_s: 场景设定运行时长。
             completed: 场景是否正常完成。
             takeover: 是否发生人工接管（文档 §9.2.4）。
+            min_safe_distance_m: 平台成功判据的最小安全距离阈值（米，V3.8.4）；
+                None 表示不下发该判据，退回文档默认目标。
+            max_speed_deviation_ms: 平台成功判据的速度偏差上限（m/s，V3.8.4）；
+                None 表示不下发该判据。
 
         Returns:
             SceneEvaluationResult。
@@ -251,6 +257,15 @@ class EvaluationEngine:
 
         # 成功准则（文档 §9.4 success_criteria）
         max_speed_deviation = max(0.0, efficiency.max_speed_ms - speed_limit_ms)
+        min_distance_ok = (
+            min_safe_distance_m is None
+            or safety.min_distance_m == float("inf")
+            or safety.min_distance_m >= min_safe_distance_m
+        )
+        speed_deviation_ok = (
+            max_speed_deviation_ms is None
+            or max_speed_deviation <= max_speed_deviation_ms
+        )
         success_criteria = {
             "no_collision": safety.collision_count == 0,
             "max_speed_deviation": round(max_speed_deviation, 3),
@@ -259,10 +274,23 @@ class EvaluationEngine:
                 if safety.min_distance_m != float("inf")
                 else None
             ),
+            # V3.8.4：平台判据阈值与逐项达标布尔（供平台裁决与报告展示）。
+            "min_safe_distance_required": min_safe_distance_m,
+            "max_speed_deviation_limit": max_speed_deviation_ms,
+            "min_safe_distance_ok": min_distance_ok,
+            "max_speed_deviation_ok": speed_deviation_ok,
         }
 
         # 任务指标：基于成功准则判定通过/失败（文档 §9.3 步骤 5）
-        passed = completed and not takeover and safety.meets_targets()
+        # V3.8.4：叠加平台下发的 min_safe_distance / max_speed_deviation 判据，
+        # 避免「近距擦碰/超速却 passed=True」的假通过。
+        passed = (
+            completed
+            and not takeover
+            and safety.meets_targets()
+            and min_distance_ok
+            and speed_deviation_ok
+        )
 
         # 等级判定（单场景用 pass/fail，批量用 pass_rate）
         grade = EvalGrade.S if passed else EvalGrade.D

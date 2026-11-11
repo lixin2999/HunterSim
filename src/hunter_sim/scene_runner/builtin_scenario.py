@@ -189,6 +189,16 @@ _EGO_BRAKE_ACTION_KEYWORDS = ("brake", "stop", "decelerate")
 #: （横向数米）时不制动，避免「自车刹停 ↔ 行人等自车靠近」互锁死锁。
 _EGO_BRAKE_LANE_HALF_M = 2.0
 
+#: V3.8.4：事件制动释放滞回半宽（米）。制动一旦生效（锁存），需危险物横向越过
+#: 该更宽阈值或落到自车后方才释放，避免横穿物在 2m 边界来回穿越导致
+#: 「制动↔巡航」高频切换（画面抖动 + 近距擦碰）。
+_EGO_BRAKE_RELEASE_HALF_M = 3.0
+#: V3.8.4：确定性控制输出（油门/刹车/转向）一阶低通系数，抑制 bang-bang 切换
+#: 引起的悬架俯仰/侧倾阶跃（环视相机刚性挂自车，表现为画面抖动）。
+_EGO_CTRL_EMA_ALPHA = 0.35
+#: V3.8.4：最小车距采样上限（防超长场景内存膨胀）。
+_MAX_MIN_DISTANCE_SAMPLES = 20000
+
 #: 事件度量纵向加速度的一阶低通系数（与面板/遥测口径一致）。
 _ACCEL_EMA_ALPHA = 0.5
 
@@ -393,6 +403,12 @@ class BuiltinScenario(CustomScenarioBase):
         self._world: Any = None
         self._ego_lane_steer: float = 0.0
         self._ego_lane_steer_age_s: float = 0.0
+        # V3.8.4：事件制动滞回锁存 + 控制输出低通状态 + 最小车距采样（评估用）。
+        self._ego_brake_latched: bool = False
+        self._ego_ctrl_throttle: float = 0.0
+        self._ego_ctrl_brake: float = 0.0
+        self._ego_ctrl_steer: float = 0.0
+        self.min_distance_samples: list[float] = []
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
         self._ego_event_brake_ms: Optional[float] = None
@@ -467,7 +483,9 @@ class BuiltinScenario(CustomScenarioBase):
                 "blueprint": getattr(actor, "type_id", participant.blueprint),
                 "spawned": actor is not None,
                 "speed_ms": (
-                    round(self._current_speed(actor), 2) if actor is not None else 0.0
+                    round(self._participant_speed_ms(actor), 2)
+                    if actor is not None
+                    else 0.0
                 ),
                 "x": None,
                 "y": None,
@@ -521,6 +539,11 @@ class BuiltinScenario(CustomScenarioBase):
         self._world = world
         self._ego_lane_steer = 0.0
         self._ego_lane_steer_age_s = 0.0
+        self._ego_brake_latched = False
+        self._ego_ctrl_throttle = 0.0
+        self._ego_ctrl_brake = 0.0
+        self._ego_ctrl_steer = 0.0
+        self.min_distance_samples = []
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
@@ -742,6 +765,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego = None
         self._ego_spawn = None
         self._world = None
+        self._ego_brake_latched = False
+        self.min_distance_samples = []
         self._actors.clear()
         self._actor_by_participant.clear()
         self._participant_spawns.clear()
@@ -1422,14 +1447,21 @@ class BuiltinScenario(CustomScenarioBase):
         参与者时才返回制动目标，否则返回 None（恢复巡航）。
         """
         if self._ego_event_brake_ms is None:
+            self._ego_brake_latched = False
             return None
         if self._hazard_in_ego_path():
             return self._ego_event_brake_ms
         return None
 
     def _hazard_in_ego_path(self) -> bool:
-        """是否存在落在自车行驶路径内（前方且横向≤半宽）的参与者。"""
+        """是否存在落在自车行驶路径内（前方且横向≤半宽）的参与者。
+
+        V3.8.4：带滞回。未锁存时用进入半宽 ``_EGO_BRAKE_LANE_HALF_M`` 判定；一旦
+        制动生效（锁存）改用更宽的释放半宽 ``_EGO_BRAKE_RELEASE_HALF_M`` 且要求仍
+        在前方，直到危险物横向越界或落到后方才解锁，避免边界抖振与近距擦碰。
+        """
         if self._ego is None:
+            self._ego_brake_latched = False
             return False
         forward, left = self._ego_axes()
         try:
@@ -1437,6 +1469,11 @@ class BuiltinScenario(CustomScenarioBase):
             ex, ey = float(location.x), float(location.y)
         except Exception:  # noqa: BLE001
             return False
+        half = (
+            _EGO_BRAKE_RELEASE_HALF_M
+            if self._ego_brake_latched
+            else _EGO_BRAKE_LANE_HALF_M
+        )
         for actor in self._actors:
             try:
                 p = actor.get_transform().location
@@ -1448,8 +1485,10 @@ class BuiltinScenario(CustomScenarioBase):
             dx, dy = px - ex, py - ey
             ahead = dx * forward[0] + dy * forward[1]
             lateral = abs(dx * left[0] + dy * left[1])
-            if ahead > 0.0 and lateral <= _EGO_BRAKE_LANE_HALF_M:
+            if ahead > 0.0 and lateral <= half:
+                self._ego_brake_latched = True
                 return True
+        self._ego_brake_latched = False
         return False
 
     def _reapply_post_spawn_controls_once(self) -> None:
@@ -1701,6 +1740,9 @@ class BuiltinScenario(CustomScenarioBase):
 
         V3.8.3：确定性模式下转向不再固定为初始值，改由 :meth:`_lane_keep_steer`
         沿车道中心线纯追踪过弯，避免直道判定之后的弯道把自车甩出路外。
+
+        V3.8.4：确定性模式下对油门/刹车/转向输出一阶低通，抑制 bang-bang 切换
+        引起的悬架俯仰/侧倾阶跃（环视相机刚性挂自车，表现为画面抖动）。
         """
         if self._ego is None:
             return
@@ -1732,6 +1774,13 @@ class BuiltinScenario(CustomScenarioBase):
         steer = self._ego_initial_steer
         if self._ego_deterministic:
             steer = self._lane_keep_steer(delta_seconds)
+            alpha = _EGO_CTRL_EMA_ALPHA
+            self._ego_ctrl_throttle += alpha * (throttle - self._ego_ctrl_throttle)
+            self._ego_ctrl_brake += alpha * (brake - self._ego_ctrl_brake)
+            self._ego_ctrl_steer += alpha * (steer - self._ego_ctrl_steer)
+            throttle = self._ego_ctrl_throttle
+            brake = self._ego_ctrl_brake
+            steer = self._ego_ctrl_steer
         self._apply_vehicle_control(
             self._ego,
             throttle=throttle,
@@ -1892,6 +1941,14 @@ class BuiltinScenario(CustomScenarioBase):
 
         distances, lead_gap, lead_speed = self._relative_gaps()
         metrics.relative_distance_m = distances
+        # V3.8.4：记录自车-参与者最小欧氏距离采样，供评估引擎判定 min_safe_distance。
+        gap = distances.get("euclidean")
+        if (
+            gap is not None
+            and gap != math.inf
+            and len(self.min_distance_samples) < _MAX_MIN_DISTANCE_SAMPLES
+        ):
+            self.min_distance_samples.append(float(gap))
         if lead_gap is None:
             self._warn_follow_condition_unmet()
             return metrics
@@ -2068,6 +2125,22 @@ class BuiltinScenario(CustomScenarioBase):
             return math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         except Exception:  # noqa: BLE001
             return 0.0
+
+    def _participant_speed_ms(self, actor: Any) -> float:
+        """参与者面板速度（m/s）。
+
+        V3.8.4：脚本化行人（sudden_cross 等）用 ``set_transform`` 推进，CARLA
+        ``get_velocity()`` 恒为 0，面板会误显「0.0 m/s 却在移动」。这里改报脚本
+        的有效速度（等待/到达=0，dash 用窜入速度），非脚本参与者仍读物理速度。
+        """
+        for walker in self._scripted_walkers:
+            if walker.actor is actor:
+                if walker.done or walker.waiting:
+                    return 0.0
+                if walker.mode == "dash" and walker.dash_speed_ms > 0:
+                    return float(walker.dash_speed_ms)
+                return float(walker.speed_ms)
+        return self._current_speed(actor)
 
     @staticmethod
     def _apply_vehicle_control(

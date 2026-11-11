@@ -605,20 +605,34 @@ class SimulationExecutor:
     def _evaluate(
         self, context: _RunContext, completed: bool
     ) -> SceneEvaluationResult:
-        """用已采样轨迹与事件计算评估结果。"""
+        """用已采样轨迹与事件计算评估结果。
+
+        V3.8.4：接入平台成功判据（success_criteria）与自车-参与者最小距离采样，
+        速度偏差以场景期望初速为基准，避免硬编码 10 m/s 与空采样导致的假通过。
+        """
         runner = context.runner
         events = [_event_to_dict(event) for event in _detected_events(runner)]
         collisions = [event for event in events if event.get("event_type") == "collision"]
+        criteria = dict(context.scene.extra_params.get("success_criteria") or {})
+        min_safe = criteria.get("min_safe_distance")
+        max_dev = criteria.get("max_speed_deviation")
+        desired_speed = float(context.scene.ego_vehicle.initial_speed_ms)
+        raw_samples = getattr(runner, "min_distance_samples", None)
+        min_distances = (
+            [float(v) for v in raw_samples] if isinstance(raw_samples, (list, tuple)) else []
+        )
         return self._evaluator.evaluate_scene(
             scene_id=context.scene.scene_id,
             vehicle_states=context.samples,
             events=events,
             collision_events=collisions,
             ttc_samples=[],
-            min_distances=[],
-            speed_limit_ms=10.0,
+            min_distances=min_distances,
+            speed_limit_ms=desired_speed if desired_speed > 0 else 10.0,
             scene_duration_s=context.scene.duration_seconds,
             completed=completed,
+            min_safe_distance_m=float(min_safe) if min_safe is not None else None,
+            max_speed_deviation_ms=float(max_dev) if max_dev is not None else None,
         )
 
     def _write_artifacts(
