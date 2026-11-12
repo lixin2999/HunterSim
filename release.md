@@ -4576,3 +4576,56 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.7 → **3.8.8**。
 
 ---
+
+## V3.8.9 — 欠速兜底解耦平台可选判据 + presign 4xx 记录响应体（实机 SCN-2085-1a1e-animal 暴露）
+
+**发布日期**：2026-11-12
+**版本定位**：问题修复（patch）。V3.8.8 实机验收确认卡滞 latch 自锁（缺陷 A）已修复（`ego_physical_stuck_probe` 每 6s 稳定探测、不再永久冻结），但停驶假通过（缺陷 B）**仍未兜住**：本场景 `success_criteria` 未带 `max_speed_deviation` 判据 → V3.8.8 欠速检查被整块跳过 → 冻结 218s 仍 `passed=True`。同时 presign 由 401 转 422（令牌已修、但响应体被丢弃无法定位）。
+
+### 缺陷 C：欠速检查门控在平台可选判据上（V3.8.8 未修干净）
+
+- **现象**：实机 `Instance completed: passed=True`，而自车 0.05 m/s 卡滞 218s（占 90% 时长）；`ego_physical_stuck_probe` 一路探到 233s 说明是真物理卡死、非 latch 自锁。
+- **根因**：V3.8.8 把欠速检查门控在 `max_speed_deviation_ms is not None` 上，而该值来自平台可选判据 `criteria.get("max_speed_deviation")`；本场景不下发该判据 → `max_speed_deviation_ms=None` → 整块欠速检查跳过，且 `speed_deviation_ok = (max_speed_deviation_ms is None or …)` 在判据缺失时恒 True。**把「防假通过」挂在了平台可发可不发的判据上，不发就消失**——正是 V3.8.4/V3.8.8 反复出现的「默认放行假通过」同类。
+- **变更**（`eval_service/evaluation_engine.py`）：
+  - 欠速偏差 `underspeed_deviation` 的计算**不再门控 `max_speed_deviation_ms`**：只要给出 `desired_speed_ms` 就算并留痕。
+  - `speed_deviation_ok` 分两支：① 平台下发 `max_speed_deviation_ms` → 双边按其阈值裁决（V3.8.8 语义，向后兼容）；② **平台未下发时启用内置兜底** `_ego_never_moved()`——仅当**全程最高速 与 ramp 后均值同时** < 期望×`_EVAL_STOP_FRACTION(0.5)` 才判「全程几乎没起步」→ fail。
+  - **兜底只拦停驶/楔死、不约束超速侧**（不发该判据的旧场景向后兼容）；**不误杀「先加速到期望、后刹停避让」**（后者最高速≈期望，不触发）；ramp 窗口内无采样（短场景）或无期望速度时不判（空采样≠欠速，与 V3.8.4 同口径）。
+  - `executor._evaluate` 无需改动（`desired_speed_ms` 已在 V3.8.8 透传）。
+
+### 缺陷 D：presign/complete 4xx 丢弃响应体（422 黑盒）
+
+- **现象**：产物直传 `presign HTTP 422`（V3.8.7 令牌 SOP 生效后 401 消失、认证已通过），但日志只有 `RuntimeError: /api/v1/data/files/presign HTTP 422`，看不到是哪个字段不合法。
+- **根因**：`platform_adapter/artifacts.py::_post` 在 4xx 时 `raise RuntimeError(f"{path} HTTP {status}")`，**只带状态码、丢弃响应体**。
+- **变更**：新增 `_response_detail()`（优先 `text` 后退 `content`、折叠空白、截断 `_RESPONSE_DETAIL_MAX_CHARS=200`、兼容无属性 mock 返回空串）；`_post` 4xx 异常与直传 `put` 失败日志均拼接截断响应体，使 422/4xx 可定位到具体非法字段。
+
+### 验证
+
+- 全量 `pytest`：**1615 passed**（1605 + 10 新增）；覆盖率门禁复测 **83.50%**（≥80%）。
+- 新增单测：`TestV389UnderspeedFallbackWithoutCriterion`（6 例：无判据卡滞复算失败/先行驶后刹停不误杀/正常巡航通过/短场景跳过/无期望无判据退回旧行为/`_ego_never_moved` 阈值与 None 守卫）、`TestV389PresignErrorDetail`（4 例：422 日志含响应体/字节解码截断/空白折叠/无属性 mock 返回空串）。
+- `flake8` exit=0；`mypy` Success（91 源文件）。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.9`。
+2. 重下发同一动物穿行场景：即使平台仍不下发 `max_speed_deviation`，只要自车全程几乎没起步，评估应输出 `max_speed_deviation_ok=false` → `passed=false`（不再假通过）。
+3. 若产物直传仍 422：日志会带上平台校验回文（如 `bucket`/`vehicle_id` 字段错误），据此定位请求体不合法字段。
+
+### 遗留（非本版本代码范围，属实机环境/平台侧）
+
+- **自车真物理卡死**：出生起 `throttle=1.0` 持续 3s → `actual=0.00`、最近障碍 45m 外、TM 已解除（`ego_speed_stuck` 里 `autopilot=True` 是日志误读配置声明值、非运行时状态）；探测给油仍不动 → 属 CARLA 物理/出生点层面（蓝图缺失回退、spawn z、路面几何），需现场排查。
+- **数据面 Kafka 全挂**：`sensor_data` 与 `simulation.sim-node-01.result` 全程 `Failed to update metadata after 1.0 secs`（doctor 显示 9093 可达但取不到 topic metadata）→ 典型 topic 未建+禁自动创建 / SASL 无 DESCRIBE 权限 / advertised.listeners 不可达，需平台侧处理。
+- **资产缺失**：`hunter_se` 蓝图缺失回退 `vehicle.tesla.model3`；animal `object_kind=cattle` 回退 pedestrian 蓝图。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.9`；`pyproject.toml` 版本 `3.8.9`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.9`，追加 V3.8.9 条目；测试计数 1605 → 1615。
+- `user_manual.md`：版本头 → V3.8.9；FAQ 补充「停驶假通过兜底不再依赖平台判据」「presign 4xx 带响应体」。
+- `deployment_and_operations.md`：版本头 → V3.8.9；新增 `### V3.8.8 → V3.8.9` 升级章节；排障表补 presign 422 行。
+- `docs/单机部署指南.md`：版本头 → V3.8.9；排障表补充 V3.8.9 行；冒烟预期补充 V3.8.9 bullet。
+- `pyproject.toml`：`version` 3.8.8 → **3.8.9**。
+
+---

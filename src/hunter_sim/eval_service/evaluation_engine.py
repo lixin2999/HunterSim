@@ -33,6 +33,12 @@ DEFAULT_FRAME_DT_S = 0.02
 #: 阶段，不计入平均速度，避免正常起步被误判欠速；无 ramp 后采样时跳过欠速检查。
 _EVAL_SPEED_RAMPUP_S = 5.0
 
+#: V3.8.9：平台未下发 ``max_speed_deviation`` 判据时的「停驶/楔死」兜底阈值系数。
+#: 仅当自车全程最高速 **与** 起步窗口后均值同时 < 期望速度 × 该系数，才判定自车
+#: 几乎没起步（区别于「先加速到期望、后刹停避让」——后者最高速≈期望，不触发），
+#: 修复「卡滞 214s 仍 passed=True」的默认放行假通过不再依赖平台是否发该可选判据。
+_EVAL_STOP_FRACTION = 0.5
+
 # 评估等级标准
 _EVAL_THRESHOLDS: list[tuple[EvalGrade, float, float]] = [
     (EvalGrade.S, 0.95, 0.00),   # 通过率 >= 95%, 碰撞率 0%
@@ -247,9 +253,11 @@ class EvaluationEngine:
                 None 表示不下发该判据，退回文档默认目标。
             max_speed_deviation_ms: 平台成功判据的速度偏差上限（m/s，V3.8.4）；
                 None 表示不下发该判据。
-            desired_speed_ms: 场景期望巡航速度（m/s，V3.8.8）；非 None 且下发了
-                max_speed_deviation_ms 时，偏差判据改为双边（超速/欠速取大），
-                修复「自车停驶 87% 时长却 passed=True」的单边假通过。
+            desired_speed_ms: 场景期望巡航速度（m/s，V3.8.8/V3.8.9）。与
+                max_speed_deviation_ms 同时下发时偏差判据双边（超速/欠速取大）；
+                未下发 max_speed_deviation_ms 但给出期望速度时，V3.8.9 启用内置
+                兜底：自车全程几乎没起步（最高速与 ramp 后均值均 < 期望×系数）
+                则判 fail，修复「停驶 87% 时长却 passed=True」不再依赖平台可选判据。
 
         Returns:
             SceneEvaluationResult。
@@ -264,26 +272,34 @@ class EvaluationEngine:
         comfort = self._compute_comfort(vehicle_states)
 
         # 成功准则（文档 §9.4 success_criteria）
-        max_speed_deviation = max(0.0, efficiency.max_speed_ms - speed_limit_ms)
-        # V3.8.8：欠速侧偏差——原判据只抓超速（max_speed − limit），自车长时间
-        # 停驶/爬行时 max_speed ≤ limit → deviation=0 → 假通过（实机 SCN-2085
-        # 冻结 214s 仍 passed=True）。仅当下发偏差上限且给出期望速度时启用，
-        # 排除起步窗口后取均值与期望比较，无采样则跳过（向后兼容）。
+        overspeed_deviation = max(0.0, efficiency.max_speed_ms - speed_limit_ms)
+        # V3.8.8/V3.8.9：欠速侧偏差——原判据只抓超速（max_speed − limit），自车长时间
+        # 停驶/爬行时 max_speed ≤ limit → deviation=0 → 假通过（实机 SCN-2085 冻结 214s
+        # 仍 passed=True）。V3.8.9 起欠速偏差的计算不再门控平台是否下发 max_speed_deviation：
+        # 只要给出期望速度就计算并留痕；是否据此判失败见下方 speed_deviation_ok 分支。
         underspeed_deviation = 0.0
-        if max_speed_deviation_ms is not None and desired_speed_ms:
+        avg_post_ramp: float | None = None
+        if desired_speed_ms:
             avg_post_ramp = self._post_ramp_avg_speed(vehicle_states, desired_speed_ms)
             if avg_post_ramp is not None:
                 underspeed_deviation = max(0.0, desired_speed_ms - avg_post_ramp)
-                max_speed_deviation = max(max_speed_deviation, underspeed_deviation)
+        # 双边偏差供报告展示与平台判据裁决用
+        max_speed_deviation = max(overspeed_deviation, underspeed_deviation)
         min_distance_ok = (
             min_safe_distance_m is None
             or safety.min_distance_m == float("inf")
             or safety.min_distance_m >= min_safe_distance_m
         )
-        speed_deviation_ok = (
-            max_speed_deviation_ms is None
-            or max_speed_deviation <= max_speed_deviation_ms
-        )
+        if max_speed_deviation_ms is not None:
+            # 平台显式下发偏差上限：双边按其阈值裁决（V3.8.8 语义，向后兼容）。
+            speed_deviation_ok = max_speed_deviation <= max_speed_deviation_ms
+        else:
+            # V3.8.9：平台未下发偏差上限时的内置兜底——只拦「全程几乎没起步」的停驶/楔死
+            # 假通过，不约束超速侧（保持不发该判据的旧场景向后兼容）；合法「先行驶后刹停
+            # 避让」的最高速≈期望，不会被误判。
+            speed_deviation_ok = not self._ego_never_moved(
+                efficiency.max_speed_ms, avg_post_ramp, desired_speed_ms
+            )
         success_criteria = {
             "no_collision": safety.collision_count == 0,
             "max_speed_deviation": round(max_speed_deviation, 3),
@@ -296,9 +312,7 @@ class EvaluationEngine:
             "min_safe_distance_required": min_safe_distance_m,
             "max_speed_deviation_limit": max_speed_deviation_ms,
             # V3.8.8：过/欠速明细（超速侧/欠速侧各自偏差，便于报告与排障）
-            "overspeed_deviation_ms": round(
-                max(0.0, efficiency.max_speed_ms - speed_limit_ms), 3
-            ),
+            "overspeed_deviation_ms": round(overspeed_deviation, 3),
             "underspeed_deviation_ms": round(underspeed_deviation, 3),
             "min_safe_distance_ok": min_distance_ok,
             "max_speed_deviation_ok": speed_deviation_ok,
@@ -462,6 +476,25 @@ class EvaluationEngine:
         if not speeds:
             return None
         return sum(speeds) / len(speeds)
+
+    @staticmethod
+    def _ego_never_moved(
+        max_speed_ms: float,
+        avg_post_ramp: float | None,
+        desired_speed_ms: float | None,
+    ) -> bool:
+        """判定自车是否「全程几乎没起步」（V3.8.9 欠速兜底，区别于先行驶后刹停）。
+
+        仅当最高速 **与** 起步窗口后均值同时 < 期望×``_EVAL_STOP_FRACTION`` 才判停驶/楔死：
+        先加速到期望再刹停避让的场景最高速≈期望，不触发（避免误杀合法避让）；
+        无期望速度或 ramp 窗口内无采样（``avg_post_ramp is None``）时不判（空采样≠欠速）。
+        """
+        if not desired_speed_ms or desired_speed_ms <= 0.0:
+            return False
+        if avg_post_ramp is None:
+            return False
+        threshold = desired_speed_ms * _EVAL_STOP_FRACTION
+        return max_speed_ms < threshold and avg_post_ramp < threshold
 
     @staticmethod
     def _compute_efficiency(

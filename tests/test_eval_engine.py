@@ -9,6 +9,7 @@ import pytest
 from hunter_sim.common.models import EvalGrade
 from hunter_sim.eval_service.evaluation_engine import (
     _EVAL_SPEED_RAMPUP_S,
+    _EVAL_STOP_FRACTION,
     BatchEvaluator,
     ComfortMetrics,
     determine_grade,
@@ -558,3 +559,93 @@ class TestV388BilateralSpeedDeviation:
         # 全部落在 ramp 窗口内 → None（跳过检查而非当 0 误判）
         early = self._states([(0.0, 2.0, 0.0)])
         assert EvaluationEngine._post_ramp_avg_speed(early, 3.0) is None  # noqa: SLF001
+
+
+class TestV389UnderspeedFallbackWithoutCriterion:
+    """V3.8.9：平台未下发 max_speed_deviation 时的欠速内置兜底。
+
+    V3.8.8 把欠速检查门控在 ``max_speed_deviation_ms is not None`` 上，实机
+    SCN-2085-...-1a1e-animal 的 success_criteria 未带该判据 → 检查被跳过 → 卡滞 218s
+    仍 passed=True。V3.8.9 只要给出期望速度就用内置兜底拦「全程几乎没起步」，
+    但不约束超速侧、不误杀「先行驶后刹停避让」。
+    """
+
+    @staticmethod
+    def _states(segments: list[tuple[float, float, float]]) -> list[dict[str, object]]:
+        """按 (起始s, 时长s, 速度m/s) 分段生成 10Hz 状态帧。"""
+        states: list[dict[str, object]] = []
+        for start_s, dur_s, speed in segments:
+            for i in range(int(dur_s * 10)):
+                states.append(
+                    {
+                        "vehicle_speed": speed,
+                        "timestamp": start_s + i * 0.1,
+                        "acceleration": (0.0, 0.0, 0.0),
+                        "steering": 0.0,
+                    }
+                )
+        return states
+
+    def _evaluate(self, states: list[dict[str, object]], **kwargs: Any) -> SceneEvaluationResult:
+        # 注意：不传 max_speed_deviation_ms，走 V3.8.9 内置兜底分支
+        return EvaluationEngine().evaluate_scene(
+            scene_id="v389",
+            vehicle_states=states,
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[],
+            speed_limit_ms=3.0,
+            scene_duration_s=220.0,
+            completed=True,
+            **kwargs,
+        )
+
+    def test_wedged_ego_no_criterion_now_fails(self) -> None:
+        """复刻实机：全程 0.05 m/s 爬行、无平台偏差判据 → 兜底拦下 passed=False。"""
+        states = self._states([(0.0, 220.0, 0.05)])
+        result = self._evaluate(states, desired_speed_ms=3.0)
+        assert result.passed is False
+        sc = result.success_criteria
+        assert sc["max_speed_deviation_ok"] is False
+        assert sc["underspeed_deviation_ms"] == pytest.approx(2.95, abs=0.1)
+
+    def test_drive_then_avoidance_stop_not_flagged(self) -> None:
+        """合法「先巡航 3.0、后刹停避让」：最高速≈期望 → 不被兜底误杀。"""
+        states = self._states([(0.0, 100.0, 3.0), (100.0, 120.0, 0.0)])
+        result = self._evaluate(states, desired_speed_ms=3.0)
+        assert result.passed is True
+        assert result.success_criteria["max_speed_deviation_ok"] is True
+
+    def test_normal_cruise_no_criterion_passes(self) -> None:
+        """全程正常巡航：ramp 后均值≈期望 → 通过。"""
+        states = self._states([(0.0, 220.0, 3.0)])
+        result = self._evaluate(states, desired_speed_ms=3.0)
+        assert result.passed is True
+
+    def test_short_scene_no_criterion_skips(self) -> None:
+        """短场景（全落在 ramp 窗口）：无采样→不判（空采样≠欠速）。"""
+        states = self._states([(0.0, 2.0, 0.1)])
+        result = self._evaluate(states, desired_speed_ms=3.0)
+        assert result.passed is True
+
+    def test_no_desired_no_criterion_legacy_pass(self) -> None:
+        """既无期望速度又无判据：保持旧行为（偏差侧全放行）。"""
+        states = self._states([(0.0, 220.0, 0.0)])
+        result = self._evaluate(states)
+        assert result.passed is True
+        assert result.success_criteria["underspeed_deviation_ms"] == 0.0
+
+    def test_ego_never_moved_threshold_and_none_guard(self) -> None:
+        """_ego_never_moved 单元：双低才判、任一高即不判、None/无期望不判。"""
+        never = EvaluationEngine._ego_never_moved  # noqa: SLF001
+        thr = 3.0 * _EVAL_STOP_FRACTION
+        assert never(max_speed_ms=thr - 0.1, avg_post_ramp=thr - 0.1, desired_speed_ms=3.0) is True
+        # 最高速达阈（先行驶后刹停）→ 不判
+        assert never(max_speed_ms=thr + 0.1, avg_post_ramp=0.0, desired_speed_ms=3.0) is False
+        # 均值达阈（正常巡航）→ 不判
+        assert never(max_speed_ms=0.0, avg_post_ramp=thr + 0.1, desired_speed_ms=3.0) is False
+        # 无采样 / 无期望 / 期望≤0 → 不判
+        assert never(max_speed_ms=0.0, avg_post_ramp=None, desired_speed_ms=3.0) is False
+        assert never(max_speed_ms=0.0, avg_post_ramp=0.0, desired_speed_ms=None) is False
+        assert never(max_speed_ms=0.0, avg_post_ramp=0.0, desired_speed_ms=0.0) is False

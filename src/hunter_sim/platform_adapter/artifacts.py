@@ -142,6 +142,7 @@ class ArtifactManager:
                 if getattr(response, "status_code", 500) >= 300:
                     logger.warning(
                         f"产物直传失败 {file_name}: HTTP {response.status_code}"
+                        f": {_response_detail(response)}"
                     )
                     return None
             self._complete(client, presign, path)
@@ -190,8 +191,13 @@ class ArtifactManager:
         """POST 到 data-collector 并解统一响应体。"""
         url = self._settings.gateway_url.rstrip("/") + path
         response = client.post(url, json=body)
-        if getattr(response, "status_code", 500) >= 400:
-            raise RuntimeError(f"{path} HTTP {response.status_code}")
+        status = getattr(response, "status_code", 500)
+        if status >= 400:
+            # V3.8.9：带上截断响应体，使 4xx（如 presign 422 字段校验失败）可定位；
+            # 旧版只抛状态码、丢弃响应体，导致 422 黑盒无法排障。
+            raise RuntimeError(
+                f"{path} HTTP {status}: {_response_detail(response)}"
+            )
         payload = response.json()
         code = payload.get("code") if isinstance(payload, dict) else None
         if code not in (0, None):
@@ -212,6 +218,36 @@ def _safe(value: str) -> str:
     """路径/对象键安全化（只保留字母数字与 ``._-``）。"""
     cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in value)
     return cleaned or "unknown"
+
+
+#: 错误响应体入日志的最大长度（字符）：足够容纳平台校验回文又不至于刷屏。
+_RESPONSE_DETAIL_MAX_CHARS = 200
+
+
+def _response_detail(response: Any) -> str:
+    """从响应里取截断文本（供 4xx/5xx 定位）；无文本/读取失败返回空串。
+
+    兼容 mock（无 ``text``/``content`` 属性时 ``getattr`` 返回 None → 空串），
+    不抛异常；优先 ``text``（已解码）后退 ``content``（字节）。
+    """
+    raw: Any = None
+    for attr in ("text", "content"):
+        try:
+            raw = getattr(response, attr, None)
+        except Exception:  # noqa: BLE001  任何读取异常都不影响主流程
+            raw = None
+        if raw:
+            break
+    if not raw:
+        return ""
+    try:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    except Exception:  # noqa: BLE001
+        return ""
+    text = " ".join(text.split())
+    if len(text) > _RESPONSE_DETAIL_MAX_CHARS:
+        text = text[:_RESPONSE_DETAIL_MAX_CHARS] + "…"
+    return text
 
 
 __all__ = ["ArtifactManager", "ArtifactResult"]

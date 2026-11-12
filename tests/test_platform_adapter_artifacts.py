@@ -9,13 +9,19 @@ import pytest
 from pydantic import SecretStr
 
 from hunter_sim.common.models import CloudSettings
-from hunter_sim.platform_adapter.artifacts import ArtifactManager
+from hunter_sim.platform_adapter.artifacts import ArtifactManager, _response_detail
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int = 200, payload: Optional[dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        status_code: int = 200,
+        payload: Optional[dict[str, Any]] = None,
+        text: Optional[str] = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload or {}
+        self.text = text
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -30,10 +36,14 @@ class _FakeClient:
         presign: Optional[dict[str, Any]] = None,
         put_status: int = 200,
         post_error: bool = False,
+        post_status: int = 200,
+        post_text: Optional[str] = None,
     ) -> None:
         self.presign = presign or {}
         self.put_status = put_status
         self.post_error = post_error
+        self.post_status = post_status
+        self.post_text = post_text
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.puts: list[str] = []
 
@@ -41,6 +51,8 @@ class _FakeClient:
         if self.post_error:
             raise RuntimeError("presign unavailable")
         self.posts.append((url, json))
+        if self.post_status >= 400:
+            return _FakeResponse(self.post_status, {}, text=self.post_text)
         if url.endswith("/presign"):
             return _FakeResponse(200, {"code": 0, "data": self.presign})
         return _FakeResponse(200, {"code": 0, "data": {}})
@@ -161,3 +173,48 @@ class TestPresignedUpload:
         # 不允许逃逸出实例目录
         resolved = (manager.directory / artifact.object_key.split("/")[-1]).resolve()
         assert manager.directory.resolve() in resolved.parents
+
+
+class TestV389PresignErrorDetail:
+    """V3.8.9：presign/complete 4xx 带上截断响应体，使 422 等校验失败可定位。
+
+    旧版 _post 在 4xx 只抛状态码、丢弃响应体（实机 presign 422 无法看到哪个字段
+    不合法）；V3.8.9 把响应体截断后拼进异常/日志。
+    """
+
+    def test_presign_422_logs_response_body(self, tmp_path: Path, caplog) -> None:
+        client = _FakeClient(
+            post_status=422,
+            post_text='{"detail":[{"loc":["body","bucket"],"msg":"field required"}]}',
+        )
+        manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
+
+        with caplog.at_level("WARNING"):
+            artifact = manager.write_json("eval.json", {})
+
+        assert artifact.uploaded is False
+        # 异常信息既含状态码又含响应体片段（不再黑盒）
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "HTTP 422" in joined
+        assert "bucket" in joined and "field required" in joined
+
+    def test_response_detail_decodes_bytes_and_truncates(self) -> None:
+        class _Resp:
+            content = b"a" * 500
+
+        detail = _response_detail(_Resp())
+        assert len(detail) <= 201  # 200 字 + 省略号
+        assert detail.endswith("…")
+
+    def test_response_detail_normalizes_whitespace(self) -> None:
+        class _Resp:
+            text = "  err1\n  err2   err3 "
+
+        assert _response_detail(_Resp()) == "err1 err2 err3"
+
+    def test_response_detail_empty_when_no_text_attr(self) -> None:
+        # 兼容旧 mock（无 text/content 属性）：返回空串而非报错
+        class _Bare:
+            status_code = 500
+
+        assert _response_detail(_Bare()) == ""
