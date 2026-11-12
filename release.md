@@ -4525,3 +4525,54 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.6 → **3.8.7**。
 
 ---
+
+## V3.8.8 — 卡滞 latch 自锁修复 + 速度偏差判据双边化（实机 SCN-2085 暴露）
+
+**发布日期**：2026-11-12
+**版本定位**：问题修复（patch）。V3.8.7 实机验收（动物穿行 SCN-2085-AC-HRD-L4）确认待办 1/2 通过后，暴露两个存量缺陷：自车 0 m/s 冻结 214s（V3.8.6 卡滞保护自锁）却仍 `passed=True`（偏差判据单边）。
+
+### 缺陷 A：物理卡滞 latch 自锁（冻结整场）
+
+- **现象**：`18:20:10 ego_physical_stuck: throttle=1.00 却 actual=0.00` 后，`ego_speed_stuck …throttle=0.00 brake=0.30` 持续刷屏到 214s 场景结束；期间动物已 done 并离开行驶路径（横向 5.6m > 释放半宽 3.0m，事件制动已正确释放），自车仍不动。
+- **根因**：V3.8.6 卡滞保护的复位/恢复检查嵌在「`throttle>0.5 且 current<0.1`」门内：latch 后施加 `brake=0.30` 使 `current` 恒 0，而恢复行驶时 `throttle` 由 P 控制器重算（目标 3.0、current≈0 → 仍 >0.5）——两个方向的复位条件都不可达，形成**自锁死锁**：保护机制把自己焊死在保护态。
+- **变更**（`scene_runner/builtin_scenario.py`）：
+  - latch 态改为**优先判定的周期探测状态机**：`current ≥ _EGO_PHYS_STUCK_CLEAR_MS(0.3)` 即解除并落 `ego_physical_stuck_recovered` INFO（恢复判定不再受原门条件限制）；未恢复时每 `_EGO_PHYS_STUCK_PROBE_INTERVAL_S(5.0)` 释放制动、给 `_EGO_PHYS_STUCK_PROBE_THROTTLE(0.6)` 探 `_EGO_PHYS_STUCK_PROBE_S(1.0)`，落 `ego_physical_stuck_probe` WARNING；真楔住时窗口到期自动回锁、下个间隔再探。
+  - **危险物仍在行驶路径（事件制动生效）时绝不探测**，避免顶着制动给油冲撞参与者（与 V3.8.2 互锁修复口径对齐）。
+  - latch/探测日志附 `_nearest_actor_summary()`（最近 Actor 距离/前瞻/横向），区分「顶住障碍」与「空转打滑/路外」两类根因。
+  - 新常量 `_EGO_PHYS_STUCK_LATCH_MS=0.1`（沿用旧语义）与探测/滞回阈值；新状态字段 `_ego_phys_stuck_latched_at_s/_next_probe_at_s/_probe_until_s`（`__init__` + `setup()` 重置）。
+
+### 缺陷 B：速度偏差判据单边（停驶假通过）
+
+- **现象**：自车 0 m/s 冻结 87% 时长，`Instance completed: passed=True`。
+- **根因**：`eval_service/evaluation_engine.py` 的 `max_speed_deviation = max(0, max_speed − speed_limit)` 只抓超速侧；冻结时 `max_speed(3.0) ≤ limit(3.0)` → deviation=0 → `speed_deviation_ok=True`。与 V3.8.4「空采样=达标」同类：「没测到超速」被当成「没违规」。
+- **变更**：
+  - `evaluate_scene` 新增可选参 `desired_speed_ms`；仅当下发 `max_speed_deviation_ms` **且**给出期望速度时启用欠速侧：`_post_ramp_avg_speed` 取排除起步窗口（`_EVAL_SPEED_RAMPUP_S=5.0`s）后的平均速度，`underspeed_deviation = max(0, desired − avg)`，偏差取过/欠两侧较大者；ramp 窗口内无采样（短场景）则跳过，不误伤。
+  - `success_criteria` 新增 `overspeed_deviation_ms` / `underspeed_deviation_ms` 明细供报告与排障。
+  - `platform_adapter/executor._evaluate` 透传 `desired_speed_ms=initial_speed_ms`（>0 才传）。
+  - 实机场景复算：avg≈0.1 → deviation≈2.9 > 1.15 → `passed=false`；正常短暂停驶（如 60s 巡航中停 6s）deviation≈0.5 < 1.15 不误伤。
+
+### 验证
+
+- 全量 `pytest`：**1605 passed**（1597 + 8 新增）；覆盖率门禁复测 **83.46%**（≥80%）。
+- 新增单测：`TestV388StuckProbeRecovery`（3 例：探测恢复解除/真楔住窗口到期回锁且下轮已排定/事件制动在路径不探测）、`TestV388BilateralSpeedDeviation`（5 例：冻结复算失败/正常不误伤/未传期望退回单边/短场景跳过/ramp 过滤）。
+- `flake8` exit=0；`mypy` Success（91 源文件）。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.8`。
+2. 重下发动物穿行场景：若再发生卡滞，日志应每 5s 出现一次 `ego_physical_stuck_probe`；动物离开路径后探测成功应落 `ego_physical_stuck_recovered` 并恢复巡航（不再冻结到场景结束）。
+3. 即使因物理原因（顶住障碍）整场停驶，评估应输出 `underspeed_deviation_ms > 上限` → `passed=false`（不再假通过）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.8`；`pyproject.toml` 版本 `3.8.8`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.8`，追加 V3.8.8 条目；测试计数 1597 → 1605。
+- `user_manual.md`：版本头 → V3.8.8；FAQ 补充「卡滞探测恢复日志」「停驶不再假通过」。
+- `deployment_and_operations.md`：版本头 → V3.8.8；新增 `### V3.8.7 → V3.8.8` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.8；排障表补充 V3.8.8 行；冒烟预期补充 V3.8.8 bullet。
+- `pyproject.toml`：`version` 3.8.7 → **3.8.8**。
+
+---

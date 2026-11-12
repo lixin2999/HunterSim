@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from hunter_sim.common.models import EvalGrade
 from hunter_sim.eval_service.evaluation_engine import (
+    _EVAL_SPEED_RAMPUP_S,
     BatchEvaluator,
     ComfortMetrics,
     determine_grade,
@@ -459,3 +462,99 @@ class TestPublishResults:
             result=result,
         )
         # 无异常即通过
+
+
+class TestV388BilateralSpeedDeviation:
+    """V3.8.8：速度偏差判据双边化，修复长时间停驶的假通过。
+
+    原判据只算 max_speed − limit（超速侧），自车冻结 87% 时长时 max_speed ≤
+    limit → deviation=0 → passed=True（实机 SCN-2085）。下发偏差上限且给出
+    期望速度时叠加欠速侧：排除起步窗口后取均值与期望比较；无采样/未给
+    期望则跳过（向后兼容、不误伤短场景与正常短暂停驶）。
+    """
+
+    @staticmethod
+    def _states(segments: list[tuple[float, float, float]]) -> list[dict[str, object]]:
+        """按 (起始s, 时长s, 速度m/s) 分段生成 10Hz 状态帧。"""
+        states: list[dict[str, object]] = []
+        for start_s, dur_s, speed in segments:
+            n = int(dur_s * 10)
+            for i in range(n):
+                states.append(
+                    {
+                        "vehicle_speed": speed,
+                        "timestamp": start_s + i * 0.1,
+                        "acceleration": (0.0, 0.0, 0.0),
+                        "steering": 0.0,
+                    }
+                )
+        return states
+
+    def _evaluate(self, states: list[dict[str, object]], **kwargs: Any) -> SceneEvaluationResult:
+        return EvaluationEngine().evaluate_scene(
+            scene_id="v388",
+            vehicle_states=states,
+            events=[],
+            collision_events=[],
+            ttc_samples=[],
+            min_distances=[],
+            speed_limit_ms=3.0,
+            scene_duration_s=220.0,
+            completed=True,
+            **kwargs,
+        )
+
+    def test_underspeed_frozen_ego_fails_deviation(self) -> None:
+        """复刻实机：前 12s 巡航 3.0，之后冻结 208s → passed=False、欠速明细留痕。"""
+        states = self._states([(0.0, 12.0, 3.0), (12.0, 208.0, 0.0)])
+        result = self._evaluate(
+            states,
+            max_speed_deviation_ms=1.15,
+            desired_speed_ms=3.0,
+        )
+        assert result.passed is False
+        sc = result.success_criteria
+        assert sc["max_speed_deviation_ok"] is False
+        assert sc["overspeed_deviation_ms"] == pytest.approx(0.0)
+        # ramp 后均值 ≈ (7s×3.0 + 208s×0) / 215 ≈ 0.10 → 欠速偏差 ≈ 2.9
+        assert sc["underspeed_deviation_ms"] == pytest.approx(2.90, abs=0.15)
+
+    def test_normal_drive_not_penalized(self) -> None:
+        """短暂停驶 6s（含巡航 3.0）：欠速偏差在上限内→仍通过。"""
+        states = self._states([(0.0, 60.0, 3.0), (60.0, 6.0, 0.0), (66.0, 54.0, 3.0)])
+        result = self._evaluate(
+            states,
+            max_speed_deviation_ms=1.15,
+            desired_speed_ms=3.0,
+        )
+        assert result.passed is True
+        assert result.success_criteria["max_speed_deviation_ok"] is True
+
+    def test_no_desired_keeps_legacy_overspeed_only(self) -> None:
+        """未传期望速度：退回单边超速判据（向后兼容旧调用）。"""
+        states = self._states([(0.0, 30.0, 0.0)])  # 全程停驶
+        result = self._evaluate(states, max_speed_deviation_ms=1.15)
+        assert result.passed is True
+        assert result.success_criteria["underspeed_deviation_ms"] == 0.0
+
+    def test_short_scene_skips_underspeed(self) -> None:
+        """ramp 窗口内无采样（短场景）：跳过欠速检查，不把好场景误判失败。"""
+        states = self._states([(0.0, 2.0, 0.5)])
+        result = self._evaluate(
+            states,
+            max_speed_deviation_ms=1.15,
+            desired_speed_ms=3.0,
+        )
+        assert result.passed is True
+        assert result.success_criteria["underspeed_deviation_ms"] == 0.0
+
+    def test_post_ramp_avg_speed_excludes_rampup(self) -> None:
+        """_post_ramp_avg_speed 只取起步窗口后的采样。"""
+        states = self._states(
+            [(0.0, _EVAL_SPEED_RAMPUP_S, 0.0), (_EVAL_SPEED_RAMPUP_S, 1.0, 2.0)]
+        )
+        avg = EvaluationEngine._post_ramp_avg_speed(states, desired_speed_ms=3.0)  # noqa: SLF001
+        assert avg == pytest.approx(2.0)
+        # 全部落在 ramp 窗口内 → None（跳过检查而非当 0 误判）
+        early = self._states([(0.0, 2.0, 0.0)])
+        assert EvaluationEngine._post_ramp_avg_speed(early, 3.0) is None  # noqa: SLF001

@@ -19,6 +19,8 @@ from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.scene_runner.builtin_scenario import (
     _EGO_BRAKE_HOLD,
     _EGO_CTRL_EMA_ALPHA,
+    _EGO_PHYS_STUCK_PROBE_INTERVAL_S,
+    _EGO_PHYS_STUCK_PROBE_THROTTLE,
     _EGO_SPEED_FEEDFORWARD,
     BuiltinScenario,
 )
@@ -2023,6 +2025,114 @@ class TestV386IntersectionBranchSampleRetentionAndWedgeGuard:
         kwargs = ctl.call_args.kwargs
         assert kwargs["throttle"] == 0.0
         assert kwargs["brake"] == pytest.approx(_EGO_BRAKE_HOLD)
+
+
+class TestV388StuckProbeRecovery:
+    """V3.8.8：卡滞 latch 周期探测恢复，修复自锁死锁。
+
+    V3.8.6 的复位条件「throttle≤0.5 或 current≥0.1」被 latch 自身施加的制动阻断：
+    P 控制器恒重算出 throttle=1.0、制动使 current 恒 0 → 永不复位（实机 SCN-2085
+    动物已离开路径仍冻结 214s）。改为：探测间隔到期释放制动给油试探，
+    速度达阈值解除并复位；事件制动在路径时禁止探测；真楔住时探测窗口到期回锁。
+    """
+
+    @staticmethod
+    def _scenario() -> BuiltinScenario:
+        scenario = TestV386IntersectionBranchSampleRetentionAndWedgeGuard._scenario()
+        ego = mock.Mock()
+        ego.get_velocity.return_value = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        ego.get_transform.return_value = types.SimpleNamespace(
+            location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            rotation=types.SimpleNamespace(yaw=0.0),
+        )
+        scenario._ego = ego  # noqa: SLF001
+        scenario._ego_deterministic = False  # noqa: SLF001  避开 EMA 低通
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._actors = []  # noqa: SLF001  无危险物→事件制动不拦截探测
+        return scenario
+
+    @staticmethod
+    def _drive(
+        scenario: BuiltinScenario, timeline: list[tuple[float, float]]
+    ) -> dict[str, float]:
+        """按 (elapsed, forward_speed) 序列逐 tick 驱动，返回末 tick 控制量。"""
+        ego = scenario._ego  # noqa: SLF001
+        with mock.patch.object(scenario, "_apply_vehicle_control") as ctl:
+            for elapsed, speed in timeline:
+                scenario._elapsed = elapsed  # noqa: SLF001
+                ego.get_velocity.return_value = types.SimpleNamespace(
+                    x=speed, y=0.0, z=0.0
+                )
+                scenario._apply_ego_manual_speed(0.02)  # noqa: SLF001
+        return dict(ctl.call_args.kwargs)
+
+    def test_probe_recovers_and_clears_latch(self, caplog) -> None:
+        """latch 后到期探测给油；速度恢复→落 recovered 痕并复位状态机。"""
+        scenario = self._scenario()
+        with caplog.at_level(logging.INFO):
+            kwargs = self._drive(
+                scenario,
+                [
+                    (10.0, 0.0),  # 计时起点
+                    (14.0, 0.0),  # 持续 4s>3s → latch
+                    (19.0, 0.0),  # 探测间隔到期 → 释放制动给油
+                    (19.5, 0.5),  # 探测窗口内速度达阈值 → 解除
+                ],
+            )
+        assert kwargs["throttle"] == pytest.approx(1.0)  # 解除后本 tick 即恢复常规 P 输出
+        assert kwargs["brake"] == pytest.approx(0.0)
+        assert "ego_physical_stuck:" in caplog.text
+        assert "ego_physical_stuck_probe" in caplog.text
+        assert "ego_physical_stuck_recovered" in caplog.text
+        assert scenario._ego_phys_stuck_warned is False  # noqa: SLF001
+        assert scenario._ego_phys_stuck_since_s == 0.0  # noqa: SLF001
+        assert scenario._ego_phys_stuck_latched_at_s == 0.0  # noqa: SLF001
+
+    def test_true_wedge_relocks_after_probe_window(self) -> None:
+        """真楔住（物理上不动）：探测窗口到期回锁，下个间隔再探。"""
+        scenario = self._scenario()
+        kwargs = self._drive(
+            scenario,
+            [
+                (10.0, 0.0),
+                (14.0, 0.0),  # latch
+                (19.0, 0.0),  # 起探：给油
+                (19.5, 0.0),  # 窗口内仍不动，继续探测给油
+                (20.1, 0.0),  # 窗口到期（>19+1.0）回锁：停油+制动
+            ],
+        )
+        assert kwargs["throttle"] == 0.0
+        assert kwargs["brake"] == pytest.approx(_EGO_BRAKE_HOLD)
+        assert scenario._ego_phys_stuck_warned is True  # noqa: SLF001
+        # 下一轮探测时刻已在起探时一次性排定（窗口截止 + 间隔），回锁不重排
+        assert scenario._ego_phys_stuck_next_probe_at_s == pytest.approx(  # noqa: SLF001
+            20.0 + _EGO_PHYS_STUCK_PROBE_INTERVAL_S
+        )
+        # 到下个探测时刻仍不动 → 再次释放制动
+        kwargs = self._drive(scenario, [(25.2, 0.0)])
+        assert kwargs["throttle"] == pytest.approx(_EGO_PHYS_STUCK_PROBE_THROTTLE)
+
+    def test_no_probe_while_event_brake_in_path(self) -> None:
+        """危险物仍在行驶路径（事件制动生效）时绝不探测，避免冲撞。"""
+        scenario = self._scenario()
+        hazard = mock.Mock()
+        hazard.get_transform.return_value = types.SimpleNamespace(
+            location=types.SimpleNamespace(x=5.0, y=0.0, z=0.0),
+            rotation=types.SimpleNamespace(yaw=0.0),
+        )
+        scenario._actors = [hazard]  # noqa: SLF001  在路径内→制动保持
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001  武装事件制动（brake 动作默认停驶）
+        kwargs = self._drive(
+            scenario,
+            [
+                (10.0, 0.0),
+                (14.0, 0.0),  # latch
+                (20.0, 0.0),  # 已到探测时刻，但危险物在路径 → 不探测
+            ],
+        )
+        assert kwargs["throttle"] == 0.0
+        assert kwargs["brake"] == pytest.approx(_EGO_BRAKE_HOLD)
+        assert scenario._ego_phys_stuck_probe_until_s == 0.0  # noqa: SLF001
 
 
 class TestV387ParticipantLabelAndActionSemantics:

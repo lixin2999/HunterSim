@@ -609,6 +609,8 @@ class SimulationExecutor:
 
         V3.8.4：接入平台成功判据（success_criteria）与自车-参与者最小距离采样，
         速度偏差以场景期望初速为基准，避免硬编码 10 m/s 与空采样导致的假通过。
+        V3.8.8：透传 desired_speed_ms，使偏差判据双边化（长时间停驶/爬行不再
+        因 max_speed ≤ limit 而假通过，实机 SCN-2085 冻结 214s 仍 passed=True）。
         """
         runner = context.runner
         events = [_event_to_dict(event) for event in _detected_events(runner)]
@@ -633,6 +635,7 @@ class SimulationExecutor:
             completed=completed,
             min_safe_distance_m=float(min_safe) if min_safe is not None else None,
             max_speed_deviation_ms=float(max_dev) if max_dev is not None else None,
+            desired_speed_ms=desired_speed if desired_speed > 0 else None,
         )
 
     def _write_artifacts(

@@ -29,6 +29,10 @@ STEERING_SMOOTHNESS_TARGET = 0.3  # 转向平滑度 < 0.3 rad/s
 # 默认帧步长（秒，50Hz）：仅在无法从数据帧时间戳推导时作为回退（审查项 R）
 DEFAULT_FRAME_DT_S = 0.02
 
+#: V3.8.8：欠速侧偏差评估的起步窗口排除时长（秒）：场景开始前 N 秒为加速/起步
+#: 阶段，不计入平均速度，避免正常起步被误判欠速；无 ramp 后采样时跳过欠速检查。
+_EVAL_SPEED_RAMPUP_S = 5.0
+
 # 评估等级标准
 _EVAL_THRESHOLDS: list[tuple[EvalGrade, float, float]] = [
     (EvalGrade.S, 0.95, 0.00),   # 通过率 >= 95%, 碰撞率 0%
@@ -224,6 +228,7 @@ class EvaluationEngine:
         takeover: bool = False,
         min_safe_distance_m: float | None = None,
         max_speed_deviation_ms: float | None = None,
+        desired_speed_ms: float | None = None,
     ) -> SceneEvaluationResult:
         """计算单场景的完整评估结果。
 
@@ -242,6 +247,9 @@ class EvaluationEngine:
                 None 表示不下发该判据，退回文档默认目标。
             max_speed_deviation_ms: 平台成功判据的速度偏差上限（m/s，V3.8.4）；
                 None 表示不下发该判据。
+            desired_speed_ms: 场景期望巡航速度（m/s，V3.8.8）；非 None 且下发了
+                max_speed_deviation_ms 时，偏差判据改为双边（超速/欠速取大），
+                修复「自车停驶 87% 时长却 passed=True」的单边假通过。
 
         Returns:
             SceneEvaluationResult。
@@ -257,6 +265,16 @@ class EvaluationEngine:
 
         # 成功准则（文档 §9.4 success_criteria）
         max_speed_deviation = max(0.0, efficiency.max_speed_ms - speed_limit_ms)
+        # V3.8.8：欠速侧偏差——原判据只抓超速（max_speed − limit），自车长时间
+        # 停驶/爬行时 max_speed ≤ limit → deviation=0 → 假通过（实机 SCN-2085
+        # 冻结 214s 仍 passed=True）。仅当下发偏差上限且给出期望速度时启用，
+        # 排除起步窗口后取均值与期望比较，无采样则跳过（向后兼容）。
+        underspeed_deviation = 0.0
+        if max_speed_deviation_ms is not None and desired_speed_ms:
+            avg_post_ramp = self._post_ramp_avg_speed(vehicle_states, desired_speed_ms)
+            if avg_post_ramp is not None:
+                underspeed_deviation = max(0.0, desired_speed_ms - avg_post_ramp)
+                max_speed_deviation = max(max_speed_deviation, underspeed_deviation)
         min_distance_ok = (
             min_safe_distance_m is None
             or safety.min_distance_m == float("inf")
@@ -277,6 +295,11 @@ class EvaluationEngine:
             # V3.8.4：平台判据阈值与逐项达标布尔（供平台裁决与报告展示）。
             "min_safe_distance_required": min_safe_distance_m,
             "max_speed_deviation_limit": max_speed_deviation_ms,
+            # V3.8.8：过/欠速明细（超速侧/欠速侧各自偏差，便于报告与排障）
+            "overspeed_deviation_ms": round(
+                max(0.0, efficiency.max_speed_ms - speed_limit_ms), 3
+            ),
+            "underspeed_deviation_ms": round(underspeed_deviation, 3),
             "min_safe_distance_ok": min_distance_ok,
             "max_speed_deviation_ok": speed_deviation_ok,
         }
@@ -420,6 +443,25 @@ class EvaluationEngine:
             lane_invasion_count=lane_inv,
             red_light_count=red_light,
         )
+
+    @staticmethod
+    def _post_ramp_avg_speed(
+        states: list[dict[str, Any]], desired_speed_ms: float
+    ) -> float | None:
+        """起步窗口后的平均速度（V3.8.8 欠速判据用）；无采样返 None 跳过检查。
+
+        只取帧时间 ≥ ``_EVAL_SPEED_RAMPUP_S`` 的 ``vehicle_speed``，排除起步/加速
+        阶段；时间戳缺失或全部落在 ramp 窗口内（短场景）时返 None，避免把
+        「没测到」当成「欠速」（与 V3.8.4 空采样教训同口径）。
+        """
+        speeds = [
+            float(s.get("vehicle_speed", 0.0))
+            for s in states
+            if EvaluationEngine._frame_time_s(s) >= _EVAL_SPEED_RAMPUP_S
+        ]
+        if not speeds:
+            return None
+        return sum(speeds) / len(speeds)
 
     @staticmethod
     def _compute_efficiency(

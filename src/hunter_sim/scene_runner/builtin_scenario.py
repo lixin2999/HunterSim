@@ -176,6 +176,18 @@ _EGO_LANE_MAX_STEER_RAD = 0.7
 _EGO_LANE_STEER_INTERVAL_S = 0.1
 #: V3.8.6：物理卡滞判定窗口（秒）：油门高却几乎不动持续超此时长→停油保持制动。
 _EGO_PHYS_STUCK_S = 3.0
+#: V3.8.8：卡滞 latch 恢复探测——原实现 latch 后施加 brake=_EGO_BRAKE_HOLD 使车速
+#: 恒 <0.1，复位条件「throttle≤0.5 或 current≥0.1」被自身制动阻断，形成自锁死锁
+#: （实机 SCN-2085 动物已离开路径后仍冻结 214s）。改为周期探测状态机：每
+#: PROBE_INTERVAL_S 释放制动给 PROBE_THROTTLE 探 PROBE_S，速度达 CLEAR_MS 即解除。
+_EGO_PHYS_STUCK_PROBE_S = 1.0
+_EGO_PHYS_STUCK_PROBE_INTERVAL_S = 5.0
+_EGO_PHYS_STUCK_PROBE_THROTTLE = 0.6
+#: 解除卡滞的前向速度阈值（m/s）。与 latch 阈值（_EGO_PHYS_STUCK_LATCH_MS）拉开
+#: 区间形成滞回，避免「动了 0.05→解除→又判卡滞」高频抖动。
+_EGO_PHYS_STUCK_CLEAR_MS = 0.3
+#: V3.8.8：卡滞 latch 判定速度阈值（m/s），沿用 V3.8.6 的 current<0.1 语义。
+_EGO_PHYS_STUCK_LATCH_MS = 0.1
 #: 确定性速度控制：比例增益 / 巡航前馈油门 / 制动增益 / 稳态死区（m/s）。
 _EGO_SPEED_KP = 0.6
 _EGO_SPEED_FEEDFORWARD = 0.12
@@ -419,6 +431,10 @@ class BuiltinScenario(CustomScenarioBase):
         # V3.8.6：物理卡滞保护计时与告警标志（油门高却不动→停油保持制动）。
         self._ego_phys_stuck_since_s: float = 0.0
         self._ego_phys_stuck_warned: bool = False
+        # V3.8.8：卡滞 latch 恢复探测状态（latch 时刻 / 下次探测时刻 / 探测窗口截止）。
+        self._ego_phys_stuck_latched_at_s: float = 0.0
+        self._ego_phys_stuck_next_probe_at_s: float = 0.0
+        self._ego_phys_stuck_probe_until_s: float = 0.0
         self.min_distance_samples: list[float] = []
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
@@ -560,6 +576,9 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_ctrl_steer = 0.0
         self._ego_phys_stuck_since_s = 0.0
         self._ego_phys_stuck_warned = False
+        self._ego_phys_stuck_latched_at_s = 0.0
+        self._ego_phys_stuck_next_probe_at_s = 0.0
+        self._ego_phys_stuck_probe_until_s = 0.0
         self.min_distance_samples = []
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
@@ -1894,24 +1913,90 @@ class BuiltinScenario(CustomScenarioBase):
         # V3.8.6：物理卡滞保护——油门高却几乎不动（路外/楔住/顶住障碍）持续
         # >_EGO_PHYS_STUCK_S 时停止给油并保持制动，避免 throttle=1 空转楔死整场
         # （实机 Town01 自车冲出路外后 throttle=1.00/actual=0.00刷 170s）。
-        if throttle > 0.5 and current < 0.1:
+        # V3.8.8：latch 态改为优先判定的周期探测状态机，修复自锁死锁——旧实现的
+        # 复位/恢复检查嵌在「throttle>0.5 且 current<0.1」门内，latch 后速度一旦
+        # 恢复就不再进入该门，而常规控制又恒算出 throttle=1.0，永不可达复位
+        # （实机动物已离开路径仍冻结 214s）。
+        if self._ego_phys_stuck_warned:
+            # latched 态优先分支：恢复判定不受原门条件限制
+            if current >= _EGO_PHYS_STUCK_CLEAR_MS:
+                # 探测成功（或其它途径恢复移动）：解除 latch，复位计时与探测状态；
+                # 控制量不干预，本 tick 即恢复常规 P 控制输出（与 V3.8.6 复位语义一致）
+                logger.info(
+                    "ego_physical_stuck_recovered: actual=%.2f m/s ≥ %.2f，"
+                    "卡滞解除，恢复常规控制 latched=%.1fs",
+                    current,
+                    _EGO_PHYS_STUCK_CLEAR_MS,
+                    self.elapsed_seconds - self._ego_phys_stuck_latched_at_s,
+                )
+                self._ego_phys_stuck_since_s = 0.0
+                self._ego_phys_stuck_warned = False
+                self._ego_phys_stuck_latched_at_s = 0.0
+                self._ego_phys_stuck_next_probe_at_s = 0.0
+                self._ego_phys_stuck_probe_until_s = 0.0
+            elif self.elapsed_seconds < self._ego_phys_stuck_probe_until_s and (
+                event_brake is None
+            ):
+                # 探测窗口内：给油不起制动，让车尝试移动（真楔住时物理上仍不动，
+                # 窗口到期自动回锁）
+                throttle = _EGO_PHYS_STUCK_PROBE_THROTTLE
+                brake = 0.0
+            elif self.elapsed_seconds >= self._ego_phys_stuck_next_probe_at_s and (
+                event_brake is None
+            ):
+                # 开启新一轮探测窗口（下轮时刻与窗口截止在此一次性排定，
+                # 回锁分支不重排，避免浮点边界把窗口腰斩）
+                self._ego_phys_stuck_probe_until_s = (
+                    self.elapsed_seconds + _EGO_PHYS_STUCK_PROBE_S
+                )
+                self._ego_phys_stuck_next_probe_at_s = (
+                    self._ego_phys_stuck_probe_until_s + _EGO_PHYS_STUCK_PROBE_INTERVAL_S
+                )
+                logger.warning(
+                    "ego_physical_stuck_probe: 释放制动探测恢复（持续已 %.0fs）"
+                    "throttle=%.2f 探测 %.1fs nearest=%s",
+                    self.elapsed_seconds - self._ego_phys_stuck_latched_at_s,
+                    _EGO_PHYS_STUCK_PROBE_THROTTLE,
+                    _EGO_PHYS_STUCK_PROBE_S,
+                    self._nearest_actor_summary(),
+                )
+                throttle = _EGO_PHYS_STUCK_PROBE_THROTTLE
+                brake = 0.0
+            else:
+                # 保持锁死：停油 + 保持制动（危险物仍在路径时禁止探测，避免冲撞）
+                throttle = 0.0
+                brake = _EGO_BRAKE_HOLD
+        elif throttle > 0.5 and current < _EGO_PHYS_STUCK_LATCH_MS:
             if self._ego_phys_stuck_since_s == 0.0:
                 self._ego_phys_stuck_since_s = self.elapsed_seconds
             elif self.elapsed_seconds - self._ego_phys_stuck_since_s > _EGO_PHYS_STUCK_S:
-                if not self._ego_phys_stuck_warned:
-                    self._ego_phys_stuck_warned = True
-                    logger.warning(
-                        "ego_physical_stuck: throttle=%.2f 却 actual=%.2f m/s 持续 >%.0fs，"
-                        "判定物理卡滞（路外/楔住/顶住障碍），停止给油并保持制动",
-                        throttle,
-                        current,
-                        _EGO_PHYS_STUCK_S,
-                    )
+                self._ego_phys_stuck_warned = True
+                self._ego_phys_stuck_latched_at_s = self.elapsed_seconds
+                self._ego_phys_stuck_next_probe_at_s = (
+                    self.elapsed_seconds + _EGO_PHYS_STUCK_PROBE_INTERVAL_S
+                )
+                logger.warning(
+                    "ego_physical_stuck: throttle=%.2f 却 actual=%.2f m/s 持续 >%.0fs，"
+                    "判定物理卡滞（路外/楔住/顶住障碍），停止给油并保持制动，"
+                    "每 %.0fs 释放制动探测恢复 nearest=%s",
+                    throttle,
+                    current,
+                    _EGO_PHYS_STUCK_S,
+                    _EGO_PHYS_STUCK_PROBE_INTERVAL_S,
+                    self._nearest_actor_summary(),
+                )
                 throttle = 0.0
                 brake = _EGO_BRAKE_HOLD
+        elif current < _EGO_PHYS_STUCK_CLEAR_MS:
+            # 半动半停（0.1~0.3 m/s）：保持现有判定不打断计时也不复位，
+            # 避免在滞回区间内高频抖动
+            pass
         else:
             self._ego_phys_stuck_since_s = 0.0
             self._ego_phys_stuck_warned = False
+            self._ego_phys_stuck_latched_at_s = 0.0
+            self._ego_phys_stuck_next_probe_at_s = 0.0
+            self._ego_phys_stuck_probe_until_s = 0.0
         steer = self._ego_initial_steer
         if self._ego_deterministic:
             steer = self._lane_keep_steer(delta_seconds)
@@ -1928,6 +2013,36 @@ class BuiltinScenario(CustomScenarioBase):
             brake=brake,
             steer=steer,
         )
+
+    def _nearest_actor_summary(self) -> str:
+        """最近 Actor 观测摘要（ahead/lateral 米，自车坐标系），无可用 Actor 返 'n/a'。
+
+        V3.8.8：卡滞 latch/探测日志附带，用于区分「顶住障碍（近距）」与
+        「空转打滑/路外（无近距 Actor）」两类根因；仅读 get_transform，失败降级。
+        """
+        if self._ego is None:
+            return "n/a"
+        forward, left = self._ego_axes()
+        try:
+            location = self._ego.get_transform().location
+            ex, ey = float(location.x), float(location.y)
+        except Exception:  # noqa: BLE001
+            return "n/a"
+        best: tuple[float, float, float] | None = None
+        for actor in self._actors:
+            try:
+                p = actor.get_transform().location
+            except Exception:  # noqa: BLE001
+                continue
+            dx, dy = float(p.x) - ex, float(p.y) - ey
+            ahead = dx * forward[0] + dy * forward[1]
+            lateral = dx * left[0] + dy * left[1]
+            dist = math.hypot(dx, dy)
+            if best is None or dist < best[0]:
+                best = (dist, ahead, lateral)
+        if best is None:
+            return "n/a"
+        return f"{best[0]:.1f}m(ahead={best[1]:.1f},lat={best[2]:.1f})"
 
     def _lane_keep_steer(self, delta_seconds: float) -> float:
         """确定性控制的车道保持转向（V3.8.3：pure-pursuit 沿车道中心线）。
