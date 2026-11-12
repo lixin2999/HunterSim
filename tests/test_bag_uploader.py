@@ -158,6 +158,42 @@ def test_multipart_flow(tmp_path: Path) -> None:
     assert len(complete_body["parts"]) == 2
 
 
+def test_multipart_part_size_at_least_5mib(tmp_path: Path) -> None:
+    """V3.8.17 回归守卫：分片必须 ≥ 5 MiB（S3/MinIO 合并硬限，EntityTooSmall 根因）。
+
+    实机 V3.8.16 日志：1 MiB 分片各片 PUT 均成功，CompleteMultipartUpload 却被
+    MinIO 拒 `EntityTooSmall`→网关包成 complete 422。确保：切片按 _PART_SIZE，
+    除最后一片外每片≥ 5 MiB，且 presign 申报的 part_count 与实传片数一致。
+    """
+    from hunter_sim.cloud.bag_uploader import _PART_SIZE, _part_count
+
+    assert _PART_SIZE >= 5 * 1024 * 1024
+
+    data = b"z" * (_PART_SIZE + 5)  # 两片：满片 + 5B 尾片
+    bag = tmp_path / "bag.mcap"
+    bag.write_bytes(data)
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/bag.mcap",
+        "method": "multipart",
+        "upload_id": "uid-1",
+        "parts": [
+            {"part_number": 1, "upload_url": "http://minio/p1"},
+            {"part_number": 2, "upload_url": "http://minio/p2"},
+        ],
+    }
+    client = FakeClient(presign, multipart=True)
+    uploader = BagUploader(_settings(), client_factory=lambda: client)
+    uploader.connect()
+    assert uploader.upload(bag) is not None
+    assert [len(c) for _, c in client.puts] == [_PART_SIZE, 5]
+    assert _part_count(len(data)) == 2
+    # 实机体量（V3.8.16 日志 1.6 GB）换算：193 片，均 ≥ 5 MiB（末片 7.7 MiB）；
+    # 小于 32 MiB 阈值时 presign 不申报 part_count（现有行为，服务端自定分片）。
+    assert _part_count(1618711702) == 193
+    assert "part_count" not in client.posts[0][1]
+
+
 def test_business_error_code_raises(bag_file: Path) -> None:
     """统一响应体 code!=0 抛 UploadError。"""
 

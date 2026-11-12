@@ -23,7 +23,13 @@ logger = get_logger(__name__)
 
 _PRESIGN_PATH = "/api/v1/data/files/presign"
 _COMPLETE_PATH = "/api/v1/data/files/complete"
-_CHUNK = 1024 * 1024  # 分片大小 1 MiB
+# V3.8.17：multipart 分片大小必须 ≥ 5 MiB（S3/MinIO 硬限，除最后一片外）。
+# 旧值 1 MiB 时每个分片 PUT 单独都成功，却在 CompleteMultipartUpload 合并时
+# 被拒：`EntityTooSmall: Your proposed upload is smaller than the minimum
+# allowed object size`（实机 V3.8.16 日志 complete 422 响应体定性）。取 8 MiB：
+# 留出余量且内存占用可控（1.6 GB bag ≈ 193 片）。
+_PART_SIZE = 8 * 1024 * 1024
+_HASH_CHUNK = 1024 * 1024  # 流式哈希读块（与分片大小无关）
 # 超过该阈值走分片（大文件 ROS Bag）
 _MULTIPART_THRESHOLD = 32 * 1024 * 1024
 
@@ -195,7 +201,9 @@ class BagUploader:
         etags: list[dict[str, Any]] = []
         with file_path.open("rb") as fh:
             for part in parts:
-                chunk = fh.read(_CHUNK)
+                # V3.8.17：按 _PART_SIZE（≥ 5 MiB）切片；服务端按我们申报的 part_count
+                # 返回对应数量的 URL，顺序读取拼接即为完整文件，最后一片允许小于 5 MiB。
+                chunk = fh.read(_PART_SIZE)
                 # V3.8.14：每个分片 presigned URL 同样需回送签名时纳入的 content-type 等头。
                 part_headers = presigned_upload_headers(part["upload_url"])
                 resp = client.put(part["upload_url"], content=chunk, headers=part_headers)
@@ -286,7 +294,7 @@ def _digest_file(path: Path) -> tuple[int, str, str]:
     sha256 = hashlib.sha256()
     size = 0
     with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(_CHUNK), b""):
+        for block in iter(lambda: fh.read(_HASH_CHUNK), b""):
             size += len(block)
             md5.update(block)
             sha256.update(block)
@@ -294,8 +302,8 @@ def _digest_file(path: Path) -> tuple[int, str, str]:
 
 
 def _part_count(size: int) -> int:
-    """按分片大小估算 part 数。"""
-    return max(1, (size + _CHUNK - 1) // _CHUNK)
+    """按分片大小（_PART_SIZE，≥ 5 MiB）估算 part 数。"""
+    return max(1, (size + _PART_SIZE - 1) // _PART_SIZE)
 
 
 def _now() -> float:

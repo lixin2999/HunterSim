@@ -325,7 +325,7 @@ make doctor        # 部署预检
 
 当前门禁基线：
 
-- **测试**：`1644 passed`（单元 + 集成，V3.6.0 新增 68 项信箱/日志回归守卫），全仓行覆盖 **83.5%**（门禁 ≥80%）。
+- **测试**：`1645 passed`（单元 + 集成，V3.6.0 新增 68 项信箱/日志回归守卫），全仓行覆盖 **83.5%**（门禁 ≥80%）。
 - **类型**：`mypy src/hunter_sim`（strict）**91 个源文件 0 错误**。
 - **Lint**：`flake8 src tests` **0 告警**。
 - **死代码**：`tests/test_no_orphan_exports.py` 断言 `__init__.py` 导出的符号在包内有生产引用（本期接入的 `StateVisualizer`/`FrameHub`/`McapRecorder`/`FrameAligner`/`CarlaRosBridge` 均有回归守卫）。

@@ -4966,3 +4966,48 @@ presign_keys=['bucket','expires_in','method','object_key','parts','upload_id','u
 - `pyproject.toml`：`version` 3.8.15 → **3.8.16**。
 
 ---
+
+## V3.8.17 — bag multipart 分片 1 MiB 撞 S3/MinIO 合并硬限（EntityTooSmall）（实机 V3.8.16 日志定性）
+
+### 背景与根因
+
+实机 V3.8.16 日志一次性验证了两处新语义：422 **不再重试**（单行 WARN，无 1/3、2/3 行）、响应体完整入日志——并直接给出根因原文：
+
+```
+UploadError: /api/v1/data/files/complete HTTP 422: {"code":2001,"message":"分片合并失败（upload_id=…）：An error occurred (EntityTooSmall) when calling the CompleteMultipartUpload operation: Your proposed upload is smaller than the minimum allowed object size."}
+```
+
+`bag_uploader._CHUNK` 旧值 **1 MiB**：S3/MinIO multipart 硬性要求除最后一片外每片 ≥ **5 MiB**，每片 PUT 单独都成功（服务端不拒小片），直到 CompleteMultipartUpload 合并才整体拒绝——属「客户端可修」确定无疑，无需平台侧改动。
+
+### 变更
+
+- `cloud/bag_uploader.py`：常量拆分——`_PART_SIZE = 8 MiB`（multipart 切片与 `_part_count` 申报口径，留出 5 MiB 硬限余量且内存可控：1.6 GB bag ≈ 193 片、末片 7.7 MiB）；`_HASH_CHUNK = 1 MiB`（仅流式哈希读块，与分片无关）；`_MULTIPART_THRESHOLD` 维持 32 MiB 不变。
+- 新增回归守卫 `test_multipart_part_size_at_least_5mib`：断言 `_PART_SIZE ≥ 5 MiB`、实传切片长度 `[8 MiB, 尾片]`、实机体量 1618711702B 换算 193 片、片数与 presign 申报口径一致。
+- 全量 `pytest`：**1645 passed**（1644 + 1）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+升级 `pip install -U hunter-sim==3.8.17` 后重下发同一场景：
+
+- 预期 `rosbag 上传完成：{object_key}（{size} bytes）` + `bag 上传完成 … → BagUploadResult(...)`，平台收到 `sensor_file`；
+- 分片数从 ≈1548（1 MiB×1.6 GB）降到 ≈193（8 MiB），HTTP 往返骤减，总耗时应持平或更快；
+- 若 complete 再报 422，响应体原文仍会单行入日志（V3.8.16 语义），据原文继续定性。
+
+### 遗留
+
+- 重试仍为全量重传（含重新哈希+全部分片 PUT）；瞬态失败精细恢复（仅重试 complete 步/断点续传）待有需要再做。
+- 场景 `passed=False`（`ego_physical_stuck` 循环：animal-1 楔在 lat≈-1.0m）属既有 SIL 行为遗留；空产物 `file_size=0` 潜在 422（V3.8.10/V3.8.11 遗留）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.17`；`pyproject.toml` 版本 `3.8.17`。
+
+### 文档同步明细
+
+- `README.md`：测试计数 1644 → 1645。
+- `user_manual.md`：版本头 → V3.8.17；FAQ 补充「complete 422 EntityTooSmall：分片 1 MiB 撞 5 MiB 合并硬限，已改 8 MiB」。
+- `deployment_and_operations.md`：版本头 → V3.8.17；新增 `### V3.8.16 → V3.8.17` 升级章节；排障表 422 行更新为已功性修复。
+- `docs/单机部署指南.md`：版本头 → V3.8.17；预期行补 V3.8.17（bag 上传预期全程成功）。
+- `pyproject.toml`：`version` 3.8.16 → **3.8.17**。
+
+---
