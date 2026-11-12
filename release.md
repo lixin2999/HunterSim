@@ -4809,3 +4809,60 @@ V3.8.12 的 `_presign_diagnostics` 只白名单 5 个 `X-Amz-*` 键，无法反�
 - `pyproject.toml`：`version` 3.8.12 → **3.8.13**。
 
 ---
+
+## V3.8.14 — presigned 直传 403 SignatureDoesNotMatch 根因修复（回送签名时纳入的 content-type 头）（实机 V3.8.13 日志定性）
+
+### 背景（实机日志定性证据）
+
+V3.8.13 诊断行直接锁定了签名口径：
+
+```
+产物直传失败 mapping.json: HTTP 403 [host=192.168.31.35:9000 path=/hunter-raw-data/.../1794466476_13.json
+query_keys=[AWSAccessKeyId,Expires,Signature,content-type] has_signature=True
+presign_keys=['bucket','expires_in','method','object_key','parts','upload_id','upload_url']] : <Code>SignatureDoesNotMatch</Code>
+```
+
+关键判读：
+
+- presigned URL 为 **SigV2 形态**（`AWSAccessKeyId`/`Expires`/`Signature`），且查询串里多出一个 **`content-type`** 参数——即 presigner 在签名时把 `content-type` 作为**已签名头**写进了 canonical request。
+- 我们的 PUT 未回送这个 `Content-Type` 头 → MinIO 重算 canonical request 与实际不符 → `SignatureDoesNotMatch`。这同时解释了产物四件与 bag 链路（同一机制）。
+- 排除项：非过期（过期会回 `AccessDenied: Request has expired`）、非 host 不一致（V3.8.12 已排除）。
+
+### 变更（客户端功性修复，`common/utils.py` + `platform_adapter/artifacts.py` + `cloud/bag_uploader.py`）
+
+1. **新增共享 helper `presigned_upload_headers(url)`**（`common/utils.py`）：从 presigned URL 查询串提取需随 PUT 原样回送的已签名头。**白名单**仅限真正的 HTTP 头参数（`content-type`/`content-encoding`/`content-disposition`），**绝不当头回送子资源参数**（`uploadId`/`partNumber`/`acl` 等），避免引入新的不符。
+2. **产物直传**（`artifacts._try_upload`）：PUT 时 `headers=presigned_upload_headers(upload_url)`，回送签名时纳入的 `Content-Type`。
+3. **bag 直传**（`bag_uploader._upload_single` / `_upload_multipart`）：单次与每个分片 PUT 同样回送（同一 presign 机制，一次修复同时覆盖两条链路）。
+4. 无签名头参数时回送空字典（行为与旧版一致，不影响已有正常链路）。
+
+### 验证
+
+- 新增单测：`test_common_utils.TestPresignedUploadHeaders`（4 例：content-type 提取、保留/子资源参数忽略、空值不回送、不可解析降级）；`test_platform_adapter_artifacts.TestV3814SignedHeaderEcho`（2 例：回送签名 content-type / 无参数时空头）；`test_bag_uploader` 新增单次与分片回送各 1 例。
+- mock `put` 均扩展 `headers` 参（无行为变化）。
+- 全量 `pytest`：**1633 passed**（1625 + 8）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+升级 `pip install -U hunter-sim==3.8.14` 后重下发同一场景：
+
+- 预期 `产物直传失败 … HTTP 403 SignatureDoesNotMatch` 消失，产物 `uploaded=True`、bag `→ 非 None`；
+- 若仍 403（但 `query_keys` 已无 content-type 不符），则转下一步候选：httpx 对 base64 `Signature` 百分号重编码破坏签名（新口径，仍靠本轮日志区分）。
+
+### 遗留
+
+- **`presign_keys` 含 `method`/`parts`/`upload_id`**：artifacts 链路当前固定 PUT（产物均为小单件）；bag 链路已按 `method` 分支单次/分片。若后续平台改推 multipart，artifacts 需同样按 `method` 分支（当前不影响本轮修复）。
+- **事件制动释放后自车仍物理楔住**、**空产物 `file_size=0` 潜在 422**（V3.8.10/V3.8.11 遗留，未修）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.14`；`pyproject.toml` 版本 `3.8.14`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.14`，追加 V3.8.14 条目；测试计数 1625 → 1633。
+- `user_manual.md`：版本头 → V3.8.14；FAQ 补充「403 根因已修：回送签名时纳入的 content-type 头」。
+- `deployment_and_operations.md`：版本头 → V3.8.14；新增 `### V3.8.13 → V3.8.14` 升级章节；排障表 403 行改为已功性修复。
+- `docs/单机部署指南.md`：版本头 → V3.8.14；预期行补 V3.8.14（上传预期成功）。
+- `pyproject.toml`：`version` 3.8.13 → **3.8.14**。
+
+---

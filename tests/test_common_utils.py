@@ -345,3 +345,37 @@ class TestUvicornLoggingRouting:
         assert stray not in logging.getLogger("uvicorn.access").handlers
         assert stray_buffer.getvalue() == ""
         assert "GET /health" in sink["stream"].getvalue()
+
+
+class TestPresignedUploadHeaders:
+    """V3.8.14：presigned URL 已签名头回送提取（定位 SignatureDoesNotMatch）。"""
+
+    def test_extracts_content_type_from_query(self) -> None:
+        from hunter_sim.common.utils import presigned_upload_headers
+
+        url = (
+            "http://minio:9000/bucket/key?AWSAccessKeyId=AKID&Expires=1"
+            "&content-type=application%2Foctet-stream&Signature=x%2By%3D"
+        )
+        assert presigned_upload_headers(url) == {"content-type": "application/octet-stream"}
+
+    def test_ignores_reserved_and_subresource_params(self) -> None:
+        from hunter_sim.common.utils import presigned_upload_headers
+
+        url = (
+            "http://minio:9000/bucket/key?AWSAccessKeyId=AKID&Expires=1"
+            "&Signature=abc&uploadId=xyz&partNumber=1"
+        )
+        # 无签名头参数时不回送任何头（子资源参数不当头回送）
+        assert presigned_upload_headers(url) == {}
+
+    def test_blank_content_type_not_echoed(self) -> None:
+        from hunter_sim.common.utils import presigned_upload_headers
+
+        assert presigned_upload_headers("http://h/k?content-type=") == {}
+
+    def test_unparsable_url_returns_empty(self) -> None:
+        from hunter_sim.common.utils import presigned_upload_headers
+
+        # 不抛异常，降级为空字典
+        assert presigned_upload_headers("") == {}

@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from hunter_sim.common.models import CloudSettings
-from hunter_sim.common.utils import get_logger
+from hunter_sim.common.utils import get_logger, presigned_upload_headers
 
 logger = get_logger(__name__)
 
@@ -144,8 +144,12 @@ class ArtifactManager:
                 return None
             upload_url = presign.get("upload_url")
             if upload_url:
+                # V3.8.14：SigV2 presigned URL 会把签名时纳入的 content-type 等头附在查询
+                # 串里，直传必须原样回送，否则 MinIO 重算 canonical request 与实际不符→
+                # SignatureDoesNotMatch（实机 presigned 直传 403 的定位根因）。
+                put_headers = presigned_upload_headers(upload_url)
                 with path.open("rb") as handle:
-                    response = upload_client.put(upload_url, content=handle)
+                    response = upload_client.put(upload_url, content=handle, headers=put_headers)
                 if getattr(response, "status_code", 500) >= 300:
                     logger.warning(
                         f"产物直传失败 {file_name}: HTTP {response.status_code}"

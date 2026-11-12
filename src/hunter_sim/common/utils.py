@@ -493,3 +493,44 @@ def rmse(values: list[float]) -> float:
     if not values:
         return 0.0
     return math.sqrt(sum(v * v for v in values) / len(values))
+
+
+# ─── presigned 上传辅助 ────────────────────────────────────────────────────────
+
+#: SigV2 presigned URL 中作为「已签名头」写入查询串、需在直传时原样回送的常见 HTTP 头。
+#: presigner 将这些头纳入 canonical request，客户端不发或发不同值会导致 MinIO/S3
+#: 重算签名与实际请求不符而返回 `SignatureDoesNotMatch`。子资源参数（uploadId/
+#: partNumber/acl 等）**不在此列**，绝不回送为头。
+_PRESIGNED_SIGNED_HEADER_PARAMS: tuple[str, ...] = (
+    "content-type",
+    "content-encoding",
+    "content-disposition",
+)
+
+
+def presigned_upload_headers(url: str) -> dict[str, str]:
+    """从 presigned 上传 URL 提取需随 PUT 回送的已签名头（V3.8.14）。
+
+    SigV2 presigned URL 会把签名时纳入的 HTTP 头（如实机观测到的 `content-type`）以
+    查询参数形式附加；直传请求必须原样发送同名头，否则 MinIO/S3 重算 canonical request
+    与实际请求不符，返回 `SignatureDoesNotMatch`。返回 ``{头名: 值}``（小写头名），无则空 dict。
+
+    Args:
+        url: presigned 上传地址（含查询串）。
+
+    Returns:
+        需回送的请求头字典；解析失败或无签名头时返回空字典。
+    """
+    from urllib.parse import parse_qs, urlsplit  # noqa: PLC0415
+
+    try:
+        query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+    except Exception:  # noqa: BLE001  任何解析异常不影响主流程
+        return {}
+    headers: dict[str, str] = {}
+    for param in _PRESIGNED_SIGNED_HEADER_PARAMS:
+        for key, values in query.items():
+            if key.lower() == param and values and values[0]:
+                headers[param] = values[0]
+                break
+    return headers

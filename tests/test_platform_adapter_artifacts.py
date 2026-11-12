@@ -46,6 +46,7 @@ class _FakeClient:
         self.post_text = post_text
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.puts: list[str] = []
+        self.put_headers: list[Any] = []
 
     def post(self, url: str, json: dict[str, Any]) -> _FakeResponse:
         if self.post_error:
@@ -57,8 +58,9 @@ class _FakeClient:
             return _FakeResponse(200, {"code": 0, "data": self.presign})
         return _FakeResponse(200, {"code": 0, "data": {}})
 
-    def put(self, url: str, content: Any = None) -> _FakeResponse:
+    def put(self, url: str, content: Any = None, headers: Any = None) -> _FakeResponse:
         self.puts.append(url)
+        self.put_headers.append(headers)
         return _FakeResponse(self.put_status, {})
 
 
@@ -254,7 +256,7 @@ class TestV3811PresignedPutNoAuthHeader:
                     },
                 )
 
-            def put(self, url: str, content: Any = None) -> _FakeResponse:
+            def put(self, url: str, content: Any = None, headers: Any = None) -> _FakeResponse:
                 self.did_put = True
                 return _FakeResponse(200, {})
 
@@ -353,3 +355,40 @@ class TestV3812PresignDiagnostics:
         # 绝不输出签名值
         assert "sec" not in joined
         assert "X-Amz-Signature=" not in joined
+
+
+class TestV3814SignedHeaderEcho:
+    """V3.8.14：presigned URL 签名时纳入的 content-type 必须在 PUT 时原样回送。
+
+    实机 403 SignatureDoesNotMatch 的定位根因：平台以 SigV2 生成预签名地址，把
+    content-type 作为已签名头写进查询串，客户端不回送则 MinIO 重算签名不符。
+    """
+
+    def test_put_echoes_signed_content_type_header(self, tmp_path: Path) -> None:
+        client = _FakeClient(
+            presign={
+                "object_key": "k",
+                "bucket": "hunter-raw-data",
+                "upload_url": (
+                    "http://minio:9000/hunter-raw-data/SIM-s1/eval.json"
+                    "?AWSAccessKeyId=AKID&Expires=1794466476"
+                    "&content-type=application%2Foctet-stream&Signature=abc%2Fdef%3D"
+                ),
+            }
+        )
+        manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
+
+        artifact = manager.write_json("eval.json", {"grade": "A"})
+
+        assert artifact.uploaded is True
+        assert client.put_headers[0] == {"content-type": "application/octet-stream"}
+
+    def test_put_no_content_type_param_sends_empty_headers(self, tmp_path: Path) -> None:
+        client = _FakeClient(
+            presign={"object_key": "k", "upload_url": "http://minio:9000/b/k?sig=1"}
+        )
+        manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
+
+        manager.write_json("eval.json", {})
+
+        assert client.put_headers[0] == {}

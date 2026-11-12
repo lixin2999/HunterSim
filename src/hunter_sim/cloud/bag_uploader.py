@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.models import CloudSettings
-from hunter_sim.common.utils import get_logger
+from hunter_sim.common.utils import get_logger, presigned_upload_headers
 
 logger = get_logger(__name__)
 
@@ -166,8 +166,10 @@ class BagUploader:
         url = presign.get("upload_url")
         if not url:
             raise UploadError("presign 未返回 upload_url")
+        # V3.8.14：回送 presigned URL 签名时纳入的 content-type 等头，避免 SignatureDoesNotMatch。
+        put_headers = presigned_upload_headers(url)
         with file_path.open("rb") as fh:
-            resp = client.put(url, content=fh)
+            resp = client.put(url, content=fh, headers=put_headers)
         if resp.status_code >= 300:
             raise UploadError(f"直传失败：HTTP {resp.status_code}")
 
@@ -180,7 +182,9 @@ class BagUploader:
         with file_path.open("rb") as fh:
             for part in parts:
                 chunk = fh.read(_CHUNK)
-                resp = client.put(part["upload_url"], content=chunk)
+                # V3.8.14：每个分片 presigned URL 同样需回送签名时纳入的 content-type 等头。
+                part_headers = presigned_upload_headers(part["upload_url"])
+                resp = client.put(part["upload_url"], content=chunk, headers=part_headers)
                 if resp.status_code >= 300:
                     raise UploadError(f"分片 {part['part_number']} 上传失败：HTTP {resp.status_code}")
                 etags.append({"part_number": part["part_number"], "etag": resp.headers.get("ETag", "")})

@@ -34,6 +34,7 @@ class FakeClient:
         self._multipart = multipart
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.puts: list[Any] = []
+        self.put_headers: list[Any] = []
 
     def post(self, url: str, json: dict[str, Any] = None) -> FakeResponse:  # noqa: ANN001, D102
         self.posts.append((url, json))
@@ -41,10 +42,11 @@ class FakeClient:
             return FakeResponse(200, {"code": 0, "message": "ok", "data": self._presign})
         return FakeResponse(200, {"code": 0, "message": "ok", "data": {"status": "completed"}})
 
-    def put(self, url: str, content: Any = None) -> FakeResponse:  # noqa: ANN001, D102
+    def put(self, url: str, content: Any = None, headers: Any = None) -> FakeResponse:  # noqa: ANN001, D102
         self.puts.append((url, content))
-        headers = {"ETag": '"etag-1"'} if self._multipart else {}
-        return FakeResponse(200, headers=headers)
+        self.put_headers.append(headers)
+        resp_headers = {"ETag": '"etag-1"'} if self._multipart else {}
+        return FakeResponse(200, headers=resp_headers)
 
     def close(self) -> None:  # noqa: D102
         return None
@@ -82,6 +84,46 @@ def test_single_put_flow(bag_file: Path) -> None:
     # presign + complete 两次 post，一次直传 put
     assert len(client.posts) == 2
     assert len(client.puts) == 1
+
+
+def test_single_put_echoes_signed_content_type(bag_file: Path) -> None:
+    """V3.8.14：单次 PUT 回送 presigned URL 签名时纳入的 content-type。"""
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/run01.mcap",
+        "method": "put",
+        "upload_url": (
+            "http://minio/put?AWSAccessKeyId=AKID&Expires=1"
+            "&content-type=application%2Foctet-stream&Signature=a%2Fb%3D"
+        ),
+    }
+    client = FakeClient(presign)
+    uploader = BagUploader(_settings(), client_factory=lambda: client)
+    uploader.connect()
+    assert uploader.upload(bag_file) is not None
+    assert client.put_headers[0] == {"content-type": "application/octet-stream"}
+
+
+def test_multipart_put_echoes_signed_content_type(tmp_path: Path) -> None:
+    """V3.8.14：分片 PUT 每个 part 也回送签名时的 content-type。"""
+    big = tmp_path / "big.mcap"
+    big.write_bytes(b"y" * 2048)
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/big.mcap",
+        "method": "multipart",
+        "upload_id": "uid-9",
+        "parts": [
+            {"part_number": 1, "upload_url": "http://minio/p1?content-type=text%2Fplain"},
+            {"part_number": 2, "upload_url": "http://minio/p2"},
+        ],
+    }
+    client = FakeClient(presign, multipart=True)
+    uploader = BagUploader(_settings(), client_factory=lambda: client)
+    uploader.connect()
+    assert uploader.upload(big) is not None
+    assert client.put_headers[0] == {"content-type": "text/plain"}
+    assert client.put_headers[1] == {}
 
 
 def test_multipart_flow(tmp_path: Path) -> None:
@@ -165,7 +207,7 @@ def test_v3811_presigned_put_uses_no_auth_client(monkeypatch, bag_file: Path) ->
                 return FakeResponse(200, {"code": 0, "message": "ok", "data": presign})
             return FakeResponse(200, {"code": 0, "message": "ok", "data": {"status": "completed"}})
 
-        def put(self, url: str, content: Any = None) -> FakeResponse:
+        def put(self, url: str, content: Any = None, headers: Any = None) -> FakeResponse:
             self.did_put = True
             return FakeResponse(200, headers={})
 
