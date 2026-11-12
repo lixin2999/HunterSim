@@ -279,10 +279,10 @@ class TestV3811PresignedPutNoAuthHeader:
 
 
 class TestV3812PresignDiagnostics:
-    """V3.8.12：presigned 直传 403 SignatureDoesNotMatch 诊断。
+    """V3.8.12/V3.8.13：presigned 直传 403 SignatureDoesNotMatch 诊断。
 
-    输出非机密签名口径，以便区分 host 不一致 / signed-headers 缺 content-type /
-    时间过期；绝不泄露签名。
+    输出非机密签名口径（host/path/SigV4 字段）与查询参数名集合（值脱敏），以便区分
+    host 不一致 / signed-headers 缺 content-type / SigV2 形态 / 时间过期；绝不泄露签名值。
     """
 
     def test_diagnostics_expose_signed_headers_but_not_signature(self) -> None:
@@ -301,9 +301,30 @@ class TestV3812PresignDiagnostics:
         assert "X-Amz-SignedHeaders=host;content-type" in diag
         assert "X-Amz-Date=20261112T060249Z" in diag
         assert "X-Amz-Expires=900" in diag
-        # 绝不泄露签名
+        # V3.8.13：查询参数**名**可见（不机密），并标记含签名
+        assert "query_keys=[" in diag
+        assert "X-Amz-Signature" in diag  # 参数名可见
+        assert "has_signature=True" in diag
+        # 绝不泄露签名值
         assert "deadbeefsecret" not in diag
-        assert "X-Amz-Signature" not in diag
+        assert "X-Amz-Signature=" not in diag
+
+    def test_diagnostics_reveals_sigv2_query_shape(self) -> None:
+        """实机形态：无 X-Amz-* 但查询带 SigV2 的 Signature/AWSAccessKeyId/Expires。"""
+        from hunter_sim.platform_adapter.artifacts import _presign_diagnostics
+
+        url = (
+            "http://192.168.31.35:9000/hunter-raw-data/SIM-s1/eval.json"
+            "?AWSAccessKeyId=AKID&Expires=1794465568&Signature=abc%2Bdef%3D"
+        )
+        diag = _presign_diagnostics(url)
+        assert "host=192.168.31.35:9000" in diag
+        # X-Amz 字段全空（无 sigv4 段），但参数名集揭示 SigV2 签名口径
+        assert "X-Amz-SignedHeaders" not in diag
+        assert "query_keys=[AWSAccessKeyId,Expires,Signature]" in diag
+        assert "has_signature=True" in diag
+        # 签名值脱敏（不输出 abc/def）
+        assert "abc" not in diag
 
     def test_direct_put_failure_logs_diagnostics(self, tmp_path: Path, caplog) -> None:
         client = _FakeClient(
@@ -327,5 +348,8 @@ class TestV3812PresignDiagnostics:
         assert "HTTP 403" in joined
         assert "host=minio:9000" in joined
         assert "X-Amz-SignedHeaders=host" in joined
-        assert "X-Amz-Signature" not in joined  # 绝不输出签名
-        assert "sec" not in joined  # 签名值不泄露
+        # V3.8.13：presign 响应字段名也输出（发现是否漏用 headers/method）
+        assert "presign_keys=['bucket', 'object_key', 'upload_url']" in joined
+        # 绝不输出签名值
+        assert "sec" not in joined
+        assert "X-Amz-Signature=" not in joined

@@ -149,7 +149,8 @@ class ArtifactManager:
                 if getattr(response, "status_code", 500) >= 300:
                     logger.warning(
                         f"产物直传失败 {file_name}: HTTP {response.status_code}"
-                        f" [{_presign_diagnostics(upload_url)}]: {_response_detail(response)}"
+                        f" [{_presign_diagnostics(upload_url)}"
+                        f" presign_keys={sorted(presign)}]: {_response_detail(response)}"
                     )
                     return None
             self._complete(client, presign, path)
@@ -254,21 +255,28 @@ _PRESIGN_DIAG_FIELDS = (
 
 
 def _presign_diagnostics(upload_url: str) -> str:
-    """从 presigned URL 提取**非机密**诊断摘要（V3.8.12），用于定位 `SignatureDoesNotMatch`。
+    """从 presigned URL 提取**非机密**诊断摘要（V3.8.12/V3.8.13），定位 `SignatureDoesNotMatch`。
 
-    只输出 host、path 与 `X-Amz-SignedHeaders`/`X-Amz-Date`/`X-Amz-Expires` 等签名口径字段
-    （这些决定 MinIO 如何重算签名），**绝不输出 `X-Amz-Signature`**（机密）。据此可直接判
-    定是 host 不一致、signed-headers 含 content-type 而请求未带、还是时间/过期问题。
+    输出 host、path、（若为 SigV4）`X-Amz-SignedHeaders`/`X-Amz-Date`/`X-Amz-Expires` 等签名口径
+    字段，并（V3.8.13）**额外输出查询参数名集合（值一律脱敏）与是否含签名**——因为实机日志
+    显示 `X-Amz-*` 字段全空但 MinIO 仍回 `SignatureDoesNotMatch`，说明签名不在标准 SigV4
+    查询参数命名下（可能为 SigV2 的 `Signature`/`AWSAccessKeyId`/`Expires`），**绝不输出签名值**。
     """
     try:
         parts = urlsplit(upload_url)
-        query = parse_qs(parts.query)
+        query = parse_qs(parts.query, keep_blank_values=True)
     except Exception:  # noqa: BLE001  任何解析异常都不影响主流程
         return "presign_url=unparsable"
-    fields = ",".join(
+    sigv4 = ",".join(
         f"{k}={query[k][0]}" for k in _PRESIGN_DIAG_FIELDS if k in query and query[k]
     )
-    return f"host={parts.netloc} path={parts.path} {fields}".rstrip()
+    query_keys = ",".join(sorted(query)) or "(none)"
+    has_signature = any("signature" in k.lower() for k in query)
+    seg = f"host={parts.netloc} path={parts.path}"
+    if sigv4:
+        seg += f" {sigv4}"
+    seg += f" query_keys=[{query_keys}] has_signature={has_signature}"
+    return seg
 
 
 def _response_detail(response: Any) -> str:

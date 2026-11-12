@@ -4760,3 +4760,52 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.11 → **3.8.12**。
 
 ---
+
+## V3.8.13 — 403 签名口径进一步定位（实机 V3.8.12 日志揭示：非 SigV4 查询签名、host 无不一致）
+
+**发布日期**：2026-11-12
+**版本定位**：可观测性修复（patch）。承接 V3.8.12：实机重下发后诊断日志首次输出了 presigned URL 形态，得到一个**关键异常**，仍需一轮才能定性。
+
+### 实机日志新证据（V3.8.12 诊断）
+
+- `host=192.168.31.35:9000`：PUT 目标 host **就是** presigned URL 的 host（直连 MinIO 9000）——**排除 host 不一致**假设。
+- 但 `X-Amz-SignedHeaders`/`X-Amz-Date`/`X-Amz-Expires` **全为空**，MinIO 却回 `SignatureDoesNotMatch`（非匿名的 `AccessDenied`）——说明签名**确实参与校验，但不在标准 SigV4 的 `X-Amz-*` 查询参数命名下**（最可能为 SigV2 的 `Signature`/`AWSAccessKeyId`/`Expires`，或 presign 返回了我们未使用的 `headers`/`method` 字段）。
+- MinIO 回文未带 `CanonicalRequest`/`StringToSign`（需服务端开调试才输出），因此仅靠响应体无法定性。
+
+### 变更（`platform_adapter/artifacts.py`，仍不改上传行为）
+
+V3.8.12 的 `_presign_diagnostics` 只白名单 5 个 `X-Amz-*` 键，无法反映非 SigV4 形态。V3.8.13 扩展：
+
+1. **输出 upload_url 的查询参数名集合（值一律脱敏）** `query_keys=[...]` 与 `has_signature=True/False`——无论 SigV4/SigV2/其他，都能一眼看到签名口径。
+2. **输出 presign 响应的字段名** `presign_keys=[...]`——发现平台是否返回了我们未使用的 `headers`/`method`/`signed_headers` 等需随 PUT 一同发送的字段（若签名时纳入了这些而请求未带，就是客户端 bug）。
+
+### 验证
+
+- 新增单测：`test_diagnostics_reveals_sigv2_query_shape`（SigV2 形态：无 X-Amz 但 query_keys 揭示 Signature/AWSAccessKeyId/Expires、签名值脱敏）；扩充 `test_diagnostics_expose_signed_headers_but_not_signature`（query_keys/has_signature）与 `test_direct_put_failure_logs_diagnostics`（presign_keys）。
+- 全量 `pytest`：**1625 passed**（1624 + 1）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+升级 `pip install -U hunter-sim==3.8.13` 后重下发同一场景，新的 `产物直传失败 … HTTP 403 [host=… query_keys=[…] has_signature=… presign_keys=[…]]` 将直接定性：
+- `query_keys` 含 `Signature`/`AWSAccessKeyId`（SigV2）且 `presign_keys` 无额外字段 → 多为 httpx 对 presigned 查询串的百分号重编码破坏签名（客户端可修：原样传递 URL / 不重编码）；
+- `presign_keys` 含 `headers`/`method` 等 → 平台 presign 要求随 PUT 发送这些头/方法，而我们未发送（客户端补上即可）；
+- 两者都无签名参数→ presign 本身未签名，属平台侧返回错误。
+
+### 遗留
+
+- **本版本仍仅定位、未功性修复 403**：签名由平台生成，具体修复待本轮 `query_keys`/`presign_keys` 指认后确定（bag 链路同机制，一次指认同时解释两条链路）。
+- **事件制动释放后自车仍物理楔住**、**空产物 `file_size=0` 潜在 422**（V3.8.10/V3.8.11 遗留，未修）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.13`；`pyproject.toml` 版本 `3.8.13`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.13`，追加 V3.8.13 条目；测试计数 1624 → 1625。
+- `user_manual.md`：版本头 → V3.8.13；FAQ 补充「403 进一步定位：非 SigV4 查询签名、已输出 query_keys/presign_keys」。
+- `deployment_and_operations.md`：版本头 → V3.8.13；新增 `### V3.8.12 → V3.8.13` 升级章节；排障表 403 行补充 query_keys/presign_keys 定方法。
+- `docs/单机部署指南.md`：版本头 → V3.8.13；预期行补 V3.8.13。
+- `pyproject.toml`：`version` 3.8.12 → **3.8.13**。
+
+---
