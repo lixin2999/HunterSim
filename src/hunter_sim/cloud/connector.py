@@ -104,6 +104,10 @@ class CloudConnector:
             self._settings, sim_id=resolved_id,
             client_factory=getattr(self, "_client_factory", None),
         )
+        # V3.8.15：重建 uploader 后必须 connect()，否则 `_available` 恒 False，
+        # upload() 走「未启用」分支静默返回 None——SIL 节点（attach 路径）的 bag
+        # 上传从不真正发起（start() 路径本就调用 connect，此处为遗漏）。
+        self.uploader.connect()
         self._started = True
 
     def start(self, sim_id: str = "") -> bool:
@@ -428,27 +432,39 @@ class CloudConnector:
                         )
                         if not self._wait_before_retry(backoff_s):
                             raise
-                with self._upload_counters_lock:
-                    self._upload_success += 1
-                CLOUD_UPLOAD_TOTAL.labels(result="success").inc()
-                logger.info(f"bag 上传完成：{file_path.name} → {result}")
-                # 自动发布 sensor_file 消息（用任务自带的生产者，避免跨实例串台）
-                if result is not None and publisher is not None:
-                    publisher.publish_sensor_file(
-                        bucket=result.bucket,
-                        object_key=result.object_key,
-                        size_bytes=result.size_bytes,
-                        sha256=result.sha256,
-                        sensor_type=data_type,
-                        start_time=float(getattr(stats, "start_time", 0.0) or 0.0),
-                        end_time=float(getattr(stats, "end_time", 0.0) or 0.0),
-                        frame_count=int(getattr(stats, "frame_count", 0) or 0),
-                        vehicle_id=vehicle_id,
-                        scene_id=scene_id,
-                        md5=getattr(result, "md5", "") or "",
-                        file_format="mcap" if stats is not None else "",
-                        topics=list(getattr(stats, "topics", ()) or ()),
+                # V3.8.15：upload() 返回 None 意味 uploader 不可用（enabled=False
+                # / 缺 jwt），属静默跳过而非成功；旧版计入 success 且 INFO 「完成→None」
+                # 直接误导排障（看不出上传根本没发起）。
+                if result is None:
+                    with self._upload_counters_lock:
+                        self._upload_failed += 1
+                    CLOUD_UPLOAD_TOTAL.labels(result="failed").inc()
+                    logger.warning(
+                        f"bag 上传跳过（uploader 不可用：核对 HUNTER_CORE_ENABLED 与 "
+                        f"HUNTER_CORE_JWT_TOKEN）：{file_path.name}"
                     )
+                else:
+                    with self._upload_counters_lock:
+                        self._upload_success += 1
+                    CLOUD_UPLOAD_TOTAL.labels(result="success").inc()
+                    logger.info(f"bag 上传完成：{file_path.name} → {result}")
+                    # 自动发布 sensor_file 消息（用任务自带的生产者，避免跨实例串台）
+                    if publisher is not None:
+                        publisher.publish_sensor_file(
+                            bucket=result.bucket,
+                            object_key=result.object_key,
+                            size_bytes=result.size_bytes,
+                            sha256=result.sha256,
+                            sensor_type=data_type,
+                            start_time=float(getattr(stats, "start_time", 0.0) or 0.0),
+                            end_time=float(getattr(stats, "end_time", 0.0) or 0.0),
+                            frame_count=int(getattr(stats, "frame_count", 0) or 0),
+                            vehicle_id=vehicle_id,
+                            scene_id=scene_id,
+                            md5=getattr(result, "md5", "") or "",
+                            file_format="mcap" if stats is not None else "",
+                            topics=list(getattr(stats, "topics", ()) or ()),
+                        )
             except Exception as exc:  # noqa: BLE001
                 with self._upload_counters_lock:
                     self._upload_failed += 1

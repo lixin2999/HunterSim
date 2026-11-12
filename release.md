@@ -4866,3 +4866,54 @@ presign_keys=['bucket','expires_in','method','object_key','parts','upload_id','u
 - `pyproject.toml`：`version` 3.8.13 → **3.8.14**。
 
 ---
+
+## V3.8.15 — bag 上传在 SIL 节点路径下从未真正发起（`attach_producer` 遗漏 `connect()`）（实机 V3.8.14 日志暴露）
+
+### 背景与根因
+
+实机 V3.8.14 日志（两场景）确认产物 presigned 直传修复生效：4 个产物文件均 `产物已上传`、无 403。产物问题消除后，`bag 上传完成：sensors_r1.mcap → None`（INFO 级、计数 success）成为唯一剩余上传异常，且**没有任何 4xx/5xx 失败痕迹**——说明这不是上传失败，而是上传从未发起。
+
+源码回溯定位：
+
+- `BagUploader.upload()` 唯一不抛异常返回 `None` 的路径是 `if not self._available: return None`；
+- SIL 节点下 executor 走 `connector.attach_producer(producer, sim_id=...)`（`platform_adapter/executor.py` `_connector_for`），而非 `start()`；
+- `attach_producer` 重建 `BagUploader` 后**遗漏 `connect()`**，`_available` 恒 False → bag 上传静默空转；`start()` 路径本就调用 `connect()`，两路径行为不一致；
+- 旧 `_perform_upload` 把 `result is None` 计入 success 并打 INFO「完成→None」，进一步误导排障。
+
+此前该缺陷被产物 403 掩盖：产物链路先失败时无人注意到 bag 一直空传。
+
+### 变更
+
+- `cloud/connector.py`：
+  - `attach_producer()`：重建 uploader 后调用 `self.uploader.connect()`，与 `start()` 路径对齐；
+  - `_perform_upload()`：`result is None` 分支改判为 failed——`CLOUD_UPLOAD_TOTAL{result="failed"}` 计数 + WARN「bag 上传跳过（uploader 不可用：核对 HUNTER_CORE_ENABLED 与 HUNTER_CORE_JWT_TOKEN）」，不再误报成功；`sensor_file` 发布逻辑移入真实成功分支。
+- 新增单测：`test_cloud_connector.py` 2 例——`test_attach_producer_connects_uploader`（attach 后 `uploader.available is True`）、`test_perform_upload_none_marks_failed`（None 记 failed 不记 success）。
+- 全量 `pytest`：**1635 passed**（1633 + 2）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+升级 `pip install -U hunter-sim==3.8.15` 后重下发同一场景：
+
+- 预期 `bag 上传完成：sensors_r1.mcap → BagUploadResult(bucket=..., object_key=..., ...)`，且平台侧收到 `sensor_file` 消息；
+- 若仍见 None，日志将变为 WARN「bag 上传跳过（uploader 不可用）」，据此核对 `HUNTER_CORE_ENABLED` / `HUNTER_CORE_JWT_TOKEN`；
+- bag 文件较大（~2 GB）将真正首次走 multipart 分片路径，若平台 presign `parts` 侧签名口径与产物不同可能暴露新错误（403/400），据本轮日志区分。
+
+### 遗留
+
+- **bag multipart 上传路径尚未在实机执行过**：V3.8.15 前从未真正发起，分片签名/合并口径待实机验证。
+- **场景 `passed=False`**：`ego_physical_stuck` 探测循环、`follow_condition_unmet`（lead-1 ahead=18.5m 但报「找不到」）属既有 SIL 行为遗留，非本次修复范围。
+- **空产物 `file_size=0` 潜在 422**（V3.8.10/V3.8.11 遗留，未修）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.15`；`pyproject.toml` 版本 `3.8.15`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.15`，追加 V3.8.15 条目；测试计数 1633 → 1635。
+- `user_manual.md`：版本头 → V3.8.15；FAQ 补充「bag → None 根因：SIL 节点 attach 路径遗漏 connect，已修」。
+- `deployment_and_operations.md`：版本头 → V3.8.15；新增 `### V3.8.14 → V3.8.15` 升级章节；排障表新增「bag 上传完成→None（V3.8.15 起为静默跳过已改 WARN）」行。
+- `docs/单机部署指南.md`：版本头 → V3.8.15；预期行补 V3.8.15（bag 上传预期成功）。
+- `pyproject.toml`：`version` 3.8.14 → **3.8.15**。
+
+---

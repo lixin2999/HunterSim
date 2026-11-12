@@ -135,6 +135,37 @@ def test_publish_event_swallows_exception() -> None:
     conn.stop()
 
 
+def test_attach_producer_connects_uploader() -> None:
+    """V3.8.15：attach_producer 重建 uploader 后必须 connect()（否则 bag 静默不上传）。
+
+    SIL 节点下 executor 走 attach_producer 而非 start，旧版未调用 connect，
+    导致 `_available` 恒 False，`upload()` 直接返回 None（日志 INFO 「完成→None」，
+    无任何上传行为且无任何失败痕迹）。修复后 attach 路径与 start 路径行为对齐。
+    """
+    from pydantic import SecretStr
+
+    fake = FakeKafkaProducer()
+    conn = CloudConnector(
+        _settings(jwt_token=SecretStr("t0k")),
+        producer_factory=_factory(fake),
+    )
+    conn.attach_producer(fake, sim_id="sim-001")
+    assert conn.uploader.available is True
+    conn.stop()
+
+
+def test_perform_upload_none_marks_failed() -> None:
+    """V3.8.15：upload() 返回 None（uploader 不可用）应记 failed 而非 success。"""
+    fake = FakeKafkaProducer()
+    conn = CloudConnector(_settings(), producer_factory=_factory(fake))  # 无 jwt → 不可用
+
+    conn._perform_upload(Path("x.mcap"), "rosbag")
+
+    stats = conn.upload_stats
+    assert stats["success"] == 0
+    assert stats["failed"] == 1
+
+
 def test_upload_bag_swallows_exception() -> None:
     """_perform_upload 失败时记 WARN 不冒泡（C-1）。"""
     fake = FakeKafkaProducer()
