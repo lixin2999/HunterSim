@@ -4720,3 +4720,43 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.10 → **3.8.11**。
 
 ---
+
+## V3.8.12 — presigned 直传 403 SignatureDoesNotMatch 定位诊断（实机 SCN-2056-1a1e-animal 暴露上传链第三层）
+
+**发布日期**：2026-11-12
+**版本定位**：可观测性修复（patch）。承接 V3.8.11：移除 Authorization 头后 400（multiple authentication types）已消失（实机日志确认），但暴露同一条上传链的**第三层**——`HTTP 403 SignatureDoesNotMatch`。因 V3.8.11 前 MinIO 在鉴权阶段就 400 拒掉、从未进入签名校验，签名不匹配一直被 400 掩盖。
+
+### 缺陷 H：403 SignatureDoesNotMatch 无法定位（响应体被截断、签名口径不可见）
+
+- **现象**（实机日志）：产物四个文件均 `产物直传失败 … HTTP 403: <Error><Code>SignatureDoesNotMatch</Code><Message>… Check your key and signing metho…`（截断），bag 同步 `→ None`。
+- **分析**：签名由平台 data-collector 生成、MinIO 重算校验；HunterSim 只向不透明的 presigned URL PUT。不匹配的典型成因互斥且修法不同：①presign host ≠ 实际 PUT host（平台 `MINIO_PUBLIC_ENDPOINT`/反代改写 Host）；②`X-Amz-SignedHeaders` 含 `content-type` 而请求未带；③查询串被 httpx 重新编码；④时钟偏斜/密钥/区域错。旧日志将响应体截断在 200 字，正好切在 MinIO 回文的 `CanonicalRequest`/`StringToSign` 之前——那是定位的关键。本轮**不盲改上传行为**（会错），先补齐诊断。
+- **变更**（`platform_adapter/artifacts.py`）：①`_RESPONSE_DETAIL_MAX_CHARS` 200→**800**，容纳 MinIO `SignatureDoesNotMatch` 的 `CanonicalRequest`/`StringToSign`；②新增 `_presign_diagnostics(upload_url)`，在直传失败日志中输出 presigned URL 的**非机密**签名口径字段（host、path、`X-Amz-SignedHeaders`/`X-Amz-Date`/`X-Amz-Expires`），**绝不输出 `X-Amz-Signature`**（机密）。据此下一次重下发即可一眼判定是 host 不一致、signed-headers 缺 content-type、还是时间/过期。
+
+### 验证
+
+- 新增单测：`TestV3812PresignDiagnostics`（2 例：诊断含 host/signed-headers 但不含签名；直传 403 日志带诊断且不泄露签名）。截断上限改动同步更新 `test_response_detail_decodes_bytes_and_truncates`。
+- 全量 `pytest`：**1624 passed**（1622 + 2）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.12`。
+2. 重下发同一场景：若仍 403，日志会带 `host=… X-Amz-SignedHeaders=… X-Amz-Date/Expires=…` 与更完整的 MinIO 回文；据此定位：host 与平台 `MINIO_PUBLIC_ENDPOINT` 不一致→平台侧改 presign endpoint；`X-Amz-SignedHeaders` 含 `content-type`→需平台 presign 不纳入或客户端补带；`X-Amz-Date`+`Expires` 与当前时间相差→仿真机/服务端时钟不同步。
+
+### 遗留
+
+- **本版本仅定位、未功性修复 403**：SignatureDoesNotMatch 的签名由平台生成，具体修复待诊断日志指认后确定正在客户端还是平台侧（bag 链路同机制，未单独加诊断，一次指认即可同时解释两条链路）。
+- **事件制动释放后自车仍物理楔住**、**空产物 `file_size=0` 潜在 422**（V3.8.10/V3.8.11 遗留，未修）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.12`；`pyproject.toml` 版本 `3.8.12`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.12`，追加 V3.8.12 条目；测试计数 1622 → 1624。
+- `user_manual.md`：版本头 → V3.8.12；FAQ 补充「400 已消、现 403 SignatureDoesNotMatch（已加定位诊断）」。
+- `deployment_and_operations.md`：版本头 → V3.8.12；新增 `### V3.8.11 → V3.8.12` 升级章节；排障表补 403 行。
+- `docs/单机部署指南.md`：版本头 → V3.8.12；预期行补 V3.8.12。
+- `pyproject.toml`：`version` 3.8.11 → **3.8.12**。
+
+---

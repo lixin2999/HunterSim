@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from hunter_sim.common.models import CloudSettings
 from hunter_sim.common.utils import get_logger
@@ -148,7 +149,7 @@ class ArtifactManager:
                 if getattr(response, "status_code", 500) >= 300:
                     logger.warning(
                         f"产物直传失败 {file_name}: HTTP {response.status_code}"
-                        f": {_response_detail(response)}"
+                        f" [{_presign_diagnostics(upload_url)}]: {_response_detail(response)}"
                     )
                     return None
             self._complete(client, presign, path)
@@ -238,8 +239,36 @@ def _safe(value: str) -> str:
     return cleaned or "unknown"
 
 
-#: 错误响应体入日志的最大长度（字符）：足够容纳平台校验回文又不至于刷屏。
-_RESPONSE_DETAIL_MAX_CHARS = 200
+#: 错误响应体入日志的最大长度（字符）：需容纳 MinIO `SignatureDoesNotMatch` 回文里的
+#: `CanonicalRequest`/`StringToSign`（定位签名不匹配的关键字段），又不能刷屏。
+_RESPONSE_DETAIL_MAX_CHARS = 800
+
+#: presigned URL 中可安全输出的诊断字段（**不含 X-Amz-Signature**，避免泄露签名）。
+_PRESIGN_DIAG_FIELDS = (
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+)
+
+
+def _presign_diagnostics(upload_url: str) -> str:
+    """从 presigned URL 提取**非机密**诊断摘要（V3.8.12），用于定位 `SignatureDoesNotMatch`。
+
+    只输出 host、path 与 `X-Amz-SignedHeaders`/`X-Amz-Date`/`X-Amz-Expires` 等签名口径字段
+    （这些决定 MinIO 如何重算签名），**绝不输出 `X-Amz-Signature`**（机密）。据此可直接判
+    定是 host 不一致、signed-headers 含 content-type 而请求未带、还是时间/过期问题。
+    """
+    try:
+        parts = urlsplit(upload_url)
+        query = parse_qs(parts.query)
+    except Exception:  # noqa: BLE001  任何解析异常都不影响主流程
+        return "presign_url=unparsable"
+    fields = ",".join(
+        f"{k}={query[k][0]}" for k in _PRESIGN_DIAG_FIELDS if k in query and query[k]
+    )
+    return f"host={parts.netloc} path={parts.path} {fields}".rstrip()
 
 
 def _response_detail(response: Any) -> str:

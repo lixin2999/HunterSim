@@ -200,10 +200,10 @@ class TestV389PresignErrorDetail:
 
     def test_response_detail_decodes_bytes_and_truncates(self) -> None:
         class _Resp:
-            content = b"a" * 500
+            content = b"a" * 1200
 
         detail = _response_detail(_Resp())
-        assert len(detail) <= 201  # 200 字 + 省略号
+        assert len(detail) <= 801  # 800 字 + 省略号
         assert detail.endswith("…")
 
     def test_response_detail_normalizes_whitespace(self) -> None:
@@ -276,3 +276,56 @@ class TestV3811PresignedPutNoAuthHeader:
         assert post_clients and all("Authorization" in c.headers for c in post_clients)
         # 两者必须是不同实例
         assert put_clients[0] not in post_clients
+
+
+class TestV3812PresignDiagnostics:
+    """V3.8.12：presigned 直传 403 SignatureDoesNotMatch 诊断。
+
+    输出非机密签名口径，以便区分 host 不一致 / signed-headers 缺 content-type /
+    时间过期；绝不泄露签名。
+    """
+
+    def test_diagnostics_expose_signed_headers_but_not_signature(self) -> None:
+        from hunter_sim.platform_adapter.artifacts import _presign_diagnostics
+
+        url = (
+            "http://minio:9000/hunter-raw-data/SIM-s1/eval.json"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKID%2F20261112%2Fus-east-1%2Fs3%2Faws4_request"
+            "&X-Amz-Date=20261112T060249Z&X-Amz-Expires=900"
+            "&X-Amz-SignedHeaders=host%3Bcontent-type"
+            "&X-Amz-Signature=deadbeefsecret"
+        )
+        diag = _presign_diagnostics(url)
+        assert "host=minio:9000" in diag
+        assert "X-Amz-SignedHeaders=host;content-type" in diag
+        assert "X-Amz-Date=20261112T060249Z" in diag
+        assert "X-Amz-Expires=900" in diag
+        # 绝不泄露签名
+        assert "deadbeefsecret" not in diag
+        assert "X-Amz-Signature" not in diag
+
+    def test_direct_put_failure_logs_diagnostics(self, tmp_path: Path, caplog) -> None:
+        client = _FakeClient(
+            presign={
+                "object_key": "scenarios/uploaded/eval.json",
+                "upload_url": (
+                    "http://minio:9000/hunter-raw-data/SIM-s1/eval.json"
+                    "?X-Amz-SignedHeaders=host&X-Amz-Expires=900&X-Amz-Signature=sec"
+                ),
+                "bucket": "hunter-raw-data",
+            }
+        )
+        client.put_status = 403
+        manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
+
+        with caplog.at_level("WARNING"):
+            artifact = manager.write_json("eval.json", {})
+
+        assert artifact.uploaded is False
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "HTTP 403" in joined
+        assert "host=minio:9000" in joined
+        assert "X-Amz-SignedHeaders=host" in joined
+        assert "X-Amz-Signature" not in joined  # 绝不输出签名
+        assert "sec" not in joined  # 签名值不泄露
