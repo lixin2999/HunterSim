@@ -351,7 +351,7 @@ class EvaluationEngine:
         vehicle_id: str,
         scene_id: str,
         result: SceneEvaluationResult,
-        eval_bucket: str = "hunter-scene-assets",
+        eval_bucket: str = "hunter-raw-data",
     ) -> None:
         """将评估结果发布到平台（ sim_metrics + artifact）。
 

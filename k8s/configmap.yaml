@@ -50,7 +50,7 @@ data:
   # MJPEG 并发客户端上限（超限返回 503；0 = 不限）
   adapter_stream_max_clients: "8"
   adapter_screenshot_quality: "75"
-  adapter_artifact_bucket: "hunter-scene-assets"
+  adapter_artifact_bucket: "hunter-raw-data"
   adapter_max_scene_seconds: "7200"
   # ── HunterCore 平台接入 ──
   # 启用开关与 sim_id 由平台侧注入（HUNTER_CORE_ENABLED / HUNTER_CORE_SIM_ID）

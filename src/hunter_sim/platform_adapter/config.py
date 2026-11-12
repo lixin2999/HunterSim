@@ -51,7 +51,11 @@ class AdapterSettings(BaseSettings):
         "data/adapter/carla_instances.db", description="实例注册表 SQLite 路径"
     )
     artifacts_dir: str = Field("data/adapter/artifacts", description="本地产物暂存目录")
-    artifact_bucket: str = Field("hunter-scene-assets", description="产物对象存储 Bucket")
+    # 必须落在 data-collector UploadBucket 枚举内（hunter-raw-data|hunter-rosbag|hunter-video），
+    # 旧默认 hunter-scene-assets 不在枚举 → presign 422（实机 SCN-2056-1a1e-animal 暴露）。
+    artifact_bucket: str = Field(
+        "hunter-raw-data", description="产物对象存储 Bucket（须为 UploadBucket 枚举值）"
+    )
     # ── V3.0.0 Monitor & Recorder ──
     recordings_dir: str = Field(
         "data/adapter/recordings", description="传感器录制目录（mcap 落盘）"

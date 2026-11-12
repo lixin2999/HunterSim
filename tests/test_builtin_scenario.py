@@ -19,6 +19,7 @@ from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.scene_runner.builtin_scenario import (
     _EGO_BRAKE_HOLD,
     _EGO_CTRL_EMA_ALPHA,
+    _EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT,
     _EGO_PHYS_STUCK_PROBE_INTERVAL_S,
     _EGO_PHYS_STUCK_PROBE_THROTTLE,
     _EGO_SPEED_FEEDFORWARD,
@@ -1719,6 +1720,97 @@ class TestDeterministicEgoDrive:
         ego._velocity = MockVector3D(1.0, 0.0, 0.0)  # noqa: SLF001
         scenario._apply_ego_manual_speed(0.1)  # noqa: SLF001
         assert ego._control.steer == pytest.approx(0.0)  # noqa: SLF001
+
+
+class TestV3810EventBrakeMaxHold:
+    """V3.8.10：事件制动最长保持兜底，打破「刹停自车楔住脚本化横穿→整场冻结」。"""
+
+    @staticmethod
+    def _scenario() -> BuiltinScenario:
+        scenario = _make_scenario(
+            {
+                "ego_vehicle": {
+                    "vehicle_blueprint": "hunter_se",
+                    "spawn_point": {"x": 0.0, "y": 0.0},
+                    "autopilot": True,
+                    "initial_speed_ms": 3.0,
+                },
+                "traffic_participants": [],
+            }
+        )
+        scenario._ego = MockVehicle()  # noqa: SLF001
+        scenario._ego_spawn = SpawnPoint(x=0.0, y=0.0, z=0.5, yaw_deg=0.0)  # noqa: SLF001
+        scenario._ego_deterministic = True  # noqa: SLF001
+        scenario._ego_manual_speed = 3.0  # noqa: SLF001
+        scenario._ego_event_brake_ms = 0.0  # noqa: SLF001
+        return scenario
+
+    @staticmethod
+    def _hazard(x: float, y: float) -> Any:
+        actor = MockActor("walker.pedestrian.0001")
+        actor.set_transform(MockTransform(location=MockLocation(x, y, 0.3)))
+        return actor
+
+    def test_hold_within_limit_keeps_braking(self) -> None:
+        scenario = self._scenario()
+        scenario._actors = [self._hazard(10.0, 0.0)]  # noqa: SLF001
+        scenario._elapsed = 100.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        assert scenario._ego_event_brake_since_s == pytest.approx(100.0)  # noqa: SLF001
+        scenario._elapsed = 100.0 + _EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT - 1.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        assert scenario._ego_event_brake_hold_expired is False  # noqa: SLF001
+
+    def test_hold_timeout_forces_release_and_latches_expired(self) -> None:
+        scenario = self._scenario()
+        scenario._actors = [self._hazard(10.0, 0.0)]  # noqa: SLF001
+        scenario._elapsed = 100.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        scenario._elapsed = 100.0 + _EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT + 0.1
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+        assert scenario._ego_event_brake_hold_expired is True  # noqa: SLF001
+        assert scenario._ego_brake_latched is False  # noqa: SLF001
+        # 过期后即使危险物仍在路径内也不再回检
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+
+    def test_hazard_clearing_resets_hold_timer(self) -> None:
+        scenario = self._scenario()
+        actor = self._hazard(10.0, 0.0)
+        scenario._actors = [actor]  # noqa: SLF001
+        scenario._elapsed = 100.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        # 危险物离开路径 → 复位计时（未过期）
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 6.0, 0.3)))
+        scenario._elapsed = 110.0
+        assert scenario._ego_event_brake_active() is None  # noqa: SLF001
+        assert scenario._ego_event_brake_since_s is None  # noqa: SLF001
+        assert scenario._ego_event_brake_hold_expired is False  # noqa: SLF001
+        # 重新进入路径 → 从头计时，旧时长不累计
+        actor.set_transform(MockTransform(location=MockLocation(10.0, 0.0, 0.3)))
+        scenario._elapsed = 112.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        assert scenario._ego_event_brake_since_s == pytest.approx(112.0)  # noqa: SLF001
+
+    def test_rearm_resets_expired_flag(self) -> None:
+        scenario = self._scenario()
+        scenario._ego_event_brake_hold_expired = True  # noqa: SLF001
+        scenario._ego_event_brake_since_s = 50.0  # noqa: SLF001
+        fired = types.SimpleNamespace(
+            event_id="ev-2", action_type="brake", action_parameters={}
+        )
+        scenario._apply_scene_event_actions([fired])  # noqa: SLF001
+        assert scenario._ego_event_brake_hold_expired is False  # noqa: SLF001
+        assert scenario._ego_event_brake_since_s is None  # noqa: SLF001
+
+    def test_env_zero_disables_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HUNTER_SIM_EGO_EVENT_BRAKE_MAX_HOLD_S", "0")
+        scenario = self._scenario()
+        scenario._actors = [self._hazard(10.0, 0.0)]  # noqa: SLF001
+        scenario._elapsed = 100.0
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        scenario._elapsed = 1000.0  # 远超默认阈值，但兜底已关闭
+        assert scenario._ego_event_brake_active() == pytest.approx(0.0)  # noqa: SLF001
+        assert scenario._ego_event_brake_hold_expired is False  # noqa: SLF001
 
 
 class TestV384SmoothingHysteresisAndMetrics:

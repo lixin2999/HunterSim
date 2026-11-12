@@ -326,7 +326,7 @@ class EvaluationReportGenerator:
         evaluator: BatchEvaluator,
         report_id: str = "",
         sim_id: str = "",
-        bucket: str = "hunter-scene-assets",
+        bucket: str = "hunter-raw-data",
     ) -> dict[str, Any]:
         """将批量评估报告序列化为字节，并返回发布制品所需的元数据。
 

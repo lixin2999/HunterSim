@@ -213,6 +213,27 @@ _EGO_BRAKE_LANE_HALF_M = 2.0
 #: 该更宽阈值或落到自车后方才释放，避免横穿物在 2m 边界来回穿越导致
 #: 「制动↔巡航」高频切换（画面抖动 + 近距擦碰）。
 _EGO_BRAKE_RELEASE_HALF_M = 3.0
+
+#: V3.8.10：事件制动最长保持时长（秒）兜底默认值。脚本化横穿（如 deer 回退为
+#: pedestrian）可能被刹停的自车物理楔住、永远走不出行驶路径，导致滞回锁存恒真、
+#: 自车整场 0 m/s 冻结（掩盖真实评估结果）。连续「在路径内」制动超过该时长即
+#: 一次性强制释放恢复巡航，打破死锁；正常横穿（数秒内离开路径）计时每 tick 复位，
+#: 不会误触。可用 ``HUNTER_SIM_EGO_EVENT_BRAKE_MAX_HOLD_S`` 覆盖（<=0 关闭兜底=旧行为）。
+_EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT = 15.0
+_EGO_EVENT_BRAKE_MAX_HOLD_S_ENV = "HUNTER_SIM_EGO_EVENT_BRAKE_MAX_HOLD_S"
+
+
+def _ego_event_brake_max_hold_s() -> float:
+    """事件制动最长保持时长（秒）；env 覆盖，非法/空回退默认，<=0 表示关闭兜底。"""
+    raw = os.getenv(_EGO_EVENT_BRAKE_MAX_HOLD_S_ENV, "").strip()
+    if not raw:
+        return _EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _EGO_EVENT_BRAKE_MAX_HOLD_S_DEFAULT
+
+
 #: V3.8.4：确定性控制输出（油门/刹车/转向）一阶低通系数，抑制 bang-bang 切换
 #: 引起的悬架俯仰/侧倾阶跃（环视相机刚性挂自车，表现为画面抖动）。
 _EGO_CTRL_EMA_ALPHA = 0.35
@@ -439,6 +460,10 @@ class BuiltinScenario(CustomScenarioBase):
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
         self._ego_event_brake_ms: Optional[float] = None
+        # V3.8.10：事件制动连续「在路径内」起始时刻（None=当前未在持续制动）与
+        # 超时强制释放标记（本次武装内不再回检，避免与楔住的横穿物反复制动↔巡航）。
+        self._ego_event_brake_since_s: Optional[float] = None
+        self._ego_event_brake_hold_expired: bool = False
         # 已行驶里程积分（平台事件 traveled_distance 用）
         self._traveled_distance_m: float = 0.0
         # 车类 prop（停放/事故/故障车）生成位置，boarding 行为据此选择目标
@@ -567,6 +592,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_initial_steer = 0.0
         self._ego_deterministic = False
         self._ego_event_brake_ms = None
+        self._ego_event_brake_since_s = None
+        self._ego_event_brake_hold_expired = False
         self._world = world
         self._ego_lane_steer = 0.0
         self._ego_lane_steer_age_s = 0.0
@@ -829,6 +856,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_spawn = None
         self._world = None
         self._ego_brake_latched = False
+        self._ego_event_brake_since_s = None
+        self._ego_event_brake_hold_expired = False
         # V3.8.6：min_distance_samples 不在 cleanup 清空——评估在 cleanup 之后
         # 读取（executor._evaluate），清空会让最小车距=inf→近距擦碰假通过。
         # 新场景由 setup() 重置。
@@ -1507,6 +1536,9 @@ class BuiltinScenario(CustomScenarioBase):
             except (TypeError, ValueError):
                 target_ms = 0.0
             self._ego_event_brake_ms = max(0.0, target_ms)
+            # V3.8.10：新事件重新武装制动→复位最长保持计时与超时释放标记。
+            self._ego_event_brake_since_s = None
+            self._ego_event_brake_hold_expired = False
             logger.info(
                 "scene_event_action ego_brake: event=%s action=%s -> 自车减速目标 %.1f m/s"
                 "（确定性纵向控制接管；目标进入自车行驶路径后才制动，达目标后保持）",
@@ -1584,12 +1616,38 @@ class BuiltinScenario(CustomScenarioBase):
         sudden_cross 动物）尚未进入自车行驶路径，立即刹停会让自车永远到不了
         行人的窜出触发距离，形成互锁死锁。故仅当存在前方且在车道横向半宽内的
         参与者时才返回制动目标，否则返回 None（恢复巡航）。
+
+        V3.8.10：若危险物持续在路径内超过 ``_ego_event_brake_max_hold_s()``（多为
+        脚本化横穿被刹停自车物理楔住、走不出去），则一次性强制释放（置
+        ``_ego_event_brake_hold_expired``）恢复巡航，打破整场 0 m/s 冻结。
         """
         if self._ego_event_brake_ms is None:
             self._ego_brake_latched = False
+            self._ego_event_brake_since_s = None
+            self._ego_event_brake_hold_expired = False
+            return None
+        if self._ego_event_brake_hold_expired:
+            # V3.8.10：本次武装已因超时强制释放，不再回检（避免与楔住的横穿物反复制动↔巡航）。
             return None
         if self._hazard_in_ego_path():
+            now = self.elapsed_seconds
+            if self._ego_event_brake_since_s is None:
+                self._ego_event_brake_since_s = now
+            max_hold = _ego_event_brake_max_hold_s()
+            if max_hold > 0.0 and now - self._ego_event_brake_since_s >= max_hold:
+                # 危险物长时间未离开行驶路径（多为脚本化横穿被刹停自车物理楔住）：
+                # 强制释放制动恢复巡航，打破整场冻结（避免冻结掩盖真实评估结果）。
+                self._ego_event_brake_hold_expired = True
+                self._ego_brake_latched = False
+                self._ego_event_brake_since_s = None
+                logger.warning(
+                    "ego_event_brake_hold_timeout: 事件制动已连续保持 %.0fs 而危险物仍未离开"
+                    "行驶路径（多为脚本化横穿被刹停自车物理楔住），强制释放制动恢复巡航。",
+                    max_hold,
+                )
+                return None
             return self._ego_event_brake_ms
+        self._ego_event_brake_since_s = None  # 危险物已离开路径，复位持续制动计时
         return None
 
     def _hazard_in_ego_path(self) -> bool:

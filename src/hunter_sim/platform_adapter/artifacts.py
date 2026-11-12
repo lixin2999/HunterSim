@@ -1,8 +1,8 @@
-"""场景产物写入与预签名上传（``hunter-scene-assets``）。
+"""场景产物写入与预签名上传（``hunter-raw-data``）。
 
 平台 ``get_result`` 只需要 ``name`` + ``object_key`` 即可登记产物并换发下载地址；
 本模块先把产物写到本地暂存目录，再尽力通过 data-collector 预签名上传到
-``hunter-scene-assets``。上传失败**不阻断**结果发布（平台侧 presign 失败可降级）。
+``hunter-raw-data``（须为 UploadBucket 枚举值）。上传失败**不阻断**结果发布（平台侧 presign 失败可降级）。
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class ArtifactManager:
     Args:
         cloud_settings: HunterCore 接入配置（enabled/JWT/gateway）。
         artifacts_dir: 本地暂存根目录。
-        bucket: 目标 Bucket（默认 ``hunter-scene-assets``）。
+        bucket: 目标 Bucket（须为 UploadBucket 枚举：``hunter-raw-data``/``hunter-rosbag``/``hunter-video``）。
         sim_id: 仿真实例 ID。
         scene_id: 场景 ID。
         client_factory: 可注入的 httpx 客户端工厂（单测用）。

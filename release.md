@@ -4629,3 +4629,54 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.8 → **3.8.9**。
 
 ---
+
+## V3.8.10 — presign 422 根因修复（bucket 枚举越界）+ 事件制动最长保持兜底（实机 SCN-2056-1a1e-animal 暴露）
+
+**发布日期**：2026-11-12
+**版本定位**：问题修复（patch）。承接 V3.8.9 遗留的两项实机问题：① 产物直传 `presign HTTP 422`（V3.8.9 已能打印响应体 `参数错误`，但根因未定位）——对照 data-collector `FilePresignRequest` schema 确认是 `bucket` 枚举越界；② 动物穿行场景自车整场 0 m/s 冻结（brake 逻辑本身正确，真因是刹停自车把带碰撞的脚本化横穿楔在车侧、危险物永不离开行驶路径 → 滞回锁存恒真）。
+
+### 缺陷 E：产物 presign `bucket` 不在 UploadBucket 枚举内（422 根因）
+
+- **现象**：动物穿行场景 4 个产物（mapping/eval/events/run.log）上传全部 `presign HTTP 422 {"code":2001,"message":"参数错误"}`，本地副本保留、结果仍发布。
+- **根因**：data-collector `FilePresignRequest.bucket` 为枚举 `UploadBucket = hunter-raw-data | hunter-rosbag | hunter-video`，而产物链路发的是 `hunter-scene-assets`（**不在枚举**）→ 平台 schema 校验拒绝（422）。其余必填字段（`vehicle_id` 满足 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`、`data_type=other` 在枚举内、`file_name`/`file_size` 合规）均无问题；bag 链路 `rosbag_bucket=hunter-rosbag` 合法，故 422 全来自产物 bucket。V3.8.9 的 `_response_detail` 让 422 可见但未修根因。
+- **变更**：产物 bucket 默认值 `hunter-scene-assets` → **`hunter-raw-data`**（eval/report/log 属通用数据），覆盖代码默认值 + 所有会盖回默认值的部署 env：
+  - `platform_adapter/config.py`（`artifact_bucket`，生产链路真正取值处）、`eval_service/evaluation_engine.py`（`eval_bucket`）、`eval_service/evaluation_report.py`（`to_artifact_info` bucket）、`platform_adapter/artifacts.py`（文档字符串）。
+  - `docker/docker-compose.yml`、`docker/docker-compose.windows.yml`、`k8s/configmap.yaml` 的 `ADAPTER_ARTIFACT_BUCKET` 默认值（deployment.yaml 仅引用 configmap key）。
+  - 仍可用 `ADAPTER_ARTIFACT_BUCKET` 环境变量覆盖。
+
+### 缺陷 F：事件制动无最长保持兜底 → 楔死后整场冻结
+
+- **现象**：自车 `distance<12` 触发刹停后 56s 全程 0 m/s，面板行人「前 0.3 / 右 1.0」几乎不动（紧贴车侧 ≈ 车半宽 1.08m），横穿走不完。
+- **根因**：`_ego_event_brake_active()`/`_hazard_in_ego_path()` 设计正确（危险物离开 3m 释放半宽即恢复巡航），但脚本化横穿（deer 回退 pedestrian）带碰撞体，被刹停在横穿走廊里的自车物理挡住 → 危险物永远在路径内 → 滞回锁存恒真 → 制动永不释放 → 整场冻结（掩盖真实评估结果）。
+- **变更**（`scene_runner/builtin_scenario.py`）：为事件制动加**最长保持时长兜底**——新增 `_ego_event_brake_since_s`（连续「在路径内」起始时刻）与 `_ego_event_brake_hold_expired`（本次武装内一次性强制释放、不再回检，避免反复制动↔巡航抖振）；`_ego_event_brake_active()` 在危险物持续在路径内超过 `_ego_event_brake_max_hold_s()`（默认 **15s**，env `HUNTER_SIM_EGO_EVENT_BRAKE_MAX_HOLD_S` 覆盖，`<=0` 关闭兜底=旧行为）时强制释放制动、复位锁存、落 `ego_event_brake_hold_timeout` WARNING。计时在危险物离开路径时复位，故正常横穿（数秒内完成）不受影响；新事件重新武装时复位过期标记。init/setup/cleanup/`_apply_scene_event_actions` 同步复位新状态。
+
+### 验证
+
+- 全量 `pytest`：**1620 passed**（1615 + 5 新增）。
+- 新增单测：`TestV3810EventBrakeMaxHold`（5 例：阈值内持续制动/超时强制释放并锁存过期/危险物离开复位计时/重新武装复位过期标记/env=0 关闭兜底）。presign bucket 相关断言随 `test_platform_adapter_artifacts`/`test_platform_adapter_executor` 更新为 `hunter-raw-data`。
+- `flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.10`（或 `uv pip install -e .`）。
+2. 重下发动物穿行场景：产物直传应 presign 成功（bucket=`hunter-raw-data`）；自车若被楔住，约 15s 后见 `ego_event_brake_hold_timeout` 并恢复巡航（不再整场冻结）。
+3. 若产物仍 422：核对平台 `UploadBucket` 是否已含 `hunter-raw-data`，或用 `ADAPTER_ARTIFACT_BUCKET` 指定合法枚举。
+
+### 遗留（非本版本代码范围）
+
+- **deer/cattle 动物资产缺失**：CARLA 0.9.16 无动物蓝图，`object_kind=deer` 有意回退 `walker.pedestrian`（保留横穿运动，为无资产条件下最优近似）。要真实渲染鹿需给服务端挂载自定义鹿蓝图后再在 `scene_mapper` 加映射链——本次维持现状。
+- **空产物 `file_size=0` 潜在 422**：`write_jsonl` 在 0 事件时产出空内容 → `file_size=0` 违反 schema `>=1`；本场景有事件未触发，留待后续加「空产物跳过上传」兜底。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.10`；`pyproject.toml` 版本 `3.8.10`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.10`，追加 V3.8.10 条目；测试计数 1615 → 1620。
+- `user_manual.md`：版本头 → V3.8.10；FAQ 补充「presign 422 根因是 bucket 枚举」「事件制动最长保持兜底」。
+- `deployment_and_operations.md`：版本头 → V3.8.10；新增 `### V3.8.9 → V3.8.10` 升级章节；排障表更新 presign 422 行、补事件制动超时行。
+- `docs/单机部署指南.md`：版本头 → V3.8.10；排障表补充 V3.8.10 行。
+- `pyproject.toml`：`version` 3.8.9 → **3.8.10**。
+
+---

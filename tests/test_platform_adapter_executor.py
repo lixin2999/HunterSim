@@ -395,7 +395,7 @@ class TestExecution:
             "run.log",
         }
         for item in producer.artifacts:
-            assert item["bucket"] == "hunter-scene-assets"
+            assert item["bucket"] == "hunter-raw-data"
             assert item["object_key"].startswith("scenarios/simulations/sim-42/scene-1/")
             assert "upload_url" not in item
 

@@ -74,7 +74,7 @@ def _manager(tmp_path: Path, cloud: CloudSettings, factory: Any = None) -> Artif
     return ArtifactManager(
         cloud,
         artifacts_dir=str(tmp_path / "artifacts"),
-        bucket="hunter-scene-assets",
+        bucket="hunter-raw-data",
         sim_id="sim-1",
         scene_id="scene-1",
         client_factory=factory,
@@ -115,7 +115,7 @@ class TestPresignedUpload:
             presign={
                 "object_key": "scenarios/uploaded/eval.json",
                 "upload_url": "http://minio/upload",
-                "bucket": "hunter-scene-assets",
+                "bucket": "hunter-raw-data",
             }
         )
         manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
@@ -129,7 +129,7 @@ class TestPresignedUpload:
             "http://gateway:8080/api/v1/data/files/presign",
             "http://gateway:8080/api/v1/data/files/complete",
         ]
-        assert client.posts[0][1]["bucket"] == "hunter-scene-assets"
+        assert client.posts[0][1]["bucket"] == "hunter-raw-data"
         assert client.posts[0][1]["vehicle_id"] == "SIM-sim-1"
 
     def test_upload_failure_falls_back_to_local_key(self, tmp_path: Path) -> None:
