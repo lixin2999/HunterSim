@@ -107,13 +107,19 @@ class BagUploader:
 
         size, md5, sha256 = _digest_file(file_path)
         client = self._client_factory() if self._client_factory is not None else self._default_client()
+        # V3.8.11：presigned PUT 直传用无鉴权头客户端——presigned URL 已含查询串签名，
+        # 复用带 Bearer 头的客户端会被 MinIO/S3 判定「多种鉴权方式并存」返回 400。
+        # 测试注入时复用同一 mock（put 无副作用），生产时另建无鉴权头客户端。
+        upload_client = (
+            client if self._client_factory is not None else self._default_upload_client()
+        )
         try:
             presign = self._presign(client, file_path.name, size)
             method = presign.get("method", "put")
             if method == "multipart":
-                etags = self._upload_multipart(client, presign, file_path)
+                etags = self._upload_multipart(upload_client, presign, file_path)
             else:
-                self._upload_single(client, presign, file_path)
+                self._upload_single(upload_client, presign, file_path)
             self._complete(
                 client, presign, size, md5, sha256, data_type,
                 etags if method == "multipart" else None,
@@ -121,6 +127,7 @@ class BagUploader:
         finally:
             if self._client_factory is None:
                 client.close()
+                upload_client.close()
 
         result = BagUploadResult(
             bucket=presign["bucket"],
@@ -223,7 +230,7 @@ class BagUploader:
         return payload.get("data")
 
     def _default_client(self) -> Any:
-        """构建带 Bearer JWT 的 httpx 客户端。"""
+        """构建带 Bearer JWT 的 httpx 客户端（仅用于网关 presign/complete POST）。"""
         import httpx  # noqa: PLC0415
 
         token = self._settings.jwt_token.get_secret_value() if self._settings.jwt_token else ""
@@ -231,6 +238,16 @@ class BagUploader:
             timeout=self._settings.upload_timeout_s,
             headers={"Authorization": f"Bearer {token}"},
         )
+
+    def _default_upload_client(self) -> Any:
+        """构建直传 presigned URL 用的**无鉴权头** httpx 客户端（V3.8.11）。
+
+        presigned 地址已把签名放在查询串里，请求不能再带 Authorization 头，
+        否则 MinIO/S3 判定「多种鉴权方式并存」返回 400。
+        """
+        import httpx  # noqa: PLC0415
+
+        return httpx.Client(timeout=self._settings.upload_timeout_s)
 
 
 def _digest_file(path: Path) -> tuple[int, str, str]:

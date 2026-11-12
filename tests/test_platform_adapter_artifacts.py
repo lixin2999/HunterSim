@@ -218,3 +218,61 @@ class TestV389PresignErrorDetail:
             status_code = 500
 
         assert _response_detail(_Bare()) == ""
+
+
+class TestV3811PresignedPutNoAuthHeader:
+    """V3.8.11：presigned URL 直传 PUT 不得携带 Authorization 头。
+
+    presigned 地址已把签名放在查询串里，若复用带 Bearer 头的客户端 PUT，
+    MinIO/S3 会判定「多种鉴权方式并存」返回 400（multiple authentication types）。
+    网关 presign/complete POST 仍需带 Bearer；两者必须用不同客户端。
+    """
+
+    def test_presigned_put_uses_no_auth_client(self, monkeypatch, tmp_path: Path) -> None:
+        import httpx
+
+        made: list[Any] = []
+
+        class _RecClient:
+            def __init__(self, timeout: Any = None, headers: Any = None) -> None:
+                self.headers = dict(headers or {})
+                self.did_put = False
+                self.did_post = False
+                made.append(self)
+
+            def post(self, url: str, json: Any = None) -> _FakeResponse:
+                self.did_post = True
+                return _FakeResponse(
+                    200,
+                    {
+                        "code": 0,
+                        "data": {
+                            "object_key": "scenarios/uploaded/eval.json",
+                            "upload_url": "http://minio/put?sig=1",
+                            "bucket": "hunter-raw-data",
+                        },
+                    },
+                )
+
+            def put(self, url: str, content: Any = None) -> _FakeResponse:
+                self.did_put = True
+                return _FakeResponse(200, {})
+
+            def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(httpx, "Client", _RecClient)
+        manager = _manager(tmp_path, _cloud(True), factory=None)
+
+        artifact = manager.write_json("eval.json", {"grade": "A"})
+
+        assert artifact.uploaded is True
+        put_clients = [c for c in made if c.did_put]
+        post_clients = [c for c in made if c.did_post]
+        assert len(put_clients) == 1
+        # 直传客户端不能带 Authorization（否则 MinIO 400 multiple auth types）
+        assert "Authorization" not in put_clients[0].headers
+        # 网关 POST 客户端必须带 Bearer
+        assert post_clients and all("Authorization" in c.headers for c in post_clients)
+        # 两者必须是不同实例
+        assert put_clients[0] not in post_clients

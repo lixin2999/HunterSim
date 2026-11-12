@@ -4680,3 +4680,43 @@ owner（tick）线程：mailbox.run/submit 内联执行，每 tick drain() 一�
 - `pyproject.toml`：`version` 3.8.9 → **3.8.10**。
 
 ---
+
+## V3.8.11 — presigned 直传携带 Authorization 头导致 MinIO 400（multiple authentication types）（实机 SCN-2056-1a1e-animal 暴露）
+
+**发布日期**：2026-11-12
+**版本定位**：问题修复（patch）。承接 V3.8.10：bucket 枚举修正后 presign 已过（不再 422），PUT 直传第一次真正执行，随即暴露下一层潜伏缺陷——向 presigned URL 的 PUT 复用了带 `Authorization: Bearer` 的网关客户端，MinIO 返回 400。V3.8.10 之前 presign 先失败于 422，PUT 从未执行，故该 400 一直潜伏。
+
+### 缺陷 G：presigned PUT 与网关 POST 共用带鉴权头的客户端（直传 400）
+
+- **现象**（实机日志）：产物四个文件（mapping.json/eval.json/events.jsonl/run.log）均 `产物直传失败 … HTTP 400: <Error><Code>InvalidRequest</Code><Message>Invalid Request (request has multiple authentication types, please use one)</Message><Resource>/hunter-raw-data/SIM-…`；bag 链路同步 `bag 上传完成：sensors_r1.mcap → None`（PUT 400 抛 `UploadError`被 connector 兼容后返回 None）。
+- **根因**：`ArtifactManager._default_client()` 与 `BagUploader._default_client()` 构的 httpx.Client 默认带 `Authorization: Bearer <jwt>` 头（网关 presign/complete POST 需要），但同一个 client 被复用于向 **presigned `upload_url` 发 PUT**。presigned URL 已把签名放在查询串（X-Amz-Credential/X-Amz-Signature），再叠加 Authorization 头 → MinIO/S3 判定「多种鉴权方式并存」拒 400。
+- **变更**：`platform_adapter/artifacts.py` 与 `cloud/bag_uploader.py` 均新增 `_default_upload_client()`（**无鉴权头**的 httpx.Client）；直传 PUT（含 bag 分片 part PUT）改用 `upload_client`，网关 presign/complete POST 仍用带 Bearer 的 `client`。生产（无 `client_factory`）两个客户端分开、`finally` 各自 close；测试注入时 `upload_client is client`（复用同一 mock，`put` 无副作用），既有断言全部不变。
+
+### 验证
+
+- 新增单测：`test_platform_adapter_artifacts.TestV3811PresignedPutNoAuthHeader`、`test_bag_uploader.test_v3811_presigned_put_uses_no_auth_client`（各断言：直传客户端不含 Authorization、网关 POST 客户端含 Bearer、两者为不同实例）。
+- 聚焦回归：`test_platform_adapter_artifacts`/`test_bag_uploader`/`test_adapter_recording_flow`/`test_cloud_connector` 共 **51 passed**；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+1. 升级 `pip install -U hunter-sim==3.8.11`（或 `uv pip install -e .`）。
+2. 重下发动物穿行场景：产物直传应 `产物已上传：…`（不再 400）；bag 上传不再 `→ None`。
+
+### 遗留（非本版本代码范围）
+
+- **事件制动释放后自车仍物理楔住**（本轮实机日志确认）：V3.8.10 的 15s 兜底已按预期触发（`ego_event_brake_hold_timeout` 强制释放制动），但释放后自车立即 `ego_physical_stuck`（throttle=1.00 却 0 m/s、nearest≈1.0m）——脚本化横穿（deer 回退 pedestrian）与自车已物理接触、互相顶住，15s 释放只解「制动锁存」不解「物理碰撞」。`passed=False` 是 V3.8.9 欠速兜底的**正确结果**（不再假通过）。根除需平台侧补横穿路径净空/真实动物资产（见 V3.8.10 遗留 deer 项），非仿真端快速修复。
+- **空产物 `file_size=0` 潜在 422**（V3.8.10 遗留、未修）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.11`；`pyproject.toml` 版本 `3.8.11`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → `3.8.11`，追加 V3.8.11 条目；测试计数 1620 → 1622。
+- `user_manual.md`：版本头 → V3.8.11；FAQ 补充「presign 已过但直传 PUT 400 multiple authentication types」。
+- `deployment_and_operations.md`：版本头 → V3.8.11；新增 `### V3.8.10 → V3.8.11` 升级章节；排障表补 presigned PUT 400 行。
+- `docs/单机部署指南.md`：版本头 → V3.8.11；预期行补 V3.8.11。
+- `pyproject.toml`：`version` 3.8.10 → **3.8.11**。
+
+---

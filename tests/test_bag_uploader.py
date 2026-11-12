@@ -133,3 +133,53 @@ def test_disabled_noop() -> None:
     """未启用直接 no-op。"""
     uploader = BagUploader(_settings(enabled=False))
     assert uploader.connect() is False
+
+
+def test_v3811_presigned_put_uses_no_auth_client(monkeypatch, bag_file: Path) -> None:
+    """V3.8.11：presigned PUT 直传用无鉴权头客户端，网关 POST 用带 Bearer 客户端。
+
+    复用带 Bearer 头的客户端向 presigned URL PUT 会被 MinIO 判定
+    「多种鉴权方式并存」返回 400，故两者必须分开。
+    """
+    import httpx
+
+    made: list[Any] = []
+
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/run01.mcap",
+        "method": "put",
+        "upload_url": "http://minio/put?sig=1",
+    }
+
+    class RecClient:
+        def __init__(self, timeout: Any = None, headers: Any = None) -> None:
+            self.headers = dict(headers or {})
+            self.did_put = False
+            self.did_post = False
+            made.append(self)
+
+        def post(self, url: str, json: Any = None) -> FakeResponse:
+            self.did_post = True
+            if "presign" in url:
+                return FakeResponse(200, {"code": 0, "message": "ok", "data": presign})
+            return FakeResponse(200, {"code": 0, "message": "ok", "data": {"status": "completed"}})
+
+        def put(self, url: str, content: Any = None) -> FakeResponse:
+            self.did_put = True
+            return FakeResponse(200, headers={})
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(httpx, "Client", RecClient)
+    uploader = BagUploader(_settings())  # 无 client_factory → 走生产双客户端分支
+    assert uploader.connect() is True
+    result = uploader.upload(bag_file)
+    assert result is not None
+    put_clients = [c for c in made if c.did_put]
+    post_clients = [c for c in made if c.did_post]
+    assert len(put_clients) == 1
+    assert "Authorization" not in put_clients[0].headers
+    assert post_clients and all("Authorization" in c.headers for c in post_clients)
+    assert put_clients[0] not in post_clients

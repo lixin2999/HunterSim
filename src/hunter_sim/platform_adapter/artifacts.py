@@ -128,8 +128,14 @@ class ArtifactManager:
             logger.debug("HUNTER_CORE_JWT_TOKEN 未配置，产物仅落本地")
             return None
         client = None
+        upload_client = None
         try:
             client = self._client_factory() if self._client_factory else self._default_client(token)
+            # V3.8.11：直传用不带 Authorization 头的独立客户端——presigned URL 已把签名
+            # 放在查询串里，若复用带 Bearer 头的客户端 PUT，MinIO/S3 会判定「多种鉴权方式
+            # 并存」返回 400（multiple authentication types）。测试注入时复用同一 mock
+            # （put 无副作用），生产时另建无鉴权头客户端。
+            upload_client = client if self._client_factory else self._default_upload_client()
             size = path.stat().st_size
             presign = self._presign(client, file_name, size)
             object_key = presign.get("object_key")
@@ -138,7 +144,7 @@ class ArtifactManager:
             upload_url = presign.get("upload_url")
             if upload_url:
                 with path.open("rb") as handle:
-                    response = client.put(upload_url, content=handle)
+                    response = upload_client.put(upload_url, content=handle)
                 if getattr(response, "status_code", 500) >= 300:
                     logger.warning(
                         f"产物直传失败 {file_name}: HTTP {response.status_code}"
@@ -152,10 +158,12 @@ class ArtifactManager:
             logger.warning(f"产物上传失败（保留本地副本）：{type(exc).__name__}: {exc}")
             return None
         finally:
-            if client is not None and self._client_factory is None:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
+            if self._client_factory is None:
+                for _c in (client, upload_client):
+                    if _c is not None:
+                        close = getattr(_c, "close", None)
+                        if callable(close):
+                            close()
 
     def _presign(self, client: Any, file_name: str, size: int) -> dict[str, Any]:
         """申请预签名地址。"""
@@ -205,13 +213,23 @@ class ArtifactManager:
         return payload.get("data") if isinstance(payload, dict) else None
 
     def _default_client(self, token: str) -> Any:
-        """构建带 Bearer JWT 的 httpx 客户端。"""
+        """构建带 Bearer JWT 的 httpx 客户端（仅用于网关 presign/complete POST）。"""
         import httpx  # noqa: PLC0415
 
         return httpx.Client(
             timeout=self._settings.upload_timeout_s,
             headers={"Authorization": f"Bearer {token}"},
         )
+
+    def _default_upload_client(self) -> Any:
+        """构建直传 presigned URL 用的**无鉴权头** httpx 客户端（V3.8.11）。
+
+        presigned 地址已把签名放在查询串里，请求不能再带 Authorization 头，
+        否则 MinIO/S3 判定「多种鉴权方式并存」返回 400。
+        """
+        import httpx  # noqa: PLC0415
+
+        return httpx.Client(timeout=self._settings.upload_timeout_s)
 
 
 def _safe(value: str) -> str:
