@@ -17,10 +17,17 @@ from pydantic import SecretStr
 
 
 class FakeResponse:
-    def __init__(self, status_code: int = 200, body: Any = None, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+        text: str = "",
+    ) -> None:
         self.status_code = status_code
         self._body = body
         self.headers = headers or {}
+        self.text = text
 
     def json(self) -> Any:
         return self._body
@@ -162,6 +169,81 @@ def test_business_error_code_raises(bag_file: Path) -> None:
     uploader.connect()
     with pytest.raises(UploadError):
         uploader.upload(bag_file)
+
+
+def test_complete_422_includes_body_and_hint(bag_file: Path) -> None:
+    """V3.8.16：网关 4xx 抛错携截断响应体与 status_hint（实机 complete 422 定位）。"""
+
+    class Complete422Client(FakeClient):
+        def post(self, url, json=None):  # noqa: ANN001, D102
+            if "complete" in url:
+                return FakeResponse(
+                    422, body=None, text='{"error":"SizeBytes field required"}'
+                )
+            return super().post(url, json)
+
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/run01.mcap",
+        "method": "put",
+        "upload_url": "http://minio/put?sig=1",
+    }
+    uploader = BagUploader(
+        _settings(), client_factory=lambda: Complete422Client(presign)
+    )
+    uploader.connect()
+    with pytest.raises(UploadError) as ei:
+        uploader.upload(bag_file)
+    assert ei.value.status_hint == 422
+    assert "field required" in str(ei.value)
+
+
+def test_single_put_failure_includes_body_and_hint(bag_file: Path) -> None:
+    """V3.8.16：单次直传 PUT 失败拼 MinIO 错误体并携 status_hint。"""
+
+    class Put403Client(FakeClient):
+        def put(self, url, content=None, headers=None):  # noqa: ANN001, D102
+            return FakeResponse(403, text="<Error><Code>SignatureDoesNotMatch</Code></Error>")
+
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/run01.mcap",
+        "method": "put",
+        "upload_url": "http://minio/put?sig=1",
+    }
+    uploader = BagUploader(_settings(), client_factory=lambda: Put403Client(presign))
+    uploader.connect()
+    with pytest.raises(UploadError) as ei:
+        uploader.upload(bag_file)
+    assert ei.value.status_hint == 403
+    assert "SignatureDoesNotMatch" in str(ei.value)
+
+
+def test_multipart_part_failure_includes_hint(bag_file: Path) -> None:
+    """V3.8.16：分片 PUT 失败携分片号、响应体与 status_hint。"""
+
+    class Part403Client(FakeClient):
+        def put(self, url, content=None, headers=None):  # noqa: ANN001, D102
+            if "p2" in url:
+                return FakeResponse(403, text="<Error><Code>SignatureDoesNotMatch</Code></Error>")
+            return super().put(url, content, headers)
+
+    presign = {
+        "bucket": "hunter-rosbag",
+        "object_key": "SIM_001/run01.mcap",
+        "method": "multipart",
+        "upload_id": "uid-9",
+        "parts": [
+            {"part_number": 1, "upload_url": "http://minio/p1"},
+            {"part_number": 2, "upload_url": "http://minio/p2"},
+        ],
+    }
+    uploader = BagUploader(_settings(), client_factory=lambda: Part403Client(presign, multipart=True))
+    uploader.connect()
+    with pytest.raises(UploadError) as ei:
+        uploader.upload(bag_file)
+    assert ei.value.status_hint == 403
+    assert "分片 2" in str(ei.value)
 
 
 def test_missing_jwt_downgrades() -> None:

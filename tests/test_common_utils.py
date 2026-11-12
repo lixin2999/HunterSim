@@ -379,3 +379,46 @@ class TestPresignedUploadHeaders:
 
         # 不抛异常，降级为空字典
         assert presigned_upload_headers("") == {}
+
+
+class TestResponseDetail:
+    """V3.8.16：共享 response_detail（4xx/5xx 截断响应体提取）。"""
+
+    def test_text_whitespace_fold_and_truncate(self) -> None:
+        from hunter_sim.common.utils import response_detail
+
+        class Resp:
+            text = "a\n\nb  " + "x" * 50
+
+        assert response_detail(Resp(), max_chars=10) == "a b " + "x" * 6 + "…"
+
+    def test_bytes_decoded(self) -> None:
+        from hunter_sim.common.utils import response_detail
+
+        class Resp:
+            text = ""
+            content = "字段缺失".encode("utf-8")
+
+        assert response_detail(Resp()) == "字段缺失"
+
+    def test_mock_without_attrs_returns_empty(self) -> None:
+        from hunter_sim.common.utils import response_detail
+
+        class Bare:
+            pass
+
+        assert response_detail(Bare()) == ""
+
+    def test_read_error_swallowed(self) -> None:
+        from hunter_sim.common.utils import response_detail
+
+        class Boom:
+            @property
+            def text(self) -> str:
+                raise RuntimeError("stream closed")
+
+            @property
+            def content(self) -> bytes:
+                raise RuntimeError("stream closed")
+
+        assert response_detail(Boom()) == ""

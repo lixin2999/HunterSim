@@ -424,7 +424,13 @@ class CloudConnector:
                         result = self.uploader.upload(file_path, data_type=data_type)
                         break
                     except Exception as exc:  # noqa: BLE001
-                        if attempt >= max_attempts:
+                        # V3.8.16：4xx 为确定性失败（请求本身非法，如 complete
+                        # 422 字段校验），重试必重败；旧版重试会把 2 GB 文件全量
+                        # 重传 3 次（实机观测每次 ~100s），白烧带宽还刷日志。5xx/
+                        # 网络错（无 status_hint）仍按配置重试。
+                        hint = getattr(exc, "status_hint", None)
+                        deterministic = isinstance(hint, int) and 400 <= hint < 500
+                        if attempt >= max_attempts or deterministic:
                             raise
                         logger.warning(
                             f"bag 上传失败（{attempt}/{max_attempts} 次），"

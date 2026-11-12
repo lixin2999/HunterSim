@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from hunter_sim.common.models import CloudSettings
-from hunter_sim.common.utils import get_logger, presigned_upload_headers
+from hunter_sim.common.utils import get_logger, presigned_upload_headers, response_detail
 
 logger = get_logger(__name__)
 
@@ -286,27 +286,10 @@ def _presign_diagnostics(upload_url: str) -> str:
 def _response_detail(response: Any) -> str:
     """从响应里取截断文本（供 4xx/5xx 定位）；无文本/读取失败返回空串。
 
-    兼容 mock（无 ``text``/``content`` 属性时 ``getattr`` 返回 None → 空串），
-    不抛异常；优先 ``text``（已解码）后退 ``content``（字节）。
+    V3.8.16：实现上提为 ``common.utils.response_detail`` 供产物/bag 两条链路复用，
+    本包装保留模块内入口与截断长度常量（行为与旧版一致，含 mock 兼容）。
     """
-    raw: Any = None
-    for attr in ("text", "content"):
-        try:
-            raw = getattr(response, attr, None)
-        except Exception:  # noqa: BLE001  任何读取异常都不影响主流程
-            raw = None
-        if raw:
-            break
-    if not raw:
-        return ""
-    try:
-        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-    except Exception:  # noqa: BLE001
-        return ""
-    text = " ".join(text.split())
-    if len(text) > _RESPONSE_DETAIL_MAX_CHARS:
-        text = text[:_RESPONSE_DETAIL_MAX_CHARS] + "…"
-    return text
+    return response_detail(response, _RESPONSE_DETAIL_MAX_CHARS)
 
 
 __all__ = ["ArtifactManager", "ArtifactResult"]

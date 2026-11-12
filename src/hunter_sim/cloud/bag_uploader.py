@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hunter_sim.common.models import CloudSettings
-from hunter_sim.common.utils import get_logger, presigned_upload_headers
+from hunter_sim.common.utils import get_logger, presigned_upload_headers, response_detail
 
 logger = get_logger(__name__)
 
@@ -31,7 +31,16 @@ ClientFactory = Callable[[], Any]
 
 
 class UploadError(RuntimeError):
-    """上传流程失败（预签名拒绝 / 直传失败 / 完整性校验不通过）。"""
+    """上传流程失败（预签名拒绝 / 直传失败 / 完整性校验不通过）。
+
+    V3.8.16：携带 ``status_hint``（HTTP 状态码）供调用方区分确定性失败：
+    4xx 为请求本身非法（重试必重败，2 GB 重传白白烧几分钟带宽），
+    5xx/网络错才有重试价值。
+    """
+
+    def __init__(self, message: str, status_hint: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_hint = status_hint
 
 
 @dataclass(frozen=True)
@@ -171,7 +180,12 @@ class BagUploader:
         with file_path.open("rb") as fh:
             resp = client.put(url, content=fh, headers=put_headers)
         if resp.status_code >= 300:
-            raise UploadError(f"直传失败：HTTP {resp.status_code}")
+            # V3.8.16：拼上截断响应体（MinIO 错误 XML 含 Code 字段），与产物链路
+            # V3.8.9 同口径；旧版只报状态码，直传失败时无法定位。
+            status = resp.status_code
+            raise UploadError(
+                f"直传失败：HTTP {status}: {response_detail(resp)}", status_hint=status
+            )
 
     def _upload_multipart(self, client: Any, presign: dict[str, Any], file_path: Path) -> list[dict[str, Any]]:
         """分片 PUT，返回 complete 所需的 parts（part_number + etag）。"""
@@ -186,7 +200,13 @@ class BagUploader:
                 part_headers = presigned_upload_headers(part["upload_url"])
                 resp = client.put(part["upload_url"], content=chunk, headers=part_headers)
                 if resp.status_code >= 300:
-                    raise UploadError(f"分片 {part['part_number']} 上传失败：HTTP {resp.status_code}")
+                    # V3.8.16：同样拼上截断响应体供定位。
+                    status = resp.status_code
+                    raise UploadError(
+                        f"分片 {part['part_number']} 上传失败：HTTP {status}: "
+                        f"{response_detail(resp)}",
+                        status_hint=status,
+                    )
                 etags.append({"part_number": part["part_number"], "etag": resp.headers.get("ETag", "")})
         return etags
 
@@ -223,7 +243,13 @@ class BagUploader:
         url = self._settings.gateway_url.rstrip("/") + path
         resp = client.post(url, json=body)
         if resp.status_code >= 400:
-            raise UploadError(f"{path} HTTP {resp.status_code}")
+            # V3.8.16：带上截断响应体——实机 `complete HTTP 422` 因旧版丢弃
+            # 响应体无法定位非法字段，同 V3.8.9 产物链路旧坑（当时修复未同步
+            # 本链路）；平台字段级校验错误（如 `field required`）仅在响应体里。
+            status = resp.status_code
+            raise UploadError(
+                f"{path} HTTP {status}: {response_detail(resp)}", status_hint=status
+            )
         try:
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001

@@ -166,6 +166,49 @@ def test_perform_upload_none_marks_failed() -> None:
     assert stats["failed"] == 1
 
 
+def test_perform_upload_4xx_not_retried() -> None:
+    """V3.8.16：确定性 4xx（status_hint=422）不重试，避免 2 GB 文件全量重传。"""
+    from hunter_sim.cloud.bag_uploader import UploadError
+
+    fake = FakeKafkaProducer()
+    conn = CloudConnector(
+        _settings(upload_retry_backoff_s=0.0), producer_factory=_factory(fake)
+    )
+    conn.start("sim-001")
+    calls: list[int] = []
+
+    def fail_422(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        raise UploadError("/api/v1/data/files/complete HTTP 422: field required", 422)
+
+    conn.uploader.upload = fail_422  # type: ignore[method-assign]
+    conn._perform_upload(Path("x.mcap"), "rosbag")
+    assert len(calls) == 1  # 旧版会跑满 1+2=3 次
+    assert conn.upload_stats["failed"] == 1
+    conn.stop()
+
+
+def test_perform_upload_5xx_still_retried() -> None:
+    """V3.8.16：5xx（非确定性）仍按配置重试满 max_attempts。"""
+    from hunter_sim.cloud.bag_uploader import UploadError
+
+    fake = FakeKafkaProducer()
+    conn = CloudConnector(
+        _settings(upload_retry_backoff_s=0.0), producer_factory=_factory(fake)
+    )
+    conn.start("sim-001")
+    calls: list[int] = []
+
+    def fail_503(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        raise UploadError("gateway HTTP 503: bad gateway", 503)
+
+    conn.uploader.upload = fail_503  # type: ignore[method-assign]
+    conn._perform_upload(Path("x.mcap"), "rosbag")
+    assert len(calls) == 3  # 1 + upload_max_retries(2)
+    conn.stop()
+
+
 def test_upload_bag_swallows_exception() -> None:
     """_perform_upload 失败时记 WARN 不冒泡（C-1）。"""
     fake = FakeKafkaProducer()

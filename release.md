@@ -4917,3 +4917,52 @@ presign_keys=['bucket','expires_in','method','object_key','parts','upload_id','u
 - `pyproject.toml`：`version` 3.8.14 → **3.8.15**。
 
 ---
+
+## V3.8.16 — bag 链 complete 首次真实到达即撞 422，但旧版丢弃响应体无法定位（实机 V3.8.15 日志暴露）
+
+### 背景与根因
+
+实机 V3.8.15 日志确认 attach 路径 connect() 修复生效：bag 历史上**首次真正发起上传**——presign（含 multipart parts）通过、2.06 GB 分片 PUT 全部成功（~100s），最终卡在 `POST /api/v1/data/files/complete → HTTP 422`，重试 3 次全同败。
+
+两层缺陷：
+
+1. **诊断黑盒复发**：`bag_uploader._post` 招 4xx 只报状态码、丢弃响应体——V3.8.9 在产物链路修的同一坑（当时新增的 `_response_detail` 未同步到 bag 链路），平台字段级校验错误（如 `field required`）只在响应体里，没有它就定不了非法字段；对比产物链 complete 同端点成功，差异集中在 bag 独有的 `upload_id`/`parts` 字段与 `data_type="rosbag"`，但具哪个字段非法必须靠响应体定性；
+2. **确定性失败盲重试**：422 重试必重败，但旧重试逻辑会把 2 GB 文件**全量重传 3 次**（实机每次 ~100s，共白烧 ~5 分钟带宽与磁盘 IO）。
+
+### 变更
+
+- `common/utils.py`：新增共享 helper `response_detail(response, max_chars=800)`（由 artifacts 私有实现上提，行为一致：优先 text 退 content、bytes 解码、空白折叠、截断补省略号、mock/读异常不抛）；`artifacts.py` `_response_detail` 改为委托包装（对外行为无变化）。
+- `cloud/bag_uploader.py`：
+  - `UploadError` 新增 `status_hint`（HTTP 状态码）属性；
+  - `_post` 4xx/5xx、`_upload_single` 与 `_upload_multipart` 直传失败均拼上截断响应体并携带 `status_hint`。
+- `cloud/connector.py` `_perform_upload`：`400 <= status_hint < 500` 为确定性失败**不再重试**直接收口 failed；无 hint（网络错/原生异常）与 5xx 仍按 `upload_max_retries` 重试。
+- 新增单测 9 例：`test_bag_uploader` 3（complete 422 携体+hint / 单次 PUT 403 携 MinIO 体 / 分片失败携分片号+hint）、`test_common_utils.TestResponseDetail` 4（折叠截断/bytes 解码/裸 mock/读异常）、`test_cloud_connector` 2（422 只调 1 次 / 503 跑满 3 次）。
+- 全量 `pytest`：**1644 passed**（1635 + 9）；`flake8` exit=0；`mypy` Success。
+
+### 实机执行步骤
+
+升级 `pip install -U hunter-sim==3.8.16` 后重下发同一场景：
+
+- complete 仍 422 时日志变为单行（不重试）：`bag 上传失败（已忽略，不阻断仿真）：UploadError: /api/v1/data/files/complete HTTP 422: {…字段级校验错误原文…}`；
+- 据响应体定性非法字段（候选：`parts` 项命名/类型、`upload_id` 缺失、`md5` 对 multipart 对象的形态、`data_type` 枚举）——若属客户端可修则下一版修，若属平台 schema 不匹配则转平台侧；
+- 附带收益：整场失败回收从 ~5 分钟降到 ~100s（不再重传 2 次 2 GB）。
+
+### 遗留
+
+- **422 具体非法字段待响应体定性**（本版只保证「看得见」，修复待下一轮日志）。
+- 重试为全量重传（含重新哈希+全部分片 PUT）：未做断点续传/仅重试 complete 步的精细恢复；若 422 定性后确属 complete 步可独立重试，再评估。
+- 场景 `passed=False`（`ego_physical_stuck` 循环等）属既有 SIL 行为遗留；空产物 `file_size=0` 潜在 422（V3.8.10/V3.8.11 遗留）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.16`；`pyproject.toml` 版本 `3.8.16`。
+
+### 文档同步明细
+
+- `README.md`：测试计数 1635 → 1644。
+- `user_manual.md`：版本头 → V3.8.16；FAQ 补充「complete 422 黑盒：响应体已上共享 helper，4xx 不再盲重试」。
+- `deployment_and_operations.md`：版本头 → V3.8.16；新增 `### V3.8.15 → V3.8.16` 升级章节；排障表新增「bag complete HTTP 422」行。
+- `docs/单机部署指南.md`：版本头 → V3.8.16；预期行补 V3.8.16（422 携响应体、不重试）。
+- `pyproject.toml`：`version` 3.8.15 → **3.8.16**。
+
+---

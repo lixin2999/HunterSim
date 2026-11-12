@@ -534,3 +534,41 @@ def presigned_upload_headers(url: str) -> dict[str, str]:
                 headers[param] = values[0]
                 break
     return headers
+
+
+def response_detail(response: Any, max_chars: int = 800) -> str:
+    """从 HTTP 响应里取截断文本（供 4xx/5xx 定位），读取失败返回空串（V3.8.16 上提）。
+
+    V3.8.9 在产物链路验证：服务端 422 响应体携带字段级校验错误（如
+    ``field required``），不带响应体则 4xx 变黑盒无法排障。原为 artifacts 模块
+    私有 helper，bag 链路（``cloud/bag_uploader.py``）同类 4xx 仍丢弃响应体
+    致实机 complete 422 无法定位，故上提为共享工具供两条链路复用。
+
+    兼容 mock（无 ``text``/``content`` 属性时 ``getattr`` 返回 None → 空串），
+    不抛异常；优先 ``text``（已解码）后退 ``content``（字节）。
+
+    Args:
+        response: httpx Response 或同形对象。
+        max_chars: 截断长度，超出补省略号。
+
+    Returns:
+        折叠空白后的截断文本；无文本/读取异常时为空串。
+    """
+    raw: Any = None
+    for attr in ("text", "content"):
+        try:
+            raw = getattr(response, attr, None)
+        except Exception:  # noqa: BLE001  任何读取异常都不影响主流程
+            raw = None
+        if raw:
+            break
+    if not raw:
+        return ""
+    try:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    except Exception:  # noqa: BLE001
+        return ""
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
