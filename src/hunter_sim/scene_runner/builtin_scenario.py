@@ -136,6 +136,11 @@ _OVERVIEW_HALF_FOV_DEG = 50.0
 #: 行人脚本化横穿的到达判定阈值（米）
 _WALKER_ARRIVE_EPS_M = 0.3
 
+#: V3.8.18：脚本化行人与自车的接触判定阈值（米，水平距离）。
+#: 行人物理禁用后碰撞传感器不再触发，用该阈值补报碰撞（行人半径≈0.5m
+#: + 自车半宽≈1.0m 的近似）；离开 2 倍阈值后复位去重标记。
+_SCRIPTED_WALKER_CONTACT_M = 1.5
+
 #: 行人速度物理范围（m/s）：平台下发的 crossing_speed 可能高达 3+ m/s，
 #: 不能沿用旧版 1.4 m/s 硬上限，否则鬼探头会「慢动作」。
 _WALKER_MIN_SPEED = 0.3
@@ -307,6 +312,8 @@ class _ScriptedWalker:
         waiting: ``dash`` 模式下是否仍在等待自车接近（未到触发距离前不移动）。
         trigger_distance_m: ``dash`` 模式下自车水平距离小于该值才发起窜入。
         dash_speed_ms: ``dash`` 窜入阶段的速度（>0 时覆盖 speed_ms）。
+        contact_reported: V3.8.18 是否已上报过与自车的接触碰撞（去重，
+            物理禁用后碰撞传感器不再触发，改由距离接触判定补报一次）。
     """
 
     actor: Any
@@ -319,6 +326,7 @@ class _ScriptedWalker:
     waiting: bool = False
     trigger_distance_m: float = 0.0
     dash_speed_ms: float = 0.0
+    contact_reported: bool = False
 
 
 @dataclass(frozen=True)
@@ -457,6 +465,10 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_phys_stuck_next_probe_at_s: float = 0.0
         self._ego_phys_stuck_probe_until_s: float = 0.0
         self.min_distance_samples: list[float] = []
+        # V3.8.18：传感器诊断——每流编码队列丢帧计数与标称帧率（面板展示
+        # 实际/标称 fps 与丢帧数，定位「fps 低于标称」是丢帧还是 tick 上限）。
+        self._frame_drops: dict[str, int] = {}
+        self._nominal_fps: dict[str, float] = {}
         # V3.8.1：事件驱动的自车减速目标速度（m/s）；None=未触发。仅确定性控制下生效，
         # 由 ev-*.action_type=brake 越沿触发置位，使直道绕开 TM 的自车能响应前车/窜出物制动。
         self._ego_event_brake_ms: Optional[float] = None
@@ -501,6 +513,18 @@ class BuiltinScenario(CustomScenarioBase):
             if actor_id is not None:
                 ids.append(int(actor_id))
         return ids
+
+    @property
+    def sensor_diagnostics(self) -> dict[str, Any]:
+        """传感器诊断快照（V3.8.18：每流丢帧计数与标称帧率）。
+
+        供可视化面板展示「实际/标称 fps」与丢帧数，定位 fps 低于标称
+        是编码队列丢帧还是仿真 tick 上限。只读拷贝，不持 CARLA 句柄。
+        """
+        return {
+            "dropped": dict(self._frame_drops),
+            "nominal_fps": dict(self._nominal_fps),
+        }
 
     def participant_states(self) -> list[dict[str, Any]]:
         """交通参与者状态快照（可视化「参与者」面板数据源）。
@@ -607,6 +631,8 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_phys_stuck_next_probe_at_s = 0.0
         self._ego_phys_stuck_probe_until_s = 0.0
         self.min_distance_samples = []
+        self._frame_drops = {}
+        self._nominal_fps = {}
         self._traveled_distance_m = 0.0
         self._parked_spawns.clear()
         self._actor_by_participant.clear()
@@ -2793,6 +2819,18 @@ class BuiltinScenario(CustomScenarioBase):
             carla_module=carla_module,
             spawn=spawn_point,
         )
+        # V3.8.18：脚本化横穿是纯运动学（set_transform 逐帧推进），禁用物理
+        # 仿真避免双向楔死：旧版行人物理体被刹停自车顶住后引擎回推，横穿走廊
+        # 永远走不完（_hazard_in_ego_path 恒真 → 整场 0 m/s 冻结）；自车 likewise
+        # 被行人碰撞体楔住无法恢复。禁用后 set_transform 为唯一位姿权威，
+        # 与静态障碍的碰撞不受影响（静态物仍走物理）。与自车的碰撞改由
+        # _advance_scripted_walkers 的距离接触判定补报（评估不漏判）。
+        physics_setter = getattr(actor, "set_simulate_physics", None)
+        if callable(physics_setter):
+            try:
+                physics_setter(False)
+            except Exception as exc:  # noqa: BLE001  旧版服务端/桩不支持时降级
+                logger.debug(f"Walker set_simulate_physics(False) failed: {exc}")
         if is_sudden:
             walker.mode = "dash"
             walker.waiting = True
@@ -2889,9 +2927,47 @@ class BuiltinScenario(CustomScenarioBase):
                     ),
                 )
                 setter(new_transform)
+                # V3.8.18：物理禁用后碰撞传感器不再触发，用距离接触判定补报
+                # 与自车的碰撞（每次接触只报一次，避免逐 tick 重复计数）。
+                self._report_scripted_walker_contact(walker)
             except Exception as exc:  # noqa: BLE001  单帧推进失败不阻断场景
                 logger.debug(f"Scripted walker update failed: {exc}")
                 walker.done = True
+
+    def _report_scripted_walker_contact(self, walker: _ScriptedWalker) -> None:
+        """脚本化行人与自车接触时补报碰撞事件（V3.8.18，去重）。
+
+        脚本化行人物理仿真已禁用（避免楔死），自车碰撞传感器对其不再
+        触发；若不补报，「撞了行人却 no_collision=True」会形成新的假通过。
+        接触阈值取行人半径+自车半宽近似（水平距离），与 min_distance_samples
+        的欧氏距离口径一致；每次接触只报一次（离开后再次接触可再报）。
+        """
+        if self._ego is None:
+            return
+        ego_pose = self._ego_live_pose()
+        if ego_pose is None:
+            return
+        try:
+            location = walker.actor.get_transform().location
+            gap = math.hypot(ego_pose.x - float(location.x), ego_pose.y - float(location.y))
+        except Exception:  # noqa: BLE001  读数失败不补报
+            return
+        if gap <= _SCRIPTED_WALKER_CONTACT_M:
+            if walker.contact_reported:
+                return  # 持续接触去重：不得逐 tick 重复计数
+            walker.contact_reported = True
+            actor_id = int(getattr(walker.actor, "id", -1))
+            logger.warning(
+                "scripted_walker_contact: 自车与脚本化行人 actor=%s 接触（gap=%.2fm ≤ %.2fm，"
+                "物理禁用后距离判定补报碰撞）",
+                actor_id,
+                gap,
+                _SCRIPTED_WALKER_CONTACT_M,
+            )
+            self._event_detector.on_collision(self.elapsed_seconds, actor_id, 0.0)
+        elif gap > _SCRIPTED_WALKER_CONTACT_M * 2.0:
+            # 已离开接触区：复位去重标记，再次接触可再报
+            walker.contact_reported = False
 
     def _attach_event_sensors(self, world: Any, library: Any) -> None:
         """按场景事件声明挂载碰撞/车道偏离传感器（事件回调驱动 EventDetector）。"""
@@ -2989,6 +3065,16 @@ class BuiltinScenario(CustomScenarioBase):
             return
 
         attached = 0
+        # V3.8.18：标称帧率按型号剖面记录（面板「实际/标称」对比用）
+        nominal_by_type: dict[SensorType, float] = {}
+        if bundle.lidar is not None:
+            nominal_by_type[SensorType.LIDAR] = float(bundle.lidar.rotation_frequency_hz)
+        if bundle.rgb_camera is not None:
+            nominal_by_type[SensorType.RGB_CAMERA] = float(bundle.rgb_camera.fps)
+        if bundle.depth_camera is not None:
+            nominal_by_type[SensorType.DEPTH_CAMERA] = float(bundle.depth_camera.fps)
+        if bundle.imu is not None:
+            nominal_by_type[SensorType.IMU] = float(bundle.imu.frequency_hz)
         for sensor_type, blueprint in blueprints.items():
             stream = _SIM_STREAM_BY_TYPE.get(sensor_type)
             if stream is None:
@@ -3002,6 +3088,9 @@ class BuiltinScenario(CustomScenarioBase):
             self._listen_sensor(sensor, stream)
             self._sensors.append(sensor)
             attached += 1
+            nominal = nominal_by_type.get(sensor_type)
+            if nominal and nominal > 0:
+                self._nominal_fps[stream] = nominal
 
         if attached:
             self._ros_enabled = any(spec.ros_enabled for spec in specs)
@@ -3082,6 +3171,7 @@ class BuiltinScenario(CustomScenarioBase):
             with self._frame_cond:
                 self._frame_pending -= 1
             SENSOR_FRAMES_DROPPED_TOTAL.labels(stream=stream).inc()
+            self._frame_drops[stream] = self._frame_drops.get(stream, 0) + 1
 
     def _ensure_frame_worker(self) -> None:
         """惰性启动传感器编码线程（幂等）。"""
@@ -3173,6 +3263,9 @@ class BuiltinScenario(CustomScenarioBase):
                 self._overview_queue.put_nowait(frame)
             except queue.Full:
                 SENSOR_FRAMES_DROPPED_TOTAL.labels(stream=STREAM_OVERVIEW).inc()
+                self._frame_drops[STREAM_OVERVIEW] = (
+                    self._frame_drops.get(STREAM_OVERVIEW, 0) + 1
+                )
 
     def _ensure_overview_worker(self) -> None:
         """惰性启动环视编码线程（幂等）。"""
@@ -3347,9 +3440,15 @@ class BuiltinScenario(CustomScenarioBase):
         logger.warning(f"Sensor frame {stage} failed ({stream}): {exc}{suffix}")
 
     def _dispatch_sensor_data(self, stream: str, data: Any) -> None:
-        """实际分发逻辑（拆分便于单测直接调用）。"""
+        """实际分发逻辑（拆分便于单测直接调用）。
+
+        V3.8.18 时钟统一：``ts`` 为 CARLA 仿真经过秒（仅供 FrameHub fps
+        滑窗/面板仿真时刻列）；mcap 的 ``log_time_ns`` 改用墙钟 epoch ns，
+        离线 bag 工具才能按真实时间轴回放；仿真经过秒另存消息 meta。
+        """
         ts = float(getattr(data, "timestamp", 0.0)) or time.time()
-        log_time_ns = int(ts * 1e9)
+        wall_ts = time.time()
+        log_time_ns = int(wall_ts * 1e9)
         frame_id = _FRAME_IDS.get(stream, stream)
 
         if stream == STREAM_OVERVIEW:
@@ -3377,6 +3476,7 @@ class BuiltinScenario(CustomScenarioBase):
                         "width": encoded.width,
                         "height": encoded.height,
                         "quality": quality,
+                        "sim_ts": ts,
                     },
                 )
             return
@@ -3400,6 +3500,7 @@ class BuiltinScenario(CustomScenarioBase):
                         "format": encoded.format,
                         "width": encoded.width,
                         "height": encoded.height,
+                        "sim_ts": ts,
                     },
                 )
             if self._recorder is not None:
@@ -3408,6 +3509,7 @@ class BuiltinScenario(CustomScenarioBase):
                     stream,
                     log_time_ns,
                     build_image_message(raw, width, height, "bgra8", frame_id, log_time_ns),
+                    meta={"sim_ts": ts},
                 )
             self._publish_ros("rgb", data)
             return
@@ -3427,6 +3529,7 @@ class BuiltinScenario(CustomScenarioBase):
                             "width": width,
                             "height": height,
                             "frame_id": frame_id,
+                            "sim_ts": ts,
                         },
                     )
                 if self._recorder is not None:
@@ -3434,6 +3537,7 @@ class BuiltinScenario(CustomScenarioBase):
                         stream,
                         log_time_ns,
                         build_image_message(meters, width, height, "32FC1", frame_id, log_time_ns),
+                        meta={"sim_ts": ts},
                     )
             self._publish_ros("depth", data)
             return
@@ -3441,12 +3545,13 @@ class BuiltinScenario(CustomScenarioBase):
         if stream == "lidar":
             payload, points = self._lidar_xyz(points_bytes=_measurement_bytes(data))
             if self._frame_hub is not None:
-                self._frame_hub.push(stream, ts, payload, {"points": points})
+                self._frame_hub.push(stream, ts, payload, {"points": points, "sim_ts": ts})
             if self._recorder is not None and payload:
                 self._recorder.push_stream(
                     stream,
                     log_time_ns,
                     build_pointcloud2_message(payload, points, frame_id, log_time_ns),
+                    meta={"sim_ts": ts},
                 )
             self._publish_ros("lidar", data)
             return
@@ -3455,12 +3560,15 @@ class BuiltinScenario(CustomScenarioBase):
             accel = _vec3(getattr(data, "accelerometer", None))
             gyro = _vec3(getattr(data, "gyroscope", None))
             if self._frame_hub is not None:
-                self._frame_hub.push(stream, ts, repr((accel, gyro)).encode("utf-8"), {})
+                self._frame_hub.push(
+                    stream, ts, repr((accel, gyro)).encode("utf-8"), {"sim_ts": ts}
+                )
             if self._recorder is not None:
                 self._recorder.push_stream(
                     stream,
                     log_time_ns,
                     build_imu_message(accel, gyro, frame_id, log_time_ns),
+                    meta={"sim_ts": ts},
                 )
             self._publish_ros("imu", data)
 

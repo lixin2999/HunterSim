@@ -593,6 +593,19 @@ class SceneRunnerService:
         """
         return [dict(state) for state in self._actor_state_cache]
 
+    def sensor_diagnostics(self) -> dict[str, Any]:
+        """传感器诊断快照（V3.8.18：每流丢帧计数与标称帧率）。
+
+        透传 ``BuiltinScenario.sensor_diagnostics``；场景未装载时返回空字典。
+        """
+        scenario = self._scenario
+        if scenario is None:
+            return {"dropped": {}, "nominal_fps": {}}
+        try:
+            return dict(getattr(scenario, "sensor_diagnostics", {}) or {})
+        except Exception:  # noqa: BLE001  只读诊断不得因场景释放而抛异常
+            return {"dropped": {}, "nominal_fps": {}}
+
     def _refresh_actor_states(self) -> None:
         """刷新参与者状态缓存（仅 tick 线程调用）。
 

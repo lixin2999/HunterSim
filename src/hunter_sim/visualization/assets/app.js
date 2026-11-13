@@ -109,6 +109,19 @@
     );
   }
 
+  // V3.8.18：仿真经过秒（非 Unix epoch）格式化为 hh:mm:ss，供传感器表「仿真时刻」列。
+  function simClock(seconds) {
+    if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0) {
+      return "—";
+    }
+    var total = Math.floor(seconds);
+    var hours = Math.floor(total / 3600);
+    var minutes = Math.floor((total % 3600) / 60);
+    var rest = total % 60;
+    var prefix = hours > 0 ? pad(hours) + ":" : "";
+    return prefix + pad(minutes) + ":" + pad(rest);
+  }
+
   function humanDuration(seconds) {
     var total = Math.max(0, Math.floor(typeof seconds === "number" ? seconds : 0));
     var hours = Math.floor(total / 3600);
@@ -294,7 +307,7 @@
       setBadge("badge-carla", "CARLA 未知", "warn");
     }
     setBadge("badge-platform", platform.enabled ? "平台已接入" : "平台未启用", platform.enabled ? "ok" : "warn");
-    setBadge("badge-ros", ros.enabled ? "ROS2 已启用" : "ROS2 未启用", ros.enabled ? "ok" : "");
+    setBadge("badge-ros", ros.enabled ? "ROS2 已启用" : ros.reason === "unavailable" ? "ROS2 不可用" : "ROS2 未启用", ros.enabled ? "ok" : "");
     setBadge(
       "badge-scene",
       active ? "场景 " + (active.status || "?") : "场景空闲",
@@ -509,10 +522,50 @@
       ["场景", sceneLabel],
       ["模式", payload.mode],
       ["车辆", payload.vehicle_id],
-      ["状态", statusText, statusKind],
+      ["平台状态", statusText, statusKind],
     ];
+    // V3.8.18：评估结论与平台状态分行展示（succeeded ≠ 评估通过）。
+    var evaluation = payload.evaluation || null;
+    if (evaluation) {
+      var evalText = evaluation.passed ? "通过" : "未通过";
+      if (evaluation.grade) {
+        evalText += "（等级 " + evaluation.grade + "）";
+      }
+      rows.push(["评估结论", evalText, evaluation.passed ? "" : "err"]);
+      var criteria = evaluation.success_criteria || {};
+      if (criteria.max_speed_deviation !== undefined) {
+        var devText = num(criteria.max_speed_deviation, 2) + " m/s";
+        if (criteria.max_speed_deviation_limit !== undefined && criteria.max_speed_deviation_limit !== null) {
+          devText += " / 上限 " + num(criteria.max_speed_deviation_limit, 2);
+        }
+        devText += criteria.max_speed_deviation_ok ? " ✓" : " ✗";
+        rows.push(["速度偏差", devText, criteria.max_speed_deviation_ok ? "" : "err"]);
+      }
+      if (criteria.min_safe_distance !== undefined && criteria.min_safe_distance !== null) {
+        var distText = num(criteria.min_safe_distance, 2) + " m";
+        if (criteria.min_safe_distance_required !== undefined && criteria.min_safe_distance_required !== null) {
+          distText += " / 要求 ≥ " + num(criteria.min_safe_distance_required, 2);
+        }
+        distText += criteria.min_safe_distance_ok ? " ✓" : " ✗";
+        rows.push(["最小安全距离", distText, criteria.min_safe_distance_ok ? "" : "err"]);
+      }
+      if (criteria.no_collision !== undefined) {
+        rows.push(["无碰撞", criteria.no_collision ? "是 ✓" : "否 ✗", criteria.no_collision ? "" : "err"]);
+      }
+    } else if (isTerminalInstance()) {
+      rows.push(["评估结论", "无评估结果", "warn"]);
+    }
     if (message) {
       rows.push(["原因", message, messageKind]);
+    }
+    // V3.8.18：运行期录制态可见（旧版运行中一直显「未录制」，终态才出现文件大小）。
+    var recordingText;
+    if (payload.recording_active) {
+      recordingText = "录制中 (" + formatBytes(payload.recording_bytes) + ")";
+    } else if (payload.recording_path) {
+      recordingText = formatBytes(payload.recording_bytes);
+    } else {
+      recordingText = "未录制";
     }
     rows.push(
       ["进度", progress],
@@ -520,7 +573,7 @@
       ["参与者", num(payload.actors_count, 0)],
       ["碰撞", num(payload.collisions, 0)],
       ["车道侵入", num(payload.lane_invasions, 0)],
-      ["录制", payload.recording_path ? formatBytes(payload.recording_bytes) : "未录制"],
+      ["录制", recordingText],
       ["更新时间", payload.updated_at]
     );
     fillKv($("instance-info"), rows);
@@ -809,15 +862,26 @@
       }
       row.appendChild(el("td", "", name));
       row.appendChild(el("td", "num", item.count === undefined ? "—" : item.count));
-      row.appendChild(el("td", "num", num(item.fps, 1)));
-      row.appendChild(el("td", "num", frame ? clock(frame.ts) : "—"));
+      // V3.8.18：帧率列展示「实际 / 标称」，丢帧数附后（定位 fps 低于标称的成因）。
+      var fpsText = num(item.fps, 1);
+      if (typeof item.nominal_fps === "number" && item.nominal_fps > 0) {
+        fpsText += " / " + num(item.nominal_fps, 0);
+      }
+      if (item.dropped_frames > 0) {
+        fpsText += "（丢 " + item.dropped_frames + "）";
+      }
+      row.appendChild(el("td", "num", fpsText));
+      // V3.8.18：时钟列用墙钟 wall_ts（旧版用仿真秒 frame.ts 渲染出 1970 年）；
+      // 仿真时刻单独一列（仿真经过秒，格式化为 mm:ss）。
+      row.appendChild(el("td", "num", frame ? clock(frame.wall_ts || frame.ts) : "—"));
+      row.appendChild(el("td", "num", frame ? simClock(frame.sim_ts !== undefined ? frame.sim_ts : frame.ts) : "—"));
       row.appendChild(el("td", "num", frame ? num(frame.age_s, 1) + " s" : "—"));
       row.appendChild(el("td", "num", frame ? formatBytes(frame.size) : "—"));
       row.appendChild(el("td", "", frame ? describeMeta(frame.meta) : "—"));
       body.appendChild(row);
     });
     if (!names.length) {
-      body.appendChild(emptyRow(7, payload.attached ? "尚未收到任何传感器帧" : "当前实例无活动运行器"));
+      body.appendChild(emptyRow(8, payload.attached ? "尚未收到任何传感器帧" : "当前实例无活动运行器"));
     }
     setNote(
       "sensor-note",
@@ -843,7 +907,16 @@
     if (!mappings.length) {
       rosBody.appendChild(emptyRow(5, "无话题映射"));
     }
-    setNote("ros-note", ros.enabled ? "桥接已启用（rclpy 在线）" : "桥接未启用（rclpy 未安装或已关闭）");
+    // V3.8.18：ROS2 状态文案区分未启用/不可用/已启用（旧版笼统显示「桥接未启用」）。
+    var rosNote;
+    if (ros.enabled) {
+      rosNote = "桥接已启用（rclpy 在线）";
+    } else if (ros.reason === "unavailable") {
+      rosNote = "桥接不可用（rclpy 未安装或初始化失败；真 SIL 走 Kafka 链路无需 rclpy）";
+    } else {
+      rosNote = "桥接未启用（sensors[].ros_enabled=false，默认关闭）";
+    }
+    setNote("ros-note", rosNote);
   }
 
   // ── 预览：深度图 / 点云 / IMU ────────────────────────────────────────────

@@ -92,6 +92,8 @@ class _RunContext:
     last_disk_check_at: float = 0.0
     recording_stopped: str = ""
     ros_bridge: Optional[Any] = None
+    # V3.8.18：ROS2 桥接不可用原因（disabled=未启用 / unavailable=rclpy 缺失或初始化失败）
+    ros_reason: str = "disabled"
 
     def add_sample(self, ego: dict[str, Any], sim_time: float) -> None:
         """按 10Hz 采样自车状态（供评估引擎消费）。"""
@@ -288,41 +290,107 @@ class SimulationExecutor:
     def detected_events(self, instance_id: str) -> list[dict[str, Any]]:
         """当前运行已检测到的场景事件（碰撞/偏离/超速等）。
 
-        只读快照：事件由 ``EventDetector`` 有界缓冲持有，实例不在运行或运行器
-        尚未装配时返回空列表（可视化客户端据此渲染事件面板）。
+        只读快照：事件由 ``EventDetector`` 有界缓冲持有；实例终态后运行器
+        已释放，回退读终态快照（V3.8.18，旧版终态后面板永远为空）。
         """
         with self._lock:
             context = self._contexts.get(instance_id)
         if context is None or context.runner is None:
-            return []
+            return self._terminal_snapshot_items(instance_id, "events")
         return [_event_to_dict(event) for event in _detected_events(context.runner)]
 
     def actors(self, instance_id: str) -> list[dict[str, Any]]:
         """当前运行的交通参与者状态快照（可视化「参与者」面板）。
 
         数据来自 ``SceneRunnerService.actor_states()``（tick 线程 5Hz 缓存）：
-        HTTP 线程不得直接访问 CARLA Actor。实例未运行/未装配时返回空列表。
+        HTTP 线程不得直接访问 CARLA Actor。实例终态后回退读终态快照
+        （V3.8.18）；未运行/未装配时返回空列表。
         """
         with self._lock:
             context = self._contexts.get(instance_id)
         if context is None or context.runner is None:
-            return []
+            return self._terminal_snapshot_items(instance_id, "actors")
         return _runner_actor_states(context.runner)
+
+    def _terminal_snapshot_items(self, instance_id: str, key: str) -> list[dict[str, Any]]:
+        """读终态快照中的 actors/events（无快照返回空列表，只读不抛异常）。"""
+        try:
+            record = self._store.get(instance_id)
+        except Exception:  # noqa: BLE001  只读视图不得因存储瞬时异常 500
+            return []
+        if record is None or record.status not in TERMINAL_STATUSES:
+            return []
+        snapshot = (record.result or {}).get("terminal_snapshot") or {}
+        items = snapshot.get(key) or []
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+    def _persist_terminal_snapshot(self, context: _RunContext) -> None:
+        """上下文释放前落终态快照（V3.8.18：参与者/事件面板终态不再空）。
+
+        在 worker finally 释放 context 前调用：把运行器最后一帧缓存的
+        参与者状态与已检测事件存入 ``result.terminal_snapshot``（追加字段，
+        平台契约不受影响）。失败只告警不阻断收尾。
+        """
+        runner = context.runner
+        if runner is None:
+            return
+        try:
+            snapshot = {
+                "actors": _runner_actor_states(runner),
+                "events": [_event_to_dict(event) for event in _detected_events(runner)],
+                "captured_at": time.time(),
+            }
+            record = self._store.get(context.record.instance_id)
+            result = dict((record.result if record is not None else None) or {})
+            result["terminal_snapshot"] = snapshot
+            self._store.patch(context.record.instance_id, result=result)
+        except Exception as exc:  # noqa: BLE001  快照失败不影响终态收尾
+            logger.warning(f"Terminal snapshot persist failed for {context.record.instance_id}: {exc}")
 
     def ros_status(self, instance_id: str) -> dict[str, Any]:
         """当前运行的 ROS2 桥接状态（未启用时 ``enabled=False``）。
 
         Returns:
-            ``{enabled, topics:{topic: 已发布条数}}``；无活动场景返回禁用态。
+            ``{enabled, reason, topics:{topic: 已发布条数}}``；无活动场景返回禁用态。
+            V3.8.18：``reason`` 区分 disabled（sensors[].ros_enabled 未开）/
+            unavailable（rclpy 缺失或初始化失败）/ enabled，面板不再笼统
+            显示「桥接未启用」。
         """
         with self._lock:
             context = self._contexts.get(instance_id)
         bridge = context.ros_bridge if context is not None else None
         if bridge is None:
-            return {"enabled": False, "topics": {}}
+            reason = context.ros_reason if context is not None else "disabled"
+            return {"enabled": False, "reason": reason, "topics": {}}
         counter = getattr(bridge, "message_counts", None)
         counts = dict(counter) if isinstance(counter, dict) else {}
-        return {"enabled": bool(getattr(bridge, "is_initialized", False)), "topics": counts}
+        return {
+            "enabled": bool(getattr(bridge, "is_initialized", False)),
+            "reason": "enabled",
+            "topics": counts,
+        }
+
+    def sensor_diagnostics(self, instance_id: str) -> dict[str, Any]:
+        """传感器诊断快照（V3.8.18：每流丢帧计数与标称帧率）。
+
+        只读视图：运行器已释放/未装配时返回空字典，不抛异常。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        runner = context.runner if context is not None else None
+        getter = getattr(runner, "sensor_diagnostics", None)
+        if not callable(getter):
+            return {"dropped": {}, "nominal_fps": {}}
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001  只读视图不得因运行器释放而 500
+            return {"dropped": {}, "nominal_fps": {}}
+        if not isinstance(raw, dict):
+            return {"dropped": {}, "nominal_fps": {}}
+        return {
+            "dropped": dict(raw.get("dropped") or {}),
+            "nominal_fps": dict(raw.get("nominal_fps") or {}),
+        }
 
     def _interrupt(self, instance_id: str, reason: str) -> None:
         """登记中断原因并停止当前运行器（不持锁调用 CARLA）。"""
@@ -417,6 +485,17 @@ class SimulationExecutor:
         # ROS2 桥接：构造后必须 initialize() 才会真正建 publisher，否则是静默死代码
         ros_bridge = self._ros_bridge_for(scene)
         context.ros_bridge = ros_bridge
+        # V3.8.18：记录桥接状态原因（面板区分「未启用」与「不可用」）
+        if ros_bridge is not None:
+            context.ros_reason = "enabled"
+        elif any(
+            spec.ros_enabled
+            for spec in getattr(scene, "sensors", [])
+            if spec.enabled
+        ):
+            context.ros_reason = "unavailable"
+        else:
+            context.ros_reason = "disabled"
 
         vil: Optional[VILRuntime] = None
         try:
@@ -486,6 +565,9 @@ class SimulationExecutor:
             self._shutdown_ros_bridge(context)
             if vil is not None:
                 vil.stop()
+            # V3.8.18：必须在 plane.release 销毁运行器前落终态快照，
+            # 否则参与者/事件缓存已清空，面板终态永远为空。
+            self._persist_terminal_snapshot(context)
             try:
                 self._plane.release(instance_id)
             except Exception as exc:  # noqa: BLE001
@@ -858,6 +940,14 @@ class SimulationExecutor:
         ego = _runner_ego_state(runner)
         if ego:
             fields["ego_state"] = ego
+        # V3.8.18：运行期录制态随进度周期回写（payload 累计字节，仅作进度参考；
+        # 终态由 _close_recording 回写文件实际大小）。
+        recorder = context.recorder
+        if recorder is not None and recorder.is_recording:
+            fields["recording_active"] = True
+            fields["recording_bytes"] = recorder.bytes_written
+        elif context.record_stats is not None or context.recording_stopped:
+            fields["recording_active"] = False
         self._store.patch(context.record.instance_id, **fields)
 
     def _watchdog_loop(self) -> None:
@@ -966,6 +1056,12 @@ class SimulationExecutor:
         context.recorder = recorder
         context.last_disk_check_at = time.time()
         RECORDING_EVENTS_TOTAL.labels(event="started").inc()
+        # V3.8.18：录制启动即回写运行期录制态（旧版仅终态回写 recording_path，
+        # 面板运行中一直显示「未录制」，与事实不符）。
+        try:
+            self._store.patch(record.instance_id, recording_active=True)
+        except Exception as exc:  # noqa: BLE001  面板态回写失败不影响录制
+            logger.debug(f"Recording active flag persist failed: {exc}")
 
     def _enforce_disk_gate(self, context: _RunContext) -> None:
         """运行期磁盘闸门：低于阈值时中途停录（已录部分照常收尾/上传）。
@@ -1010,6 +1106,7 @@ class SimulationExecutor:
                 context.record.instance_id,
                 recording_path=stats.path,
                 recording_bytes=stats.size_bytes,
+                recording_active=False,
             )
         except Exception as exc:  # noqa: BLE001  记录回写失败不影响终态
             logger.debug(f"Recording metadata persist failed: {exc}")

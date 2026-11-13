@@ -5009,5 +5009,40 @@ UploadError: /api/v1/data/files/complete HTTP 422: {"code":2001,"message":"分�
 - `deployment_and_operations.md`：版本头 → V3.8.17；新增 `### V3.8.16 → V3.8.17` 升级章节；排障表 422 行更新为已功性修复。
 - `docs/单机部署指南.md`：版本头 → V3.8.17；预期行补 V3.8.17（bag 上传预期全程成功）。
 - `pyproject.toml`：`version` 3.8.16 → **3.8.17**。
+---
 
+## V3.8.18 — 可视化面板异常修复（时钟/评估/录制态/终态快照/横穿楔死/诊断）
+
+**发布日期**：2026-11-13
+**版本定位**：针对实机 SCN-2056 动物横穿场景 `/viz` 面板暴露的多项数据异常做逐项功性修复（patch）。不改对外接口与平台契约（均为追加字段），不新增环境变量。
+
+### 背景
+
+实机面板同时暴露多项异常：传感器帧龄 `age_s≈1.79e9 s`、时钟渲染成 1970 年、自车全程 0 m/s 却 `succeeded`、运行中「未录制」、终态参与者/事件面板空、ROS2 全 0、fps 低于标称。逐项定性为六个独立缺陷，本版逐一修复。
+
+### 变更
+
+- **A1 时钟统一**（`sensor_sim/frame_hub.py`、`scene_runner/builtin_scenario.py`、`sensor_sim/mcap_recorder.py`、`platform_adapter/service.py`、`visualization/assets/app.js`）：`Frame` 增 `wall_ts`（入汇聚中心墙钟 Unix 秒），`ts` 保留 CARLA 仿真经过秒（fps 滑窗语义不变）。面板时钟改渲染 `wall_ts`、传感器表新增「仿真时刻」列（`sim_ts`）；帧龄改 `now - wall_ts`（修 `age_s≈1.8e9 s`）；mcap `log_time_ns` 改墙钟 epoch ns（离线 bag 工具可按真实时间轴回放），仿真经过秒另存消息 meta（mcap_ros2 0.6.0 无 `metadata` 参数时自动探测降级走 `publish_time` 通道）。
+- **A2 评估结果上屏**（`platform_adapter/models.py`、`app.js`）：`to_view()` 增 `evaluation` 摘要（`passed`/`grade`/`success_criteria` 明细，取自既有 `result.evaluation`，追加字段不改平台契约）；面板「平台状态」（succeeded）与「评估结论」（通过/未通过 + 逐项阈值对比）分行展示，未通过红色徽标——修「succeeded ≠ 评估通过」被掩盖。
+- **A3 运行期录制态**（`platform_adapter/models.py`/`store.py`/`executor.py`、`app.js`）：`InstanceRecord` 增 `recording_active`（SQLite 幂等迁移）；录制启动即回写、运行期随进度周期回写（`bytes_written` payload 累计）、停录/终态翻转 False；面板运行中显「录制中 (xxx MB)」、终态显文件路径+大小——修运行中「未录制」假象。
+- **A4 终态快照**（`platform_adapter/executor.py`）：`_run` finally 于 `plane.release` 前将运行器最后缓存的 `actors()`/`detected_events()` 存入 `result.terminal_snapshot`（追加字段）；`actors()`/`detected_events()` 终态回退读快照——修终态参与者/事件面板空。
+- **A5 脚本横穿楔死修复**（`scene_runner/builtin_scenario.py`）：脚本化 walker/动物 `set_simulate_physics(False)`（纯运动学，`set_transform` 为唯一位姿权威），打破「事件制动 hold 超时→卡滞 latch→整场 0 m/s」物理楔死链条；与自车碰撞改由距离接触判定补报（水平距离 ≤1.5 m 报一次碰撞，离开 2 倍阈值复位、再接触可再报）——防「撞了行人却 no_collision=True」的新假通过。
+- **A6 ROS2/fps 诊断**（`scene_runner/builtin_scenario.py`、`scene_runner/scene_runner_service.py`、`platform_adapter/executor.py`/`service.py`、`app.js`）：每流编码队列丢帧计数（`_frame_drops`）与标称帧率（`_nominal_fps`，按传感器剖面记录）；面板 fps 列显「实际 / 标称（丢 N）」；ROS2 状态 `reason` 三态（disabled=未启用 / unavailable=rclpy 缺失 / enabled），面板文案区分。真 SIL 场景由 V3.9.0 Kafka 链路替代，Windows 无需 rclpy。
+
+### 验证
+
+- 全量 `pytest`：**1677 passed**（1645 + 32 项新增 `test_v3818_panel_fixes.py` 专项守卫：时钟双字段/评估透出/录制态迁移/终态快照/脚本行人物理禁用+接触补报去重复位/丢帧诊断/ROS reason）；`flake8` exit=0；`mypy` Success（91 文件）；全仓行覆盖 **84.02%**（≥80% 门禁，较 V3.8.17 基线 83.5% 因新增专项守卫而上）。
+- 新增回归守卫同时暴露并修复一处 A5 实现缺陷：原 `contact_reported` 早退使复位分支永不可达（去重标记无法复位），改为去重判定内置于接触判定。
+
+### 分发
+
+镜像 tag `hunter-sim:3.8.18`；`pyproject.toml` 版本 `3.8.18`。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → 3.8.18；测试计数 1645 → 1677。
+- `user_manual.md`：版本头 → V3.8.18；面板行为补充（评估结论行/录制态/仿真时刻列/fps 诊断/ROS 三态）+ FAQ。
+- `deployment_and_operations.md`：版本头 → V3.8.18；新增 `### V3.8.17 → V3.8.18` 升级章节。
+- `docs/单机部署指南.md`：版本头 → V3.8.18；排障表补面板异常条目。
+- `pyproject.toml`：`version` 3.8.17 → **3.8.18**。
 ---

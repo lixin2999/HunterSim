@@ -55,10 +55,13 @@ class Frame:
 
     Attributes:
         stream: 流名（``rgb`` / ``depth`` / ``lidar`` / ``imu`` / ``overview``）。
-        ts: 数据时间戳（Unix 秒，CARLA 仿真时刻）。
+        ts: 数据时间戳（CARLA 仿真经过秒，非 Unix epoch）。
         seq: 该流的单调递增帧序号（从 1 开始）。
         payload: 序列化后的原始字节（JPEG/PNG/点云/IMU 二进制）。
         meta: 附加元信息（宽高、点数、编码等）。
+        wall_ts: 帧入汇聚中心的墙钟时刻（Unix 秒，V3.8.18）。
+            面板时钟渲染与帧龄（age_s）必须用墙钟：``ts`` 是仿真经过秒，
+            当 Unix epoch 渲染会得到 1970 年、算帧龄会得到 ~1.8e9 s。
     """
 
     stream: str
@@ -66,6 +69,7 @@ class Frame:
     seq: int
     payload: bytes
     meta: dict[str, Any] = field(default_factory=dict)
+    wall_ts: float = 0.0
 
     @property
     def size(self) -> int:
@@ -108,7 +112,7 @@ class FrameHub:
 
         Args:
             stream: 流名，须在 ``KNOWN_STREAMS`` 内。
-            ts: 数据时间戳（Unix 秒）。
+            ts: 数据时间戳（CARLA 仿真经过秒）。
             payload: 原始字节。
             meta: 附加元信息。
 
@@ -126,7 +130,14 @@ class FrameHub:
         with self._lock:
             seq = self._counts[name] + 1
             self._counts[name] = seq
-            frame = Frame(stream=name, ts=ts, seq=seq, payload=payload, meta=dict(meta or {}))
+            frame = Frame(
+                stream=name,
+                ts=ts,
+                seq=seq,
+                payload=payload,
+                meta=dict(meta or {}),
+                wall_ts=now_ts(),
+            )
             self._latest[name] = frame
             stamps = self._timestamps[name]
             # 时钟回退保护：时间戳非单调时不入窗，避免 fps 出现负值

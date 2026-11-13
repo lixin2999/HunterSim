@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS instances (
     result TEXT,
     recording_path TEXT NOT NULL DEFAULT '',
     recording_bytes INTEGER NOT NULL DEFAULT 0,
+    recording_active INTEGER NOT NULL DEFAULT 0,
     revision INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -78,6 +79,7 @@ _UPDATABLE = (
     "result",
     "recording_path",
     "recording_bytes",
+    "recording_active",
     "revision",
     "updated_at",
     "started_at",
@@ -149,8 +151,9 @@ class InstanceStore:
                     status, carla_status, message, progress_percent, current_time_s,
                     total_time_s, actors_count, collisions, lane_invasions, ego_state,
                     scene_config, vil_config, result, recording_path, recording_bytes,
+                    recording_active,
                     revision, created_at, updated_at, started_at, finished_at, watchdog_deadline
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.instance_id,
@@ -174,6 +177,7 @@ class InstanceStore:
                     _dump(record.result) if record.result is not None else None,
                     record.recording_path,
                     record.recording_bytes,
+                    int(bool(record.recording_active)),
                     record.revision,
                     record.created_at,
                     record.updated_at,
@@ -317,6 +321,7 @@ class InstanceStore:
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("recording_path", "TEXT NOT NULL DEFAULT ''"),
     ("recording_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("recording_active", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -371,6 +376,7 @@ def _row_to_record(row: sqlite3.Row) -> InstanceRecord:
         result=(json.loads(result_raw) if result_raw else None),
         recording_path=str(row["recording_path"] or ""),
         recording_bytes=int(row["recording_bytes"] or 0),
+        recording_active=bool(row["recording_active"]) if "recording_active" in row.keys() else False,
         revision=int(row["revision"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),

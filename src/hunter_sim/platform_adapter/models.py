@@ -128,7 +128,8 @@ class InstanceRecord:
         vil_config: VIL 配置（含 calibration）。
         result: 终态结果（evaluation/artifacts 等）。
         recording_path: 传感器录制文件本地路径（未录制为空串）。
-        recording_bytes: 传感器录制文件大小（字节）。
+        recording_bytes: 传感器录制文件大小（字节；运行期为 payload 累计近似）。
+        recording_active: 是否正在录制（V3.8.18：运行期即可见，不再等终态）。
         revision: 场景下发版本号（用于队列合并去重）。
         created_at/updated_at/started_at/finished_at: Unix 时间戳。
         watchdog_deadline: 看门狗绝对截止时间戳（0 表示未启动）。
@@ -155,6 +156,7 @@ class InstanceRecord:
     result: Optional[dict[str, Any]] = None
     recording_path: str = ""
     recording_bytes: int = 0
+    recording_active: bool = False
     revision: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -190,6 +192,10 @@ class InstanceRecord:
             "ego_state": dict(self.ego_state),
             "recording_path": self.recording_path or None,
             "recording_bytes": self.recording_bytes,
+            "recording_active": bool(self.recording_active),
+            # V3.8.18：评估结论摘要上屏（succeeded 是平台执行状态，不等于
+            # 场景评估通过；旧版面板只显平台状态，掩盖了评估 fail）。
+            "evaluation": self._evaluation_view(),
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
             "started_at": _iso(self.started_at),
@@ -210,6 +216,22 @@ class InstanceRecord:
             }
         )
         return view
+
+    def _evaluation_view(self) -> Optional[dict[str, Any]]:
+        """评估结论摘要（V3.8.18，供可视化面板区分平台状态与评估结论）。
+
+        终态前无 result 返回 None；终态后给出 passed/grade/判据明细，
+        不携带 artifacts 等大字段（详情走 ``/result`` 端点）。
+        """
+        result = self.result or {}
+        evaluation = result.get("evaluation")
+        if not isinstance(evaluation, dict) or not evaluation:
+            return None
+        return {
+            "passed": bool(result.get("success", evaluation.get("passed", False))),
+            "grade": evaluation.get("grade"),
+            "success_criteria": dict(evaluation.get("success_criteria") or {}),
+        }
 
 
 def _iso(value: Optional[float]) -> Optional[str]:

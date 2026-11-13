@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -123,9 +124,17 @@ class _FakeRecorder:
 
     def __init__(self) -> None:
         self.messages: list[tuple[str, int, Any]] = []
+        self.metas: list[Optional[dict[str, Any]]] = []
 
-    def push_stream(self, stream: str, log_time_ns: int, message: Any) -> bool:
+    def push_stream(
+        self,
+        stream: str,
+        log_time_ns: int,
+        message: Any,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> bool:
         self.messages.append((stream, log_time_ns, message))
+        self.metas.append(meta)
         return True
 
 
@@ -382,7 +391,11 @@ class TestDispatch:
         assert len(recorder.messages) == 1
         stream, log_time_ns, message = recorder.messages[0]
         assert stream == STREAM_RGB
-        assert log_time_ns == 100 * 1_000_000_000
+        # V3.8.18：mcap 时间戳改墙钟 epoch ns（不再是仿真秒×1e9）；
+        # 仿真经过秒另存 meta。
+        assert abs(log_time_ns / 1e9 - time.time()) < 5.0
+        assert recorder.metas[0] is not None
+        assert recorder.metas[0]["sim_ts"] == pytest.approx(100.0)
         assert message.encoding == "bgra8"  # 录制保留原始像素
         assert message.header.frame_id == "camera_front"
 

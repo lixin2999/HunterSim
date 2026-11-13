@@ -272,6 +272,7 @@ class McapRecorder:
         self._degraded = False
         self._write_errors = 0
         self._broken = False
+        self._meta_supported = False
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -320,16 +321,34 @@ class McapRecorder:
             self._degraded = False
             self._write_errors = 0
             self._broken = False
+            # V3.8.18：旧版 mcap_ros2（如 0.6.0）write_message 无 metadata 参数，
+            # 探测一次；不支持时仿真秒改走 publish_time 通道。
+            try:
+                import inspect  # noqa: PLC0415
+
+                self._meta_supported = (
+                    "metadata" in inspect.signature(writer.write_message).parameters
+                )
+            except (TypeError, ValueError):
+                self._meta_supported = False
             logger.info(f"McapRecorder opened: {path}")
             return True
 
-    def push(self, topic: str, log_time_ns: int, message: Any) -> bool:
+    def push(
+        self,
+        topic: str,
+        log_time_ns: int,
+        message: Any,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> bool:
         """写入一条消息。
 
         Args:
             topic: 主题（须在 ``TOPIC_SCHEMAS`` 内）。
-            log_time_ns: 记录时间（纳秒 Unix 时间戳）。
+            log_time_ns: 记录时间（纳秒 Unix 时间戳，V3.8.18 起为墙钟）。
             message: 可被 CDR 序列化的消息对象。
+            meta: 附加元信息（V3.8.18：仿真经过秒 ``sim_ts`` 等，
+                写入 mcap message metadata，不污染 ROS 消息本体）。
 
         Returns:
             True 表示写入成功。
@@ -343,7 +362,19 @@ class McapRecorder:
                 return False
             try:
                 schema = self._schema_locked(topic, entry)
-                self._writer.write_message(topic, schema, message, log_time=log_time_ns)
+                kwargs: dict[str, Any] = {"log_time": log_time_ns}
+                if meta:
+                    # 仿真经过秒 → publish_time（纳秒）：离线回放可按仿真时间轴
+                    # 对齐；墙钟 log_time 供 bag 工具按真实时间轴展示。
+                    sim_ts = meta.get("sim_ts")
+                    if sim_ts is not None:
+                        try:
+                            kwargs["publish_time"] = int(float(sim_ts) * 1e9)
+                        except (TypeError, ValueError):
+                            pass
+                    if self._meta_supported:
+                        kwargs["metadata"] = {str(k): str(v) for k, v in meta.items()}
+                self._writer.write_message(topic, schema, message, **kwargs)
             except Exception as exc:  # noqa: BLE001  单帧写入失败不影响整段录制
                 self._record_write_error(topic, exc)
                 return False
@@ -386,13 +417,19 @@ class McapRecorder:
             "后续帧不再写入，已写入部分保留"
         )
 
-    def push_stream(self, stream: str, log_time_ns: int, message: Any) -> bool:
+    def push_stream(
+        self,
+        stream: str,
+        log_time_ns: int,
+        message: Any,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> bool:
         """按流名写入（``rgb`` / ``depth`` / ``lidar`` / ``imu``）。"""
         topic = STREAM_TO_TOPIC.get(stream.strip().lower())
         if topic is None:
             logger.debug(f"McapRecorder ignored unknown stream: {stream}")
             return False
-        return self.push(topic, log_time_ns, message)
+        return self.push(topic, log_time_ns, message, meta=meta)
 
     def close(self) -> RecordStats:
         """结束录制并返回统计（幂等）；未打开时返回空统计。"""
@@ -455,6 +492,16 @@ class McapRecorder:
         """已写入消息数。"""
         with self._lock:
             return self._frame_count
+
+    @property
+    def bytes_written(self) -> int:
+        """已写入 payload 累计字节（V3.8.18：运行期录制态面板展示）。
+
+        注意是消息 payload 累计（未含 mcap 容器/压缩开销），与终态
+        ``RecordStats.size_bytes``（文件实际大小）口径不同，仅作运行期进度参考。
+        """
+        with self._lock:
+            return self._bytes
 
     # ── 内部实现 ──────────────────────────────────────────────────────────
 

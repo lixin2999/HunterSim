@@ -365,19 +365,39 @@ class AdapterService:
         if hub is None:
             return {"attached": False, "counts": {}, "streams": {}}
         now = time.time()
+        # V3.8.18：丢帧计数与标称帧率（运行器诊断，无运行器时为空）
+        diagnostics: dict[str, Any] = {"dropped": {}, "nominal_fps": {}}
+        diag_getter = getattr(self._executor, "sensor_diagnostics", None)
+        if callable(diag_getter):
+            try:
+                raw = diag_getter(instance_id)
+                if isinstance(raw, dict):
+                    diagnostics = raw
+            except Exception as exc:  # noqa: BLE001  只读视图不得因瞬时异常 500
+                logger.debug(f"Read sensor diagnostics failed for {instance_id}: {exc}")
+        dropped = diagnostics.get("dropped") or {}
+        nominal_fps = diagnostics.get("nominal_fps") or {}
         streams: dict[str, Any] = {}
         for name in KNOWN_STREAMS:
             frame = hub.latest(name)
             streams[name] = {
                 "count": hub.count(name),
                 "fps": round(hub.fps(name), 2),
+                "nominal_fps": nominal_fps.get(name),
+                "dropped_frames": int(dropped.get(name, 0)),
                 "frame": None
                 if frame is None
                 else {
                     "seq": frame.seq,
+                    # V3.8.18：ts 为仿真经过秒，wall_ts 为墙钟 Unix 秒；
+                    # 帧龄必须用墙钟相减（旧版用 now - 仿真秒 → ~1.8e9 s）。
                     "ts": round(frame.ts, 3),
+                    "sim_ts": round(frame.ts, 3),
+                    "wall_ts": round(frame.wall_ts, 3) if frame.wall_ts else None,
                     "size": frame.size,
-                    "age_s": round(max(0.0, now - frame.ts), 3),
+                    "age_s": round(
+                        max(0.0, now - (frame.wall_ts or now)), 3
+                    ),
                     "meta": dict(frame.meta),
                 },
             }
@@ -385,15 +405,20 @@ class AdapterService:
         return {"attached": True, "counts": counts, "streams": streams}
 
     def ros(self, instance_id: str) -> dict[str, Any]:
-        """ROS2 桥接状态（未启用时 ``enabled=False``，``topics`` 仍给出映射表）。"""
+        """ROS2 桥接状态（未启用时 ``enabled=False``，``topics`` 仍给出映射表）。
+
+        V3.8.18：透传 ``reason``（disabled/unavailable/enabled），面板区分
+        「未启用」与「rclpy 不可用」。
+        """
         getter = getattr(self._executor, "ros_status", None)
-        status: dict[str, Any] = {"enabled": False, "topics": {}}
+        status: dict[str, Any] = {"enabled": False, "reason": "disabled", "topics": {}}
         if callable(getter):
             try:
                 raw = getter(instance_id)
                 if isinstance(raw, dict):
                     status = {
                         "enabled": bool(raw.get("enabled", False)),
+                        "reason": str(raw.get("reason") or "disabled"),
                         "topics": dict(raw.get("topics") or {}),
                     }
             except Exception as exc:  # noqa: BLE001
