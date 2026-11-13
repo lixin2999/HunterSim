@@ -426,6 +426,25 @@ class AdapterService:
         status["mappings"] = [_topic_view(item, status["topics"]) for item in ROS2_TOPIC_MAP]
         return status
 
+    def edge_link(self, instance_id: str) -> dict[str, Any]:
+        """真 SIL 边缘链路状态（V3.9.0，三方互联卡片数据源）。
+
+        未装配时 ``enabled=False`` + ``control_source="script"``，面板据此区分
+        「脚本自车的普通 SIL」与「车端全栈驱动的真 SIL」；装配后透传
+        ``EdgeLinkRuntime.stats`` 全量诊断（链路年龄/控制回传频率/看门狗态/
+        各流馈送速率）并合并运行器侧控制诊断。
+        """
+        fallback: dict[str, Any] = {"enabled": False, "control_source": "script"}
+        getter = getattr(self._executor, "edge_link_status", None)
+        if not callable(getter):
+            return fallback
+        try:
+            raw = getter(instance_id)
+        except Exception as exc:  # noqa: BLE001  只读视图不得因瞬时异常 500
+            logger.debug(f"Read edge_link status failed for {instance_id}: {exc}")
+            return fallback
+        return dict(raw) if isinstance(raw, dict) else fallback
+
     def runtime_status(self) -> dict[str, Any]:
         """仿真端运行态汇总（可视化客户端顶栏）。
 
@@ -438,9 +457,11 @@ class AdapterService:
         carla = self._settings.carla
         sensor: dict[str, Any] = {"attached": False, "counts": {}, "streams": {}}
         ros: dict[str, Any] = {"enabled": False, "topics": {}}
+        edge_link: dict[str, Any] = {"enabled": False, "control_source": "script"}
         if current is not None:
             sensor = self.sensors(current.instance_id)
             ros = self.ros(current.instance_id)
+            edge_link = self.edge_link(current.instance_id)
         return {
             "instances": {"total": len(records), "active": len(active)},
             "active_instance": None if current is None else current.to_view(),
@@ -457,6 +478,7 @@ class AdapterService:
             },
             "sensor": sensor,
             "ros": ros,
+            "edge_link": edge_link,
             "stream": self._stream_view(),
         }
 

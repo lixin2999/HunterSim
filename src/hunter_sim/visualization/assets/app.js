@@ -288,6 +288,7 @@
     var carla = payload.carla || {};
     var platform = payload.platform || {};
     var ros = payload.ros || {};
+    var edge = payload.edge_link || {};
     var sensor = payload.sensor || {};
     var log = payload.log || {};
     var instances = payload.instances || {};
@@ -333,8 +334,161 @@
             "（" + num(stream.fps, 0) + " fps）"
       ],
       ["ROS 话题", ros.enabled ? published.length + " 路有数据" : "未启用"],
+      ["SIL 链路", edge.enabled ? "EdgeLink 已装配" : "未装配（脚本自车）"],
       ["日志缓冲", (log.records || 0) + " / " + (log.capacity || 0)]
     ]);
+    renderEdgeLink(edge, carla, platform, active);
+  }
+
+  // ── SIL 链路卡片（V3.9.0：仿真端 → 车端 HunterEdge → 平台三方互联）──────
+  //
+  // 数据源是 /viz/api/status 的 edge_link 段（完整诊断，非平台契约的精简段）。
+  // 未装配时后端只给 enabled/control_source，卡片必须明示「脚本自车」，
+  // 避免把模拟 SIL 误读成真闭环。
+
+  // 上行流展示顺序，与后端 _STREAM_FPS_FIELDS 一致
+  var EDGE_STREAM_ORDER = ["rgb", "depth", "lidar", "imu", "ego_state"];
+
+  function hzText(value) {
+    return typeof value === "number" && isFinite(value) ? num(value, 1) + " Hz" : "—";
+  }
+
+  function edgeBadgeText(edge) {
+    if (!edge.enabled) {
+      return ["SIL 未装配", ""];
+    }
+    if (edge.watchdog_tripped) {
+      return ["SIL 断流刹停", "err"];
+    }
+    if (edge.waiting_first_control) {
+      return ["SIL 等待车端", "warn"];
+    }
+    if (typeof edge.control_hz === "number" && edge.control_hz > 0) {
+      return ["SIL 闭环中", "ok"];
+    }
+    return ["SIL 已装配", "warn"];
+  }
+
+  function renderEdgeLink(edge, carla, platform, active) {
+    var enabled = edge.enabled === true;
+    var badge = edgeBadgeText(edge);
+    setBadge("badge-edge", badge[0], badge[1]);
+
+    var tripped = edge.watchdog_tripped === true;
+    var watchdogMs = typeof edge.watchdog_ms === "number" ? edge.watchdog_ms : 500;
+    var ageMs = edge.control_age_ms;
+    var ageKnown = typeof ageMs === "number" && isFinite(ageMs);
+    // boot 帧两种口径兼容：viz 完整 stats 用 boot_sent，平台精简段用 session_booted
+    var booted = edge.boot_sent !== undefined ? edge.boot_sent : edge.session_booted;
+    var received = typeof edge.control_received === "number" ? edge.control_received : null;
+
+    var simText = carla.connected === true
+      ? "CARLA 已连接"
+      : carla.connected === false ? "CARLA 未连接" : "CARLA 未知";
+
+    var edgeText;
+    var edgeKind;
+    if (!enabled) {
+      edgeText = "未接入（当前为脚本自车）";
+      edgeKind = "warn";
+    } else if (tripped) {
+      edgeText = "控制断流 → 零速刹停保持";
+      edgeKind = "err";
+    } else if (edge.waiting_first_control) {
+      edgeText = booted ? "会话已建立，等待首帧 /cmd_vel" : "等待会话 boot 帧";
+      edgeKind = "warn";
+    } else if (received === 0) {
+      edgeText = "尚未收到控制帧";
+      edgeKind = "warn";
+    } else {
+      edgeText = "已回传 " + (received === null ? hzText(edge.control_hz) : received + " 帧");
+      edgeKind = "";
+    }
+
+    var platText = platform.enabled ? "网关已接入" : "平台未启用";
+    if (active) {
+      platText += " · 实例 " + (active.status || "?");
+    }
+
+    fillKv($("edge-info"), [
+      ["仿真端", simText, carla.connected === true ? "" : "err"],
+      ["车端", edgeText, edgeKind],
+      ["平台", platText, platform.enabled ? "" : "warn"],
+      ["控制源", enabled ? "EdgeLink（车端接管）" : "脚本自车", enabled ? "" : "warn"],
+      ["上行 Topic", edge.sensor_topic || "—"],
+      ["下行 Topic", edge.control_topic || "—"],
+      ["看门狗", tripped ? "已触发（零速刹停）" : "正常 · 阈值 " + watchdogMs + " ms", tripped ? "err" : ""],
+      [
+        "控制延迟",
+        ageKnown ? num(ageMs, 0) + " ms" : "尚未收到控制帧",
+        ageKnown && ageMs > watchdogMs ? "err" : ""
+      ],
+      ["控制频率", hzText(edge.control_hz)],
+      [
+        "最新指令",
+        "v " + num(edge.last_linear_x, 2) + " m/s · ω " + num(edge.last_angular_z, 2) + " rad/s"
+      ],
+      [
+        "上行错误",
+        edge.send_errors === undefined ? "—" : String(edge.send_errors),
+        edge.send_errors > 0 ? "warn" : ""
+      ],
+      ["链路时长", enabled ? humanDuration(edge.uptime_s) : "—"]
+    ]);
+
+    var body = $("edge-table").querySelector("tbody");
+    body.textContent = "";
+    if (!enabled) {
+      body.appendChild(emptyRow(6, "未装配 EdgeLink（脚本自车，无 Kafka 上行）"));
+      setNote("edge-note", "未装配 EdgeLink：当前为脚本自车，非真 SIL 闭环");
+      return;
+    }
+
+    var hz = edge.sensor_hz || {};
+    var nominal = edge.sensor_nominal_fps || {};
+    var sent = edge.sensor_sent || {};
+    var rateDropped = edge.sensor_rate_dropped || {};
+    var sizeDropped = edge.sensor_size_dropped || {};
+    var names = EDGE_STREAM_ORDER.filter(function (name) {
+      return hz[name] !== undefined || nominal[name] !== undefined || sent[name] !== undefined;
+    });
+    // 信封里出现的新流也要上表，不能因为不在预设顺序里就漏显
+    Object.keys(hz).concat(Object.keys(nominal), Object.keys(sent)).forEach(function (name) {
+      if (names.indexOf(name) < 0) {
+        names.push(name);
+      }
+    });
+    names.forEach(function (name) {
+      var actual = hz[name];
+      var expect = nominal[name];
+      var count = sent[name] || 0;
+      var tr = el("tr");
+      // 断流（曾发送但窗口内为 0）或明显低于标称（<80%）标黄：
+      // 这正是「馈送速率失真」的直接判据，比只看累计帧数更早暴露问题。
+      var stalled = count > 0 && !(typeof actual === "number" && actual > 0);
+      var degraded = typeof expect === "number" && expect > 0 &&
+        typeof actual === "number" && actual < expect * 0.8;
+      if (stalled || degraded) {
+        tr.className = "stale";
+        tr.title = stalled ? "该流已断流（窗口内无上行）" : "实际速率低于标称 80%，检查带宽/限频丢弃";
+      }
+      tr.appendChild(el("td", "", name));
+      tr.appendChild(el("td", "num", hzText(actual)));
+      tr.appendChild(el("td", "num", typeof expect === "number" && expect > 0 ? num(expect, 1) : "不限"));
+      tr.appendChild(el("td", "num", count));
+      tr.appendChild(el("td", "num", rateDropped[name] || 0));
+      tr.appendChild(el("td", "num", sizeDropped[name] || 0));
+      body.appendChild(tr);
+    });
+    if (!names.length) {
+      body.appendChild(emptyRow(6, "尚未上行任何传感器帧"));
+    }
+    setNote(
+      "edge-note",
+      (booted ? "会话已建立" : "会话未建立") +
+        (edge.sim_id ? " · sim_id " + edge.sim_id : "") +
+        " · 已运行 " + humanDuration(edge.uptime_s)
+    );
   }
 
   // ── 实例选择与控制 ────────────────────────────────────────────────────────
@@ -430,6 +584,7 @@
     setNote("event-summary", "—");
     $("sensor-table").querySelector("tbody").textContent = "";
     $("ros-table").querySelector("tbody").textContent = "";
+    $("edge-table").querySelector("tbody").textContent = "";
     $("actor-table").querySelector("tbody").textContent = "";
     setNote("actor-summary", "—");
     fillKv($("instance-info"), []);
@@ -449,6 +604,7 @@
       stopVideo();
       setNote("sensor-note", "未选择实例");
       setNote("ros-note", "—");
+      setNote("edge-note", "—");
       setNote("video-meta", "未推流");
       setNote("video-empty", "暂无活动场景，等待平台下发实例…");
     }

@@ -5046,3 +5046,66 @@ UploadError: /api/v1/data/files/complete HTTP 422: {"code":2001,"message":"分�
 - `docs/单机部署指南.md`：版本头 → V3.8.18；排障表补面板异常条目。
 - `pyproject.toml`：`version` 3.8.17 → **3.8.18**。
 ---
+
+## V3.9.0 — 真 SIL 全栈闭环（Kafka 边缘链路接入 HunterEdge，控制权真正交给车端）
+
+**发布日期**：2026-11-13
+**版本定位**：功能新增（minor）。把此前由**仿真侧脚本自车**驱动的「假 SIL」换成真 SIL：CARLA 传感器经 Kafka 注入车端 HunterEdge 真实输入话题，车端全栈（感知/决策/巡航）产出的 `/cmd_vel` 回传驱动仿真自车。**被测软件与实车完全相同，只换输入来源**。平台（HunterCore）侧**零改动**，`edge_link` 默认关闭时行为与 V3.8.18 完全一致。
+
+### 背景
+
+V3.8.18 修完面板异常后，实机 SCN-2056 暴露的更本质问题是：SIL 模式下自车由仿真自己的确定性速度环 + 车道保持驱动，车端全栈并未参与，评估结论反映的是脚本而非被测软件。本版按已确认决策落地：**Kafka 数据总线桥接 + Jetson 实机 + HunterEdge 新增 `sil_bridge_agent` + 全栈自动驾驶闭环（mapping cruise）**。
+
+```
+CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
+  → Kafka carla.{sim_id}.edge_sensor (SASL_SSL)
+  → Jetson sil_bridge_agent → ROS2 真实输入话题 → HunterEdge 全栈
+    (perception / decision_making / auto_mission，mapping cruise 在线建图)
+  → /cmd_vel → sil_bridge_agent → Kafka carla.{sim_id}.edge_control
+  → EdgeLinkRuntime → control_driver hook → 仿真自车
+```
+
+### 变更
+
+- **B1 仿真端 EdgeLinkRuntime**（新增 `cloud/edge_link.py`、`common/models.py` 增 `EdgeLinkSettings`）：单实例链路运行时，传感器上行 JSON 信封 `{stream, sim_ts, wall_ts_ns, seq, meta, payload_b64}`，五流 `rgb`(JPEG)/`depth`(32FC1)/`lidar`(XYZ float32)/`imu`/`ego_state`；控制下行订阅 `carla.{sim_id}.edge_control`（Twist 语义，按 `seq` 去重丢乱序、latest-wins）；会话信令 setup 发 `stream="session"` boot 帧（sim_id/scene_id/map_id/初始位姿/流清单/看门狗阈值）、cleanup 发 stop 帧。连接参数**复用既有 `KafkaSettings`**（SASL_SSL + SCRAM + 证书，`HUNTER_CORE_*` 自动继承到 `KAFKA_*`），新增配置组只管链路特有项（`EDGE_LINK_` 前缀）。带宽默认档：rgb/depth/lidar 10Hz、imu 50Hz、ego_state 20Hz，`watchdog_ms=500`、`max_payload_bytes=4 MiB`（超限丢弃并计数）。**复用既有编码产物，不重复编码**；rgb 宽度沿用 `ADAPTER_STREAM_MAX_WIDTH`（默认 640）。
+- **B2 仿真端控制接管 hook**（`platform_adapter/executor.py`、`scene_runner/scene_runner_service.py`、`scene_runner/builtin_scenario.py`）：mode **仍是 `SIL`**（平台契约不变），由 `EdgeLinkSettings.enabled` 决定是否装配，装配方式与 VIL 对齐（`hooks["control_driver"]=edge_link.step`、`status_provider`、`edge_link_sink`、`edge_link_stats`）；场景 `extra_params.edge_link` 支持 bool/dict/字符串三形态逐场景覆盖。`control_driver` 非空时**完全绕过**脚本确定性纵向与车道保持：纵向沿用 P + 巡航前馈 + 稳态死区（含倒车挡滞回与换挡前停稳，反馈量按挡位取符号使负目标与前进同形）；横向按自行车模型 `steer = -atan(L·ω / max(|v|,0.5)) / MAX_STEER` 限幅归一——**负号是 CARLA/Unreal 左手系（steer>0 朝 +Y 右）与 ROS REP-103 右手系（ω>0 左转）的必然结果**。**看门狗**：控制帧断流 >500ms → 零速刹停保持（`brake=_EGO_BRAKE_HOLD`），**不经低通**（安全语义优先于画面平滑）并清空物理卡滞 latch（避免恢复后被旧 latch 冻住）；控制源抛异常**等同断流**，绝不沿用上一帧指令滑行；恢复后继续。Kafka 不可达 → `KafkaConnectionError` **快速失败**落 `_fail_instance` 并明确报错，**不静默回退脚本自车**（避免「假 SIL」）。新增 `control_source`（`script`/`edge_link`）与 `edge_control_diagnostics` 只读诊断。
+- **B3 车端 HunterEdge `sil_bridge_agent`**（HunterEdge 仓 **V0.1.38**，ROS 包版本 1.0.0）：新增 ament_python 包，`codec.py`（坐标系转换 + 信封/payload 编解码）与 `session.py`（会话绑定 + 断流看门狗 + 控制序号 + 各流限频）**均无 rclpy/confluent_kafka 依赖**故可纯逻辑单测；`sil_bridge_agent.py` 为 ROS2 节点 + Kafka 收发线程（导入守卫，缺 ROS/缺库时明确报错而非崩溃）。正则订阅 `^carla\..+\.edge_sensor$` 后**按 boot 帧绑定唯一 sim_id**（多实例隔离，boot 幂等、异 sim_id 的 stop 不终止本会话）；注入 `/lidar_points`、`/camera/color/image_raw`、`/camera/depth/image_rect_raw`、`/imu/data`，`ego_state` → `/chassis/state` + `/localization/odom`（**SIL 用仿真真值定位替代 fast_lio2/robot_localization**）。坐标系反射 `R=diag(1,-1,1)`，**真向量 `(x,-y,z)` 与伪向量 `(-x,+y,-z)` 翻转规则不同**（四元数 `(-qx,+qy,-qz,qw)`、欧拉 `(-roll,+pitch,-yaw)`），是 B2 负号约定成立的前提。三条安全语义：传感器断流 >500ms **停发 ROS 帧**（让车端超时停车语义自然生效，**不伪造零速点云**）、**控制回传不停**（两侧看门狗不互相掩盖）、stop 与进程退出**补恰好一帧零速**且 `seq` 严格接续（否则自车滑行 500ms×3.5m/s≈1.75m）。配套 `hunter_bringup/launch/hunter_sil.launch.py` SIL 整栈编排（不启动真实传感器驱动/CAN/LIO 避免双发布者，`auto_mission` 走 **mapping cruise** 在线建图，规避 Town 地图与实车地图不匹配）。**已核实：mapping 模式下实车栈本就不启动 `safety_guard`**，`auto_mission` cruise 是 `/cmd_vel` 的**唯一所有者**，障碍制动由 `stop/warn_obstacle_dist` 阈值负责；SIL 保持一致避免双发布者（本文「对齐车端超时停车语义」指**看门狗语义对齐**，不意味着 SIL 下跑了 `safety_guard` 节点）。另：`health_monitor` 默认关闭（SIL 无 CAN 会持续报 CRITICAL → `auto_mission` 永久暂停巡航）；SIL **固定墙钟**，不提供 `use_sim_time` 旋钮（链路无 `/clock` 发布者，置 true 会让整栈定时器停摆且无报错）。`carla.*` 为 SIL 专用通道，**不走 `topic_name()` 8 Topic 契约**，契约文件不受影响；**不新增任何 ROS 话题/消息**，话题名与 `frame_id` 全取自既有 `sensor_params.yaml`。
+- **B4 三方互联与可视化**（`cloud/sim_data_mapper.py`、`platform_adapter/service.py`、`visualization/routes.py`、`visualization/assets/{index.html,style.css,app.js}`）：`sim_status`/`sim_telemetry` payload 增 **`edge_link` 段**（`Optional`，未装配为 `null`，与既有 `message` 同风格）；平台契约走**精简 11 键** `summary()`（链路年龄/控制回传频率/看门狗态/控制源/馈送速率/发送错误/在线时长），完整 24 键 `stats` 只走 viz 只读端点，**不进 10Hz 上行报文**。viz 面板新增 **SIL 链路卡片**（仿真端/车端/平台三方状态、控制源、上下行 Topic、看门狗、控制延迟与频率、最新指令、上行错误、链路时长）+ 五流速率表（实际 Hz / 标称 Hz / 已发送 / 限频丢弃 / 超限丢弃），顶栏新增 SIL 徽标五态（未装配 / 已装配 / 等待车端 / 闭环中 / 断流刹停）。**未新增任何端点**：`edge_link` 是既有 `/viz/api/status` 的追加段，viz 仍 9 条路由、平台 10 个 `/api/v1/*` 零改动。断流判据 `count>0 且 actual=0`、降级判据 `actual < 标称×0.8` 命中行标黄；未装配时明示「脚本自车，无 Kafka 上行」。**评估引擎不变**：消费真实自车行为采样，`success_criteria` 照常裁决，结论真实反映 HunterEdge 全栈表现（V3.8.18 A2 保证上屏）。
+
+### 本版新增测试暴露并修复的缺陷
+
+- **`model_copy(update=...)` 不做校验（真实缺陷，热路径崩溃风险）**：Pydantic v2 的 `model_copy` 跳过校验，非法覆盖值（如 `rgb_fps="not-a-number"`）会**静默写入**，直到 `_fps_for` 转 float 才抛 `ValueError`——而那是 `stats`/viz 卡片/`sim_status` 上报的**热路径**，会致面板 500 与上报中断，docstring 声称的「非法值退回默认」从未生效。改走 `model_validate(base.model_dump() | update)` 完整校验，失败整体退回全局默认；`_fps_for` 另加 try/except 退回**字段声明默认档**（刻意不返回 0，否则变成不限频而撑爆带宽）。
+- **浮点量级致标称帧率静默腰斩**：`time.time()` 处于 epoch 量级（~1.76e9）时 float64 间距约 2.4e-7 s，`now - last < 1/fps` 会把**恰好按标称周期到达**的帧误丢，10Hz 静默退化成约 5Hz。限频判据改带容差 `tol = max(1e-9, |now|*1e-15)`（与车端 `StreamRateLimiter` 同口径），新增扫 24 个相位的回归守卫证明标称周期不误丢。
+- **Pydantic v2.11 实例访问 `model_fields` 已弃用**：改 `type(base).model_fields`（`model_fields_set` 是另一属性，未弃用），消除 17 条弃用告警。
+- **`.env.example` 违背既有极简模板契约**：B1 初版逐条罗列 14 个调优键致模板 111 行，撞 `test_settings_env.py` 的 `<100` 行守护断言，且违背模板第 12–14 行明写的「绝大多数调优项**不在本模板罗列**」。精简为 7 行（**98 行**），只留开关与默认档说明，调优键指向 `models.py`/`user_manual.md`——**选择改模板而非放宽断言**，尊重仓库既有约定。
+- **速率窗口锚点刻意区别于 `FrameHub.fps`**：同为 `(n-1)/span`、窗口 5.0s、样本上限 600，但右端锚 **`now`** 而非最后样本，使断流时速率衰减到 0；否则卡片会在看门狗已刹停后仍显标称速率，反而掩盖断流（FrameHub 另有 `age_s` 判 stale，此处没有）。
+
+### 验证
+
+- 全量 `pytest`：**1805 passed**（V3.8.18 基线 1677 + B2 `test_v390_edge_control.py` 56 项 + B4 `test_v390_edge_link_viz.py` 72 项）；`flake8` exit=0；`mypy` **Success（92 文件）**；全仓行覆盖 **84.49%**（≥80% 门禁，且**不低于 V3.8.18 基线 84.02%**）。
+- B2 专项守卫：cmd_vel→throttle/brake/steer 换算（含倒车负值与符号约定）、看门狗刹停与恢复、控制源异常等同断流、`extra_params.edge_link` 三形态覆盖、Kafka 不可达快速失败不回退、脚本控制让位。
+- B4 专项守卫：限频容差 24 相位扫描、速率断流衰减到 0、stats/summary 键集契约、看门狗可观测性、payload `edge_link` 段、运行器汇总、service 透出、viz 骨架、生命周期（mock Kafka 生产者/消费者工厂）、会话 boot/stop 信令、发送三条失败路径、Kafka 构建参数、配置覆盖非法值退回。
+- **遵守编码规则 §10.2「禁止测试中 sleep()」**：消费循环测试改**同步驱动**（直调 `_consume_loop`，桩消费者批次耗尽即清 `_running` 自然退出），完全确定性、无线程调度抖动。此重构曾暴露一处测试自身陷阱：未注入桩消费者时 `_consume_loop` 走 `consumer is None → sleep → continue` 分支，而时钟桩的 `sleep` 是空操作 → **无限忙循环**；已补 `link._consumer` 注入修复。
+- HunterEdge 侧：`sil_bridge_agent` **103 项单测**（mock rclpy / ROS 消息 / confluent_kafka / hunter_kafka）、`flake8` exit=0、`ruff`（F821/F822/F823/F811/F841）exit=0、`mypy` 复核通过——据 mypy 修正一处**类型不变量表达**（`on_message` 的 `stream` 改 `cast(str, ...)`：`decode_envelope` 已在入口拒绝非法 `stream`，但 `Optional[Dict[str, Any]]` 让检查器误报 `arg-type`；**零运行时行为变化**，改后四项门禁复跑全绿）；坐标系转换用**独立推导交叉校验**（先翻欧拉角再转四元数 ≡ 直接翻四元数分量、纯 yaw 与参考公式对照、单位范数），而非把实现公式抄进断言。
+- **未做**：计划中的 docker-compose Kafka 环回集成测试需真实 broker，本环境不具备，改以**文档化实机验收剧本**替代（见 `user_manual.md`「真 SIL」章节）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.9.0`；`pyproject.toml` 版本 `3.9.0`。车端配套 HunterEdge **V0.1.38**（`sil_bridge_agent` ROS 包 1.0.0）。
+
+### 向后兼容与行为变化
+
+- **默认零影响**：`EDGE_LINK_ENABLED` 默认 `false` → 不装配 EdgeLinkRuntime，SIL 仍走脚本自车，行为与 V3.8.18 完全一致。
+- **平台契约零改动**：mode 仍是 `SIL`（不新增模式枚举）；10 个 `/api/v1/*` 端点、场景下发、`success_criteria`、结果回传全部沿用；车端→平台仍走现有 `hunter.<vid>.telemetry/event/health`。
+- **追加字段**：`sim_status`/`sim_telemetry` 的 `edge_link` 为 `Optional`（未装配 `null`），旧消费方忽略即可；viz **未新增端点**。
+- **开启后的行为变化（须知）**：① Kafka 不可达时实例**快速失败**并明确报错，**不再静默回退脚本自车**；② 自车控制权交车端，脚本确定性控制完全让位；③ 控制帧断流 >500ms **零速刹停保持**（对齐车端超时停车语义），面板显式标记控制源与看门狗态；④ 需车端同时起 HunterEdge SIL 模式，否则链路停在「等待车端」。
+- **新增配置组**：`EDGE_LINK_*`（11 字段，均有合理默认，`.env.example` 只留开关一行）。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → 3.9.0；能力清单补真 SIL 闭环；测试计数 1677 → 1805、覆盖率 84.02% → 84.49%。
+- `user_manual.md`：版本头 → V3.9.0；新增「真 SIL 全栈闭环」章节（链路图/开启步骤/配置档位表/面板判读/**实机验收剧本**）+ FAQ。
+- `deployment_and_operations.md`：版本头 → V3.9.0；新增 `### V3.8.18 → V3.9.0` 升级章节（含双端前置条件与回滚）。
+- `docs/单机部署指南.md`：版本头 → V3.9.0；排障表补真 SIL 链路条目。
+- `pyproject.toml`：`version` 3.8.18 → **3.9.0**。
+---

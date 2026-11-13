@@ -130,6 +130,7 @@ def register_viz_routes(app: FastAPI) -> None:
             "sensor": {"attached": False, "counts": {}, "streams": {}},
             "stream": {"clients": 0, "limit": 0, "fps": 0.0},
             "ros": {"enabled": False, "topics": {}, "mappings": []},
+            "edge_link": {"enabled": False, "control_source": "script"},
         }
         snapshot = getattr(service, "runtime_status", None)
         if callable(snapshot):

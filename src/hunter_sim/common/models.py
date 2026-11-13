@@ -398,6 +398,64 @@ class VILSettings(BaseSettings):
     )
 
 
+class EdgeLinkSettings(BaseSettings):
+    """真 SIL 边缘链路配置（V3.9.0：Kafka 传感器上行 / 控制下行 / 会话信令）。
+
+    仿真端经 ``carla.{sim_id}.edge_sensor`` 向车端 HunterEdge 馈送传感器，
+    车端全栈自动驾驶产出 ``/cmd_vel`` 经 ``carla.{sim_id}.edge_control`` 回传，
+    由 ``control_driver`` hook 驱动仿真自车，形成真 SIL 闭环。
+
+    连接参数（broker / SASL_SSL / SCRAM / 证书）复用 ``KafkaSettings``
+    （``KAFKA_*``，并由 ``HunterSimSettings`` 自动继承 ``HUNTER_CORE_*``），
+    本组只管理边缘链路特有的开关、各流限频、看门狗与 payload 尺寸上限。
+
+    ``enabled=false``（默认）时不装配 EdgeLinkRuntime，SIL 仍走脚本自车；
+    置 true 即进入 SIL_EDGE：Kafka 不可达时快速失败，不静默回退（避免假 SIL）。
+    rgb 上行宽度沿用现有 ``ADAPTER_STREAM_MAX_WIDTH``（默认 640）编码产物，不重复编码。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="EDGE_LINK_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        False,
+        description="是否启用真 SIL 边缘链路（SIL_EDGE）；默认关闭，SIL 走脚本自车",
+    )
+    sensor_topic_template: str = Field(
+        "carla.{sim_id}.edge_sensor",
+        description="传感器上行 Topic 模板（{sim_id} 运行时渲染）",
+    )
+    control_topic_template: str = Field(
+        "carla.{sim_id}.edge_control",
+        description="控制下行 Topic 模板（Twist 语义，{sim_id} 运行时渲染）",
+    )
+    control_group_id: str = Field(
+        "carla-edge-control",
+        description="控制下行消费组 ID（每实例独立消费最新指令）",
+    )
+    # ── 各流上行限频（带宽默认档：rgb/depth/lidar 10Hz、imu 50Hz、ego_state 20Hz）──
+    rgb_fps: float = Field(10.0, gt=0.0, le=60.0, description="rgb(JPEG) 上行帧率上限")
+    depth_fps: float = Field(10.0, gt=0.0, le=60.0, description="depth(32FC1) 上行帧率上限")
+    lidar_fps: float = Field(10.0, gt=0.0, le=60.0, description="lidar(XYZ float32) 上行频率上限")
+    imu_fps: float = Field(50.0, gt=0.0, le=200.0, description="imu 上行频率上限")
+    ego_state_fps: float = Field(
+        20.0, gt=0.0, le=100.0, description="ego_state(速度/横摆/位姿) 上行频率上限"
+    )
+    # ── 看门狗与尺寸保护 ──
+    watchdog_ms: int = Field(
+        500,
+        ge=50,
+        le=5000,
+        description="控制帧断流看门狗（毫秒）：超时零速刹停保持，对齐车端 safety_guard",
+    )
+    max_payload_bytes: int = Field(
+        4_194_304,
+        ge=1024,
+        description="单帧 payload 尺寸上限（字节），超限丢弃并计数（防超大帧撑爆 broker）",
+    )
+
+
 class ResourceSettings(BaseSettings):
     """资源管理配置（V3.0.0：单世界串行后仅保留实例寿命与巡检周期）。
 
@@ -739,6 +797,7 @@ class HunterSimSettings(BaseSettings):
     carla: CarlaSettings = Field(default_factory=CarlaSettings)
     kafka: KafkaSettings = Field(default_factory=KafkaSettings)
     vil: VILSettings = Field(default_factory=VILSettings)
+    edge_link: EdgeLinkSettings = Field(default_factory=EdgeLinkSettings)
     resource: ResourceSettings = Field(default_factory=ResourceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     cloud: CloudSettings = Field(default_factory=CloudSettings)

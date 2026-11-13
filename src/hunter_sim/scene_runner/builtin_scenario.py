@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
@@ -242,6 +243,14 @@ def _ego_event_brake_max_hold_s() -> float:
 #: V3.8.4：确定性控制输出（油门/刹车/转向）一阶低通系数，抑制 bang-bang 切换
 #: 引起的悬架俯仰/侧倾阶跃（环视相机刚性挂自车，表现为画面抖动）。
 _EGO_CTRL_EMA_ALPHA = 0.35
+
+#: V3.9.0：真 SIL 外部控制（车端 /cmd_vel）自行车模型换算的最小车速分母（m/s）。
+#: 低速时 ω/v 会发散把转向打满，故给分母兜底（与车端换算口径一致）。
+_EDGE_STEER_MIN_SPEED_MS = 0.5
+#: V3.9.0：倒车挡切换滞回阈值（m/s）——指令速度越过该值才换挡，避免零点附近
+#: 前进/倒车高频抖动；换挡前必须先把车停稳到 _EDGE_GEAR_SHIFT_STOP_MS 以下。
+_EDGE_REVERSE_SWITCH_MS = 0.3
+_EDGE_GEAR_SHIFT_STOP_MS = 0.5
 #: V3.8.4：最小车距采样上限（防超长场景内存膨胀）。
 _MAX_MIN_DISTANCE_SAMPLES = 20000
 
@@ -386,6 +395,8 @@ class BuiltinScenario(CustomScenarioBase):
         stream_max_width: int = 0,
         traffic_manager: Optional[Any] = None,
         traffic_manager_port: int = _AUTOPILOT_TM_PORT,
+        control_driver: Optional[Callable[[float], Any]] = None,
+        edge_link_sink: Optional[Callable[..., Any]] = None,
     ) -> None:
         super().__init__(config, state_manager, event_detector)
         self._transform_factory = transform_factory
@@ -457,6 +468,18 @@ class BuiltinScenario(CustomScenarioBase):
         self._ego_ctrl_throttle: float = 0.0
         self._ego_ctrl_brake: float = 0.0
         self._ego_ctrl_steer: float = 0.0
+        # V3.9.0：真 SIL 外部控制扩展点。control_driver 非空即由车端 /cmd_vel
+        # 驱动自车（绕过脚本确定性纵向/车道保持控制）；edge_link_sink 把已编码的
+        # 传感器产物馈送到 Kafka 上行（不重复编码）。
+        self._control_driver = control_driver
+        self._edge_link_sink = edge_link_sink
+        # 外部控制态：倒车挡锁存 / 看门狗刹停 / 帧计数 / 最近指令（面板诊断用）
+        self._edge_reverse: bool = False
+        self._edge_watchdog_stale: bool = False
+        self._edge_control_frames: int = 0
+        self._edge_stale_frames: int = 0
+        self._edge_last_linear_x: float = 0.0
+        self._edge_last_angular_z: float = 0.0
         # V3.8.6：物理卡滞保护计时与告警标志（油门高却不动→停油保持制动）。
         self._ego_phys_stuck_since_s: float = 0.0
         self._ego_phys_stuck_warned: bool = False
@@ -524,6 +547,36 @@ class BuiltinScenario(CustomScenarioBase):
         return {
             "dropped": dict(self._frame_drops),
             "nominal_fps": dict(self._nominal_fps),
+        }
+
+    @property
+    def control_source(self) -> str:
+        """当前自车控制源（V3.9.0）。
+
+        ``edge_link``=车端 HunterEdge /cmd_vel 驱动（真 SIL）；
+        ``script``=脚本确定性控制。面板必须显式区分两者，
+        避免「假 SIL」（看起来在跑自动驾驶，实际是脚本自车）。
+        """
+        return "edge_link" if self._control_driver is not None else "script"
+
+    @property
+    def edge_control_diagnostics(self) -> dict[str, Any]:
+        """外部控制诊断快照（只读拷贝，不持 CARLA 句柄）。
+
+        供面板标记控制源与看门狗刹停态，并回显最近一帧 /cmd_vel 指令
+        与实际下发的油门/刹车/转向，便于定位「车端发了但仿真没动」。
+        """
+        return {
+            "source": self.control_source,
+            "watchdog_stale": self._edge_watchdog_stale,
+            "control_frames": self._edge_control_frames,
+            "stale_frames": self._edge_stale_frames,
+            "linear_x": round(self._edge_last_linear_x, 3),
+            "angular_z": round(self._edge_last_angular_z, 3),
+            "reverse": self._edge_reverse,
+            "throttle": round(self._ego_ctrl_throttle, 3),
+            "brake": round(self._ego_ctrl_brake, 3),
+            "steer": round(self._ego_ctrl_steer, 3),
         }
 
     def participant_states(self) -> list[dict[str, Any]]:
@@ -761,7 +814,11 @@ class BuiltinScenario(CustomScenarioBase):
         使可视化里自车与参与者真正按场景设置运动。行人由 AI 控制器导航。
         """
         self._reapply_post_spawn_controls_once()
-        self._apply_ego_manual_speed(delta_seconds)
+        if self._control_driver is not None:
+            # V3.9.0 真 SIL：自车由车端 /cmd_vel 驱动，脚本确定性控制完全让位
+            self._apply_edge_control(delta_seconds)
+        else:
+            self._apply_ego_manual_speed(delta_seconds)
         self._advance_scripted_walkers(delta_seconds)
         self._update_traveled_distance(delta_seconds)
         self._warn_ego_speed_stuck()
@@ -2098,6 +2155,140 @@ class BuiltinScenario(CustomScenarioBase):
             steer=steer,
         )
 
+    def _apply_edge_control(self, delta_seconds: float) -> None:
+        """真 SIL 外部控制：把车端 /cmd_vel（Twist）换算成油门/刹车/转向。
+
+        V3.9.0：``control_driver`` 非空时接管自车，脚本确定性纵向控制与车道
+        保持完全让位——评估引擎消费的是 HunterEdge 全栈的真实行为，而不是
+        脚本自车（否则 success_criteria 裁决的不是被测系统）。
+
+        - ``linear_x``：复用 P + 巡航前馈速度环（目标速度=指令速度），负值走倒车挡。
+        - ``angular_z``：自行车模型换算前轮转角并限幅（见 :meth:`_edge_twist_to_control`）。
+        - **看门狗**：``control.stale``（断流 >watchdog_ms 或从未收到控制帧）→ 零油门 +
+          保持制动刹停，对齐车端 safety_guard 超时停车语义；恢复后继续。
+        - 输出经一阶低通（与确定性控制同口径），但看门狗刹停立即生效不走低通。
+
+        仅由 tick 线程调用（读 CARLA 速度/位姿属 RPC）；``control_driver`` 内部已持锁。
+        """
+        if self._ego is None or self._control_driver is None:
+            return
+        control: Any = None
+        failed = False
+        try:
+            control = self._control_driver(delta_seconds)
+        except Exception as exc:  # noqa: BLE001  控制源异常按断流处理，不阻断仿真
+            logger.warning(f"edge control_driver failed: {exc}")
+            failed = True
+        if control is None and not failed:
+            # 自车尚未绑定（首 tick 前）：不下发控制，保持静止
+            return
+        # 控制源抛异常等同断流：必须刹停，不得沿用上一帧指令滑行
+        stale = failed or bool(getattr(control, "stale", False))
+        linear_x = _safe_float(getattr(control, "linear_x", 0.0))
+        angular_z = _safe_float(getattr(control, "angular_z", 0.0))
+        self._edge_control_frames += 1
+        self._edge_last_linear_x = linear_x
+        self._edge_last_angular_z = angular_z
+        forward, _ = self._ego_axes()
+        projected = self._projected_speed(self._ego, forward)
+        current = projected if projected is not None else self._current_speed(self._ego)
+        if stale:
+            self._edge_stale_frames += 1
+            if not self._edge_watchdog_stale:
+                logger.warning(
+                    "edge_control_watchdog: 控制帧断流，零速刹停保持"
+                    "（对齐车端 safety_guard 超时停车语义）"
+                )
+            self._edge_watchdog_stale = True
+            throttle, brake, steer = 0.0, _EGO_BRAKE_HOLD, 0.0
+            # 刹停期间清空物理卡滞判定，避免控制恢复后被旧 latch 冻住
+            self._ego_phys_stuck_since_s = 0.0
+            self._ego_phys_stuck_warned = False
+        else:
+            if self._edge_watchdog_stale:
+                logger.info("edge_control_recovered: 控制帧恢复，继续执行 /cmd_vel")
+            self._edge_watchdog_stale = False
+            throttle, brake, steer = self._edge_twist_to_control(
+                linear_x, angular_z, current
+            )
+        if stale:
+            # 看门狗刹停必须立即生效，不经低通（安全语义优先于画面平滑）
+            self._ego_ctrl_throttle = throttle
+            self._ego_ctrl_brake = brake
+            self._ego_ctrl_steer = steer
+        else:
+            alpha = _EGO_CTRL_EMA_ALPHA
+            self._ego_ctrl_throttle += alpha * (throttle - self._ego_ctrl_throttle)
+            self._ego_ctrl_brake += alpha * (brake - self._ego_ctrl_brake)
+            self._ego_ctrl_steer += alpha * (steer - self._ego_ctrl_steer)
+        self._apply_vehicle_control(
+            self._ego,
+            throttle=self._ego_ctrl_throttle,
+            brake=self._ego_ctrl_brake,
+            steer=self._ego_ctrl_steer,
+            reverse=self._edge_reverse,
+        )
+
+    def _edge_twist_to_control(
+        self, linear_x: float, angular_z: float, current: float
+    ) -> tuple[float, float, float]:
+        """Twist → ``(throttle, brake, steer)``，含倒车挡滞回与换挡前停稳。
+
+        Args:
+            linear_x: 纵向速度指令（m/s，负值倒车）。
+            angular_z: 横摆角速度指令（rad/s，ROS 约定左转为正）。
+            current: 当前前向投影速度（m/s，带符号，倒车为负）。
+
+        纵向沿用确定性控制的 P + 巡航前馈 + 稳态死区；倒车时把反馈量按挡位
+        方向取符号，使 ``|目标| - 反馈`` 与前进同形（否则负目标会被误判为超速而刹停）。
+
+        横向按自行车模型 ``steer = atan(L·ω / max(|v|, 0.5))``，限幅后归一到 [-1, 1]。
+        **符号约定**：CARLA/Unreal 为左手系（X 前、Y 右），``steer>0`` 使车朝 +Y
+        （右）偏转——这一点由既有车道保持 pure-pursuit 在实机 Town01/Town06 验证；
+        ROS REP-103 为右手系（Y 左），``ω>0`` 为左转，故此处取反号。前提是
+        sil_bridge 把 CARLA 位姿按 ROS 系转换（y/yaw 取反）后再喂给 HunterEdge，
+        使车端 ``ω = v·tan(δ)/L``（auto_mission 建图遥控桥同式）算出的指令语义一致。
+        轴距用 CARLA 自车的 ``_EGO_LANE_WHEELBASE_M``（决定仿真中实际横摆响应），
+        而非车端 HUNTER-SE 的 0.46m；车端 R_min=1.9m 的曲率钳制会让大 ω 指令在此
+        被限幅，属预期的保真度折中。
+        """
+        # 挡位滞回：指令越过阈值才切换，零点附近保持当前挡
+        if linear_x < -_EDGE_REVERSE_SWITCH_MS:
+            want_reverse = True
+        elif linear_x > _EDGE_REVERSE_SWITCH_MS:
+            want_reverse = False
+        else:
+            want_reverse = self._edge_reverse
+        if want_reverse != self._edge_reverse:
+            if abs(current) > _EDGE_GEAR_SHIFT_STOP_MS:
+                # 仍在移动：先刹停，挡位保持不变（CARLA 行进中换挡无效）
+                return 0.0, 1.0, 0.0
+            self._edge_reverse = want_reverse
+        reverse = self._edge_reverse
+        target = abs(linear_x)
+        feedback = -current if reverse else current
+        error = target - feedback
+        if error > _EGO_SPEED_DEADBAND:
+            throttle = min(1.0, max(0.0, _EGO_SPEED_FEEDFORWARD + _EGO_SPEED_KP * error))
+            brake = 0.0
+        elif error < -_EGO_SPEED_DEADBAND:
+            throttle = 0.0
+            brake = min(1.0, max(0.0, _EGO_BRAKE_GAIN * -error))
+        elif target <= _EGO_SPEED_DEADBAND:
+            # 指令为零：停稳后保持制动（防溜车）
+            throttle = 0.0
+            brake = _EGO_BRAKE_HOLD
+        else:
+            throttle = _EGO_SPEED_FEEDFORWARD
+            brake = 0.0
+        speed = max(abs(current), _EDGE_STEER_MIN_SPEED_MS)
+        steer_rad = math.atan(_EGO_LANE_WHEELBASE_M * angular_z / speed)
+        steer_rad = max(
+            -_EGO_LANE_MAX_STEER_RAD, min(_EGO_LANE_MAX_STEER_RAD, steer_rad)
+        )
+        steer = -steer_rad / _EGO_LANE_MAX_STEER_RAD
+        return throttle, brake, steer
+
     def _nearest_actor_summary(self) -> str:
         """最近 Actor 观测摘要（ahead/lateral 米，自车坐标系），无可用 Actor 返 'n/a'。
 
@@ -2516,9 +2707,17 @@ class BuiltinScenario(CustomScenarioBase):
 
     @staticmethod
     def _apply_vehicle_control(
-        actor: Any, throttle: float, brake: float, steer: float
+        actor: Any,
+        throttle: float,
+        brake: float,
+        steer: float,
+        reverse: bool = False,
     ) -> None:
-        """下发车辆控制（无 CARLA SDK 时用轻量对象兼容单测桩）。"""
+        """下发车辆控制（无 CARLA SDK 时用轻量对象兼容单测桩）。
+
+        V3.9.0：新增 ``reverse`` 挡位（真 SIL 车端 /cmd_vel 负速度倒车用）；
+        默认 False，脚本控制路径行为不变。
+        """
         apply = getattr(actor, "apply_control", None)
         if not callable(apply):
             return
@@ -2526,10 +2725,12 @@ class BuiltinScenario(CustomScenarioBase):
             import carla  # noqa: PLC0415
 
             control: Any = carla.VehicleControl(
-                throttle=throttle, steer=steer, brake=brake
+                throttle=throttle, steer=steer, brake=brake, reverse=reverse
             )
         except ImportError:
-            control = SimpleNamespace(throttle=throttle, steer=steer, brake=brake)
+            control = SimpleNamespace(
+                throttle=throttle, steer=steer, brake=brake, reverse=reverse
+            )
         try:
             apply(control)
         except Exception as exc:  # noqa: BLE001
@@ -3512,11 +3713,28 @@ class BuiltinScenario(CustomScenarioBase):
                     meta={"sim_ts": ts},
                 )
             self._publish_ros("rgb", data)
+            self._feed_edge_link(
+                stream,
+                ts,
+                log_time_ns,
+                encoded.payload,
+                {
+                    "content_type": encoded.content_type,
+                    "format": encoded.format,
+                    "width": encoded.width,
+                    "height": encoded.height,
+                    "frame_id": frame_id,
+                },
+            )
             return
 
         if stream == STREAM_DEPTH:
             raw, width, height = self._raw_image(data)
-            if self._frame_hub is not None or self._recorder is not None:
+            if (
+                self._frame_hub is not None
+                or self._recorder is not None
+                or self._edge_link_sink is not None
+            ):
                 # 米制深度只算一次：FrameHub 暴露最新深度图（调试/上层取用），录制落 32FC1
                 meters = depth_bgra_to_meters(raw, width, height).tobytes()
                 if self._frame_hub is not None:
@@ -3540,6 +3758,18 @@ class BuiltinScenario(CustomScenarioBase):
                         meta={"sim_ts": ts},
                     )
             self._publish_ros("depth", data)
+            self._feed_edge_link(
+                stream,
+                ts,
+                log_time_ns,
+                meters,
+                {
+                    "encoding": "32FC1",
+                    "width": width,
+                    "height": height,
+                    "frame_id": frame_id,
+                },
+            )
             return
 
         if stream == "lidar":
@@ -3554,6 +3784,18 @@ class BuiltinScenario(CustomScenarioBase):
                     meta={"sim_ts": ts},
                 )
             self._publish_ros("lidar", data)
+            self._feed_edge_link(
+                stream,
+                ts,
+                log_time_ns,
+                payload,
+                {
+                    "points": points,
+                    "point_bytes": _LIDAR_POINT_BYTES,
+                    "encoding": "xyzI",
+                    "frame_id": frame_id,
+                },
+            )
             return
 
         if stream == "imu":
@@ -3571,6 +3813,36 @@ class BuiltinScenario(CustomScenarioBase):
                     meta={"sim_ts": ts},
                 )
             self._publish_ros("imu", data)
+            self._feed_edge_link(
+                stream,
+                ts,
+                log_time_ns,
+                json.dumps({"accel": list(accel), "gyro": list(gyro)}).encode("utf-8"),
+                {"encoding": "json", "frame_id": frame_id},
+            )
+
+    def _feed_edge_link(
+        self,
+        stream: str,
+        sim_ts: float,
+        wall_ts_ns: int,
+        payload: bytes,
+        meta: dict[str, Any],
+    ) -> None:
+        """把已编码的传感器产物馈送到 EdgeLink 上行（V3.9.0 真 SIL）。
+
+        复用 FrameHub/录制同一份编码产物，**不重复编码**；由编码 worker 线程
+        调用，只做 Kafka send，不碰 CARLA。未装配 sink / 空载荷 / 发送异常均
+        跳过（限频与丢帧计数由 EdgeLinkRuntime 内部负责），不得影响仿真与录制。
+        环视流（overview）仅可视化，不在此馈送。
+        """
+        sink = self._edge_link_sink
+        if sink is None or not payload:
+            return
+        try:
+            sink(stream, sim_ts, wall_ts_ns, payload, meta)
+        except Exception as exc:  # noqa: BLE001  上行失败不阻断仿真
+            logger.debug(f"edge_link feed skipped ({stream}): {exc}")
 
     def _publish_ros(self, stream: str, data: Any) -> None:
         """可选 ROS2 话题发布（未启用/未初始化/无 rclpy 时静默跳过）。"""
@@ -3774,6 +4046,19 @@ def _measurement_bytes(data: Any) -> bytes:
     if raw is None:
         raw = getattr(data, "data", b"")
     return bytes(raw or b"")
+
+
+def _safe_float(value: Any) -> float:
+    """安全转 float（None/非法/非有限值回退 0.0）。
+
+    V3.9.0：车端 /cmd_vel 经 Kafka JSON 解码后可能带 NaN/Inf 或缺字段，
+    直接参与速度环会把油门/转向算成 NaN 并下发到 CARLA，故在此统一兜底。
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
 
 
 def _vec3(value: Any) -> tuple[float, float, float]:

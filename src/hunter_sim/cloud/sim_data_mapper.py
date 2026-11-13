@@ -53,6 +53,9 @@ class SimStatusPayload:
         events_triggered: 已触发事件总数（方案 §5.4 sim_status 字段）。
         message: 可选错误/提示信息。
         updated_at: Unix epoch 秒（契约要求 number）。
+        edge_link: 真 SIL 边缘链路段（V3.9.0，可选）。仅装配 EdgeLinkRuntime 时
+            携带：控制源/链路年龄/控制回传频率/看门狗态/各流馈送速率。
+            未装配（脚本自车的普通 SIL/VIL）为 None，不影响既有字段。
     """
 
     status: str
@@ -66,6 +69,7 @@ class SimStatusPayload:
     events_triggered: int = 0
     message: Optional[str] = None
     updated_at: float = 0.0
+    edge_link: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.updated_at:
@@ -151,6 +155,7 @@ def build_sim_telemetry(
     steering: float,
     acceleration: float,
     sim_time: Optional[float] = None,
+    edge_link: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """构建 sim_telemetry 消息（方案 §5.4）。
 
@@ -166,6 +171,7 @@ def build_sim_telemetry(
         steering: 方向盘角度（弧度）。
         acceleration: 加速度标量（m/s²，契约要求 number）。
         sim_time: 仿真时间轴时刻（秒，可选）。
+        edge_link: 真 SIL 边缘链路段（V3.9.0，可选；未装配时不写入 payload）。
 
     Returns:
         符合方案 §5.4 sim_telemetry 格式的 dict 消息。
@@ -181,6 +187,8 @@ def build_sim_telemetry(
     }
     if sim_time is not None:
         payload["sim_time"] = max(0.0, float(sim_time))
+    if edge_link is not None:
+        payload["edge_link"] = dict(edge_link)
     return _envelope(
         sim_id=sim_id,
         vehicle_id=vehicle_id,

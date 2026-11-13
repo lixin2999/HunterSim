@@ -20,6 +20,7 @@
       <span class="badge" id="badge-carla">CARLA</span>
       <span class="badge" id="badge-platform">平台</span>
       <span class="badge" id="badge-ros">ROS2</span>
+      <span class="badge" id="badge-edge">SIL</span>
       <span class="badge" id="badge-scene">场景</span>
     </div>
     <div class="controls">
@@ -112,6 +113,24 @@
           <tbody></tbody>
         </table>
       </div>
+    </section>
+
+    <!-- V3.9.0：真 SIL 三方互联（仿真端 → 车端 HunterEdge → 平台），未装配时明示脚本自车 -->
+    <section class="panel edge-panel">
+      <div class="panel-head">
+        <h2>SIL 链路</h2>
+        <span class="muted" id="edge-note">—</span>
+      </div>
+      <dl class="kv" id="edge-info"></dl>
+      <div class="table-wrap">
+        <table id="edge-table">
+          <thead>
+            <tr><th title="Kafka carla.{sim_id}.edge_sensor 的信封 stream 名">流</th><th title="最近 5s 窗口实际上行速率；断流衰减到 0">实际 Hz</th><th>标称 Hz</th><th>已发送</th><th title="超出该流 fps 上限被丢弃">限频丢弃</th><th title="payload 超出尺寸上限被丢弃">超限丢弃</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted small" id="edge-hint">控制延迟超过看门狗阈值即零速刹停；实际 Hz 明显低于标称多为带宽或限频丢弃。</p>
     </section>
 
     <section class="panel event-panel">

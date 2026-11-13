@@ -100,6 +100,10 @@ class SceneRunnerService:
         pose_driver: VIL 位姿驱动（每 tick 前调用）。
         sample_sink: 轨迹采样回调（评估引擎消费）。
         status_provider: 状态覆盖回调（VIL 数据中断→PAUSED）。
+        control_driver: 真 SIL 外部控制驱动（V3.9.0，每 tick 取车端 /cmd_vel）。
+        edge_link_sink: 真 SIL 传感器上行馈送回调（复用已编码产物）。
+        edge_link_stats: 真 SIL 链路诊断回调（V3.9.0，供 sim_status/sim_telemetry
+            的 ``edge_link`` 段；未装配时为 None，报文不带该段）。
         frame_hub: 传感器帧汇聚中心（控制面 MJPEG/截图取用）。
         recorder: mcap 录制器（场景期间落盘传感器数据）。
         ros_bridge: ROS2 桥接器（可选出口）。
@@ -133,6 +137,9 @@ class SceneRunnerService:
         traffic_manager: Optional[Any] = None,
         traffic_manager_port: int = 8000,
         engine_key: str = "",
+        control_driver: Optional[Callable[[float], Any]] = None,
+        edge_link_sink: Optional[Callable[..., Any]] = None,
+        edge_link_stats: Optional[Callable[[], dict[str, Any]]] = None,
     ) -> None:
         self._world = world
         self._on_state_change = on_state_change
@@ -145,6 +152,12 @@ class SceneRunnerService:
         self._pose_driver = pose_driver
         self._sample_sink = sample_sink
         self._status_provider = status_provider
+        # V3.9.0 真 SIL 扩展点：外部控制驱动（车端 /cmd_vel）与传感器上行馈送。
+        # control_driver 在 scenario.tick() 内调用（tick 线程=信箱 owner，直读 CARLA 安全）；
+        # edge_link_sink 在编码 worker 线程调用（只做 Kafka send，不碰 CARLA）。
+        self._control_driver = control_driver
+        self._edge_link_sink = edge_link_sink
+        self._edge_link_stats = edge_link_stats
         # Sensor Emulator 出口（FrameHub → MJPEG/截图；McapRecorder → sensor_file）
         self._frame_hub = frame_hub
         self._recorder = recorder
@@ -434,6 +447,8 @@ class SceneRunnerService:
                     stream_max_width=self._stream_max_width,
                     traffic_manager=self._traffic_manager,
                     traffic_manager_port=self._traffic_manager_port,
+                    control_driver=self._control_driver,
+                    edge_link_sink=self._edge_link_sink,
                 )
             self._scenario = scenario
             self._scenario_cleaned = False
@@ -605,6 +620,20 @@ class SceneRunnerService:
             return dict(getattr(scenario, "sensor_diagnostics", {}) or {})
         except Exception:  # noqa: BLE001  只读诊断不得因场景释放而抛异常
             return {"dropped": {}, "nominal_fps": {}}
+
+    def control_diagnostics(self) -> dict[str, Any]:
+        """自车控制源诊断快照（V3.9.0：脚本 / EdgeLink + 看门狗态）。
+
+        透传 ``BuiltinScenario.edge_control_diagnostics``；场景未装载时返回
+        ``source="script"`` 的空诊断（面板不得因运行器释放而报错）。
+        """
+        scenario = self._scenario
+        if scenario is None:
+            return {"source": "script"}
+        try:
+            return dict(getattr(scenario, "edge_control_diagnostics", {}) or {})
+        except Exception:  # noqa: BLE001  只读诊断不得因场景释放而抛异常
+            return {"source": "script"}
 
     def _refresh_actor_states(self) -> None:
         """刷新参与者状态缓存（仅 tick 线程调用）。
@@ -959,6 +988,7 @@ class SceneRunnerService:
                 events_triggered=self._get_event_count(),
                 message=message,
                 updated_at=time.time(),
+                edge_link=self._edge_link_summary(),
             )
             msg = build_sim_status(
                 sim_id=self._sim_id,
@@ -1015,10 +1045,26 @@ class SceneRunnerService:
                 velocity=speed,
                 steering=ego.get("steering", 0.0),
                 acceleration=float(ego.get("acceleration", 0.0)),
+                edge_link=self._edge_link_summary(),
             )
             self._sim_data_producer.publish_telemetry(msg)
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"_publish_sim_telemetry failed: {exc}")
+
+    def _edge_link_summary(self) -> Optional[dict[str, Any]]:
+        """真 SIL 链路段（V3.9.0）；未装配或读取失败返回 None。
+
+        只读诊断不得阻断状态/遥测上报：链路已释放或瞬时异常时降级为不带该段，
+        而不是让整条 sim_status/sim_telemetry 发布失败。
+        """
+        if self._edge_link_stats is None:
+            return None
+        try:
+            raw = self._edge_link_stats()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Read edge_link stats failed: {exc}")
+            return None
+        return dict(raw) if isinstance(raw, dict) else None
 
     def publish_event_to_platform(self, event: DetectedEvent) -> None:
         """发布单条事件到平台 sim_event（由 on_event 回调链调用）。

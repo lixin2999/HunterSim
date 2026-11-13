@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from hunter_sim.cloud.connector import CloudConnector
+from hunter_sim.cloud.edge_link import EdgeLinkRuntime
 from hunter_sim.cloud.node_result_producer import NodeResultProducer, build_node_result
 from hunter_sim.common.exceptions import (
     CarlaSimulationError,
@@ -72,6 +73,23 @@ _UPLOAD_DRAIN_TIMEOUT_S = 10.0
 _DISK_CHECK_INTERVAL_S = 5.0
 
 
+def _edge_link_override(scene: SceneConfig) -> Optional[dict[str, Any]]:
+    """场景 ``extra_params.edge_link`` 覆盖（V3.9.0）。
+
+    支持 bool / dict / 字符串三种下发形态：bool 与字符串只覆盖 ``enabled``，
+    dict 可逐字段覆盖（各流 fps / watchdog_ms / payload 上限等，由
+    ``EdgeLinkRuntime`` 按模型字段过滤，非法值退回默认）。未声明返回 None。
+    """
+    raw = scene.extra_params.get("edge_link")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, bool):
+        return {"enabled": raw}
+    if isinstance(raw, str) and raw.strip():
+        return {"enabled": raw.strip().lower() in {"1", "true", "yes", "on"}}
+    return None
+
+
 @dataclass
 class _RunContext:
     """一次运行的上下文（仅工作线程/看门狗访问）。"""
@@ -80,6 +98,8 @@ class _RunContext:
     scene: SceneConfig
     runner: Any = None
     vil: Optional[VILRuntime] = None
+    # V3.9.0：真 SIL 边缘链路（SIL 模式 + EdgeLinkSettings.enabled 时装配）
+    edge_link: Optional[EdgeLinkRuntime] = None
     samples: list[dict[str, Any]] = field(default_factory=list)
     last_sample_time: float = -1.0
     last_progress_at: float = 0.0
@@ -392,6 +412,41 @@ class SimulationExecutor:
             "nominal_fps": dict(raw.get("nominal_fps") or {}),
         }
 
+    def control_diagnostics(self, instance_id: str) -> dict[str, Any]:
+        """自车控制源诊断（V3.9.0：脚本 / EdgeLink + 看门狗刹停态）。
+
+        只读视图：运行器已释放/未装配时返回 ``source="script"``，不抛异常。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        runner = context.runner if context is not None else None
+        getter = getattr(runner, "control_diagnostics", None)
+        if not callable(getter):
+            return {"source": "script"}
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001  只读视图不得因运行器释放而 500
+            return {"source": "script"}
+        return dict(raw) if isinstance(raw, dict) else {"source": "script"}
+
+    def edge_link_status(self, instance_id: str) -> dict[str, Any]:
+        """真 SIL 边缘链路状态（V3.9.0，三方互联面板数据源）。
+
+        未装配时 ``enabled=False``；装配后透传 ``EdgeLinkRuntime.stats``
+        （链路年龄/控制回传频率/看门狗态/馈送速率）并合并运行器侧控制诊断。
+        """
+        with self._lock:
+            context = self._contexts.get(instance_id)
+        link = context.edge_link if context is not None else None
+        if link is None:
+            return {"enabled": False, "control_source": "script"}
+        try:
+            stats = dict(link.stats)
+        except Exception:  # noqa: BLE001  只读视图不得因链路释放而 500
+            return {"enabled": False, "control_source": "script"}
+        stats["control"] = self.control_diagnostics(instance_id)
+        return stats
+
     def _interrupt(self, instance_id: str, reason: str) -> None:
         """登记中断原因并停止当前运行器（不持锁调用 CARLA）。"""
         with self._lock:
@@ -498,6 +553,7 @@ class SimulationExecutor:
             context.ros_reason = "disabled"
 
         vil: Optional[VILRuntime] = None
+        edge_link: Optional[EdgeLinkRuntime] = None
         try:
             hooks: dict[str, Any] = {
                 "sample_sink": context.add_sample,
@@ -518,6 +574,28 @@ class SimulationExecutor:
                 context.vil = vil
                 hooks["pose_driver"] = vil.step
                 hooks["status_provider"] = vil.status_override
+            elif mode is SimMode.SIL:
+                # V3.9.0 真 SIL：mode 仍是 SIL（平台契约不变），由 EdgeLinkSettings.enabled
+                # 决定是否装配边缘链路；场景 extra_params.edge_link 可逐场景覆盖。
+                edge_config = _edge_link_override(scene)
+                enabled = self._settings.edge_link.enabled
+                if edge_config is not None and "enabled" in edge_config:
+                    enabled = bool(edge_config["enabled"])
+                if enabled:
+                    edge_link = EdgeLinkRuntime(
+                        self._settings,
+                        sim_id=record.sim_id,
+                        runner_provider=lambda: self._plane.get_runner(instance_id),
+                        scene_id=scene.scene_id,
+                        map_id=scene.map_id,
+                        edge_config=edge_config,
+                    )
+                    context.edge_link = edge_link
+                    hooks["control_driver"] = edge_link.step
+                    hooks["status_provider"] = edge_link.status_override
+                    hooks["edge_link_sink"] = edge_link.publish_sensor
+                    # 平台契约用精简段（完整诊断走 viz 只读端点，不进 10Hz 上行报文）
+                    hooks["edge_link_stats"] = edge_link.summary
 
             plane_instance = self._plane_instance(record, scene)
             runner = self._plane.ensure_runner(
@@ -534,6 +612,10 @@ class SimulationExecutor:
                 return
             if vil is not None:
                 vil.start()
+            if edge_link is not None:
+                # Kafka 不可达 → KafkaConnectionError，由下方 except 链落 _fail_instance
+                # 快速失败并明确报错，绝不静默回退脚本自车（避免「假 SIL」）
+                edge_link.start()
             runner.start()
             if self._pause_requested_of(instance_id):
                 runner.pause()
@@ -565,6 +647,8 @@ class SimulationExecutor:
             self._shutdown_ros_bridge(context)
             if vil is not None:
                 vil.stop()
+            if edge_link is not None:
+                edge_link.stop()
             # V3.8.18：必须在 plane.release 销毁运行器前落终态快照，
             # 否则参与者/事件缓存已清空，面板终态永远为空。
             self._persist_terminal_snapshot(context)

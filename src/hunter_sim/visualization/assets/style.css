@@ -101,19 +101,21 @@ main {
     "video side"
     "actors side"
     "sensor side"
+    "edge side"
     "event log";
 }
 .video-panel { grid-area: video; }
 .actor-panel { grid-area: actors; }
 .side-panel { grid-area: side; }
 .sensor-panel { grid-area: sensor; }
+.edge-panel { grid-area: edge; }
 .event-panel { grid-area: event; }
 .log-panel { grid-area: log; }
 
 @media (max-width: 1180px) {
   main {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "video" "side" "actors" "sensor" "event" "log";
+    grid-template-areas: "video" "side" "actors" "sensor" "edge" "event" "log";
   }
 }
 
