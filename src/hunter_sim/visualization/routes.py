@@ -49,6 +49,10 @@ _LOG_STREAM_QUEUE_SIZE = 512
 #: SSE 心跳间隔（秒）：避免反向代理空闲断连
 _LOG_STREAM_KEEPALIVE_S = 15.0
 
+#: 页面与静态资产的缓存头（V3.10.0）：资产名不带指纹，浏览器若做启发式缓存，
+#: 升级后仍会拿旧 CSS/JS 渲染出「布局错乱」的假象（实测踩过）。要求每次重验证。
+_ASSET_CACHE_HEADERS = {"Cache-Control": "no-cache"}
+
 #: 未显式配置时的可视化默认值（lifespan 未装配时的兜底）
 _DEFAULT_VIZ = VizSettings()
 
@@ -90,7 +94,7 @@ def register_viz_routes(app: FastAPI) -> None:
     @app.get("/viz", response_class=HTMLResponse, include_in_schema=False)
     def viz_page() -> HTMLResponse:
         """可视化客户端页面（单页应用）。"""
-        return HTMLResponse(_asset_text("index.html"))
+        return HTMLResponse(_asset_text("index.html"), headers=_ASSET_CACHE_HEADERS)
 
     @app.get("/viz/assets/{name}", include_in_schema=False)
     def viz_asset(name: str) -> Response:
@@ -98,7 +102,9 @@ def register_viz_routes(app: FastAPI) -> None:
         media_type = ASSETS.get(name)
         if media_type is None:
             raise HTTPException(status_code=404, detail=f"asset not found: {name}")
-        return Response(content=_asset_bytes(name), media_type=media_type)
+        return Response(
+            content=_asset_bytes(name), media_type=media_type, headers=_ASSET_CACHE_HEADERS
+        )
 
     @app.get("/viz/api/status", include_in_schema=False)
     def viz_status(request: Request) -> dict[str, Any]:

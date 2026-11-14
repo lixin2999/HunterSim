@@ -62,7 +62,11 @@
     logMode: "",
     logPaused: false,
     logSeq: 0,
-    filterTimer: 0
+    filterTimer: 0,
+    // V3.10.0：实例结束即卸载 EdgeLink，/viz/api/status 的 edge_link 退回
+    // 「未装配」，会把一次「首帧控制超时失败」渲染成「脚本自车、无 Kafka 上行」，
+    // 与本场失败原因自相矛盾。这里缓存最后一份装配快照供终态回显。
+    lastEdge: null
   };
 
   // ── 通用工具 ──────────────────────────────────────────────────────────────
@@ -315,6 +319,14 @@
       active ? "ok" : ""
     );
 
+    // 终态实例的链路快照：见 state.lastEdge 注释。只在本实例仍是终态时沿用，
+    // 切换实例或重新装配会由 selectInstance / enabled=true 分支刷新。
+    if (edge.enabled === true) {
+      state.lastEdge = edge;
+    } else if (state.lastEdge && TERMINAL.indexOf(state.instanceStatus) >= 0) {
+      edge = Object.assign({}, state.lastEdge, { detached: true });
+    }
+
     var published = Object.keys(ros.topics || {}).filter(function (key) {
       return ros.topics[key] > 0;
     });
@@ -371,7 +383,9 @@
 
   function renderEdgeLink(edge, carla, platform, active) {
     var enabled = edge.enabled === true;
-    var badge = edgeBadgeText(edge);
+    // detached：实例已结束、运行时已卸载，展示的是结束前最后一份快照
+    var detached = edge.detached === true;
+    var badge = detached ? ["SIL 已卸载", "warn"] : edgeBadgeText(edge);
     setBadge("badge-edge", badge[0], badge[1]);
 
     var tripped = edge.watchdog_tripped === true;
@@ -485,9 +499,11 @@
     }
     setNote(
       "edge-note",
-      (booted ? "会话已建立" : "会话未建立") +
-        (edge.sim_id ? " · sim_id " + edge.sim_id : "") +
-        " · 已运行 " + humanDuration(edge.uptime_s)
+      detached
+        ? "实例已结束 · EdgeLink 已卸载（下表为本场结束前最后快照）"
+        : (booted ? "会话已建立" : "会话未建立") +
+            (edge.sim_id ? " · sim_id " + edge.sim_id : "") +
+            " · 已运行 " + humanDuration(edge.uptime_s)
     );
   }
 
@@ -576,6 +592,7 @@
     state.instanceMessage = "";
     state.carlaStatus = "";
     state.terminalSynced = false;
+    state.lastEdge = null;
     var select = $("instance-select");
     if (state.instanceId) {
       select.value = state.instanceId;

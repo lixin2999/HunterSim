@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/viz/assets/style.css" />
 </head>
 <body>
+  <!-- 顶栏：不冻结（V3.10.0），随页面一起滚走 -->
   <header class="topbar">
     <div class="brand">
       <span class="logo">HS</span>
@@ -31,134 +32,141 @@
     </div>
   </header>
 
+  <!-- 布局：左主栏 2fr / 右栏 1fr，两栏都是普通文档流（整页只有一条滚动条） -->
   <main>
-    <section class="panel video-panel">
-      <div class="panel-head">
-        <h2>可视化画面</h2>
-        <span class="muted" id="video-meta">未推流</span>
-      </div>
-      <div class="video-stage">
-        <img id="video" alt="仿真实时画面" />
-        <div class="empty" id="video-empty">暂无活动场景，等待平台下发实例…</div>
-      </div>
-      <div class="video-foot">
-        <span class="muted" id="stream-state">图像流（MJPEG）</span>
-        <label class="check"><input type="checkbox" id="toggle-depth" checked /> 深度图预览</label>
-      </div>
-    </section>
-
-    <section class="panel actor-panel">
-      <div class="panel-head">
-        <h2>交通参与者</h2>
-        <span class="muted" id="actor-summary">—</span>
-      </div>
-      <div class="table-wrap">
-        <table id="actor-table">
-          <thead>
-            <tr><th>ID</th><th>类型</th><th title="平台下发的原始行为标签（如 sudden_cross）；行悬停可看内部映射行为">行为标签</th><th>车速</th><th>相对自车（前 / 左）</th><th>距自车</th><th>环视主视区</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="muted small" id="actor-note">环视相机挂在自车后缘、朝前 100° 视场；“视区外”的参与者画面里看不到。</p>
-    </section>
-
-    <aside class="panel side-panel">
-      <div class="panel-head"><h2>实例状态</h2></div>
-      <dl class="kv" id="instance-info"></dl>
-      <div class="panel-head"><h2>自车状态</h2></div>
-      <dl class="kv" id="ego-info"></dl>
-      <div class="panel-head"><h2>仿真端模块</h2></div>
-      <dl class="kv" id="module-info"></dl>
-    </aside>
-
-    <section class="panel sensor-panel">
-      <div class="panel-head">
-        <h2>传感器数据</h2>
-        <span class="muted" id="sensor-note">—</span>
-      </div>
-      <div class="table-wrap">
-        <table id="sensor-table">
-          <thead>
-            <tr><th>流</th><th>帧数</th><th>帧率</th><th>最新帧时间</th><th>仿真时刻</th><th>数据陈旧度</th><th>大小</th><th>编码/尺寸</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="previews">
-        <div class="preview-block">
-          <h3>深度图（32FC1 → 归一化）</h3>
-          <img id="depth-preview" alt="深度图预览" />
-          <p class="muted small" id="depth-empty">等待深度帧…</p>
+    <div class="col col-main">
+      <section class="panel video-panel">
+        <div class="panel-head">
+          <h2>可视化画面</h2>
+          <span class="muted" id="video-meta">未推流</span>
         </div>
-        <div class="preview-block">
-          <h3>激光雷达俯视（XY 抽样）</h3>
-          <canvas id="lidar-canvas" width="360" height="240"></canvas>
-          <p class="muted small" id="lidar-empty">无点云数据</p>
+        <div class="video-stage">
+          <img id="video" alt="仿真实时画面" />
+          <div class="empty" id="video-empty">暂无活动场景，等待平台下发实例…</div>
         </div>
-        <div class="preview-block">
-          <h3>IMU</h3>
-          <dl class="kv" id="imu-info"></dl>
+        <div class="video-foot">
+          <span class="muted" id="stream-state">图像流（MJPEG）</span>
+          <label class="check"><input type="checkbox" id="toggle-depth" checked /> 深度图预览</label>
         </div>
-      </div>
-      <div class="panel-head">
-        <h2>ROS2 话题</h2>
-        <span class="muted" id="ros-note">—</span>
-      </div>
-      <div class="table-wrap">
-        <table id="ros-table">
-          <thead>
-            <tr><th>仿真话题</th><th>实车话题</th><th>消息类型</th><th>标称频率</th><th>已发布</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+      </section>
 
-    <!-- V3.9.0：真 SIL 三方互联（仿真端 → 车端 HunterEdge → 平台），未装配时明示脚本自车 -->
-    <section class="panel edge-panel">
-      <div class="panel-head">
-        <h2>SIL 链路</h2>
-        <span class="muted" id="edge-note">—</span>
-      </div>
-      <dl class="kv" id="edge-info"></dl>
-      <div class="table-wrap">
-        <table id="edge-table">
-          <thead>
-            <tr><th title="Kafka carla.{sim_id}.edge_sensor 的信封 stream 名">流</th><th title="最近 5s 窗口实际上行速率；断流衰减到 0">实际 Hz</th><th>标称 Hz</th><th>已发送</th><th title="超出该流 fps 上限被丢弃">限频丢弃</th><th title="payload 超出尺寸上限被丢弃">超限丢弃</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="muted small" id="edge-hint">控制延迟超过看门狗阈值即零速刹停；实际 Hz 明显低于标称多为带宽或限频丢弃。</p>
-    </section>
-
-    <section class="panel event-panel">
-      <div class="panel-head">
-        <h2>场景事件</h2>
-        <span class="muted" id="event-summary">—</span>
-      </div>
-      <ul class="event-list" id="event-list"></ul>
-    </section>
-
-    <section class="panel log-panel">
-      <div class="panel-head">
-        <h2>仿真日志</h2>
-        <div class="log-tools">
-          <select id="log-level" title="最低级别">
-            <option value="DEBUG">DEBUG</option>
-            <option value="INFO" selected>INFO</option>
-            <option value="WARNING">WARNING</option>
-            <option value="ERROR">ERROR</option>
-          </select>
-          <input id="log-filter" type="search" placeholder="关键字过滤" />
-          <button id="log-pause" class="ghost" type="button">暂停</button>
-          <button id="log-clear" class="ghost" type="button">清空</button>
-          <label class="check"><input type="checkbox" id="log-autoscroll" checked /> 自动滚动</label>
+      <section class="panel actor-panel">
+        <div class="panel-head">
+          <h2>交通参与者</h2>
+          <span class="muted" id="actor-summary">—</span>
         </div>
-      </div>
-      <pre class="log-console" id="log-console"></pre>
-    </section>
+        <div class="table-wrap">
+          <table id="actor-table">
+            <thead>
+              <tr><th>ID</th><th>类型</th><th title="平台下发的原始行为标签（如 sudden_cross）；行悬停可看内部映射行为">行为标签</th><th>车速</th><th>相对自车（前 / 左）</th><th>距自车</th><th>环视主视区</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted small" id="actor-note">环视相机挂在自车后缘、朝前 100° 视场；“视区外”的参与者画面里看不到。</p>
+      </section>
+
+      <section class="panel sensor-panel">
+        <div class="panel-head">
+          <h2>传感器数据</h2>
+          <span class="muted" id="sensor-note">—</span>
+        </div>
+        <div class="table-wrap">
+          <table id="sensor-table">
+            <thead>
+              <tr><th>流</th><th>帧数</th><th>帧率</th><th>最新帧时间</th><th>仿真时刻</th><th>数据陈旧度</th><th>大小</th><th>编码/尺寸</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="previews">
+          <div class="preview-block">
+            <h3>深度图（32FC1 → 归一化）</h3>
+            <img id="depth-preview" alt="深度图预览" />
+            <p class="muted small" id="depth-empty">等待深度帧…</p>
+          </div>
+          <div class="preview-block">
+            <h3>激光雷达俯视（XY 抽样）</h3>
+            <canvas id="lidar-canvas" width="360" height="240"></canvas>
+            <p class="muted small" id="lidar-empty">无点云数据</p>
+          </div>
+          <div class="preview-block">
+            <h3>IMU</h3>
+            <dl class="kv" id="imu-info"></dl>
+          </div>
+        </div>
+        <div class="panel-head">
+          <h2>ROS2 话题</h2>
+          <span class="muted" id="ros-note">—</span>
+        </div>
+        <div class="table-wrap">
+          <table id="ros-table">
+            <thead>
+              <tr><th>仿真话题</th><th>实车话题</th><th>消息类型</th><th>标称频率</th><th>已发布</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- V3.9.0：真 SIL 三方互联（仿真端 → 车端 HunterEdge → 平台），未装配时明示脚本自车 -->
+      <section class="panel edge-panel">
+        <div class="panel-head">
+          <h2>SIL 链路</h2>
+          <span class="muted" id="edge-note">—</span>
+        </div>
+        <dl class="kv" id="edge-info"></dl>
+        <div class="table-wrap">
+          <table id="edge-table">
+            <thead>
+              <tr><th title="Kafka carla.{sim_id}.edge_sensor 的信封 stream 名">流</th><th title="最近 5s 窗口实际上行速率；断流衰减到 0">实际 Hz</th><th>标称 Hz</th><th>已发送</th><th title="超出该流 fps 上限被丢弃">限频丢弃</th><th title="payload 超出尺寸上限被丢弃">超限丢弃</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted small" id="edge-hint">控制延迟超过看门狗阈值即零速刹停；实际 Hz 明显低于标称多为带宽或限频丢弃。</p>
+      </section>
+    </div>
+
+    <div class="col col-side">
+      <!-- 实例状态区域：实例 / 自车 / 仿真端模块合成一张卡（V3.10.0 压紧行距、自车状态两列并排） -->
+      <aside class="panel side-panel">
+        <div class="panel-head"><h2>实例状态</h2></div>
+        <dl class="kv" id="instance-info"></dl>
+        <div class="panel-head"><h2>自车状态</h2></div>
+        <dl class="kv kv-tight" id="ego-info"></dl>
+        <div class="panel-head"><h2>仿真端模块</h2></div>
+        <dl class="kv" id="module-info"></dl>
+      </aside>
+
+      <section class="panel event-panel">
+        <div class="panel-head">
+          <h2>场景事件</h2>
+          <span class="muted" id="event-summary">—</span>
+        </div>
+        <ul class="event-list" id="event-list"></ul>
+      </section>
+
+      <!-- 仿真日志：随右栏剩余高度拉伸，使左右两栏底边齐平 -->
+      <section class="panel log-panel">
+        <div class="panel-head">
+          <h2>仿真日志</h2>
+          <div class="log-tools">
+            <select id="log-level" title="最低级别">
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO" selected>INFO</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <input id="log-filter" type="search" placeholder="关键字过滤" />
+            <button id="log-pause" class="ghost" type="button">暂停</button>
+            <button id="log-clear" class="ghost" type="button">清空</button>
+            <label class="check"><input type="checkbox" id="log-autoscroll" checked /> 自动滚动</label>
+          </div>
+        </div>
+        <pre class="log-console" id="log-console"></pre>
+      </section>
+    </div>
   </main>
 
   <script src="/viz/assets/app.js"></script>

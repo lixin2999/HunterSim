@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import struct
 import sys
 import time
@@ -156,6 +157,118 @@ class TestPageAndAssets:
     def test_unlisted_asset_is_404(self, client: TestClient) -> None:
         assert client.get("/viz/assets/secret.txt").status_code == 404
         assert client.get("/viz/assets/..%2F..%2Fpyproject.toml").status_code == 404
+
+    def test_assets_require_revalidation(self, client: TestClient) -> None:
+        """页面与资产必须每次重验证（V3.10.0）。
+
+        回归现场：资产名不带指纹，浏览器做启发式缓存后，升级到新版仍用旧
+        ``style.css`` 渲染，看起来就是「新布局没生效 / 排版错乱」。实际是缓存造成的
+        假象，排查时极易误判为样式回归。
+        """
+        for path in ("/viz", "/viz/assets/app.js", "/viz/assets/style.css"):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-cache"
+
+    def test_terminal_edge_snapshot_is_kept(self, client: TestClient) -> None:
+        """终态实例回显最后一份 EdgeLink 快照（V3.10.0）。
+
+        回归现场：真 SIL 首帧控制超时 → 实例 failed → 运行时随场景销毁，
+        ``/viz/api/status`` 的 ``edge_link`` 退回「未装配（脚本自车）」，面板遂把一次
+        「车端没回 /cmd_vel」渲染成「脚本自车、无 Kafka 上行」，与本场失败原因自相矛盾。
+        """
+        script = client.get("/viz/assets/app.js").text
+
+        assert "lastEdge: null" in script
+        assert "state.lastEdge = edge;" in script
+        assert "{ detached: true }" in script
+        assert "SIL 已卸载" in script
+        assert "本场结束前最后快照" in script
+        # 切换实例必须丢弃上一场的快照，否则会把旧链路状态当成本场
+        assert "state.lastEdge = null;" in script
+
+    def test_layout_uses_single_page_scroll(self, client: TestClient) -> None:
+        """整页只允许一条滚动条（V3.10.0）。
+
+        回归现场：首版重排把右侧栏做成 ``position: sticky`` + ``max-height`` +
+        ``overflow: auto``。整页滑动时这块“独立滚动区”会浮在下方面板之上，
+        表现为“实例状态压住传感器/交通参与者、场景事件被挤成一条缝”，
+        观感就是“页面割裂 + 内容错位”。侧栏只允许普通文档流。
+        """
+        css = client.get("/viz/assets/style.css").text
+        blocks = re.findall(r"\.side-panel\s*\{([^}]*)\}", css)
+
+        assert blocks, "style.css 里找不到 .side-panel 规则"
+        for declarations in blocks:
+            assert "position" not in declarations
+            assert "overflow" not in declarations
+            assert "max-height" not in declarations
+        # 只保留数据表粘性表头这一处 sticky
+        assert css.count("position: sticky") == 1
+
+    def test_panel_columns_are_kept(self, client: TestClient) -> None:
+        """左主栏 / 右栏的分工与右栏三段顺序（V3.10.0）。
+
+        回归现场：重排过程中“场景事件”两次被挪错位置（先被浮层盖住、后又被搬到左栏底部），
+        现场按“区域消失了”报障。右栏自上而下必须是 实例状态 → 场景事件 → 仿真日志。
+        """
+        html = client.get("/viz").text
+
+        main_at = html.index('class="col col-main"')
+        side_at = html.index('class="col col-side"')
+        main_end = html.index("</main>")
+        assert main_at < side_at < main_end
+        # 宽表留在左主栏（8 列传感器 / 7 列参与者），否则会被右栏挤窄
+        for panel in ("video-panel", "actor-panel", "sensor-panel", "edge-panel"):
+            assert main_at < html.index(panel) < side_at
+        # 右栏三段顺序 + 日志是右栏最后一块
+        instance_at = html.index('class="panel side-panel"')
+        event_at = html.index("event-panel")
+        log_at = html.index("log-panel")
+        assert side_at < instance_at < event_at < log_at < main_end
+        assert event_at < html.index('id="event-list"') < log_at
+
+    def test_columns_keep_ratio_and_unpinned_topbar(self, client: TestClient) -> None:
+        """左右 2:1 比例、顶栏不冻结、右栏分工、自车状态两列（V3.10.0 / V3.10.2）。"""
+        css = client.get("/viz/assets/style.css").text
+        html = client.get("/viz").text
+
+        # 左 2fr / 右 1fr，右栏有 320 px 下限，否则键值表会被折成一条窄条
+        assert "grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr)" in css
+        # 标题栏随页面滚走：整份样式里只允许数据表表头这一处 sticky
+        topbar = re.findall(r"\.topbar\s*\{([^}]*)\}", css)
+        assert len(topbar) == 1, "style.css 里 .topbar 规则不止一处"
+        assert "position" not in topbar[0]
+        assert css.count("position: sticky") == 1
+        # 右栏分工（V3.10.2）：事件区不瓜分剩余高度，日志 basis 归零后吃掉剩余
+        assert re.search(r"\.col-side > \.event-panel\s*\{[^}]*flex: 0 0 auto", css)
+        assert re.search(r"\.col-side > \.log-panel\s*\{[^}]*flex: 1 1 0", css)
+        # 自车状态 7 行短值两列并排，实例状态卡整体高度砍掉近三成
+        assert 'class="kv kv-tight" id="ego-info"' in html
+
+    def test_event_height_cap_and_both_panels_scroll(self, client: TestClient) -> None:
+        """事件区封顶到旧版约三倍，事件与日志各自内部滚动（V3.10.2）。
+
+        回归现场（两头的错都犯过）：
+        - 旧版把事件列表写死 ``max-height: 260px``，一场 24 条事件的场景只够看两三条；
+        - V3.10.1 改成按窗口 3:1 瓜分，事件区被拉到 ~876 px，只有两三条事件时卡内
+          下半部全是空白，现场按「扩大太多了」打回。
+        现口径：事件按内容增长、列表封顶 460 px（≈旧版两三条时高度的三倍）后内部滚动；
+        日志吃剩余高度，但 ``flex-basis`` 必须归零——否则日志会按 40 行内容把整页撑到
+        3000+ px，也就永远不会滚动（开发时实测踩到）。
+        """
+        css = client.get("/viz/assets/style.css").text
+
+        event_list = re.search(r"\.event-list\s*\{([^}]*list-style[^}]*)\}", css)
+        assert event_list is not None
+        assert "max-height: 460px" in event_list.group(1)
+        assert "overflow: auto" in event_list.group(1)
+        log_console = re.search(r"\.log-console\s*\{([^}]*)\}", css)
+        assert log_console is not None
+        assert "overflow: auto" in log_console.group(1)
+        # 单列沿用同一封顶口径（不再另设一套高度），但日志给固定窗口
+        narrow = css.split("@media (max-width: 1024px)")[-1]
+        assert re.search(r"\.log-console\s*\{[^}]*height: 300px", narrow)
 
     def test_terminal_instance_stops_frame_polling(self, client: TestClient) -> None:
         """终态/未运行实例必须短路帧类轮询（V3.1.3 / V3.4.1）。

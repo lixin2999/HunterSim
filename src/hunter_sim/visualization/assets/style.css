@@ -30,7 +30,7 @@ p { margin: 0; }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
 
-/* ── 顶栏 ─────────────────────────────────────────────────────────────── */
+/* ── 顶栏（V3.10.0：不再粘性，随页面一起滚走，避免遮挡下方内容） ───────── */
 .topbar {
   display: flex;
   align-items: center;
@@ -38,9 +38,6 @@ p { margin: 0; }
   padding: 10px 14px;
   background: linear-gradient(180deg, #14202c, #0e151d);
   border-bottom: 1px solid var(--line);
-  position: sticky;
-  top: 0;
-  z-index: 5;
   flex-wrap: wrap;
 }
 
@@ -91,32 +88,39 @@ button.danger:hover { background: #43202a; border-color: var(--err); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .check { display: inline-flex; gap: 5px; align-items: center; color: var(--muted); font-size: 11px; }
 
-/* ── 布局 ─────────────────────────────────────────────────────────────── */
+/* ── 布局（V3.10.0 两栏骨架 / V3.10.2 右栏分配）──────────────────────────
+ * 左主栏 : 右栏 = 2 : 1（右栏至少 320 px）。两栏都是普通文档流，页面上只有
+ * 一条滚动条。右栏：场景事件按内容增长、**封顶到旧版的约三倍**（列表 460 px，
+ * 约 9 条），其余高度给日志（唯一弹性面板，两栏底边齐平）；两块各自内部滚动。
+ */
 main {
   display: grid;
   gap: 10px;
   padding: 10px;
-  grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
-  grid-template-areas:
-    "video side"
-    "actors side"
-    "sensor side"
-    "edge side"
-    "event log";
+  grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+  align-items: stretch;
 }
-.video-panel { grid-area: video; }
-.actor-panel { grid-area: actors; }
-.side-panel { grid-area: side; }
-.sensor-panel { grid-area: sensor; }
-.edge-panel { grid-area: edge; }
-.event-panel { grid-area: event; }
-.log-panel { grid-area: log; }
+.col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* 事件区不按窗口瓜分剩余高度（那样只有两三条事件时也会空一大片），而是按内容
+ * 增长、到三倍封顶；日志重新成为唯一弹性面板吃掉剩余高度（仍内部滚动）。 */
+.col-side > .event-panel { flex: 0 0 auto; }
+/* basis 归零：日志面板不得按内容撑高（否则 40 行日志会把整页拉到 3000+ px、
+ * 也就永远不滚动），只吃右栏剩余高度；min-height 是超短窗口的地板。 */
+.col-side > .log-panel { flex: 1 1 0; min-height: 300px; }
 
-@media (max-width: 1180px) {
-  main {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "video" "side" "actors" "sensor" "edge" "event" "log";
-  }
+/* 窄屏（≤1024 px，平板竖屏/小窗）：两栏容器「消失」，面板按两栏的阅读顺序纵向排列
+ * （画面 → 实例状态 → 场景事件 → 日志 → 参与者 → 传感器 → SIL 链路） */
+@media (max-width: 1024px) {
+  main { grid-template-columns: minmax(0, 1fr); }
+  .col { display: contents; }
+  .video-panel { order: 1; }
+  .side-panel { order: 2; }
+  .event-panel { order: 3; }
+  .log-panel { order: 4; flex: 0 0 auto; min-height: 0; }
+  /* 事件区不再受弹性分配约束，沿用全局的 460 px 封顶 + 内部滚动 */
+  .actor-panel { order: 5; }
+  .sensor-panel { order: 6; }
+  .edge-panel { order: 7; }
 }
 
 .panel {
@@ -137,6 +141,8 @@ main {
   border-bottom: 1px solid var(--line);
   padding-bottom: 6px;
 }
+/* 标题不允许被旁边的小字挤成两行（窄右栏里「仿真日志」曾被拆成「仿真日 / 志」） */
+.panel-head h2 { white-space: nowrap; }
 
 /* ── 画面 ─────────────────────────────────────────────────────────────── */
 .video-stage {
@@ -156,13 +162,34 @@ main {
 .video-foot { display: flex; justify-content: space-between; align-items: center; }
 
 /* ── 键值表 ───────────────────────────────────────────────────────────── */
-.kv { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 3px 8px; margin: 0; }
+.kv { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 2px 8px; margin: 0; }
 .kv dt { color: var(--muted); font-size: 11px; }
-.kv dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+/* break-word 而非 break-all：长 URL / sim_id 只在必要时断，不再逐字符换行把卡片撑高 */
+.kv dd { margin: 0; font-family: var(--mono); font-size: 11.5px; overflow-wrap: break-word; }
 /* 失败原因/异常状态高亮：一眼看出实例为何没画面 */
 .kv dd.err, .kv dt.kv-label.err { color: var(--err); }
 .kv dd.warn, .kv dt.kv-label.warn { color: var(--warn); }
 .kv dd.err { font-weight: 600; }
+
+/* 空键值表也要占位：旧版 IMU 块无帧时是一块空白，看不出「没数据」还是「元件坏了」 */
+.kv:empty::after {
+  content: "—";
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+#imu-info:empty::after { content: "等待 IMU 帧…"; }
+
+/* 自车状态 7 行都是短值：两列并排，实例状态卡整体高度砍掉近三成 */
+.kv-tight { grid-template-columns: 56px minmax(0, 1fr) 56px minmax(0, 1fr); }
+#imu-info { grid-template-columns: 60px minmax(0, 1fr); }
+
+/* 实例状态区域（实例 / 自车 / 模块同卡）：压紧段间距、行距与字号，整体高度再降一档 */
+.side-panel { gap: 4px; padding: 8px 10px; }
+.side-panel .panel-head { padding-bottom: 2px; }
+.side-panel .kv { row-gap: 1px; }
+.side-panel .kv dd { font-size: 11px; }
 
 /* ── 表格 ─────────────────────────────────────────────────────────────── */
 .table-wrap { overflow: auto; max-height: 220px; }
@@ -180,11 +207,16 @@ tr.stale td { color: var(--warn); }
 #lidar-canvas { width: 100%; height: auto; background: #05090d; border-radius: 6px; }
 
 /* ── 事件 ─────────────────────────────────────────────────────────────── */
-.event-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+/* 事件区上限 460 px：旧版写死 260 px（只够两三条），现取约三倍的常见渲染高度；
+ * 超出部分在卡内滚动，不会把整页拉长 */
+.event-list { list-style: none; margin: 0; padding: 0; max-height: 460px; flex: 0 0 auto; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+/* 右栏只有 400 px 出头：三列并排会让「类型」压到「描述」上，改为
+ * 第一行 时间 + 类型、第二行整行描述。 */
 .event-item {
   display: grid;
-  grid-template-columns: 74px 92px minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 8px;
+  row-gap: 2px;
   align-items: baseline;
   padding: 5px 7px;
   border-radius: 6px;
@@ -194,12 +226,18 @@ tr.stale td { color: var(--warn); }
 }
 .event-item.critical { border-left-color: var(--err); }
 .event-item.warning { border-left-color: var(--warn); }
-.event-item .t { font-family: var(--mono); color: var(--muted); }
-.event-item .k { font-weight: 600; }
-.event-item .d { color: var(--text); word-break: break-word; }
+.event-item .t { grid-area: 1 / 1; font-family: var(--mono); color: var(--muted); }
+.event-item .k { grid-area: 1 / 2; font-weight: 600; overflow-wrap: anywhere; }
+.event-item .d { grid-area: 2 / 1 / 3 / -1; color: var(--text); overflow-wrap: anywhere; }
 
-/* ── 日志 ─────────────────────────────────────────────────────────────── */
-.log-tools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* ── 日志（右栏末尾，拉伸填满剩余高度） ───────────────────────────────── */
+/* 工具栏在 400 px 宽的右栏里放不下一行：标题单独一行，工具栏另起一行整行铺开 */
+.log-panel .panel-head { flex-wrap: wrap; }
+.log-panel .log-tools { flex: 1 1 100%; }
+.log-tools { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.log-tools input[type="search"] { flex: 1 1 70px; min-width: 0; }
+.log-tools button { padding: 4px 9px; }
+.log-tools select { padding: 4px 6px; }
 .log-console {
   margin: 0;
   background: #05090d;
@@ -209,10 +247,14 @@ tr.stale td { color: var(--warn); }
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.45;
-  height: 300px;
+  min-height: 0;
+  flex: 1 1 auto;
   overflow: auto;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
+}
+@media (max-width: 1024px) {
+  .log-console { height: 300px; flex: 0 0 auto; }
 }
 .log-line { display: block; }
 .log-line .ts { color: #5c6f83; }
