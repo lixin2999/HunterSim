@@ -5108,4 +5108,71 @@ CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
 - `deployment_and_operations.md`：版本头 → V3.9.0；新增 `### V3.8.18 → V3.9.0` 升级章节（含双端前置条件与回滚）。
 - `docs/单机部署指南.md`：版本头 → V3.9.0；排障表补真 SIL 链路条目。
 - `pyproject.toml`：`version` 3.8.18 → **3.9.0**。
+
+---
+
+## V3.9.1 — 真 SIL 首跑「假闭环」根因修复（edge Topic 自检补建 + 车端参与度入判 + 空产物跳过上传）
+
+**发布日期**：2026-11-14
+**版本定位**：问题修复（patch）。V3.9.0 把控制权交给车端后，实机首个场景跑出来的**不是闭环**，而是「车端没接上、自车原地刹停跑满时长，评估仍 `passed=True`」。本版按日志时间线逐层收敛：**Topic 缺失（首因）→ 发送阻塞与告警刷屏 → 控制回传 0 帧 → 看门狗刹停 → 评估假通过 → 空产物 422**。平台契约零改动；`EDGE_LINK_ENABLED=false` 时行为与 V3.9.0 完全一致。
+
+### 背景（实机日志时间线）
+
+| 环节 | 现象 | 根因 |
+|------|------|------|
+| 上行 Topic | 面板日志刷上千条 `kafka cluster ERROR ... Topic ... edge_sensor not found in cluster metadata` | HunterCore 9093 面关闭了 `auto.create.topics.enable`，而 `EdgeLinkRuntime` 此前**没有任何建 Topic 逻辑**（生产端是唯一 owner，车端消费者也建不了） |
+| 上行阻塞 | 每条 `producer.send()` 阻塞满 `max_block_ms=1000` 后抛 `KafkaTimeoutError`：四路传感器「已发送 6/8/11/11」但「实际 Hz 0.0」，57 s 只挤进个位数帧 | Topic 元数据永远拿不到；**编码线程被同步阻塞**，`sensors_r1.mcap` 57 s 只录 50 帧 |
+| 下行控制 | `edge_control` 消费者订阅的 Topic 同样不存在 → `control_received=0`，`/cmd_vel` 从未到达 | 同上（缺建 Topic 的下游后果） |
+| 自车行为 | 看门狗按 500 ms 断流语义零速刹停，`ego_speed_stuck` 从 4 s 报到 51 s，全程 **0.00 m/s**；行人 `animal-1` 自然未被触发，「场景事件 共 0 条」 | 首因的必然后果 |
+| 评估 | 仍 `passed=True` | ①场景时长到点 `completed=True` 就算完成，判据里**没有「车端是否参与」**这一项；②停驶兜底只在「平台不下发 `max_speed_deviation`」时生效，平台一旦给宽松阈值就能掩盖 0 m/s |
+| 产物 | `/presign` 第 2 个产物失败 **422** | 唯一已知会触发平台 `file_size>=1` 校验的形态是 **0 字节 `events.jsonl`**（0 事件场景，挂了几版未修的遗留项），本场景恰好 0 事件 |
+
+### 变更
+
+1. **`cloud/edge_link.py` — Topic 自检/补建（首因修复）**：`start()` 在构建生产者/消费者**之前**先用 `KafkaAdminClient` 列 Topic，缺失则 `CreateTopics` 补建。**1 分区**（EdgeLink 以 `sim_id` 作 key，本就落同一分区保序，最省资源）；**RF = `min(3, broker 数)`**，**不用 `-1`**——kafka-python 的 `CreateTopics` 只到 v3，协议默认值语义不可靠，单 broker 现场必须为 1。**无权限建且 Topic 缺失** → `KafkaConnectionError` **快速失败**，报错文案直接给出 `kafka-topics.sh --create` 命令；**存在性自检本身失败只告警不阻断**（避免把只给读写 ACL 的现场误判为故障）；`TopicAlreadyExists` 视为并发竞态成功。
+2. **`cloud/edge_link.py` — 发送失败告警节流**：Topic 缺失时每条 `send()` 都会抛异常（1Hz×5 流），旧版每秒刷 5 条同因告警、掩盖真正首因。改为**首条必报 + 其后每 10 s 汇总一条并附被抑制条数**（`_SEND_ERROR_LOG_INTERVAL_S = 10.0`），`send_errors` 计数与降级语义不变。
+3. **`platform_adapter/executor.py` — 车端参与度入判**：SIL_EDGE 下把 `edge_link.stats["control_received"]` 作为 `edge_control_frames` 传入评估；**0 帧**时打 `edge_control_unavailable` 并判 fail，不再出现「车端没参与却通过」。未装配边缘链路传 `None`（不参与裁决，旧行为不变）。
+4. **`eval_service/evaluation_engine.py` — 两道与平台阈值解耦的兜底**：①「整场没起步」判定（`_ego_never_moved`：最高速与 ramp 后均值**同时** < 期望 × `_EVAL_STOP_FRACTION`）改为**与平台阈值无关**，平台给 100 m/s 也拦；②新增 `edge_control_frames` / `edge_control_ok` 判据并入 `passed`，0 帧直接 `passed=False`（`None` 表示非边缘链路，不参与裁决）。
+5. **`platform_adapter/artifacts.py` — 0 字节产物跳过 presign**：平台 schema 要求 `file_size >= 1`，0 字节必得 422 且只刷一条 WARNING。改为**跳过上传并保留本地文件**（日志 `产物为空（0 字节），跳过上传`），消掉 0 事件场景 `events.jsonl` 的 422。
+
+### 验证
+
+- 全量 `pytest`：**1818 passed**（V3.9.0 基线 1805 + **13 条新专项守卫**）；`flake8 src tests` **exit=0**；`mypy src` **Success（92 文件）**；全仓行覆盖 **84.45%**（≥80 门禁，与 V3.9.0 的 84.49% 基本持平——新增分支多于语句）。
+- 新增守卫分布：`test_v390_edge_link_viz.py::TestTopicProvisioning` **7 条**（补建缺失并关闭 admin / 1 分区且 RF 封顶 / 已存在跳过创建 / `list_topics` 失败仅告警 / `TopicAlreadyExists` 视为成功 / 无权限快速失败并附手工命令 / `start()` 先补建再建客户端）+ 发送告警**节流** 1 条；`test_eval_engine.py` **4 条**（平台宽松阈值仍拦「没起步」/ 0 帧判 fail / 有帧通过 / 未装配不参与裁决）；`test_platform_adapter_artifacts.py` **1 条**（0 字节不上传、本地保留）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.9.1`；`pyproject.toml` 版本 `3.9.1`。
+
+### 向后兼容与行为变化
+
+- **默认零影响**：`EDGE_LINK_ENABLED=false` 时既不建 Topic 也不参与评估裁决，行为与 V3.9.0 完全一致。
+- **开启真 SIL 后的行为变化**：①缺 Topic 时**自动补建**（账号有权限）；②无权限则**快速失败**并给出人工建 Topic 命令，不再「静默跑满时长」；③`control_received=0` 的场景**评估必 fail**（`success_criteria.edge_control_ok=false`），车端未接入不再假通过；④平台下发宽松 `max_speed_deviation` **不再能掩盖整场 0 m/s**。
+- **产物**：0 字节产物**只落本地不上传**（`uploaded=false`，`object_key` 保留本地约定路径），平台侧不再收到该文件；非空产物链路（含 bag）不受影响。
+
+### 现场待办（非代码）
+
+1. **代码同步**：本次日志来自 `D:\python\HunterSim`，改动在 `E:\python_work\HunterPilot\HunterSim`，需先同步/部署到运行机再复跑。
+2. **Topic 权限**：Kafka 账号若无建 Topic 权限，先手工建（现在代码启动时也会把该命令打进日志）：
+
+   ```bash
+   kafka-topics.sh --bootstrap-server 192.168.31.35:9093 \
+     --create --topic carla.<sim_id>.edge_sensor --partitions 1 --replication-factor 1
+   kafka-topics.sh --bootstrap-server 192.168.31.35:9093 \
+     --create --topic carla.<sim_id>.edge_control --partitions 1 --replication-factor 1
+   ```
+
+3. **车端**：`sil_bridge_agent` 仍未启动时，本版**不会再「静默跑完并判通过」**，会明确落 `edge_control_ok=false` 的失败结论——失败即结论，不是回归。
+
+### 已知遗留
+
+- **平台侧待补字段级错误信息**：若第 2 个 422 的产物其实是 `eval.json` 而非 `events.jsonl`，现有客户端只能看到平台回的「参数错误」，无法继续定性（V3.8.9 已在客户端补截断响应体，但该 422 响应体内**无字段级信息**）。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → 3.9.1；历史句补 V3.9.1（edge Topic 自检补建 / 车端参与度入判 / 空产物跳过上传）；测试计数 1805 → 1818。
+- `user_manual.md`：版本头 → V3.9.1；§5.8 补「Topic 预创建与权限」前置条件；§5.10/§5.12 补 0 帧失败语义与新验收点；FAQ 补 Topic 缺失、0 帧判 fail、0 字节产物三问。
+- `deployment_and_operations.md`：版本头 → V3.9.1；新增 `### V3.9.0 → V3.9.1` 升级章节（含现场手工建 Topic 与遗留项）；真 SIL 排障速查补 Topic 缺失/告警刷屏/评估假通过三行。
+- `docs/单机部署指南.md`：版本头 → V3.9.1（三处）+ `huntersim version` 校验值；排障表补 edge Topic 与 0 帧假通过条目。
+- `pyproject.toml`：`version` 3.9.0 → **3.9.1**。
 ---

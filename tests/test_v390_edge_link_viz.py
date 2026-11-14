@@ -673,6 +673,7 @@ def _make_unstarted_link(
     consumer: Optional[Any] = None,
     producer_factory: Optional[Callable[[], Any]] = None,
     consumer_factory: Optional[Callable[[list[str]], Any]] = None,
+    admin_factory: Optional[Callable[[], Any]] = None,
     edge_config: Optional[dict[str, Any]] = None,
     **edge_overrides: Any,
 ) -> tuple[EdgeLinkRuntime, Any, Any]:
@@ -692,6 +693,7 @@ def _make_unstarted_link(
         consumer_factory=(
             consumer_factory if consumer_factory is not None else (lambda _topics: cons)
         ),
+        admin_factory=admin_factory,
     )
     return link, prod, cons
 
@@ -829,6 +831,144 @@ class TestLinkLifecycle:
         assert link.stats["steps"] == 1
 
 
+class _Admin:
+    """桩 KafkaAdminClient：只记调用，不连接 broker。"""
+
+    def __init__(
+        self,
+        topics: Optional[list[str]] = None,
+        create_error: Optional[BaseException] = None,
+        list_error: Optional[BaseException] = None,
+    ) -> None:
+        self.topics = set(topics or [])
+        self.create_error = create_error
+        self.list_error = list_error
+        self.created: list[str] = []
+        self.specs: list[Any] = []
+        self.broker_count = 1
+        self.closed = False
+
+    def list_topics(self) -> list[str]:
+        if self.list_error is not None:
+            raise self.list_error
+        return sorted(self.topics)
+
+    def describe_cluster(self) -> dict[str, Any]:
+        return {"brokers": [{"id": i} for i in range(self.broker_count)]}
+
+    def create_topics(self, new_topics: Any, timeout_ms: Optional[int] = None) -> None:
+        if self.create_error is not None:
+            raise self.create_error
+        self.created.extend(topic.name for topic in new_topics)
+        self.specs.extend(new_topics)
+        self.topics.update(topic.name for topic in new_topics)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestTopicProvisioning:
+    """V3.9.1：broker 关闭 auto.create 时必须补建 edge_* Topic。
+
+    生产者 send() 在 Topic 不存在时会阻塞满 max_block_ms 后抛
+    KafkaTimeoutError（实机每秒 5 条），消费端则永远拿不到分区。
+    """
+
+    def test_creates_missing_topics_and_closes_admin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        admin = _Admin()
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        link._ensure_topics()  # noqa: SLF001
+        assert admin.created == ["carla.sim-b4-1.edge_sensor", "carla.sim-b4-1.edge_control"]
+        assert admin.closed is True
+
+    def test_topic_shape_is_one_partition_and_capped_rf(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """1 分区（sim_id 单一 key 本就同分区）+ 副本数 min(3, broker 数)。
+
+        kafka-python 的 CreateTopics 只到 v3，``-1``（用集群默认）不可靠；
+        单 broker 现场 RF 必须为 1，否则 InvalidReplicationFactor 直接失败。
+        """
+        admin = _Admin()
+        admin.broker_count = 5
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        link._ensure_topics()  # noqa: SLF001
+        assert [(t.num_partitions, t.replication_factor) for t in admin.specs] == [
+            (1, 3),
+            (1, 3),
+        ]
+
+    def test_existing_topics_skip_creation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _Admin(["carla.sim-b4-1.edge_sensor", "carla.sim-b4-1.edge_control"])
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        link._ensure_topics()  # noqa: SLF001
+        assert admin.created == []
+        assert admin.closed is True
+
+    def test_list_failure_only_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """自检不可用时保持既有启动行为，不把可用链路误判为故障。"""
+        admin = _Admin(list_error=RuntimeError("metadata denied"))
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        link._ensure_topics()  # noqa: SLF001
+        assert admin.created == []
+        assert admin.closed is True
+
+    def test_already_exists_is_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kafka.errors import TopicAlreadyExistsError
+
+        admin = _Admin(create_error=TopicAlreadyExistsError("exists"))
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        link._ensure_topics()  # noqa: SLF001  并发建 Topic 属成功
+
+    def test_auth_failure_fast_fails_with_ops_hint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kafka.errors import TopicAuthorizationFailedError
+
+        admin = _Admin(create_error=TopicAuthorizationFailedError("denied"))
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        with pytest.raises(KafkaConnectionError) as excinfo:
+            link._ensure_topics()  # noqa: SLF001
+        text = str(excinfo.value)
+        assert "edge_sensor" in text and "edge_control" in text
+        assert "kafka-topics.sh" in text
+
+    def test_start_provisions_topics_before_building_clients(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        admin = _Admin()
+        link, _producer, _consumer = _make_unstarted_link(
+            _Clock(), monkeypatch, admin_factory=lambda: admin
+        )
+        # 去掉工厂注入，模拟真实连接路径（build_* 打桩，不连 broker）
+        link._producer_factory = None  # noqa: SLF001
+        link._consumer_factory = None  # noqa: SLF001
+        monkeypatch.setattr(link, "_build_producer", lambda: _Producer())
+        monkeypatch.setattr(link, "_build_consumer", lambda: _Consumer())
+        link.start()
+        try:
+            assert admin.created == [
+                "carla.sim-b4-1.edge_sensor",
+                "carla.sim-b4-1.edge_control",
+            ]
+        finally:
+            link.stop()
+
+
 class TestSessionSignalling:
     def test_boot_frame_carries_session_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
         clock = _Clock()
@@ -920,6 +1060,25 @@ class TestSendFailurePaths:
         circular["self"] = circular
         assert link._send(circular) is False  # noqa: SLF001
         assert link.stats["send_errors"] == 1
+
+    def test_repeated_send_errors_are_throttled(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Topic 缺失时 1Hz×5 流的同因告警不得刷屏（V3.9.1）。"""
+
+        class _BrokenProducer(_Producer):
+            def send(self, topic: str, key: Any = None, value: bytes = b"") -> None:
+                raise RuntimeError("Failed to update metadata after 1.0 secs")
+
+        clock = _Clock()
+        link, _producer = _make_link(clock, monkeypatch, producer=_BrokenProducer())
+        with caplog.at_level("WARNING", logger="hunter_sim.cloud.edge_link"):
+            assert link.publish_sensor("rgb", 0.0, 0, b"a") is False
+            assert link.publish_sensor("lidar", 0.0, 0, b"b") is False
+        messages = [r.getMessage() for r in caplog.records if "send failed" in r.getMessage()]
+        assert len(messages) == 1
+        assert link._send_error_suppressed == 1  # noqa: SLF001
+        assert link.stats["send_errors"] == 2
 
     def test_flush_close_tolerates_stub_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _RudeProducer:

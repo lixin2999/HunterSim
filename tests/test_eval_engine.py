@@ -649,3 +649,38 @@ class TestV389UnderspeedFallbackWithoutCriterion:
         assert never(max_speed_ms=0.0, avg_post_ramp=None, desired_speed_ms=3.0) is False
         assert never(max_speed_ms=0.0, avg_post_ramp=0.0, desired_speed_ms=None) is False
         assert never(max_speed_ms=0.0, avg_post_ramp=0.0, desired_speed_ms=0.0) is False
+
+    def test_lax_platform_limit_still_blocks_never_moved(self) -> None:
+        """V3.9.1：平台给了宽松偏差上限也不得放行「整场没起步」。
+
+        实机 SCN-2056 自车 0 m/s 跑完 57s 却 passed=True——平台判据阈值一旦
+        宽松，旧逻辑就只看 deviation <= limit。停驶判定必须与阈值无关。
+        """
+        states = self._states([(0.0, 57.0, 0.0)])
+        result = self._evaluate(
+            states, desired_speed_ms=3.0, max_speed_deviation_ms=100.0
+        )
+        assert result.passed is False
+        assert result.success_criteria["max_speed_deviation_ok"] is False
+
+    def test_edge_control_zero_frames_fails(self) -> None:
+        """V3.9.1：SIL_EDGE 整场 0 控制帧 → 车端未参与，评估判 fail。"""
+        states = self._states([(0.0, 220.0, 3.0)])
+        result = self._evaluate(states, desired_speed_ms=3.0, edge_control_frames=0)
+        assert result.passed is False
+        assert result.success_criteria["edge_control_ok"] is False
+        assert result.success_criteria["edge_control_frames"] == 0
+
+    def test_edge_control_frames_present_passes(self) -> None:
+        states = self._states([(0.0, 220.0, 3.0)])
+        result = self._evaluate(states, desired_speed_ms=3.0, edge_control_frames=42)
+        assert result.passed is True
+        assert result.success_criteria["edge_control_ok"] is True
+
+    def test_edge_control_absent_legacy_ignored(self) -> None:
+        """未装配边缘链路（None）时不参与裁决，保持旧行为。"""
+        states = self._states([(0.0, 220.0, 3.0)])
+        result = self._evaluate(states, desired_speed_ms=3.0)
+        assert result.passed is True
+        assert result.success_criteria["edge_control_frames"] is None
+        assert result.success_criteria["edge_control_ok"] is True

@@ -19,6 +19,13 @@
 **Kafka 不可达时 start() 快速失败**（抛 ``KafkaConnectionError``），不静默回退脚本
 自车——避免「假 SIL」。看门狗：控制帧断流 > ``watchdog_ms`` → 零速刹停保持，
 ``status_override`` 报 PAUSED + 原因（对齐车端 safety_guard 语义）。
+
+V3.9.1：``start()`` 先做 Topic 自检/补建。broker 关闭 ``auto.create.topics.enable``
+时（HunterCore 的 9093 接入面正是如此），生产者每条 ``send()`` 会阻塞满
+``max_block_ms`` 后抛 ``KafkaTimeoutError: Failed to update metadata``，消费者也
+永远拿不到分区——表现为「传感器全部丢弃、``control_received=0``、自车被看门狗
+刹停，但实例仍跑完」。缺 Topic 属配置问题，这里补建失败即快速失败并给出可执行
+的运维命令，而不是静默跑完一场假 SIL。
 """
 
 from __future__ import annotations
@@ -65,6 +72,11 @@ _MAX_FPS_SAMPLES = 600
 #: 工厂注入点（单测用桩替换，避免依赖真实 kafka-python）。
 ProducerFactory = Callable[[], Any]
 ConsumerFactory = Callable[[list[str]], Any]
+AdminFactory = Callable[[], Any]
+
+#: Topic 补建超时（毫秒）与发送失败告警节流窗口（秒）。
+_TOPIC_CREATE_TIMEOUT_MS = 10_000
+_SEND_ERROR_LOG_INTERVAL_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,9 @@ class EdgeLinkRuntime:
         edge_config: 平台/场景下发的链路覆盖（enabled/各流 fps/watchdog_ms 等）。
         producer_factory: 可选生产者工厂（单测注入），``() -> producer``。
         consumer_factory: 可选消费者工厂（单测注入），``(topics) -> consumer``。
+        admin_factory: 可选 Admin 工厂（单测注入），``() -> admin``；仅用于
+            Topic 自检/补建。注入 producer/consumer 工厂时不做自检（连接由
+            调用方托管）。
     """
 
     def __init__(
@@ -107,6 +122,7 @@ class EdgeLinkRuntime:
         edge_config: Optional[dict[str, Any]] = None,
         producer_factory: Optional[ProducerFactory] = None,
         consumer_factory: Optional[ConsumerFactory] = None,
+        admin_factory: Optional[AdminFactory] = None,
     ) -> None:
         self._settings = settings
         self._sim_id = sim_id
@@ -115,6 +131,7 @@ class EdgeLinkRuntime:
         self._runner_provider = runner_provider
         self._producer_factory = producer_factory
         self._consumer_factory = consumer_factory
+        self._admin_factory = admin_factory
         self._edge_settings = self._resolve_edge_settings(edge_config or {})
         # 接入安全参数构造期解析：配置错误立即失败（不留空转线程）
         self._security_kwargs = build_consumer_security_kwargs(settings.kafka)
@@ -143,6 +160,8 @@ class EdgeLinkRuntime:
         self._rate_drops: dict[str, int] = {}
         self._size_drops: dict[str, int] = {}
         self._send_errors = 0
+        self._send_error_suppressed = 0
+        self._last_send_error_log_ts = 0.0
         self._send_stamps: dict[str, deque[float]] = {}
 
         # 会话/看门狗状态
@@ -211,6 +230,19 @@ class EdgeLinkRuntime:
                     "EdgeLink 需要 sim_id 渲染 carla.{sim_id}.edge_* Topic，当前为空",
                 )
             bootstrap = self._settings.kafka.bootstrap_servers
+            # V3.9.1：Topic 自检/补建（broker auto.create 关闭时必须预创建）。
+            # 只用真实连接路径时执行；单测注入生产者/消费者工厂视为连接已托管。
+            if self._producer_factory is None and self._consumer_factory is None:
+                try:
+                    self._ensure_topics()
+                except KafkaConnectionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001  自检失败同样快速失败
+                    raise KafkaConnectionError(
+                        bootstrap,
+                        f"edge Topic 自检失败（SIL_EDGE 快速失败）："
+                        f"{type(exc).__name__}: {exc}{ssl_failure_hint(exc)}",
+                    ) from exc
             try:
                 self._producer = (
                     self._producer_factory()
@@ -314,6 +346,101 @@ class EdgeLinkRuntime:
             **self._security_kwargs,
         }
         return KafkaConsumer(self.control_topic, **kwargs)
+
+    def _build_admin(self) -> Any:
+        """惰性构建 KafkaAdminClient（仅 Topic 自检/补建，V3.9.1）。"""
+        from kafka.admin import KafkaAdminClient  # noqa: PLC0415
+
+        return KafkaAdminClient(
+            bootstrap_servers=self._settings.kafka.bootstrap_servers.split(","),
+            client_id=f"hunter-sim-edge-{self._sim_id}"[:200],
+            **self._security_kwargs,
+        )
+
+    def _ensure_topics(self) -> None:
+        """确保 ``edge_sensor`` / ``edge_control`` 存在（缺则补建）。
+
+        Raises:
+            KafkaConnectionError: Topic 缺失且补建被拒（权限/策略），附人工
+                建 Topic 命令。存在性自检本身失败时只告警，不阻断启动——避免
+                在 ACL 只给 Write/Read 的现场把可用链路误判为故障。
+        """
+        admin = self._admin_factory() if self._admin_factory is not None else self._build_admin()
+        try:
+            try:
+                existing = set(admin.list_topics())
+            except Exception as exc:  # noqa: BLE001  自检不可用：保持既有行为
+                logger.warning(
+                    "EdgeLink Topic 存在性自检失败，跳过补建（若 broker 关闭 "
+                    f"auto.create 需运维预创建）：{type(exc).__name__}: {exc}"
+                )
+                return
+            missing = [
+                topic
+                for topic in (self.sensor_topic, self.control_topic)
+                if topic not in existing
+            ]
+            if not missing:
+                return
+            self._create_topics(admin, missing)
+        finally:
+            close = getattr(admin, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001  关闭失败不影响启动
+                    logger.debug(f"EdgeLink admin close failed: {exc}")
+
+    def _create_topics(self, admin: Any, missing: list[str]) -> None:
+        """补建缺失 Topic；已存在视为成功，权限/策略拒绝给出人工操作指引。"""
+        from kafka.admin import NewTopic  # noqa: PLC0415
+        from kafka.errors import (  # noqa: PLC0415
+            KafkaError,
+            TopicAuthorizationFailedError,
+        )
+
+        # 单分区：EdgeLink 以 sim_id 为 key，消息本就会落到同一分区，1 分区即可
+        # 保序且最省资源。副本数取 min(3, broker 数)——不能用 -1（kafka-python
+        # 的 CreateTopics 只到 v3，协议默认值语义不可靠），单 broker 现场必须为 1。
+        replication = self._replication_factor(admin)
+        new_topics = [
+            NewTopic(
+                name=topic,
+                num_partitions=1,
+                replication_factor=replication,
+            )
+            for topic in missing
+        ]
+        try:
+            admin.create_topics(new_topics, timeout_ms=_TOPIC_CREATE_TIMEOUT_MS)
+        except TopicAuthorizationFailedError as exc:
+            raise KafkaConnectionError(
+                self._settings.kafka.bootstrap_servers,
+                f"edge Topic 不存在且当前账号无建 Topic 权限（{missing}）："
+                f"{type(exc).__name__}: {exc}。broker 关闭 auto.create 时需运维"
+                f"预创建：kafka-topics.sh --bootstrap-server <broker> --create "
+                f"--topic {self.sensor_topic} 与 --topic {self.control_topic}",
+            ) from exc
+        except KafkaError as exc:
+            # TopicAlreadyExists 属竞态成功；其余（副本数/策略）仍应阻断启动。
+            if type(exc).__name__ == "TopicAlreadyExistsError":
+                logger.info(f"EdgeLink Topic 已被并发创建：{missing}")
+                return
+            raise KafkaConnectionError(
+                self._settings.kafka.bootstrap_servers,
+                f"edge Topic 补建失败（{missing}）：{type(exc).__name__}: {exc}",
+            ) from exc
+        logger.info(f"EdgeLink Topic 已创建：{missing}（broker auto.create 关闭时必需）")
+
+    @staticmethod
+    def _replication_factor(admin: Any) -> int:
+        """按在线 broker 数取副本数（上限 3，下限 1）。"""
+        try:
+            brokers = admin.describe_cluster().get("brokers") or []
+            return max(1, min(3, len(brokers)))
+        except Exception as exc:  # noqa: BLE001  探测失败按单副本（最保守）
+            logger.debug(f"EdgeLink describe_cluster failed, RF=1: {exc}")
+            return 1
 
     def _close_producer_locked(self) -> None:
         """构建消费者失败时回收已建生产者（调用方持锁）。"""
@@ -632,10 +759,21 @@ class EdgeLinkRuntime:
             producer.send(self.sensor_topic, key=key, value=value)
         except Exception as exc:  # noqa: BLE001  发送失败计数降级，不冒泡阻断
             self._send_errors += 1
-            logger.warning(
-                f"EdgeLink send failed (stream={envelope.get('stream')}): "
-                f"{type(exc).__name__}: {exc}"
-            )
+            now = time.time()
+            # V3.9.1：Topic 缺失时每条 send() 都会抛 KafkaTimeoutError（1Hz×5 流），
+            # 不节流会在面板刷出上千条同因告警，掩盖真正的首因。首条必报，其后
+            # 每 10s 汇总一次被抑制条数。
+            if now - self._last_send_error_log_ts >= _SEND_ERROR_LOG_INTERVAL_S:
+                suppressed = self._send_error_suppressed
+                self._send_error_suppressed = 0
+                self._last_send_error_log_ts = now
+                suffix = f"（近 {_SEND_ERROR_LOG_INTERVAL_S:.0f}s 另抑制 {suppressed} 条）" if suppressed else ""
+                logger.warning(
+                    f"EdgeLink send failed (stream={envelope.get('stream')}): "
+                    f"{type(exc).__name__}: {exc}{suffix}"
+                )
+            else:
+                self._send_error_suppressed += 1
             return False
         return True
 

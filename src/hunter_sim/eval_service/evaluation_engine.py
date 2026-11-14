@@ -235,6 +235,7 @@ class EvaluationEngine:
         min_safe_distance_m: float | None = None,
         max_speed_deviation_ms: float | None = None,
         desired_speed_ms: float | None = None,
+        edge_control_frames: int | None = None,
     ) -> SceneEvaluationResult:
         """计算单场景的完整评估结果。
 
@@ -258,6 +259,10 @@ class EvaluationEngine:
                 未下发 max_speed_deviation_ms 但给出期望速度时，V3.8.9 启用内置
                 兜底：自车全程几乎没起步（最高速与 ramp 后均值均 < 期望×系数）
                 则判 fail，修复「停驶 87% 时长却 passed=True」不再依赖平台可选判据。
+            edge_control_frames: 真 SIL 边缘链路收到的控制帧数（V3.9.1）。``None``
+                表示非 SIL_EDGE（不参与裁决）；``0`` 表示车端全栈整场未回传
+                ``/cmd_vel``（自车被看门狗刹停），评估结论不可用，直接判 fail——
+                避免「车端根本没接入却 passed=True」的假通过。
 
         Returns:
             SceneEvaluationResult。
@@ -297,9 +302,13 @@ class EvaluationEngine:
             # V3.8.9：平台未下发偏差上限时的内置兜底——只拦「全程几乎没起步」的停驶/楔死
             # 假通过，不约束超速侧（保持不发该判据的旧场景向后兼容）；合法「先行驶后刹停
             # 避让」的最高速≈期望，不会被误判。
-            speed_deviation_ok = not self._ego_never_moved(
-                efficiency.max_speed_ms, avg_post_ramp, desired_speed_ms
-            )
+            speed_deviation_ok = True
+        # V3.9.1：无论平台是否下发阈值，「整场没起步」都不得判通过——否则平台给了
+        # 一个宽松的 max_speed_deviation（如 20 m/s）就能掩盖自车 0 m/s 的假通过。
+        if self._ego_never_moved(efficiency.max_speed_ms, avg_post_ramp, desired_speed_ms):
+            speed_deviation_ok = False
+        # V3.9.1：SIL_EDGE 下控制帧为 0 = 车端全栈整场未参与，评估结论无意义。
+        edge_control_ok = edge_control_frames is None or edge_control_frames > 0
         success_criteria = {
             "no_collision": safety.collision_count == 0,
             "max_speed_deviation": round(max_speed_deviation, 3),
@@ -316,6 +325,9 @@ class EvaluationEngine:
             "underspeed_deviation_ms": round(underspeed_deviation, 3),
             "min_safe_distance_ok": min_distance_ok,
             "max_speed_deviation_ok": speed_deviation_ok,
+            # V3.9.1：SIL_EDGE 控制链路参与度（None=非边缘链路，不参与裁决）
+            "edge_control_frames": edge_control_frames,
+            "edge_control_ok": edge_control_ok,
         }
 
         # 任务指标：基于成功准则判定通过/失败（文档 §9.3 步骤 5）
@@ -327,6 +339,7 @@ class EvaluationEngine:
             and safety.meets_targets()
             and min_distance_ok
             and speed_deviation_ok
+            and edge_control_ok
         )
 
         # 等级判定（单场景用 pass/fail，批量用 pass_rate）

@@ -789,6 +789,19 @@ class SimulationExecutor:
         min_distances = (
             [float(v) for v in raw_samples] if isinstance(raw_samples, (list, tuple)) else []
         )
+        # V3.9.1：SIL_EDGE 下把控制帧参与度交给评估裁决（0 帧 = 车端整场未接入，
+        # 自车被看门狗刹停，评估结论不可用）。未装配边缘链路时为 None，不参与裁决。
+        edge_control_frames: Optional[int] = None
+        if context.edge_link is not None:
+            try:
+                edge_control_frames = int(context.edge_link.stats.get("control_received", 0) or 0)
+            except Exception:  # noqa: BLE001  诊断读取失败不阻断评估
+                edge_control_frames = 0
+            if edge_control_frames == 0:
+                logger.warning(
+                    "edge_control_unavailable: 车端整场未回传 /cmd_vel（控制帧 0），"
+                    "自车全程断流刹停，评估判 fail（SIL 结论不可用）"
+                )
         return self._evaluator.evaluate_scene(
             scene_id=context.scene.scene_id,
             vehicle_states=context.samples,
@@ -802,6 +815,7 @@ class SimulationExecutor:
             min_safe_distance_m=float(min_safe) if min_safe is not None else None,
             max_speed_deviation_ms=float(max_dev) if max_dev is not None else None,
             desired_speed_ms=desired_speed if desired_speed > 0 else None,
+            edge_control_frames=edge_control_frames,
         )
 
     def _write_artifacts(

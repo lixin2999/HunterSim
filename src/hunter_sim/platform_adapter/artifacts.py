@@ -120,6 +120,13 @@ class ArtifactManager:
         """预签名直传；未启用/失败返回 None（只保留本地产物）。"""
         if not self._settings.enabled:
             return None
+        # V3.9.1：空产物（典型为 0 事件的 events.jsonl）不上传——平台 presign
+        # schema 要求 file_size >= 1，旧版照发必得 422 且只是刷一条 WARNING。
+        if path.stat().st_size <= 0:
+            logger.info(
+                f"产物为空（0 字节），跳过上传：{file_name}（平台 file_size>=1，避免 422）"
+            )
+            return None
         token = (
             self._settings.jwt_token.get_secret_value()
             if self._settings.jwt_token is not None

@@ -168,6 +168,24 @@ class TestPresignedUpload:
         assert artifact.uploaded is False
         assert client.posts == []
 
+    def test_empty_artifact_skips_presign(self, tmp_path: Path) -> None:
+        """V3.9.1：0 字节产物不上传（平台 schema file_size>=1，旧版必得 422）。
+
+        典型触发：0 事件场景的 ``events.jsonl`` —— ``write_jsonl`` 产出空内容。
+        """
+        client = _FakeClient(
+            presign={"object_key": "unused", "upload_url": "http://minio/upload"}
+        )
+        manager = _manager(tmp_path, _cloud(True), factory=lambda: client)
+
+        artifact = manager.write_jsonl("events.jsonl", [])
+
+        assert artifact.uploaded is False
+        assert artifact.size_bytes == 0
+        assert client.posts == []
+        assert client.puts == []
+        assert (manager.directory / "events.jsonl").exists()
+
     @pytest.mark.parametrize("file_name", ["../escape.txt", "a/b.txt", ""])
     def test_unsafe_names_are_sanitized(self, tmp_path: Path, file_name: str) -> None:
         manager = _manager(tmp_path, _cloud(False))
