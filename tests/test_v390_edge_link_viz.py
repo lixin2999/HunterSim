@@ -932,9 +932,15 @@ class TestTopicProvisioning:
         )
         link._ensure_topics()  # noqa: SLF001  并发建 Topic 属成功
 
-    def test_auth_failure_fast_fails_with_ops_hint(
+    def test_auth_failure_fast_fails_with_acl_hint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """无 CREATE 权限 → 快速失败，且报错给的是**权限口径**而非手工建 Topic。
+
+        sim_id 每轮都变，手工 ``kafka-topics.sh --topic carla.<sim_id>...`` 不可能
+        作为常规手段；可执行的修法是按 ``carla.*`` 前缀授 ACL 或开 broker
+        ``auto.create``，Topic 本身由 AdminClient 预建。
+        """
         from kafka.errors import TopicAuthorizationFailedError
 
         admin = _Admin(create_error=TopicAuthorizationFailedError("denied"))
@@ -945,7 +951,11 @@ class TestTopicProvisioning:
             link._ensure_topics()  # noqa: SLF001
         text = str(excinfo.value)
         assert "edge_sensor" in text and "edge_control" in text
-        assert "kafka-topics.sh" in text
+        # 修法口径：前缀 ACL 或 broker auto.create（两项都要能看到）
+        assert "CREATE" in text and "carla.*" in text
+        assert "auto.create.topics.enable" in text
+        # 守住「不引导手工预建」的决策（sim_id 每轮变）
+        assert "kafka-topics.sh" in text and "不是常规手段" in text
 
     def test_start_provisions_topics_before_building_clients(
         self, monkeypatch: pytest.MonkeyPatch

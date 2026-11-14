@@ -5129,16 +5129,17 @@ CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
 
 ### 变更
 
-1. **`cloud/edge_link.py` — Topic 自检/补建（首因修复）**：`start()` 在构建生产者/消费者**之前**先用 `KafkaAdminClient` 列 Topic，缺失则 `CreateTopics` 补建。**1 分区**（EdgeLink 以 `sim_id` 作 key，本就落同一分区保序，最省资源）；**RF = `min(3, broker 数)`**，**不用 `-1`**——kafka-python 的 `CreateTopics` 只到 v3，协议默认值语义不可靠，单 broker 现场必须为 1。**无权限建且 Topic 缺失** → `KafkaConnectionError` **快速失败**，报错文案直接给出 `kafka-topics.sh --create` 命令；**存在性自检本身失败只告警不阻断**（避免把只给读写 ACL 的现场误判为故障）；`TopicAlreadyExists` 视为并发竞态成功。
-2. **`cloud/edge_link.py` — 发送失败告警节流**：Topic 缺失时每条 `send()` 都会抛异常（1Hz×5 流），旧版每秒刷 5 条同因告警、掩盖真正首因。改为**首条必报 + 其后每 10 s 汇总一条并附被抑制条数**（`_SEND_ERROR_LOG_INTERVAL_S = 10.0`），`send_errors` 计数与降级语义不变。
-3. **`platform_adapter/executor.py` — 车端参与度入判**：SIL_EDGE 下把 `edge_link.stats["control_received"]` 作为 `edge_control_frames` 传入评估；**0 帧**时打 `edge_control_unavailable` 并判 fail，不再出现「车端没参与却通过」。未装配边缘链路传 `None`（不参与裁决，旧行为不变）。
-4. **`eval_service/evaluation_engine.py` — 两道与平台阈值解耦的兜底**：①「整场没起步」判定（`_ego_never_moved`：最高速与 ramp 后均值**同时** < 期望 × `_EVAL_STOP_FRACTION`）改为**与平台阈值无关**，平台给 100 m/s 也拦；②新增 `edge_control_frames` / `edge_control_ok` 判据并入 `passed`，0 帧直接 `passed=False`（`None` 表示非边缘链路，不参与裁决）。
-5. **`platform_adapter/artifacts.py` — 0 字节产物跳过 presign**：平台 schema 要求 `file_size >= 1`，0 字节必得 422 且只刷一条 WARNING。改为**跳过上传并保留本地文件**（日志 `产物为空（0 字节），跳过上传`），消掉 0 事件场景 `events.jsonl` 的 422。
+1. **`cloud/edge_link.py` — Topic 自检/补建（首因修复）**：`start()` 在构建生产者/消费者**之前**先用 `KafkaAdminClient` 列 Topic，缺失则 `CreateTopics` 补建。**1 分区**（EdgeLink 以 `sim_id` 作 key，本就落同一分区保序，最省资源）；**RF = `min(3, broker 数)`**，**不用 `-1`**——kafka-python 的 `CreateTopics` 只到 v3，协议默认值语义不可靠，单 broker 现场必须为 1。**Topic 由本类预建、不引导手工建**（`sim_id` 每轮都变，手工 `kafka-topics.sh --topic carla.<sim_id>...` 无法作为常规手段）；**无权限建且 Topic 缺失** → `KafkaConnectionError` **快速失败**，报错给**权限口径**的两种修法：① 给 Kafka 主体（SASL/mTLS principal）授予 `carla.*` **前缀**的 `CREATE/DESCRIBE/READ/WRITE`（前缀 ACL 覆盖每轮变化的 `sim_id`）；② 单机测试环境可另开 broker `auto.create.topics.enable=true` 作兜底（预建在前，`CREATE` 仍需授）。**存在性自检本身失败只告警不阻断**（避免把只给读写 ACL 的现场误判为故障）；`TopicAlreadyExists` 视为并发竞态成功。
+2. **Topic 供给路径（决策）**：常规路径是**仿真端实例创建时（`EdgeLinkRuntime.start()`）用 AdminClient 预建**两个 1 分区 Topic，**不做手工预建**——`sim_id` 每轮都变，手工建的 Topic 下轮就作废，也容易造成只测一轮就「看着好了」的假象。前置条件因此变成**权限口径**而非操作手册（见下）。
+3. **`cloud/edge_link.py` — 发送失败告警节流**：Topic 缺失时每条 `send()` 都会抛异常（1Hz×5 流），旧版每秒刷 5 条同因告警、掩盖真正首因。改为**首条必报 + 其后每 10 s 汇总一条并附被抑制条数**（`_SEND_ERROR_LOG_INTERVAL_S = 10.0`），`send_errors` 计数与降级语义不变。
+4. **`platform_adapter/executor.py` — 车端参与度入判**：SIL_EDGE 下把 `edge_link.stats["control_received"]` 作为 `edge_control_frames` 传入评估；**0 帧**时打 `edge_control_unavailable` 并判 fail，不再出现「车端没参与却通过」。未装配边缘链路传 `None`（不参与裁决，旧行为不变）。
+5. **`eval_service/evaluation_engine.py` — 两道与平台阈值解耦的兜底**：①「整场没起步」判定（`_ego_never_moved`：最高速与 ramp 后均值**同时** < 期望 × `_EVAL_STOP_FRACTION`）改为**与平台阈值无关**，平台给 100 m/s 也拦；②新增 `edge_control_frames` / `edge_control_ok` 判据并入 `passed`，0 帧直接 `passed=False`（`None` 表示非边缘链路，不参与裁决）。
+6. **`platform_adapter/artifacts.py` — 0 字节产物跳过 presign**：平台 schema 要求 `file_size >= 1`，0 字节必得 422 且只刷一条 WARNING。改为**跳过上传并保留本地文件**（日志 `产物为空（0 字节），跳过上传`），消掉 0 事件场景 `events.jsonl` 的 422。
 
 ### 验证
 
 - 全量 `pytest`：**1818 passed**（V3.9.0 基线 1805 + **13 条新专项守卫**）；`flake8 src tests` **exit=0**；`mypy src` **Success（92 文件）**；全仓行覆盖 **84.45%**（≥80 门禁，与 V3.9.0 的 84.49% 基本持平——新增分支多于语句）。
-- 新增守卫分布：`test_v390_edge_link_viz.py::TestTopicProvisioning` **7 条**（补建缺失并关闭 admin / 1 分区且 RF 封顶 / 已存在跳过创建 / `list_topics` 失败仅告警 / `TopicAlreadyExists` 视为成功 / 无权限快速失败并附手工命令 / `start()` 先补建再建客户端）+ 发送告警**节流** 1 条；`test_eval_engine.py` **4 条**（平台宽松阈值仍拦「没起步」/ 0 帧判 fail / 有帧通过 / 未装配不参与裁决）；`test_platform_adapter_artifacts.py` **1 条**（0 字节不上传、本地保留）。
+- 新增守卫分布：`test_v390_edge_link_viz.py::TestTopicProvisioning` **7 条**（补建缺失并关闭 admin / 1 分区且 RF 封顶 / 已存在跳过创建 / `list_topics` 失败仅告警 / `TopicAlreadyExists` 视为成功 / 无权限快速失败且报错给 `carla.*` 前缀 ACL 与 broker `auto.create` 两种修法（并守住「手工预建不是常规手段」的反例断言）/ `start()` 先补建再建客户端）+ 发送告警**节流** 1 条；`test_eval_engine.py` **4 条**（平台宽松阈值仍拦「没起步」/ 0 帧判 fail / 有帧通过 / 未装配不参与裁决）；`test_platform_adapter_artifacts.py` **1 条**（0 字节不上传、本地保留）。
 
 ### 分发
 
@@ -5147,21 +5148,20 @@ CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
 ### 向后兼容与行为变化
 
 - **默认零影响**：`EDGE_LINK_ENABLED=false` 时既不建 Topic 也不参与评估裁决，行为与 V3.9.0 完全一致。
-- **开启真 SIL 后的行为变化**：①缺 Topic 时**自动补建**（账号有权限）；②无权限则**快速失败**并给出人工建 Topic 命令，不再「静默跑满时长」；③`control_received=0` 的场景**评估必 fail**（`success_criteria.edge_control_ok=false`），车端未接入不再假通过；④平台下发宽松 `max_speed_deviation` **不再能掩盖整场 0 m/s**。
+- **开启真 SIL 后的行为变化**：①缺 Topic 时**自动补建**（账号有权限）；②无权限则**快速失败**并给出 `carla.*` 前缀 ACL / broker `auto.create` 两种修法，不再「静默跑满时长」；③`control_received=0` 的场景**评估必 fail**（`success_criteria.edge_control_ok=false`），车端未接入不再假通过；④平台下发宽松 `max_speed_deviation` **不再能掩盖整场 0 m/s**。
 - **产物**：0 字节产物**只落本地不上传**（`uploaded=false`，`object_key` 保留本地约定路径），平台侧不再收到该文件；非空产物链路（含 bag）不受影响。
 
 ### 现场待办（非代码）
 
 1. **代码同步**：本次日志来自 `D:\python\HunterSim`，改动在 `E:\python_work\HunterPilot\HunterSim`，需先同步/部署到运行机再复跑。
-2. **Topic 权限**：Kafka 账号若无建 Topic 权限，先手工建（现在代码启动时也会把该命令打进日志）：
+2. **Topic 供给与权限（不手工建）**：Topic 由 `start()` 用 AdminClient 预建（1 分区），**不要手工建**——`sim_id` 每轮都变，手工建的下一轮即失效。前置条件只剩**权限口径**，二选一：
 
-   ```bash
-   kafka-topics.sh --bootstrap-server 192.168.31.35:9093 \
-     --create --topic carla.<sim_id>.edge_sensor --partitions 1 --replication-factor 1
-   kafka-topics.sh --bootstrap-server 192.168.31.35:9093 \
-     --create --topic carla.<sim_id>.edge_control --partitions 1 --replication-factor 1
-   ```
+   | 路径 | 做法 | 适用 |
+   |------|------|------|
+   | ① 单机测试环境 | broker `auto.create.topics.enable=true` + 给 Kafka 主体（SASL/mTLS principal）按 `carla.*` **前缀**授 `CREATE/DESCRIBE/READ/WRITE` | 快速联调；auto.create 只是兜底，四项 ACL 仍必需（预建在 `start()` 执行） |
+   | ② 生产/受限环境 | 保持 auto.create 关闭，仅按 `carla.*` 前缀授 `CREATE/DESCRIBE/READ/WRITE`，由 AdminClient 预建 | 推荐，权限最小化且覆盖每轮新 `sim_id` |
 
+   验证：实例创建后日志 `EdgeLink Topic 已创建：[…]`（第二轮起 Topic 已存在则无此行，属正常），面板五流实际 Hz 接近标称即供给正常。
 3. **车端**：`sil_bridge_agent` 仍未启动时，本版**不会再「静默跑完并判通过」**，会明确落 `edge_control_ok=false` 的失败结论——失败即结论，不是回归。
 
 ### 已知遗留
@@ -5171,8 +5171,8 @@ CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
 ### 文档同步明细
 
 - `README.md`：当前版本 → 3.9.1；历史句补 V3.9.1（edge Topic 自检补建 / 车端参与度入判 / 空产物跳过上传）；测试计数 1805 → 1818。
-- `user_manual.md`：版本头 → V3.9.1；§5.8 补「Topic 预创建与权限」前置条件；§5.10/§5.12 补 0 帧失败语义与新验收点；FAQ 补 Topic 缺失、0 帧判 fail、0 字节产物三问。
-- `deployment_and_operations.md`：版本头 → V3.9.1；新增 `### V3.9.0 → V3.9.1` 升级章节（含现场手工建 Topic 与遗留项）；真 SIL 排障速查补 Topic 缺失/告警刷屏/评估假通过三行。
+- `user_manual.md`：版本头 → V3.9.1；§5.8 补「edge Topic 权限口径（AdminClient 预建，不手工建）」前置条件；§5.10/§5.12 补 0 帧失败语义与新验收点；FAQ 补 Topic 缺失、0 帧判 fail、0 字节产物三问。
+- `deployment_and_operations.md`：版本头 → V3.9.1；新增 `### V3.9.0 → V3.9.1` 升级章节（含 Topic 权限口径与遗留项）；真 SIL 排障速查补 Topic 缺失/告警刷屏/评估假通过三行。
 - `docs/单机部署指南.md`：版本头 → V3.9.1（三处）+ `huntersim version` 校验值；排障表补 edge Topic 与 0 帧假通过条目。
 - `pyproject.toml`：`version` 3.9.0 → **3.9.1**。
 ---

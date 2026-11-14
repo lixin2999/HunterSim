@@ -24,8 +24,13 @@ V3.9.1：``start()`` 先做 Topic 自检/补建。broker 关闭 ``auto.create.to
 时（HunterCore 的 9093 接入面正是如此），生产者每条 ``send()`` 会阻塞满
 ``max_block_ms`` 后抛 ``KafkaTimeoutError: Failed to update metadata``，消费者也
 永远拿不到分区——表现为「传感器全部丢弃、``control_received=0``、自车被看门狗
-刹停，但实例仍跑完」。缺 Topic 属配置问题，这里补建失败即快速失败并给出可执行
-的运维命令，而不是静默跑完一场假 SIL。
+刹停，但实例仍跑完」。
+
+Topic 由**本类在 start() 时用 AdminClient 预建**（``sim_id`` 每轮都变，手工
+``kafka-topics.sh`` 预建不是常规手段）：账号缺 ``CREATE`` 时快速失败，并在报错里
+给出**权限口径**的修法——按 ``carla.*`` 前缀授予
+``CREATE/DESCRIBE/READ/WRITE``（单机测试环境可再开 broker
+``auto.create.topics.enable`` 作兜底）。而不是静默跑完一场假 SIL。
 """
 
 from __future__ import annotations
@@ -361,9 +366,10 @@ class EdgeLinkRuntime:
         """确保 ``edge_sensor`` / ``edge_control`` 存在（缺则补建）。
 
         Raises:
-            KafkaConnectionError: Topic 缺失且补建被拒（权限/策略），附人工
-                建 Topic 命令。存在性自检本身失败时只告警，不阻断启动——避免
-                在 ACL 只给 Write/Read 的现场把可用链路误判为故障。
+            KafkaConnectionError: Topic 缺失且补建被拒（权限/策略），附按
+                ``carla.*`` 前缀授权的口径说明。存在性自检本身失败时只告警，
+                不阻断启动——避免在 ACL 只给 Write/Read 的现场把可用链路误
+                判为故障。
         """
         admin = self._admin_factory() if self._admin_factory is not None else self._build_admin()
         try:
@@ -371,8 +377,8 @@ class EdgeLinkRuntime:
                 existing = set(admin.list_topics())
             except Exception as exc:  # noqa: BLE001  自检不可用：保持既有行为
                 logger.warning(
-                    "EdgeLink Topic 存在性自检失败，跳过补建（若 broker 关闭 "
-                    f"auto.create 需运维预创建）：{type(exc).__name__}: {exc}"
+                    "EdgeLink Topic 存在性自检失败，跳过补建（需给 Kafka 主体对 "
+                    f"carla.* 授予 DESCRIBE、或开 auto.create）：{type(exc).__name__}: {exc}"
                 )
                 return
             missing = [
@@ -416,10 +422,13 @@ class EdgeLinkRuntime:
         except TopicAuthorizationFailedError as exc:
             raise KafkaConnectionError(
                 self._settings.kafka.bootstrap_servers,
-                f"edge Topic 不存在且当前账号无建 Topic 权限（{missing}）："
-                f"{type(exc).__name__}: {exc}。broker 关闭 auto.create 时需运维"
-                f"预创建：kafka-topics.sh --bootstrap-server <broker> --create "
-                f"--topic {self.sensor_topic} 与 --topic {self.control_topic}",
+                f"edge Topic 不存在且 Kafka 主体无 CREATE 权限（{missing}）："
+                f"{type(exc).__name__}: {exc}。修法任选其一：① 给该主体授予 "
+                f"carla.* 前缀的 CREATE/DESCRIBE/READ/WRITE（ACL 按前缀生效，"
+                f"覆盖每轮变化的 sim_id）；② 单机测试环境可另开 broker "
+                f"auto.create.topics.enable=true 作兜底（预建在前，CREATE 仍需授）。"
+                f"注意 sim_id 每轮都变，手工 kafka-topics.sh 预建不是常规手段；"
+                f"Topic 由 EdgeLinkRuntime.start() 用 AdminClient 预建。",
             ) from exc
         except KafkaError as exc:
             # TopicAlreadyExists 属竞态成功；其余（副本数/策略）仍应阻断启动。
