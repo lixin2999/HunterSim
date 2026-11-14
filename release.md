@@ -5176,3 +5176,64 @@ CARLA 传感器 → BuiltinScenario(edge_link_sink) → EdgeLinkRuntime
 - `docs/单机部署指南.md`：版本头 → V3.9.1（三处）+ `huntersim version` 校验值；排障表补 edge Topic 与 0 帧假通过条目。
 - `pyproject.toml`：`version` 3.9.0 → **3.9.1**。
 ---
+
+## V3.9.2 — 真 SIL 无效跑收敛（首帧控制超时即失败 + 记录尺寸口径统一）
+
+**发布日期**：2026-11-14
+**版本定位**：问题修复（patch）。V3.9.1 让「车端没接上」这件事**判得出**了，但**判得太晚**：实机一轮 `control_received=0`，仿真端仍拉满 `duration_seconds`、录出 **1.87 GB** mcap、把整包上传完，最后才判 fail；同一轮面板还出现 `The message is 8376288 bytes ... max_request_size (1048576)` 的 `MessageSizeTooLargeError`（而面板「上行错误」显示 **0**）。本版两件事：①**首帧控制超时（默认 30 s）即结束场景判 fail**，把一次配置缺失从十几分钟压到半分钟；②**统一单条记录尺寸口径**（producer 显式 `max_request_size` + 按序列化后字节判限），不再让 kafka-python 默认 1 MiB 与仿真侧 4 MiB 帧上限互相打架。平台契约零改动。
+
+### 背景（实机日志）
+
+| 环节 | 现象 | 根因 |
+|------|------|------|
+| 供给 | `EdgeLink Topic 已创建：['carla.sim-….edge_sensor', 'carla.sim-….edge_control']` | V3.9.1 预建生效 |
+| 上行 | 4803 帧 / mcap `1,872,402,894 bytes` / 面板「上行错误 0」 | 仿真端链路本身正常 |
+| 下行 | `control_received=0 steps=2463`，`edge_control_unavailable: 车端整场未回传 /cmd_vel` | 车端 `sil_bridge` 未参与（非仿真端缺陷） |
+| 收尾 | 看门狗全程零速刹停 → `ego_speed_stuck` 4 s → 79 s → **跑满时长才 fail**，bag 仍上传 | 没有「整场无控制」的时间上界 |
+| 尺寸 | 面板红字 `The message is 8376288 bytes ... max_request_size (1048576)` | 所有 producer 都没设 `max_request_size`（kafka-python 默认 1 MiB），而 `EDGE_LINK_MAX_PAYLOAD_BYTES` 默认 4 MiB（base64 后约 5.6 MB），阈值口径不自洽 |
+
+### 变更
+
+1. **`common/models.py` + `cloud/edge_link.py` — 首帧控制超时（默认 30 s）**：新增 `EdgeLinkSettings.first_control_timeout_s`（`EDGE_LINK_FIRST_CONTROL_TIMEOUT_S`，默认 30，`0` 关闭，上限 600）。`step()` 首帧记 `_first_step_ts`；**会话已建立但从未收到任何 `/cmd_vel`** 且累计达到该时长时返回 `EdgeControl(0, 0, stale=True, fatal=True, reason=…)`。ERROR 只落一条（幂等），文案带车端排查指引：`sil_bridge` 是否在跑且绑定该 `sim_id`、`ros2 topic hz /cmd_vel`、`/auto_mission/start_mapping_cruise` 是否已启动。
+2. **`scene_runner/builtin_scenario.py` — fatal 即场景失败**：`_apply_edge_control` 收到 `fatal` 直接 `raise CarlaSimulationError("edge_control", reason)`，复用既有失败路径（`SceneStatus.FAILED` → executor `_fail_instance`）；`upload_on_failure` 默认 False，故**不再上传残缺 mcap**。诊断仍落 `control_frames=0`，评估仍判 `edge_control_ok=false`（**失败即结论**，不是回归）。
+3. **`cloud/kafka_limits.py`（新增）— 记录尺寸口径收敛一处**：`MAX_RECORD_BYTES = 1_048_576`（对齐 broker `message.max.bytes`）、`MAX_REQUEST_OVERHEAD_BYTES = 65_536`（协议头/批次预留）、`MAX_REQUEST_SIZE`。`edge_link` / `sim_data_producer` / `telemetry_producer` / `node_result_producer` / `vil_data_consumer`（DLQ）**全部显式**传 `max_request_size`，不再依赖 kafka-python 的默认值。
+4. **`cloud/edge_link.py` — 按序列化后字节判限**：新增 `EdgeLinkSettings.max_record_bytes`（`EDGE_LINK_MAX_RECORD_BYTES`，默认 1 MiB，`ge=1024`）。`_send()` 在 `send()` **之前**按 `len(value)`（含 base64 膨胀与 JSON 信封）判限，超限丢弃 + `sensor_record_dropped` / `sensor_size_dropped[stream]` 计数 + **10 s 限频** WARNING（带 stream / 实际字节 / 上限 / 处置），不再把 `MessageSizeTooLargeError` 的裸异常栈抛给面板。`max_payload_bytes` 的语义收紧为「base64 **前**的单帧上限」。
+5. **`cloud/sim_data_producer.py` — 超限记录不入缓冲**：`_send()` 同样先判 `MAX_RECORD_BYTES`，超限计 `SIM_DATA_DROPPED_TOTAL{reason="record_too_large"}` + 10 s 限频 WARNING 并返回 False；**不入重投缓冲**（超限记录每轮重投必然再失败，只会挤占真正可重投的消息）。
+6. **可观测**：`edge_link.stats` 新增 `sensor_record_dropped` / `record_limit_bytes` / `first_control_timeout_s`；不进平台精简段 `summary()`（避免 10Hz 报文膨胀），viz 只读端点可取完整诊断。
+
+### 验证
+
+- 全量 `pytest`：**1832 passed**（V3.9.1 基线 1818 + **14 条新专项守卫**）；`flake8 src tests` **exit=0**；`mypy src` **Success（93 文件，新增 `cloud/kafka_limits.py`）**；全仓行覆盖 **84.50%**（≥80 门禁）。
+- 新增守卫分布：`test_v390_edge_link_viz.py::TestFirstControlTimeout` **5 条**（到点才 fatal 且 2.0 s 前不 fatal / `0` 关闭 / 先到控制帧则永不 fatal / ERROR 只落一条 / stats 暴露配置值）+ `TestRecordSizeGate` **4 条**（超限在 `send()` 前丢弃且 `send_errors` 仍为 0 / 未超限照常发送 / 丢弃告警 10 s 限频 / 默认上限 1 MiB）+ producer kwargs 断言 `max_request_size = 记录上限 + 头预留`；`test_v390_edge_control.py` **2 条**（`fatal` → `CarlaSimulationError` 且不落假控制帧 / 无 reason 时用默认文案）；`test_sim_data_producer.py` **3 条**（超限不入缓冲 / 未超限照常发送 / `max_request_size` 对齐）。
+
+### 分发
+
+镜像 tag `hunter-sim:3.9.2`；`pyproject.toml` 版本 `3.9.2`。
+
+### 向后兼容与行为变化
+
+- **默认零影响**：`EDGE_LINK_ENABLED=false` 时既不建 Topic 也不参与裁决；`max_payload_bytes` 语义未变（仍是 base64 前）。新增 `max_request_size` 与 broker 默认 `message.max.bytes`（1 MiB）**等值**，正常负载（1Hz~50Hz 的 JPEG/点云/IMU/遥测）不受影响。
+- **开启真 SIL 后的行为变化**：①整场无 `/cmd_vel` 的场景**30 s 内**以失败收尾，不再跑满时长、不再上传 GB 级残缺 mcap；②单条记录超 1 MiB 时**丢弃并计数**（`sensor_record_dropped` / `sim_data_dropped{reason="record_too_large"}`），日志给可执行处置，而不是把 `MessageSizeTooLargeError` 栈甩到面板。
+- **想抬高交付上限**：必须**同时**改两处——broker `message.max.bytes`（含 topic 级覆盖）与 `EDGE_LINK_MAX_RECORD_BYTES`；只改一侧仍会在发送端或 broker 侧失败（`cloud/kafka_limits.py` 模块文档已写明）。
+
+### 现场待办（非代码）
+
+1. **代码同步**：本次日志来自 `D:\python\HunterSim`，改用 `E:\python_work\HunterPilot\HunterSim` 的 3.9.2 后复跑。
+2. **车端 `sil_bridge_agent`**：本版不再让「车端没接上」空跑满时长——看到 `edge_control_unavailable ... 首帧控制超时` 即按 ERROR 里的三条指引检查（进程/`sim_id` 绑定、`ros2 topic hz /cmd_vel`、mapping cruise）。
+3. **面板那条 8.3 MB 记录的定性**：请贴完整 traceback（本版已让仿真侧记录尺寸先于 `send()` 判限；若栈来自车端进程，属车端发端问题，仿真端口径已对齐）。
+
+### 已知遗留
+
+- **场景失败的上传语义**：当前由 `upload_on_failure`（默认 False）决定是否上传残缺 mcap，本版未改动该开关；若要「失败也留证据」，需显式开启并同步评估报告口径。
+- **平台侧待补字段级错误信息**（沿用 V3.9.1 遗留）：产物 presign 422 的响应体内仍无字段级信息。
+
+### 文档同步明细
+
+- `README.md`：当前版本 → 3.9.2；历史句补 V3.9.2（首帧控制超时 / 记录尺寸口径统一）；测试计数 1818 → 1832。
+- `user_manual.md`：版本头 → V3.9.2；§5.10 补「首帧控制超时 30 s 即判 fail」；§5.12 验收点补 `sensor_record_dropped`；FAQ 补「记录超限丢弃」与「为什么 30 s 就失败」两问。
+- `deployment_and_operations.md`：版本头 → V3.9.2；新增 `### V3.9.1 → V3.9.2` 升级章节（含记录上限与 broker `message.max.bytes` 的联动）；真 SIL 排障速查补「记录超限」「首帧控制超时」两行。
+- `docs/单机部署指南.md`：版本头 → V3.9.2 + `huntersim version` 校验值。
+- `docs/真 SIL 全栈闭环（接入 HunterEdge）.md`：补「第二轮联调的收口（V3.9.2）」小节（首帧控制超时 + 记录尺寸口径单点收敛，及闭环验收口径再收紧一条）。
+- `.env.example`：`EDGE_LINK_*` 段补 `EDGE_LINK_FIRST_CONTROL_TIMEOUT_S` / `EDGE_LINK_MAX_RECORD_BYTES` 注释默认值。
+- `pyproject.toml`：`version` 3.9.1 → **3.9.2**。
+---

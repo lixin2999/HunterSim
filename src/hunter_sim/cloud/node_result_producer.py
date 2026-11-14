@@ -19,6 +19,7 @@ import json
 import time
 from typing import Any, Callable, Optional
 
+from hunter_sim.cloud.kafka_limits import MAX_REQUEST_SIZE
 from hunter_sim.cloud.kafka_security import build_ssl_kwargs, ssl_failure_hint
 from hunter_sim.common.metrics import NODE_RESULT_PUBLISHED_TOTAL
 from hunter_sim.common.models import CloudSettings, SimNodeSettings
@@ -177,6 +178,8 @@ class NodeResultProducer:
             "max_block_ms": 1000,
             "request_timeout_ms": _REQUEST_TIMEOUT_MS,
             "delivery_timeout_ms": _DELIVERY_TIMEOUT_MS,
+            # V3.9.2：显式对齐单条记录上限（cloud.kafka_limits）
+            "max_request_size": MAX_REQUEST_SIZE,
         }
         if c.sasl_username is not None:
             kwargs["sasl_plain_username"] = c.sasl_username.get_secret_value()

@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError as PydanticValidationError
 
+from hunter_sim.cloud.kafka_limits import MAX_REQUEST_SIZE
 from hunter_sim.cloud.kafka_security import build_consumer_security_kwargs
 from hunter_sim.common.exceptions import KafkaConnectionError
 from hunter_sim.common.metrics import (
@@ -279,6 +280,8 @@ class VILDataConsumer:
                     "bootstrap_servers": self._settings.bootstrap_servers.split(","),
                     # V3.1.2：DLQ 生产者与消费者共用同一套接入安全参数
                     **self._security_kwargs,
+                    # V3.9.2：显式对齐单条记录上限（cloud.kafka_limits）
+                    "max_request_size": MAX_REQUEST_SIZE,
                 }
                 self._dlq_producer = KafkaProducer(**producer_kwargs)
         except Exception as exc:  # noqa: BLE001  DLQ 不可用时降级为仅计数丢弃

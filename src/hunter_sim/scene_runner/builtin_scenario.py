@@ -2182,6 +2182,15 @@ class BuiltinScenario(CustomScenarioBase):
         if control is None and not failed:
             # 自车尚未绑定（首 tick 前）：不下发控制，保持静止
             return
+        if not failed and bool(getattr(control, "fatal", False)):
+            # V3.9.2：首帧控制超时（会话已建立但整场无 /cmd_vel）。继续零速跑满时长
+            # 只会白录几百 MB~GB mcap 再判 fail；由场景失败收尾（executor 仍落
+            # edge_control_unavailable 与 passed=False，但不再空转满时长）。
+            reason = str(getattr(control, "reason", "") or "")
+            raise CarlaSimulationError(
+                "edge_control",
+                reason or "edge_control_unavailable: 首帧控制超时（未收到车端 /cmd_vel）",
+            )
         # 控制源抛异常等同断流：必须刹停，不得沿用上一帧指令滑行
         stale = failed or bool(getattr(control, "stale", False))
         linear_x = _safe_float(getattr(control, "linear_x", 0.0))

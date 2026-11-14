@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import pytest
 
+from hunter_sim.common.exceptions import CarlaSimulationError
 from hunter_sim.common.models import HunterSimSettings
 from hunter_sim.platform_adapter.config import AdapterSettings
 from hunter_sim.platform_adapter.executor import SimulationExecutor, _RunContext, _edge_link_override
@@ -111,8 +112,17 @@ def _attached(scenario: BuiltinScenario, ego: MockVehicle) -> BuiltinScenario:
     return scenario
 
 
-def _cmd(linear_x: float = 0.0, angular_z: float = 0.0, stale: bool = False) -> Any:
-    return types.SimpleNamespace(linear_x=linear_x, angular_z=angular_z, stale=stale)
+def _cmd(
+    linear_x: float = 0.0,
+    angular_z: float = 0.0,
+    stale: bool = False,
+    *,
+    fatal: bool = False,
+    reason: str = "",
+) -> Any:
+    return types.SimpleNamespace(
+        linear_x=linear_x, angular_z=angular_z, stale=stale, fatal=fatal, reason=reason
+    )
 
 
 class _Sink:
@@ -365,6 +375,40 @@ class TestWatchdog:
         scenario._apply_edge_control(0.02)  # noqa: SLF001
         assert ego._control is None  # noqa: SLF001
         assert scenario._edge_control_frames == 0  # noqa: SLF001
+
+    def test_fatal_first_control_timeout_fails_scene(self) -> None:
+        """V3.9.2：首帧控制超时 → 抛 CarlaSimulationError 结束场景。
+
+        继续零速跑只会白录 mcap 再判 fail（实机一轮拉了满时长 + 1.87 GB）。
+        必须走场景失败路径，让 executor 立即 _fail_instance。
+        """
+        reason = (
+            "edge_control_unavailable: 会话已建立 30.1s 内未收到车端任何 "
+            "/cmd_vel（首帧控制超时，EDGE_LINK_FIRST_CONTROL_TIMEOUT_S）"
+        )
+        ego = _ego(speed=0.0)
+        scenario = _attached(
+            _make_scenario(
+                control_driver=lambda _dt: _cmd(stale=True, fatal=True, reason=reason)
+            ),
+            ego,
+        )
+        with pytest.raises(CarlaSimulationError) as excinfo:
+            scenario._apply_edge_control(0.02)  # noqa: SLF001
+        text = str(excinfo.value)
+        assert "edge_control" in text
+        assert "edge_control_unavailable" in text
+        # 不得先落一帧假控制（评估引擎靠 0 帧判定断流）
+        assert scenario._edge_control_frames == 0  # noqa: SLF001
+
+    def test_fatal_without_reason_uses_default_text(self) -> None:
+        ego = _ego(speed=0.0)
+        scenario = _attached(
+            _make_scenario(control_driver=lambda _dt: _cmd(fatal=True)), ego
+        )
+        with pytest.raises(CarlaSimulationError) as excinfo:
+            scenario._apply_edge_control(0.02)  # noqa: SLF001
+        assert "/cmd_vel" in str(excinfo.value)
 
     def test_nan_command_sanitized_to_zero(self) -> None:
         ego = _ego(speed=0.0)

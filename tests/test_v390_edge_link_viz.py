@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import threading
 from collections import deque
 from pathlib import Path
@@ -434,6 +435,142 @@ class TestWatchdogObservability:
         assert stats["sensor_sent"].get("ego_state", 0) == 5
         assert stats["sensor_hz"]["ego_state"] == pytest.approx(20.0, abs=0.5)
         assert len(producer.sent) >= 5
+
+
+class TestFirstControlTimeout:
+    """V3.9.2：首帧控制超时 → fatal（结束场景），不再零速空跑满时长。
+
+    实机一轮：车端 sil_bridge 未参与，仿真端仍拉满 duration、录 1.87 GB mcap、
+    最后才判 fail。超时即 fatal 可把一次配置缺失压到 30s 内收尾。
+    """
+
+    def test_fatal_after_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _Clock()
+        link, _ = _make_link(
+            clock, monkeypatch, ego=SimpleNamespace(), first_control_timeout_s=2.0
+        )
+        first = link.step(0.02)
+        assert first is not None
+        assert first.stale is True
+        assert first.fatal is False
+
+        clock.advance(1.9)
+        early = link.step(0.02)
+        assert early is not None
+        assert early.fatal is False
+
+        clock.advance(0.2)  # 累计 2.1s ≥ 2.0s
+        late = link.step(0.02)
+        assert late is not None
+        assert late.fatal is True and late.stale is True
+        assert (late.linear_x, late.angular_z) == (0.0, 0.0)
+        assert late.reason.startswith("edge_control_unavailable:")
+        assert "EDGE_LINK_FIRST_CONTROL_TIMEOUT_S" in late.reason
+
+    def test_zero_disables_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _Clock()
+        link, _ = _make_link(
+            clock, monkeypatch, ego=SimpleNamespace(), first_control_timeout_s=0.0
+        )
+        link.step(0.02)
+        clock.advance(600.0)
+        control = link.step(0.02)
+        assert control is not None
+        assert control.fatal is False
+
+    def test_control_arrival_never_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """超时只针对「整场无 /cmd_vel」：先到控制帧则永不 fatal。"""
+        clock = _Clock()
+        link, _ = _make_link(
+            clock, monkeypatch, ego=SimpleNamespace(), first_control_timeout_s=1.0
+        )
+        link.step(0.02)
+        clock.advance(5.0)
+        link._handle_control(_control(1, linear_x=2.0))  # noqa: SLF001
+        control = link.step(0.02)
+        assert control is not None
+        assert control.fatal is False and control.stale is False
+        assert control.linear_x == 2.0
+
+    def test_timeout_logged_once(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """每 tick 都返回 fatal，但 ERROR 只落一条（否则面板被同因告警刷屏）。"""
+        clock = _Clock()
+        link, _ = _make_link(
+            clock, monkeypatch, ego=SimpleNamespace(), first_control_timeout_s=1.0
+        )
+        link.step(0.02)
+        clock.advance(1.5)
+        with caplog.at_level(logging.ERROR):
+            for _ in range(3):
+                control = link.step(0.02)
+                assert control is not None and control.fatal is True
+        records = [
+            record
+            for record in caplog.records
+            if "edge_control_unavailable" in record.getMessage()
+        ]
+        assert len(records) == 1
+
+    def test_stats_expose_timeout_setting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        link, _ = _make_link(_Clock(), monkeypatch, first_control_timeout_s=45.0)
+        assert link.stats["first_control_timeout_s"] == 45.0
+
+
+class TestRecordSizeGate:
+    """V3.9.2：按**序列化后**记录尺寸判限，先于 send() 丢弃并计数。
+
+    kafka-python 超 ``max_request_size`` 时在 ``send()`` 同步抛
+    ``MessageSizeTooLargeError``，异常栈裸奔到面板且不经 ``_send_errors``
+    （实机面板上行错误 0 的假象）。
+    """
+
+    def test_over_limit_record_dropped_before_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        link, producer = _make_link(
+            _Clock(), monkeypatch, max_payload_bytes=8192, max_record_bytes=1024
+        )
+        # payload 未超 max_payload_bytes，但 base64 + JSON 信封后超 max_record_bytes
+        assert link.publish_sensor("lidar", 0.0, 0, b"x" * 2048) is False
+        stats = link.stats
+        assert stats["sensor_record_dropped"] == 1
+        assert stats["sensor_size_dropped"]["lidar"] == 1
+        assert stats["send_errors"] == 0  # 丢弃发生在 send() 之前，不算发送失败
+        assert producer.sent == []
+
+    def test_within_limit_still_sent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        link, producer = _make_link(
+            _Clock(), monkeypatch, max_payload_bytes=8192, max_record_bytes=8192
+        )
+        assert link.publish_sensor("lidar", 0.0, 0, b"x" * 2048) is True
+        assert link.stats["sensor_record_dropped"] == 0
+        assert len(producer.sent) == 1
+
+    def test_drop_log_rate_limited(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        clock = _Clock()
+        link, _ = _make_link(
+            clock, monkeypatch, max_payload_bytes=8192, max_record_bytes=1024
+        )
+        with caplog.at_level(logging.WARNING):
+            link.publish_sensor("lidar", 0.0, 0, b"x" * 2048)
+            clock.advance(1.0)
+            link.publish_sensor("lidar", 1.0, 0, b"x" * 2048)
+        assert link.stats["sensor_record_dropped"] == 2
+        records = [
+            record for record in caplog.records if "记录超限丢弃" in record.getMessage()
+        ]
+        assert len(records) == 1
+
+    def test_default_record_limit_is_one_mib(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """默认值须对齐 Kafka 的 ``message.max.bytes``（1 MiB），不得沿用 4 MiB。"""
+        link, _ = _make_link(_Clock(), monkeypatch)
+        assert link.stats["record_limit_bytes"] == 1_048_576
 
 
 class TestSummaryContract:
@@ -1145,6 +1282,10 @@ class TestKafkaBuilderKwargs:
         assert captured["acks"] == 1
         assert captured["security_protocol"] == "PLAINTEXT"
         assert captured["retries"] == 3
+        # V3.9.2：显式跟随记录上限（+ 协议头预留）。不设则 kafka-python 默认
+        # 1 MiB，会在 send() 同步抛 MessageSizeTooLargeError。
+        limit = link.stats["record_limit_bytes"]
+        assert captured["max_request_size"] == limit + edge_link_module._MAX_REQUEST_OVERHEAD_BYTES  # noqa: SLF001,E501
 
     def test_consumer_kwargs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict[str, Any] = {}

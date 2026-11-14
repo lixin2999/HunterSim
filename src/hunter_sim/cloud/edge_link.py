@@ -44,6 +44,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from hunter_sim.cloud.kafka_limits import (
+    MAX_REQUEST_OVERHEAD_BYTES as _MAX_REQUEST_OVERHEAD_BYTES,
+)
 from hunter_sim.cloud.kafka_security import (
     build_consumer_security_kwargs,
     ssl_failure_hint,
@@ -82,6 +85,7 @@ AdminFactory = Callable[[], Any]
 #: Topic 补建超时（毫秒）与发送失败告警节流窗口（秒）。
 _TOPIC_CREATE_TIMEOUT_MS = 10_000
 _SEND_ERROR_LOG_INTERVAL_S = 10.0
+_SIZE_DROP_LOG_INTERVAL_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -93,11 +97,16 @@ class EdgeControl:
         angular_z: 横摆角速度指令（rad/s，左转为正）。
         stale: 是否处于看门狗/等待态（True 时 linear_x/angular_z 恒 0，
             调用方应零速刹停保持，不得沿用上一帧指令）。
+        fatal: V3.9.2 首帧控制超时（会话已建立但整场无 ``/cmd_vel``），
+            调用方应**结束场景**而非零速跑满时长（否则空跑满时长再判 fail）。
+        reason: ``fatal=True`` 时的失败原因（透传给场景失败描述）。
     """
 
     linear_x: float
     angular_z: float
     stale: bool = False
+    fatal: bool = False
+    reason: str = ""
 
 
 class EdgeLinkRuntime:
@@ -167,6 +176,8 @@ class EdgeLinkRuntime:
         self._send_errors = 0
         self._send_error_suppressed = 0
         self._last_send_error_log_ts = 0.0
+        self._last_size_drop_log_ts = 0.0
+        self._record_drops = 0
         self._send_stamps: dict[str, deque[float]] = {}
 
         # 会话/看门狗状态
@@ -174,6 +185,8 @@ class EdgeLinkRuntime:
         self._stop_sent = False
         self._interrupted = False
         self._waiting_first = True
+        self._first_step_ts: Optional[float] = None
+        self._first_control_fatal = False
         self._bound_ego: Any = None
         self._steps = 0
         self._start_ts = time.time()
@@ -333,6 +346,11 @@ class EdgeLinkRuntime:
             "max_block_ms": 1000,
             "request_timeout_ms": _REQUEST_TIMEOUT_MS,
             "delivery_timeout_ms": _DELIVERY_TIMEOUT_MS,
+            # V3.9.2：显式对齐单条记录上限（默认 1 MiB + 协议头预留），否则
+            # kafka-python 的默认 1 MiB 会在 send() 同步抛
+            # MessageSizeTooLargeError（历史上表现为面板里裸的线程栈）。
+            "max_request_size": self._edge_settings.max_record_bytes
+            + _MAX_REQUEST_OVERHEAD_BYTES,
             **self._security_kwargs,
         }
         return KafkaProducer(**kwargs)
@@ -481,6 +499,9 @@ class EdgeLinkRuntime:
         """
         with self._lock:
             self._steps += 1
+            now = time.time()
+            if self._first_step_ts is None:
+                self._first_step_ts = now
             self._bind_locked()
             if self._bound_ego is None:
                 return None
@@ -488,12 +509,23 @@ class EdgeLinkRuntime:
                 self._send_session("boot")
                 self._boot_sent = True
             self._publish_ego_state()
-            now = time.time()
             watchdog_s = self._edge_settings.watchdog_ms / 1000.0
             if self._last_control_recv_ts is None:
                 # 尚未收到任何控制帧：零速保持，等待车端全栈产出 /cmd_vel
                 self._waiting_first = True
                 self._interrupted = False
+                if self._first_control_timeout(now):
+                    return EdgeControl(
+                        0.0,
+                        0.0,
+                        stale=True,
+                        fatal=True,
+                        reason=(
+                            "edge_control_unavailable: 会话已建立 "
+                            f"{now - (self._first_step_ts or now):.1f}s 内未收到车端任何 "
+                            "/cmd_vel（首帧控制超时，EDGE_LINK_FIRST_CONTROL_TIMEOUT_S）"
+                        ),
+                    )
                 return EdgeControl(0.0, 0.0, stale=True)
             self._waiting_first = False
             age = now - self._last_control_recv_ts
@@ -503,6 +535,32 @@ class EdgeLinkRuntime:
                 return EdgeControl(0.0, 0.0, stale=True)
             self._interrupted = False
             return EdgeControl(self._latest_linear_x, self._latest_angular_z, stale=False)
+
+    def _first_control_timeout(self, now: float) -> bool:
+        """首帧控制是否已超时（幂等，只告警一次）。
+
+        会话已建立但累计 ``first_control_timeout_s`` 仍未收到任何 ``/cmd_vel``
+        时，返回 True 要求调用方结束场景：否则会拉完整个 ``duration_seconds``、
+        录下数百 MB~GB mcap、再判 fail，把一次配置缺失拖成十几分钟的无效跑。
+        """
+        timeout_s = self._edge_settings.first_control_timeout_s
+        if timeout_s <= 0.0 or self._first_step_ts is None:
+            return False
+        waited = now - self._first_step_ts
+        if waited < timeout_s:
+            return False
+        if not self._first_control_fatal:
+            self._first_control_fatal = True
+            logger.error(
+                "edge_control_unavailable: 会话已建立 %.1fs，仍未收到车端任何 /cmd_vel"
+                "（首帧控制超时 %.0fs，EDGE_LINK_FIRST_CONTROL_TIMEOUT_S）→ 结束场景并判 fail。"
+                "请查车端：sil_bridge 是否在跑且绑定 sim_id=%s、ros2 topic hz /cmd_vel 是否有输出、"
+                "mapping cruise 是否已启动（/auto_mission/start_mapping_cruise）",
+                waited,
+                timeout_s,
+                self._sim_id,
+            )
+        return True
 
     def status_override(self) -> Optional[tuple[str, Optional[str]]]:
         """看门狗/等待态 → PAUSED + 原因；控制正常流动时 None（运行器自行上报）。"""
@@ -764,6 +822,28 @@ class EdgeLinkRuntime:
             self._send_errors += 1
             logger.warning(f"EdgeLink envelope serialize failed: {exc}")
             return False
+        # V3.9.2：按**序列化后**记录尺寸判限（而不是只看 base64 前的 payload）。
+        # 超出 broker/producer 上限的记录 kafka-python 会在 send() 同步抛
+        # MessageSizeTooLargeError，异常栈直接冒到面板且不带 stream/尺寸上下文；
+        # 这里提前丢弃并计数，日志给出可执行的处置。
+        limit = self._edge_settings.max_record_bytes
+        if len(value) > limit:
+            stream = str(envelope.get("stream") or "unknown")
+            self._record_drops += 1
+            self._size_drops[stream] = self._size_drops.get(stream, 0) + 1
+            now = time.time()
+            if now - self._last_size_drop_log_ts >= _SIZE_DROP_LOG_INTERVAL_S:
+                self._last_size_drop_log_ts = now
+                logger.warning(
+                    "EdgeLink 记录超限丢弃：stream=%s bytes=%d limit=%d"
+                    "（EDGE_LINK_MAX_RECORD_BYTES，须 ≤ broker message.max.bytes）"
+                    "——可降该流 fps/分辨率，或让运维抬高 broker message.max.bytes "
+                    "后同步调大本值",
+                    stream,
+                    len(value),
+                    limit,
+                )
+            return False
         try:
             producer.send(self.sensor_topic, key=key, value=value)
         except Exception as exc:  # noqa: BLE001  发送失败计数降级，不冒泡阻断
@@ -824,6 +904,9 @@ class EdgeLinkRuntime:
                 },
                 "sensor_rate_dropped": dict(self._rate_drops),
                 "sensor_size_dropped": dict(self._size_drops),
+                "sensor_record_dropped": self._record_drops,
+                "record_limit_bytes": self._edge_settings.max_record_bytes,
+                "first_control_timeout_s": self._edge_settings.first_control_timeout_s,
                 "send_errors": self._send_errors,
                 "steps": self._steps,
                 "uptime_s": round(max(0.0, now - self._start_ts), 1),

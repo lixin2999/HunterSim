@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import deque
 from typing import Any, Callable, Optional
 
+from hunter_sim.cloud.kafka_limits import MAX_RECORD_BYTES, MAX_REQUEST_SIZE
 from hunter_sim.cloud.kafka_security import build_ssl_kwargs, ssl_failure_hint
 from hunter_sim.cloud.sim_data_mapper import (
     build_artifact,
@@ -55,6 +57,9 @@ _DELIVERY_TIMEOUT_MS = 30_000
 
 _MAX_BUFFER = 2000
 
+#: 记录超限丢弃告警的节流窗口（秒）：10Hz 上行遇到超限不节流会刷爆日志。
+_RECORD_DROP_LOG_INTERVAL_S = 10.0
+
 # 生产者工厂注入点（单测用桩替换，避免依赖真实 kafka-python）
 ProducerFactory = Callable[[CloudSettings, str], Any]
 
@@ -86,6 +91,7 @@ class SimDataProducer:
         self._buffer: deque[tuple[str, bytes, bytes]] = deque(maxlen=_MAX_BUFFER)
         self._lock = threading.Lock()
         self._seq = 0
+        self._last_record_drop_log_ts = 0.0
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
 
@@ -137,6 +143,9 @@ class SimDataProducer:
             "max_block_ms": 1000,
             "request_timeout_ms": _REQUEST_TIMEOUT_MS,
             "delivery_timeout_ms": _DELIVERY_TIMEOUT_MS,
+            # V3.9.2：显式对齐单条记录上限（cloud.kafka_limits），不依赖
+            # kafka-python 默认 1 MiB（与 broker message.max.bytes 同口径）
+            "max_request_size": MAX_REQUEST_SIZE,
         }
         if s.sasl_username is not None:
             kwargs["sasl_plain_username"] = s.sasl_username.get_secret_value()
@@ -348,6 +357,15 @@ class SimDataProducer:
         topic = self.sensor_data_topic
         key = self._sim_id.encode("utf-8")
         value = json.dumps(message, default=str).encode("utf-8")
+        # V3.9.2：按**序列化后**字节判限，先于 send() 丢弃。超限记录入缓冲只会在
+        # 每轮重投时重复抛 MessageSizeTooLargeError（kafka-python 在 send() 同步
+        # 抛出），既不会自愈也会把有界缓冲挤满真正的可重投消息。
+        if len(value) > MAX_RECORD_BYTES:
+            SIM_DATA_DROPPED_TOTAL.labels(
+                sim_id=self._sim_id, reason="record_too_large"
+            ).inc()
+            self._warn_record_too_large(len(value))
+            return False
         if not self._available or self._producer is None:
             self._buffer_message(topic, key, value)
             return False
@@ -365,6 +383,19 @@ class SimDataProducer:
         if callable(add_errback):
             self._attach_errback(future, topic, key, value)
         return True
+
+    def _warn_record_too_large(self, size: int) -> None:
+        """记录超限告警（10s 限频）：给出可执行的处置，避免刷屏。"""
+        now = time.time()
+        if now - self._last_record_drop_log_ts < _RECORD_DROP_LOG_INTERVAL_S:
+            return
+        self._last_record_drop_log_ts = now
+        logger.warning(
+            f"SimDataProducer[{self._sim_id}] 记录超限丢弃：bytes={size} "
+            f"limit={MAX_RECORD_BYTES}（cloud.kafka_limits 口径，与 broker "
+            f"message.max.bytes 对齐）——须同时抬高 broker message.max.bytes 与"
+            f"本侧上限，或缩减消息内容（事件 data / topics 列表等）"
+        )
 
     def _on_send_error(self, exc: BaseException, topic: str, key: bytes, value: bytes) -> None:
         """Kafka 异步投递失败回调：记 WARN + 指标，重入缓冲待 flush 重投。"""

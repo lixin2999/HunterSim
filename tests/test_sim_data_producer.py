@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from hunter_sim.cloud.kafka_limits import MAX_RECORD_BYTES, MAX_REQUEST_SIZE
 from hunter_sim.cloud.kafka_security import build_ssl_kwargs
 from hunter_sim.cloud.sim_data_producer import SimDataProducer
 from hunter_sim.cloud.telemetry_producer import TelemetryProducer
@@ -535,3 +536,32 @@ class TestV212Observability:
         assert payload["md5"] == "m"
         assert payload["format"] == "rosbag2"
         assert payload["topics"] == ["/tf"]
+
+
+# ─── V3.9.2：单条记录尺寸口径（cloud.kafka_limits）────────────────────────────
+
+
+class TestRecordSizeGate:
+    """超 ``message.max.bytes`` 的记录必须在 ``send()`` 之前丢弃。
+
+    kafka-python 会同步抛 ``MessageSizeTooLargeError``（不经 errback、也不计入
+    send_errors）；入缓冲重投只会每轮重复失败，挤占真正的可重投消息。
+    """
+
+    def test_oversize_record_dropped_without_buffering(self) -> None:
+        p, fake = _producer(sim_id="sim-big")
+        huge = {"sim_id": "sim-big", "padding": "x" * MAX_RECORD_BYTES}
+        assert p.publish_telemetry(huge) is False
+        assert fake.sent == []
+        assert p.buffered_count == 0
+
+    def test_within_limit_still_sent(self) -> None:
+        p, fake = _producer(sim_id="sim-ok")
+        assert p.publish_telemetry({"sim_id": "sim-ok", "pad": "x" * 1024}) is True
+        assert len(fake.sent) == 1
+
+    def test_max_request_size_aligned_with_record_limit(self, monkeypatch: Any) -> None:
+        captured = TestProducerMtlsWiring._patch_kafka_producer(monkeypatch)
+        SimDataProducer(_settings(), sim_id="sim-lim")._build_kafka_producer()
+        assert captured["max_request_size"] == MAX_REQUEST_SIZE
+        assert MAX_REQUEST_SIZE >= MAX_RECORD_BYTES

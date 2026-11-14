@@ -452,7 +452,27 @@ class EdgeLinkSettings(BaseSettings):
     max_payload_bytes: int = Field(
         4_194_304,
         ge=1024,
-        description="单帧 payload 尺寸上限（字节），超限丢弃并计数（防超大帧撑爆 broker）",
+        description=(
+            "单帧 payload 尺寸上限（字节，base64 前），超限丢弃并计数"
+            "（防无谓的 base64 放大）；真正的交付上限见 max_record_bytes"
+        ),
+    )
+    max_record_bytes: int = Field(
+        1_048_576,
+        ge=1024,
+        description=(
+            "单条 Kafka 记录上限（序列化后字节，含 base64 膨胀），须 ≤ broker "
+            "message.max.bytes（Kafka 默认 1 MiB）；超限丢弃并计数"
+        ),
+    )
+    first_control_timeout_s: float = Field(
+        30.0,
+        ge=0.0,
+        le=600.0,
+        description=(
+            "首帧控制超时（秒）：SIL_EDGE 下会话已建立但累计该时长仍未收到任何 "
+            "/cmd_vel 即结束场景并判 fail；0 关闭"
+        ),
     )
 
 

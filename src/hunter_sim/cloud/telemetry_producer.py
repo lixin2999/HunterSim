@@ -16,6 +16,7 @@ import threading
 from collections import deque
 from typing import Any, Callable, Optional
 
+from hunter_sim.cloud.kafka_limits import MAX_REQUEST_SIZE
 from hunter_sim.cloud.kafka_security import build_ssl_kwargs
 from hunter_sim.cloud.telemetry_mapper import build_event, build_health, build_telemetry
 from hunter_sim.common.models import CloudSettings, VehicleState
@@ -109,6 +110,8 @@ class TelemetryProducer:
             "max_block_ms": 1000,
             "request_timeout_ms": _REQUEST_TIMEOUT_MS,
             "delivery_timeout_ms": _DELIVERY_TIMEOUT_MS,
+            # V3.9.2：显式对齐单条记录上限（cloud.kafka_limits）
+            "max_request_size": MAX_REQUEST_SIZE,
         }
         if s.sasl_username is not None:
             kwargs["sasl_plain_username"] = s.sasl_username.get_secret_value()
